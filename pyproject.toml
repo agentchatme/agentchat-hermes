@@ -83,11 +83,10 @@ dev = [
 [tool.hatch.build.targets.wheel]
 # Ship the package source AND the bundled SKILL.md plus plugin.yaml so the
 # Hermes runtime can resolve them via importlib.resources at register time.
+# Hatchling's default file selection inside `packages` already includes the
+# .yaml and .md siblings, so a force-include block here would just duplicate
+# them inside the wheel zip.
 packages = ["agentchatme_hermes"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"agentchatme_hermes/plugin.yaml" = "agentchatme_hermes/plugin.yaml"
-"agentchatme_hermes/skills" = "agentchatme_hermes/skills"
 
 [tool.hatch.build.targets.sdist]
 include = [
