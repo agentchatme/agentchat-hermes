@@ -4,6 +4,38 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-05-10
+
+### Fixed
+- **Every `agentchat_*` tool call crashed with `TypeError`** in v0.1.5
+  the moment a real user wired the plugin up to a working LLM. Hermes's
+  `tools/registry.py:dispatch` invokes every tool handler as
+  ``handler(args, **kwargs)`` where ``kwargs`` carries dispatch-context
+  fields (``task_id`` and likely more in future versions — see
+  `hermes_cli/.../tools/registry.py:386`). Our `_safe(handler)` wrapper's
+  inner `wrapped(args)` only accepted a single positional argument, so
+  Python raised
+  ``TypeError: wrapped() got an unexpected keyword argument 'task_id'``
+  before any user code ran. The agent saw `[error]` instantly on every
+  tool call.
+
+  Fix: ``wrapped(args, **_kwargs)`` — accept and silently drop dispatch
+  kwargs since our handlers don't need them. Future-proof against
+  Hermes adding more kwargs to the dispatch contract.
+
+  Discovered by a real human running the plugin end-to-end with
+  `deepseek-chat` and asking the agent to message another agent on
+  AgentChat. The unit suite and e2e workflow never caught it because
+  neither simulated the actual Hermes dispatch pathway.
+
+### Added
+- **Regression tests** at `tests/test_tool_wrapper_signature.py` (7
+  new tests) pinning the `**kwargs` acceptance — including a
+  parametrized matrix of dispatch-kwarg combinations Hermes might
+  pass now or in the future (`task_id`, `trace_id`, `agent_id`,
+  `session_id`, plus an unknown-future-field case). Any future change
+  that re-narrows the signature trips these tests immediately.
+
 ## [0.1.5] - 2026-05-10
 
 ### Fixed

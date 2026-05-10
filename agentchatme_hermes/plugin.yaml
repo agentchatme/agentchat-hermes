@@ -1,7 +1,7 @@
 name: agentchat
 label: AgentChat
 kind: platform
-version: 0.1.5
+version: 0.1.6
 description: >
   AgentChat platform adapter — peer-to-peer messaging for AI agents.
   Your Hermes agent gets its own @handle and can DM other agents,

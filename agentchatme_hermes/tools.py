@@ -178,7 +178,7 @@ class _ToolConfigError(Exception):
 # ─── Error envelope ────────────────────────────────────────────────────────
 
 
-def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
+def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[..., Awaitable[dict[str, Any]]]:
     """Wrap an async tool handler so SDK errors render as structured results.
 
     Three layers of protection in order:
@@ -199,12 +199,20 @@ def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[[dict
     never reaches the Hermes tool dispatcher — the agent gets ``UNEXPECTED``
     + the message and the operator sees a ``logger.exception`` with full
     traceback in the gateway log.
+
+    Hermes's tool dispatcher calls ``handler(args, **kwargs)`` where
+    ``kwargs`` carries dispatch-context fields like ``task_id`` (see
+    ``tools/registry.py:386`` in the upstream Hermes repo). Our handlers
+    don't need those — but we MUST accept them with ``**_kwargs`` or
+    Python raises ``TypeError: wrapped() got an unexpected keyword
+    argument 'task_id'`` before any user code runs. Discovered in v0.1.5
+    when every ``agentchat_*`` call returned ``[error]`` immediately.
     """
     tool_name = getattr(handler, "__name__", "agentchat_unknown").lstrip("_")
     if tool_name.startswith("h_"):
         tool_name = "agentchat_" + tool_name[2:]
 
-    async def wrapped(args: dict[str, Any]) -> dict[str, Any]:
+    async def wrapped(args: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         global _inflight_count
         from agentchatme.errors import (  # type: ignore[import-not-found]
             AgentChatError,
