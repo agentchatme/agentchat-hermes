@@ -40,21 +40,22 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, Awaitable, Callable, Dict, Optional
+from collections.abc import Awaitable
+from typing import Any, Callable
 
 logger = logging.getLogger(__name__)
 
 # ─── Shared SDK client ─────────────────────────────────────────────────────
 
 _client: Any = None  # AsyncAgentChatClient — typed as Any for lazy import
-_client_lock: Optional[asyncio.Lock] = None
+_client_lock: asyncio.Lock | None = None
 
 
 def _api_base() -> str:
     return (os.getenv("AGENTCHATME_API_BASE") or "https://api.agentchat.me").rstrip("/")
 
 
-def _api_key() -> Optional[str]:
+def _api_key() -> str | None:
     key = (os.getenv("AGENTCHATME_API_KEY") or "").strip()
     return key or None
 
@@ -97,7 +98,7 @@ class _ToolConfigError(Exception):
 # ─── Error envelope ────────────────────────────────────────────────────────
 
 
-def _safe(handler: Callable[[Dict[str, Any]], Awaitable[Any]]) -> Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]:
+def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
     """Wrap an async tool handler so SDK errors render as structured results.
 
     The agent's LLM decides what to do with the response, so we surface
@@ -107,12 +108,11 @@ def _safe(handler: Callable[[Dict[str, Any]], Awaitable[Any]]) -> Callable[[Dict
     the tool registry.
     """
 
-    async def wrapped(args: Dict[str, Any]) -> Dict[str, Any]:
+    async def wrapped(args: dict[str, Any]) -> dict[str, Any]:
         from agentchatme.errors import (  # type: ignore
             AgentChatError,
             AwaitingReplyError,
             BlockedError,
-            ConnectionError as ACConnectionError,
             ForbiddenError,
             GroupDeletedError,
             NotFoundError,
@@ -123,6 +123,9 @@ def _safe(handler: Callable[[Dict[str, Any]], Awaitable[Any]]) -> Callable[[Dict
             SuspendedError,
             UnauthorizedError,
             ValidationError,
+        )
+        from agentchatme.errors import (
+            ConnectionError as ACConnectionError,
         )
 
         try:
@@ -201,7 +204,7 @@ def _safe(handler: Callable[[Dict[str, Any]], Awaitable[Any]]) -> Callable[[Dict
 # ─── Schema helpers ────────────────────────────────────────────────────────
 
 
-def _schema(properties: Dict[str, Dict[str, Any]], required: Optional[list] = None) -> Dict[str, Any]:
+def _schema(properties: dict[str, dict[str, Any]], required: list | None = None) -> dict[str, Any]:
     return {
         "type": "object",
         "properties": properties,
@@ -221,7 +224,7 @@ MSG_ID = {"type": "string", "description": "Message id (e.g. msg_xyz789)."}
 def register_all_tools(ctx: Any) -> None:
     """Register every ``agentchat_*`` tool on the given PluginContext."""
 
-    common: Dict[str, Any] = {
+    common: dict[str, Any] = {
         "toolset": "agentchat",
         "is_async": True,
         "requires_env": ["AGENTCHATME_API_KEY"],
@@ -745,21 +748,21 @@ def _normalize_handle(value: Any) -> str:
     return value.strip().lstrip("@").lower()
 
 
-async def _h_get_my_status(args: Dict[str, Any]) -> Any:
+async def _h_get_my_status(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.get_me()
 
 
-async def _h_get_agent_profile(args: Dict[str, Any]) -> Any:
+async def _h_get_agent_profile(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.get_agent(_normalize_handle(args["handle"]))
 
 
-async def _h_update_my_profile(args: Dict[str, Any]) -> Any:
+async def _h_update_my_profile(args: dict[str, Any]) -> Any:
     client = await _get_client()
     me = await client.get_me()
     handle = me.get("handle")
-    payload: Dict[str, Any] = {}
+    payload: dict[str, Any] = {}
     if "display_name" in args:
         payload["display_name"] = args["display_name"]
     if "description" in args:
@@ -769,9 +772,9 @@ async def _h_update_my_profile(args: Dict[str, Any]) -> Any:
     return await client.update_agent(handle, **payload)
 
 
-async def _h_send_message(args: Dict[str, Any]) -> Any:
+async def _h_send_message(args: dict[str, Any]) -> Any:
     client = await _get_client()
-    kwargs: Dict[str, Any] = {
+    kwargs: dict[str, Any] = {
         "content": {"type": "text", "text": args["text"]},
     }
     if args.get("to"):
@@ -787,16 +790,16 @@ async def _h_send_message(args: Dict[str, Any]) -> Any:
         raise _ToolConfigError("Provide either `to` (handle) or `conversation_id`.")
 
     result = await client.send_message(**kwargs)
-    out: Dict[str, Any] = {"message": getattr(result, "message", result)}
+    out: dict[str, Any] = {"message": getattr(result, "message", result)}
     backlog = getattr(result, "backlog_warning", None)
     if backlog is not None:
         out["backlog_warning"] = backlog
     return out
 
 
-async def _h_get_messages(args: Dict[str, Any]) -> Any:
+async def _h_get_messages(args: dict[str, Any]) -> Any:
     client = await _get_client()
-    kwargs: Dict[str, Any] = {"limit": args.get("limit", 50)}
+    kwargs: dict[str, Any] = {"limit": args.get("limit", 50)}
     if "before_seq" in args and args["before_seq"] is not None:
         kwargs["before_seq"] = args["before_seq"]
     if "after_seq" in args and args["after_seq"] is not None:
@@ -804,41 +807,41 @@ async def _h_get_messages(args: Dict[str, Any]) -> Any:
     return await client.get_messages(args["conversation_id"], **kwargs)
 
 
-async def _h_mark_read(args: Dict[str, Any]) -> Any:
+async def _h_mark_read(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.mark_as_read(args["message_id"])
 
 
-async def _h_delete_message(args: Dict[str, Any]) -> Any:
+async def _h_delete_message(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.delete_message(args["message_id"])
 
 
-async def _h_sync_undelivered(args: Dict[str, Any]) -> Any:
+async def _h_sync_undelivered(args: dict[str, Any]) -> Any:
     client = await _get_client()
-    kwargs: Dict[str, Any] = {"limit": args.get("limit", 200)}
-    if "after" in args and args["after"]:
+    kwargs: dict[str, Any] = {"limit": args.get("limit", 200)}
+    if args.get("after"):
         kwargs["after"] = args["after"]
     envelopes = await client.sync(**kwargs)
     return {"envelopes": envelopes}
 
 
-async def _h_list_conversations(args: Dict[str, Any]) -> Any:
+async def _h_list_conversations(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.list_conversations()
 
 
-async def _h_get_conversation_participants(args: Dict[str, Any]) -> Any:
+async def _h_get_conversation_participants(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.get_conversation_participants(args["conversation_id"])
 
 
-async def _h_hide_conversation(args: Dict[str, Any]) -> Any:
+async def _h_hide_conversation(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.hide_conversation(args["conversation_id"])
 
 
-async def _h_add_contact(args: Dict[str, Any]) -> Any:
+async def _h_add_contact(args: dict[str, Any]) -> Any:
     client = await _get_client()
     handle = _normalize_handle(args["handle"])
     notes = args.get("notes")
@@ -847,7 +850,7 @@ async def _h_add_contact(args: Dict[str, Any]) -> Any:
     return await client.add_contact(handle)
 
 
-async def _h_list_contacts(args: Dict[str, Any]) -> Any:
+async def _h_list_contacts(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.list_contacts(
         limit=args.get("limit", 100),
@@ -855,12 +858,12 @@ async def _h_list_contacts(args: Dict[str, Any]) -> Any:
     )
 
 
-async def _h_check_contact(args: Dict[str, Any]) -> Any:
+async def _h_check_contact(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.check_contact(_normalize_handle(args["handle"]))
 
 
-async def _h_update_contact_note(args: Dict[str, Any]) -> Any:
+async def _h_update_contact_note(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.update_contact_notes(
         _normalize_handle(args["handle"]),
@@ -868,30 +871,30 @@ async def _h_update_contact_note(args: Dict[str, Any]) -> Any:
     )
 
 
-async def _h_remove_contact(args: Dict[str, Any]) -> Any:
+async def _h_remove_contact(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.remove_contact(_normalize_handle(args["handle"]))
 
 
-async def _h_block_agent(args: Dict[str, Any]) -> Any:
+async def _h_block_agent(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.block_agent(_normalize_handle(args["handle"]))
 
 
-async def _h_unblock_agent(args: Dict[str, Any]) -> Any:
+async def _h_unblock_agent(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.unblock_agent(_normalize_handle(args["handle"]))
 
 
-async def _h_report_agent(args: Dict[str, Any]) -> Any:
+async def _h_report_agent(args: dict[str, Any]) -> Any:
     client = await _get_client()
     handle = _normalize_handle(args["handle"])
-    if "reason" in args and args["reason"]:
+    if args.get("reason"):
         return await client.report_agent(handle, reason=args["reason"])
     return await client.report_agent(handle)
 
 
-async def _h_mute_agent(args: Dict[str, Any]) -> Any:
+async def _h_mute_agent(args: dict[str, Any]) -> Any:
     client = await _get_client()
     handle = _normalize_handle(args["handle"])
     muted_until = args.get("muted_until")
@@ -900,7 +903,7 @@ async def _h_mute_agent(args: Dict[str, Any]) -> Any:
     return await client.mute_agent(handle)
 
 
-async def _h_mute_conversation(args: Dict[str, Any]) -> Any:
+async def _h_mute_conversation(args: dict[str, Any]) -> Any:
     client = await _get_client()
     muted_until = args.get("muted_until")
     if muted_until:
@@ -910,43 +913,43 @@ async def _h_mute_conversation(args: Dict[str, Any]) -> Any:
     return await client.mute_conversation(args["conversation_id"])
 
 
-async def _h_unmute_agent(args: Dict[str, Any]) -> Any:
+async def _h_unmute_agent(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.unmute_agent(_normalize_handle(args["handle"]))
 
 
-async def _h_unmute_conversation(args: Dict[str, Any]) -> Any:
+async def _h_unmute_conversation(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.unmute_conversation(args["conversation_id"])
 
 
-async def _h_list_mutes(args: Dict[str, Any]) -> Any:
+async def _h_list_mutes(args: dict[str, Any]) -> Any:
     client = await _get_client()
     if args.get("kind"):
         return await client.list_mutes(kind=args["kind"])
     return await client.list_mutes()
 
 
-async def _h_get_presence(args: Dict[str, Any]) -> Any:
+async def _h_get_presence(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.get_presence(_normalize_handle(args["handle"]))
 
 
-async def _h_update_presence(args: Dict[str, Any]) -> Any:
+async def _h_update_presence(args: dict[str, Any]) -> Any:
     client = await _get_client()
-    payload: Dict[str, Any] = {"status": args["status"]}
+    payload: dict[str, Any] = {"status": args["status"]}
     if "custom_message" in args:
         payload["custom_message"] = args["custom_message"]
     return await client.update_presence(**payload)
 
 
-async def _h_get_presence_batch(args: Dict[str, Any]) -> Any:
+async def _h_get_presence_batch(args: dict[str, Any]) -> Any:
     client = await _get_client()
     handles = ["@" + _normalize_handle(h) for h in args["handles"]]
     return await client.get_presence_batch(handles)
 
 
-async def _h_search_directory(args: Dict[str, Any]) -> Any:
+async def _h_search_directory(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.search_agents(
         args["query"],
@@ -955,9 +958,9 @@ async def _h_search_directory(args: Dict[str, Any]) -> Any:
     )
 
 
-async def _h_create_group(args: Dict[str, Any]) -> Any:
+async def _h_create_group(args: dict[str, Any]) -> Any:
     client = await _get_client()
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "name": args["name"],
         "member_handles": [
             "@" + _normalize_handle(h) for h in args["member_handles"]
@@ -968,14 +971,14 @@ async def _h_create_group(args: Dict[str, Any]) -> Any:
     return await client.create_group(payload)
 
 
-async def _h_get_group(args: Dict[str, Any]) -> Any:
+async def _h_get_group(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.get_group(args["group_id"])
 
 
-async def _h_update_group(args: Dict[str, Any]) -> Any:
+async def _h_update_group(args: dict[str, Any]) -> Any:
     client = await _get_client()
-    payload: Dict[str, Any] = {}
+    payload: dict[str, Any] = {}
     if "name" in args:
         payload["name"] = args["name"]
     if "description" in args:
@@ -985,60 +988,60 @@ async def _h_update_group(args: Dict[str, Any]) -> Any:
     return await client.update_group(args["group_id"], **payload)
 
 
-async def _h_add_group_member(args: Dict[str, Any]) -> Any:
+async def _h_add_group_member(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.add_group_member(
         args["group_id"], "@" + _normalize_handle(args["handle"])
     )
 
 
-async def _h_remove_group_member(args: Dict[str, Any]) -> Any:
+async def _h_remove_group_member(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.remove_group_member(
         args["group_id"], "@" + _normalize_handle(args["handle"])
     )
 
 
-async def _h_promote_group_member(args: Dict[str, Any]) -> Any:
+async def _h_promote_group_member(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.promote_group_member(
         args["group_id"], "@" + _normalize_handle(args["handle"])
     )
 
 
-async def _h_demote_group_member(args: Dict[str, Any]) -> Any:
+async def _h_demote_group_member(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.demote_group_member(
         args["group_id"], "@" + _normalize_handle(args["handle"])
     )
 
 
-async def _h_leave_group(args: Dict[str, Any]) -> Any:
+async def _h_leave_group(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.leave_group(args["group_id"])
 
 
-async def _h_delete_group(args: Dict[str, Any]) -> Any:
+async def _h_delete_group(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.delete_group(args["group_id"])
 
 
-async def _h_list_group_invites(args: Dict[str, Any]) -> Any:
+async def _h_list_group_invites(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.list_group_invites()
 
 
-async def _h_accept_group_invite(args: Dict[str, Any]) -> Any:
+async def _h_accept_group_invite(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.accept_group_invite(args["invite_id"])
 
 
-async def _h_reject_group_invite(args: Dict[str, Any]) -> Any:
+async def _h_reject_group_invite(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.reject_group_invite(args["invite_id"])
 
 
-async def _h_get_attachment_download_url(args: Dict[str, Any]) -> Any:
+async def _h_get_attachment_download_url(args: dict[str, Any]) -> Any:
     client = await _get_client()
     url = await client.get_attachment_download_url(args["attachment_id"])
     return {"download_url": url}

@@ -29,10 +29,11 @@ fills the hole.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Callable
 
 from agentchatme import (
     AsyncAgentChatClient,
@@ -43,7 +44,6 @@ from agentchatme.errors import (
     AgentChatError,
     AwaitingReplyError,
     BlockedError,
-    ConnectionError as ACConnectionError,
     GroupDeletedError,
     NotFoundError,
     RateLimitedError,
@@ -53,6 +53,9 @@ from agentchatme.errors import (
     SuspendedError,
     UnauthorizedError,
     ValidationError,
+)
+from agentchatme.errors import (
+    ConnectionError as ACConnectionError,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,7 +72,7 @@ logger = logging.getLogger(__name__)
 # and inside ``register()``; the adapter class itself is built when those
 # imports first succeed, then cached.
 
-_AdapterCls: Optional[type] = None
+_AdapterCls: type | None = None
 
 
 def _adapter_class() -> type:
@@ -133,23 +136,23 @@ def _adapter_class() -> type:
 
             # SDK clients — instantiated in connect() so a failed config
             # doesn't leak open sockets / file descriptors.
-            self._client: Optional[AsyncAgentChatClient] = None
-            self._realtime: Optional[RealtimeClient] = None
+            self._client: AsyncAgentChatClient | None = None
+            self._realtime: RealtimeClient | None = None
 
             # Identity resolved from /v1/agents/me on connect. The handle
             # is what we render to the agent in platform_hint and what we
             # use to filter our own outbound out of the inbound stream.
-            self.handle: Optional[str] = None
-            self._agent_id: Optional[str] = None
+            self.handle: str | None = None
+            self._agent_id: str | None = None
 
             # State guards. _lock_key prevents two profiles connecting
             # with the same API key (race-free identity allocation,
             # mirrors gateway/platforms/slack.py:2785-2790).
-            self._lock_key: Optional[str] = None
+            self._lock_key: str | None = None
             # Unsubscribers from RealtimeClient handler registration —
             # called in disconnect() so a re-connect doesn't double-fire
             # handlers from the previous connection.
-            self._handler_unsubs: List[Callable[[], None]] = []
+            self._handler_unsubs: list[Callable[[], None]] = []
 
             # MessageType reference for downstream code (so the adapter
             # methods can refer to it without re-importing inside loops).
@@ -180,14 +183,14 @@ def _adapter_class() -> type:
             # opening duplicate WebSockets to the same agent (which would
             # double the receive load and double-process messages).
             try:
-                from gateway.status import (  # type: ignore[import-not-found]
-                    acquire_scoped_lock,
-                )
-
                 # Don't put the full key in the lock id — leaks across logs.
                 # The first 16 hex chars of the SHA fingerprint is unique
                 # enough for the in-process lock and won't reveal the secret.
                 import hashlib
+
+                from gateway.status import (  # type: ignore[import-not-found]
+                    acquire_scoped_lock,
+                )
 
                 self._lock_key = hashlib.sha256(self.api_key.encode()).hexdigest()[:16]
                 if not acquire_scoped_lock("agentchat", self._lock_key):
@@ -316,31 +319,25 @@ def _adapter_class() -> type:
 
         async def _teardown_realtime(self) -> None:
             for off in self._handler_unsubs:
-                try:
+                with contextlib.suppress(Exception):
                     off()
-                except Exception:
-                    pass
             self._handler_unsubs = []
 
             if self._realtime is not None:
-                try:
+                # Best-effort — Hermes's 5s shutdown grace already covers us.
+                with contextlib.suppress(Exception):
                     await asyncio.wait_for(self._realtime.disconnect(), timeout=3.0)
-                except Exception:
-                    # Best-effort — Hermes's 5s shutdown grace already covers us.
-                    pass
                 self._realtime = None
 
         async def _cleanup_client(self) -> None:
             if self._client is not None:
-                try:
+                with contextlib.suppress(Exception):
                     await self._client.__aexit__(None, None, None)
-                except Exception:
-                    pass
                 self._client = None
 
         # ── Inbound: SDK frame → MessageEvent → handle_message ────────────
 
-        async def _on_realtime_frame(self, frame: Dict[str, Any]) -> None:
+        async def _on_realtime_frame(self, frame: dict[str, Any]) -> None:
             """Dispatch a realtime frame.
 
             The SDK passes the decoded JSON dict; we branch on ``type``.
@@ -364,7 +361,7 @@ def _adapter_class() -> type:
             logger.debug("AgentChat: ignoring realtime frame type=%s", ftype)
 
         async def _dispatch_inbound_message(
-            self, payload: Dict[str, Any], *, kind: str
+            self, payload: dict[str, Any], *, kind: str
         ) -> None:
             sender = payload.get("from") or payload.get("sender")
             if not isinstance(sender, str) or not sender:
@@ -440,7 +437,7 @@ def _adapter_class() -> type:
             except Exception:
                 logger.exception("AgentChat: handle_message failed")
 
-        async def _dispatch_group_deleted(self, data: Dict[str, Any]) -> None:
+        async def _dispatch_group_deleted(self, data: dict[str, Any]) -> None:
             group_id = str(data.get("group_id", ""))
             deleted_by = data.get("deleted_by_handle", "?")
             text = (
@@ -479,7 +476,7 @@ def _adapter_class() -> type:
         async def _on_realtime_connect(self) -> None:
             logger.debug("AgentChat: realtime hello.ok received")
 
-        async def _on_realtime_disconnect(self, info: Dict[str, Any]) -> None:
+        async def _on_realtime_disconnect(self, info: dict[str, Any]) -> None:
             # The SDK's RealtimeClient handles reconnect internally with
             # forever-retry by default. We escalate to Hermes's framework-
             # level supervisor only on auth-class closes — those are the
@@ -512,8 +509,8 @@ def _adapter_class() -> type:
             self,
             chat_id: str,
             content: str,
-            reply_to: Optional[str] = None,
-            metadata: Optional[Dict[str, Any]] = None,
+            reply_to: str | None = None,
+            metadata: dict[str, Any] | None = None,
         ) -> Any:
             if not self._client:
                 return self._SendResult(success=False, error="Not connected")
@@ -527,7 +524,7 @@ def _adapter_class() -> type:
             # server will return CONVERSATION_NOT_FOUND if it's bogus, and we
             # surface that cleanly below.
             cid = chat_id.strip()
-            kwargs: Dict[str, Any] = {
+            kwargs: dict[str, Any] = {
                 "content": {"type": "text", "text": content},
             }
             if cid.startswith("@"):
@@ -619,14 +616,14 @@ def _adapter_class() -> type:
             return self._SendResult(success=True, message_id=msg_id)
 
         async def send_typing(
-            self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
+            self, chat_id: str, metadata: dict[str, Any] | None = None
         ) -> None:
             # Typing indicators are still WIP server-side. No-op for now;
             # the framework's default is also no-op so this override is
             # only documentation that we considered the surface.
             return None
 
-        async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
             cid = chat_id.strip()
             if cid.startswith("conv_"):
                 kind = "group"
@@ -663,6 +660,7 @@ def register(ctx: Any) -> None:
     # Lazy imports — only fire when the entry point actually runs (which
     # implies Hermes is loaded). Keeps a bare `import agentchatme_hermes`
     # in a non-Hermes environment side-effect-free.
+    from .cli import dispatch_cli_command, setup_cli_argparse
     from .setup import (
         check_requirements,
         env_enablement,
@@ -670,7 +668,6 @@ def register(ctx: Any) -> None:
         is_connected,
         validate_config,
     )
-    from .cli import dispatch_cli_command, setup_cli_argparse
     from .tools import register_all_tools
 
     ctx.register_platform(

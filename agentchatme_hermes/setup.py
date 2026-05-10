@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Any, Optional
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -77,13 +77,9 @@ def validate_config(config: Any) -> bool:
     """
     extra = getattr(config, "extra", {}) or {}
     api_key = (os.getenv("AGENTCHATME_API_KEY") or extra.get("api_key") or "").strip()
-    if not api_key:
-        return False
-    if len(api_key) < 20:
-        # Even loosely-shaped keys exceed 20 chars. Anything shorter is a
-        # paste error — fail closed.
-        return False
-    return True
+    # Even loosely-shaped keys exceed 20 chars. Anything shorter is a paste
+    # error — fail closed. Empty string also falls through this check.
+    return len(api_key) >= 20
 
 
 def is_connected(config: Any) -> bool:
@@ -99,7 +95,7 @@ def is_connected(config: Any) -> bool:
     return bool(api_key)
 
 
-def env_enablement() -> Optional[dict]:
+def env_enablement() -> dict | None:
     """Seed PlatformConfig.extra from env vars at gateway-config load.
 
     Returns None when env-only minimum (just AGENTCHATME_API_KEY) isn't
@@ -367,7 +363,7 @@ def _advanced_options_flow(
 # ─── Prompt helpers ────────────────────────────────────────────────────────
 
 
-def _prompt_email(prompt, print_warning) -> Optional[str]:
+def _prompt_email(prompt, print_warning) -> str | None:
     for _ in range(_MAX_REGISTER_RETRIES):
         value = prompt("Email — receives the 6-digit verification code (e.g. you@example.com)").strip()
         if not value:
@@ -381,7 +377,7 @@ def _prompt_email(prompt, print_warning) -> Optional[str]:
     return None
 
 
-def _prompt_handle(prompt, print_warning) -> Optional[str]:
+def _prompt_handle(prompt, print_warning) -> str | None:
     for _ in range(_MAX_REGISTER_RETRIES):
         value = prompt(
             "Choose a @handle (3-30 chars, lowercase letters/digits/hyphens, must start with a letter)"
@@ -395,7 +391,7 @@ def _prompt_handle(prompt, print_warning) -> Optional[str]:
     return None
 
 
-def _prompt_otp(prompt, print_warning) -> Optional[str]:
+def _prompt_otp(prompt, print_warning) -> str | None:
     for _ in range(_MAX_REGISTER_RETRIES):
         value = prompt("Enter the 6-digit code from your inbox").strip()
         if _OTP_PATTERN.match(value):
@@ -405,7 +401,7 @@ def _prompt_otp(prompt, print_warning) -> Optional[str]:
     return None
 
 
-def _validate_handle(value: str) -> Optional[str]:
+def _validate_handle(value: str) -> str | None:
     """Return error message on shape failure, None on success."""
     if not value:
         return "Handle is required."
@@ -439,7 +435,7 @@ def _mask_key(key: str) -> str:
 class _RegisterError(Exception):
     """Surface a server registration error with field-context for the wizard."""
 
-    def __init__(self, message: str, *, field: Optional[str] = None) -> None:
+    def __init__(self, message: str, *, field: str | None = None) -> None:
         super().__init__(message)
         self.field = field
 
@@ -473,7 +469,7 @@ def _register_start(*, email: str, handle: str, display_name: str) -> str:
         try:
             data = resp.json()
         except Exception:
-            raise _RegisterError("invalid server response")
+            raise _RegisterError("invalid server response") from None
         pending_id = data.get("pending_id")
         if not pending_id:
             raise _RegisterError("server did not return a pending_id")
@@ -511,7 +507,7 @@ def _register_verify(*, pending_id: str, code: str) -> tuple[str, str]:
         try:
             data = resp.json()
         except Exception:
-            raise _RegisterError("invalid server response")
+            raise _RegisterError("invalid server response") from None
         api_key = data.get("api_key")
         agent = data.get("agent") or {}
         handle = agent.get("handle")
@@ -523,7 +519,7 @@ def _register_verify(*, pending_id: str, code: str) -> tuple[str, str]:
     raise _RegisterError(message or err_code or f"HTTP {resp.status_code}")
 
 
-def _validate_key_remote(api_key: str, print_warning) -> Optional[str]:
+def _validate_key_remote(api_key: str, print_warning) -> str | None:
     """Call GET /v1/agents/me and return the resolved handle on success.
 
     Used by the paste-existing-key path and by `hermes agentchat whoami`.
@@ -559,7 +555,7 @@ def _validate_key_remote(api_key: str, print_warning) -> Optional[str]:
     return None
 
 
-def _parse_error(resp) -> tuple[Optional[str], Optional[str]]:
+def _parse_error(resp) -> tuple[str | None, str | None]:
     """Pull `{code, message}` from a JSON error response. Returns (code, message)."""
     try:
         data = resp.json()
@@ -576,7 +572,7 @@ def _parse_error(resp) -> tuple[Optional[str], Optional[str]]:
 # ─── CLI subcommand backends ───────────────────────────────────────────────
 
 
-def cli_register(email: Optional[str], handle: Optional[str], display_name: Optional[str]) -> int:
+def cli_register(email: str | None, handle: str | None, display_name: str | None) -> int:
     """Backend for `hermes agentchat register`. Returns shell exit code."""
     from hermes_cli.setup import (  # type: ignore[import-not-found]
         print_header,
@@ -652,7 +648,7 @@ def cli_register(email: Optional[str], handle: Optional[str], display_name: Opti
     return 0
 
 
-def cli_login(api_key: Optional[str]) -> int:
+def cli_login(api_key: str | None) -> int:
     """Backend for `hermes agentchat login` — paste an existing key."""
     from hermes_cli.setup import (  # type: ignore[import-not-found]
         print_header,

@@ -18,7 +18,6 @@ from agentchatme_hermes.setup import (
     _validate_handle,
 )
 
-
 # ─── Handle shape ──────────────────────────────────────────────────────────
 
 
