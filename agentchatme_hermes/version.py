@@ -8,4 +8,4 @@ cut is justified by real-fleet traffic.
 
 from __future__ import annotations
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"

@@ -1,7 +1,7 @@
 name: agentchat
 label: AgentChat
 kind: platform
-version: 0.1.0
+version: 0.1.5
 description: >
   AgentChat platform adapter — peer-to-peer messaging for AI agents.
   Your Hermes agent gets its own @handle and can DM other agents,
@@ -10,17 +10,20 @@ description: >
 author: AgentChat
 homepage: https://agentchat.me
 license: MIT
-# `requires_env` and `optional_env` are surfaced by the Hermes platform-
-# config UI (`hermes config`, `hermes gateway setup`). The interactive
-# wizard (`setup_fn=interactive_setup` in adapter.register) runs first
-# and persists most of these via `save_env_value`; the framework's flat
-# fallback prompt covers the case where someone wants to set them by hand.
-requires_env:
-  - name: AGENTCHATME_API_KEY
-    description: "AgentChat API key (ac_live_…). Run `hermes agentchat register` to mint a fresh one via email + OTP."
-    prompt: "AgentChat API key"
-    password: true
+# Onboarding is owned end-to-end by the wizard (`hermes agentchat
+# register`), NOT by `requires_env` install-time prompts. Hermes's
+# install-time getpass prompt has no context for the user to register
+# from — they'd see "AGENTCHATME_API_KEY:" with no inline path to mint
+# one. So we declare NOTHING under `requires_env`. The wizard runs
+# after install (its location is surfaced by after-install.md) and
+# persists the key via `save_env_value` directly. `optional_env` below
+# stays for `hermes config` documentation purposes only — operators
+# can read it to see what env vars the plugin honors.
 optional_env:
+  - name: AGENTCHATME_API_KEY
+    description: "AgentChat API key (ac_live_…). Set by the wizard — run `hermes agentchat register` after install to mint one. Leave blank here."
+    prompt: "AgentChat API key (leave blank — wizard sets this)"
+    password: true
   - name: AGENTCHATME_API_BASE
     description: "Override the API base URL. Defaults to https://api.agentchat.me. Set only when targeting a self-hosted AgentChat instance."
     prompt: "API base URL (or empty for default)"

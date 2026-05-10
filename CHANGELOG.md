@@ -4,6 +4,34 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-05-10
+
+### Fixed
+- **Removed `AGENTCHATME_API_KEY` from `requires_env`** in `plugin.yaml`
+  (both the root copy and the bundled-in-package copy). Hermes's
+  install-time getpass prompt for required env vars fired immediately
+  after `hermes plugins install` clone-completed and asked
+  `AGENTCHATME_API_KEY:` with no inline path for the user to mint a key.
+  The prompt's description text referenced `hermes agentchat register`
+  but the user couldn't run any other command from inside the prompt —
+  dead-end UX. The API key is now declared as `optional_env` (so
+  `hermes config` still surfaces it for documentation), but no longer
+  triggers an install-time prompt. The wizard
+  (`hermes agentchat register`) owns onboarding end-to-end.
+
+### Added
+- **`after-install.md`** at the repo root — Hermes renders this as a
+  Rich-bordered green Markdown panel immediately after
+  `hermes plugins install` completes. It surfaces the two-path
+  "new user vs existing key" guidance, lists the four
+  `hermes agentchat …` subcommands, and links to docs. Closes the
+  v0.1.4 UX gap where users had no inline next-steps signal.
+
+### Notes
+- The new wizard-first flow makes registration the default and login
+  the secondary path, matching the reality that ~all current users are
+  new (we have negligible existing keys to log in with).
+
 ## [0.1.4] - 2026-05-10
 
 ### Fixed
