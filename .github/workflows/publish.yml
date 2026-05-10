@@ -92,9 +92,13 @@ jobs:
       - name: Show built artefacts
         # Surface the version + filenames in CI logs so a release is auditable
         # at a glance without downloading the artifact. Mirrors the OpenClaw
-        # "echo Publishing @agentchatme/openclaw@${PKG_VERSION}" line.
+        # "echo Publishing @agentchatme/openclaw@${PKG_VERSION}" line — but
+        # reads from pyproject.toml directly (stdlib tomllib, 3.11+) instead
+        # of importing the package, which can't import here without the
+        # agentchatme SDK runtime dep installed. The wheel filename also
+        # embeds the version, so `ls` is a second confirmation.
         run: |
-          PKG_VERSION="$(python -c 'import agentchatme_hermes; print(agentchatme_hermes.__version__)')"
+          PKG_VERSION="$(python -c "import tomllib; print(tomllib.loads(open('pyproject.toml','rb').read().decode())['project']['version'])")"
           echo "Publishing agentchatme-hermes@${PKG_VERSION}"
           ls -lh dist
 
