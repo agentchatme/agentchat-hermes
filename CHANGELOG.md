@@ -4,6 +4,76 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-05-10
+
+### Added
+- **End-to-end CI gate** at `.github/workflows/e2e.yml` — installs a
+  fresh Hermes Agent on Ubuntu, mounts the checked-out plugin into
+  `~/.hermes/plugins/agentchat/`, runs `hermes plugins enable
+  agentchat`, asserts `hermes plugins list` shows the plugin enabled,
+  asserts `hermes agentchat --help` registers the four subcommands
+  (proves `register_cli_command` fired), asserts `agentchatme` is
+  importable from Hermes's venv (proves the lazy SDK install ran).
+  Runs on tag push, push to main, and manual dispatch. Closes the
+  audit gap "git-clone path is unverified end-to-end."
+
+- **Unit tests for the v0.1.2 install shim** at
+  `tests/test_install_shim.py`. Nine new tests cover:
+  - The shim loads correctly via
+    `importlib.util.spec_from_file_location` (the same loader Hermes
+    uses).
+  - `_resolve_install_cmd` prefers `uv pip install --python
+    sys.executable` when uv is on PATH; falls back to
+    `python -m pip install` otherwise.
+  - `_ensure_sdk_installed` returns immediately when the SDK is
+    importable; fires the install when missing; retries with
+    exponential backoff on transient failure; raises a clear
+    `RuntimeError` with the manual-fix command after max attempts;
+    honors a custom `max_attempts`.
+  - `plugin.yaml` at the repo root stays byte-identical to
+    `agentchatme_hermes/plugin.yaml` (drift guard — different copies
+    are visible to the git-clone path vs the PyPI-wheel path).
+
+### Changed (lazy-install hardening — closes the v0.1.2 audit punch list)
+
+- **File-locked install** — `_ensure_sdk_installed` acquires an
+  exclusive `fcntl` lock on `.sdk-install.lock` before installing, so
+  two Hermes processes starting concurrently can't race on
+  `site-packages`. Windows degrades to best-effort without locking
+  (Hermes's documented happy paths are all Unix).
+
+- **Retry with backoff** — three attempts at 1s / 3s spacing on
+  transient pip failures (DNS blip, PyPI 503). Previously a single
+  failure left the plugin unloadable and the user had to re-run
+  manually.
+
+- **Prefers `uv pip install`** when `uv` is on PATH. Hermes's venv was
+  built with uv, so uv-native installs are faster and more compatible
+  in that environment. Falls back to `python -m pip install`
+  otherwise. Both branches pass `sys.executable` explicitly so the
+  install lands in Hermes's Python, not whatever else is on PATH.
+
+- **Removed dead `--upgrade-strategy only-if-needed`** flag — it has
+  no effect without `--upgrade`/`-U`, which we don't pass.
+
+- **Install-starting message goes to `stderr` via `print(...)`**, not
+  `logger.info`. Module-load-time emission via the logging module
+  often loses to default-WARNING root config; users wouldn't see the
+  5-10 second pause was an install. Stderr is unbuffered and always
+  reaches the terminal.
+
+- **`AGENTCHATME_HERMES_SKIP_BOOTSTRAP=1`** env var skips the
+  module-load-time install call. Used by the unit tests to load the
+  shim without firing pip; also useful for operators who pre-installed
+  the SDK and want to disable the safety net.
+
+### Notes
+- PyPI wheel layout unchanged. The new tests, `.gitignore` line, and
+  workflow live at the repo root only.
+- `.sdk-install.lock` (created by the shim under git-clone install)
+  is gitignored — never appears in this repo, but pytest's local
+  exercise of the shim can produce it during test runs.
+
 ## [0.1.2] - 2026-05-10
 
 ### Added

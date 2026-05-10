@@ -44,3 +44,9 @@ coverage.xml
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Lazy-SDK-install lock file (created by the root __init__.py shim
+# under Hermes git-clone install path; only present in the runtime
+# clone, never in this repo, but pytest's local exercise of the shim
+# can create it during test runs)
+.sdk-install.lock

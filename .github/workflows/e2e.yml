@@ -1,0 +1,124 @@
+name: E2E (hermes plugins install)
+
+# End-to-end gate that simulates the canonical user-side install path:
+#
+#   hermes plugins install --enable agentchatme/agentchat-hermes
+#   hermes agentchat --help    # must succeed, not "invalid choice"
+#
+# The unit suite (tests/test_install_shim.py) covers the load-time
+# semantics by simulating Hermes's _load_directory_module via
+# importlib.util.spec_from_file_location. This workflow goes one step
+# further and exercises the real Hermes plugin loader against a real
+# Hermes install — catches the cases where Hermes upstream changes its
+# plugin discovery contract in a way our unit tests don't see.
+#
+# Triggers:
+#   - tag push (`v*`) → runs before publish; if e2e fails, no publish
+#   - workflow_dispatch (manual) → on-demand validation
+#   - push to main → catches Hermes-upstream drift between tags
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  hermes-plugins-install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Hermes Agent
+        # The canonical one-liner from the Hermes README. Pulls uv, Python
+        # 3.11, Node, ripgrep, ffmpeg via Hermes's own bootstrap. ~2-3
+        # minutes on a fresh runner.
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash
+          # Re-export PATH after the installer's .bashrc edits.
+          if [ -d "$HOME/.local/bin" ]; then echo "$HOME/.local/bin" >> "$GITHUB_PATH"; fi
+          if [ -x /usr/local/bin/hermes ]; then echo "/usr/local/bin" >> "$GITHUB_PATH"; fi
+
+      - name: Verify Hermes is installed
+        run: |
+          which hermes
+          hermes --version
+
+      - name: Install our plugin via the canonical local-path mechanism
+        # Mirrors `hermes plugins install agentchatme/agentchat-hermes`
+        # without the github round-trip — symlinks the checkout into
+        # Hermes's plugin directory, then enables it. This is the same
+        # filesystem layout `hermes plugins install` produces after git
+        # clone, so the load path tested here is identical to a real
+        # user install.
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.hermes/plugins
+          ln -sfn "$GITHUB_WORKSPACE" ~/.hermes/plugins/agentchat
+          ls -la ~/.hermes/plugins/agentchat/
+          test -f ~/.hermes/plugins/agentchat/plugin.yaml
+          test -f ~/.hermes/plugins/agentchat/__init__.py
+          test -f ~/.hermes/plugins/agentchat/agentchatme_hermes/adapter.py
+
+      - name: Enable the plugin
+        run: |
+          set -euo pipefail
+          # Use Hermes's own enable command — verifies the plugin is
+          # discoverable via _discover_all_plugins (filesystem scan).
+          hermes plugins enable agentchat
+
+      - name: Verify plugin loads + register fires
+        # `hermes plugins list` must show agentchat as enabled. If the
+        # plugin failed to load (lazy SDK install error, import error,
+        # register() crash), the LoadedPlugin's `error` field would be
+        # non-empty and we'd surface it here.
+        run: |
+          set -euo pipefail
+          hermes plugins list | tee /tmp/plugins-list.txt
+          grep -q "agentchat" /tmp/plugins-list.txt
+          # The presence of `enabled` next to `agentchat` is the
+          # load-success signal Hermes itself uses.
+          grep -E "agentchat\s+.*enabled" /tmp/plugins-list.txt
+
+      - name: Verify CLI subcommand registered
+        # `register_cli_command(name="agentchat", ...)` only fires if
+        # register() ran successfully. If `hermes agentchat --help`
+        # returns "invalid choice", the plugin didn't load — even if
+        # `plugins list` shows it as enabled.
+        run: |
+          set -euo pipefail
+          hermes agentchat --help 2>&1 | tee /tmp/agentchat-help.txt
+          # Help output must mention the four subcommands the plugin
+          # registers.
+          grep -q "register" /tmp/agentchat-help.txt
+          grep -q "login" /tmp/agentchat-help.txt
+          grep -q "whoami" /tmp/agentchat-help.txt
+          grep -q "logout" /tmp/agentchat-help.txt
+
+      - name: Verify SDK was lazy-installed
+        # The shim's `_ensure_sdk_installed` must have run during plugin
+        # load (since Hermes's plugins install doesn't pip the deps).
+        # `agentchatme` should be importable from Hermes's venv now.
+        run: |
+          set -euo pipefail
+          /usr/local/lib/hermes-agent/venv/bin/python -c \
+            "import agentchatme; print('agentchatme', agentchatme.__name__, 'imported OK')"
+
+      - name: Surface diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== ~/.hermes/plugins/agentchat/ ==="
+          ls -la ~/.hermes/plugins/agentchat/ || true
+          echo "=== ~/.hermes/config.yaml plugins section ==="
+          grep -A 5 "^plugins:" ~/.hermes/config.yaml || true
+          echo "=== ~/.hermes/logs/errors.log (last 50 lines) ==="
+          tail -50 ~/.hermes/logs/errors.log 2>/dev/null || true
+          echo "=== ~/.hermes/logs/agent.log (last 100 lines) ==="
+          tail -100 ~/.hermes/logs/agent.log 2>/dev/null || true

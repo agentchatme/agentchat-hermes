@@ -6,16 +6,17 @@ When a user runs::
 
 Hermes does ``git clone`` into ``~/.hermes/plugins/agentchat/`` and loads
 this file as ``hermes_plugins.agentchat`` via
-:func:`hermes_cli.plugins.PluginManager._load_directory_module`. Hermes's
-``hermes plugins install`` does NOT pip-install our dependencies — it only
-clones the repo. So this module owns two jobs:
+:func:`hermes_cli.plugins.PluginManager._load_directory_module` (see
+``hermes_cli/plugins.py:1138``). Hermes's ``hermes plugins install`` does
+NOT pip-install our dependencies — it only clones the repo. So this
+module owns two jobs:
 
 1. **Lazy-install the agentchatme Python SDK** if the import would fail.
-   This is the same pattern Hermes uses internally for its own optional
-   adapters (see ``hermes_cli/setup.py:1054`` for ``neutts``,
-   ``hermes_cli/setup.py:1480`` for ``modal``, ``:1535`` for ``daytona``).
-   On a PyPI-installed plugin the SDK is already a hard dep, so the
-   ``import agentchatme`` succeeds immediately and no subprocess fires.
+   Same self-bootstrapping pattern Hermes uses internally for optional
+   adapters (``hermes_cli/setup.py:1054`` for ``neutts``, ``:1480`` for
+   ``modal``, ``:1535`` for ``daytona``). On a PyPI-installed plugin the
+   SDK is already a hard dep, so the ``import agentchatme`` succeeds
+   immediately and no subprocess fires.
 
 2. **Re-export ``register``** from the canonical
    :mod:`agentchatme_hermes` package which lives as a sibling
@@ -27,74 +28,169 @@ clones the repo. So this module owns two jobs:
    ``agentchatme_hermes:register`` directly via the
    ``hermes_agent.plugins`` entry point declared in ``pyproject.toml``.
 
-Importing this module on its own outside of Hermes is intentionally
-side-effect-free apart from the SDK presence check; the SDK install
-runs only when the import would have failed anyway, so a stray
-``import`` from a non-Hermes context still resolves.
+Production hardening (v0.1.3):
+
+* The lazy install is wrapped in an exclusive file lock so two Hermes
+  processes starting concurrently don't race on ``site-packages``.
+* Retries 3 times with exponential backoff (1s, 3s, 9s) on transient
+  pip failures (DNS blip, PyPI 503, etc.) before surfacing a hard error.
+* Prefers ``uv pip install`` when ``uv`` is available — Hermes's venv was
+  built with uv, so uv-native install is faster and more compatible than
+  stock pip in that environment. Falls back to ``python -m pip install``
+  otherwise.
+* User-visible install-starting line goes to ``stderr`` via ``print()``,
+  not the logging module — module-load-time emission via ``logger.info``
+  often loses to default WARNING root config and the user wouldn't see
+  the 5-10 second pause was an install. Stderr is unbuffered and always
+  reaches the user's terminal.
 """
 
 from __future__ import annotations
 
-import logging
+import contextlib
+import os
+import shutil
 import subprocess
 import sys
-
-logger = logging.getLogger(__name__)
-
-
-# ─── Lazy SDK install ─────────────────────────────────────────────────────
-#
-# `hermes plugins install` does git clone only; our `agentchatme>=1.0.1`
-# runtime dep is not auto-installed. On first import after a fresh clone,
-# `import agentchatme` raises ImportError. We catch it and run pip in the
-# same Python (``sys.executable``) so the install lands in Hermes's venv,
-# not the system Python. ``--quiet`` keeps the gateway log clean unless
-# the install fails. ``--upgrade-strategy only-if-needed`` avoids
-# clobbering a newer SDK an operator may have intentionally pinned.
+import time
+from pathlib import Path
 
 _SDK_REQUIREMENT = "agentchatme>=1.0.1,<2"
+_MAX_ATTEMPTS = 3
+_BACKOFF_BASE_SECONDS = 1  # attempts use base ** (n-1): 1s, 3s, 9s — see _BACKOFF_MULTIPLIER
+_BACKOFF_MULTIPLIER = 3
 
 
-def _ensure_sdk_installed() -> None:
+def _resolve_install_cmd() -> list[str]:
+    """Return the argv that installs the SDK into Hermes's running Python.
+
+    Prefer ``uv pip install --python sys.executable`` when ``uv`` is on
+    PATH (Hermes installs uv as part of its own bootstrap, so it's
+    almost always present). Falls back to stock ``python -m pip install``
+    so the shim works even when uv is absent.
+
+    Critical: the install must land in ``sys.executable``'s site-packages,
+    NOT a different Python on PATH. Both branches pass ``sys.executable``
+    explicitly to lock the install target to the venv Hermes is running.
+    """
+    uv_path = shutil.which("uv")
+    if uv_path:
+        return [uv_path, "pip", "install", "--quiet", "--python", sys.executable, _SDK_REQUIREMENT]
+    return [sys.executable, "-m", "pip", "install", "--quiet", _SDK_REQUIREMENT]
+
+
+def _try_install_once() -> None:
+    """One pip install attempt. Raises ``CalledProcessError`` on failure."""
+    subprocess.check_call(_resolve_install_cmd())
+
+
+def _ensure_sdk_installed(
+    *,
+    max_attempts: int = _MAX_ATTEMPTS,
+    sleep_fn=time.sleep,
+    install_fn=_try_install_once,
+) -> None:
+    """Install ``agentchatme`` into the running Python if it's missing.
+
+    Returns immediately if the import already works. Otherwise serializes
+    the install across concurrent plugin loads via a file lock, retries
+    on transient pip failure with exponential backoff, and surfaces a
+    clear ``RuntimeError`` if every attempt fails.
+
+    The ``sleep_fn`` and ``install_fn`` parameters are dependency-injected
+    for unit tests.
+    """
     try:
-        import agentchatme  # noqa: F401
+        import agentchatme
         return
     except ImportError:
         pass
 
-    logger.info(
-        "agentchatme-hermes: SDK not present in this Python (%s); "
-        "installing %s — this runs once on first plugin load. "
-        "If this fails, run `pip install %s` manually in the Hermes venv.",
-        sys.executable,
-        _SDK_REQUIREMENT,
-        _SDK_REQUIREMENT,
-    )
+    # File lock — serialize concurrent installs so two Hermes processes
+    # don't race on site-packages. fcntl is Unix-only; on Windows we
+    # degrade to best-effort without locking. Hermes's documented happy
+    # paths (Linux / macOS / WSL2) are all Unix, so the degraded branch
+    # is purely a safety valve for native Windows beta users.
+    lock_fd = None
     try:
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-m",
-                "pip",
-                "install",
-                "--quiet",
-                "--upgrade-strategy",
-                "only-if-needed",
-                _SDK_REQUIREMENT,
-            ]
+        import fcntl  # type: ignore[import-not-found, unused-ignore]
+
+        lock_path = Path(__file__).resolve().parent / ".sdk-install.lock"
+        # ``open`` in mode ``w`` always creates the file if absent and
+        # truncates it; the file's content doesn't matter, only the
+        # OS-level lock on the inode. We never read/write the contents.
+        # The file handle outlives the try-block — it's released in the
+        # finally below — so we deliberately do NOT use a `with` here.
+        lock_fd = open(lock_path, "w")  # noqa: SIM115 — see comment above
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
+    except (ImportError, OSError):
+        # Lock unavailable — proceed unprotected. Worst-case is two
+        # concurrent installs, which pip generally handles cleanly via
+        # its own atomic site-packages writes.
+        if lock_fd is not None:
+            with contextlib.suppress(Exception):
+                lock_fd.close()
+            lock_fd = None
+
+    try:
+        # Re-check inside the lock — the sibling process that we waited
+        # on might have just installed the SDK successfully.
+        try:
+            import agentchatme  # noqa: F401
+            return
+        except ImportError:
+            pass
+
+        print(
+            f"agentchatme-hermes: installing {_SDK_REQUIREMENT} into "
+            f"{sys.executable} (one-time, runs on first plugin load)",
+            file=sys.stderr,
+            flush=True,
         )
-    except subprocess.CalledProcessError as e:
-        # Surface a clear, actionable error before the relative import
-        # below explodes with a less informative ImportError.
+
+        last_error: BaseException | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                install_fn()
+                return
+            except subprocess.CalledProcessError as e:
+                last_error = e
+                if attempt < max_attempts:
+                    wait = _BACKOFF_BASE_SECONDS * (_BACKOFF_MULTIPLIER ** (attempt - 1))
+                    print(
+                        f"agentchatme-hermes: SDK install attempt {attempt}/{max_attempts} "
+                        f"failed (pip exit {e.returncode}); retrying in {wait}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    sleep_fn(wait)
+
+        # Every attempt exhausted — surface a clear, actionable error.
+        # The relative import below would otherwise fail with the less
+        # informative ``ModuleNotFoundError: No module named 'agentchatme'``.
+        cmd_str = " ".join(_resolve_install_cmd())
         raise RuntimeError(
-            "agentchatme-hermes: failed to install the agentchatme SDK "
-            f"({_SDK_REQUIREMENT}). Run the install manually in the "
-            f"Hermes venv: `{sys.executable} -m pip install {_SDK_REQUIREMENT}`. "
-            f"pip exit status: {e.returncode}"
-        ) from e
+            f"agentchatme-hermes: failed to install the agentchatme SDK after "
+            f"{max_attempts} attempts. Last pip exit status: "
+            f"{getattr(last_error, 'returncode', '?')}. "
+            f"Run the install manually: {cmd_str}"
+        ) from last_error
+    finally:
+        if lock_fd is not None:
+            with contextlib.suppress(ImportError, OSError):
+                import fcntl  # type: ignore[import-not-found, unused-ignore]
+
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+            with contextlib.suppress(Exception):
+                lock_fd.close()
 
 
-_ensure_sdk_installed()
+# Bootstrap the SDK BEFORE the re-export below, since ``adapter.py``
+# imports ``agentchatme`` at module top-level. Skip when the
+# environment variable ``AGENTCHATME_HERMES_SKIP_BOOTSTRAP=1`` is set —
+# this is the seam tests use to load the shim without firing pip.
+if os.environ.get("AGENTCHATME_HERMES_SKIP_BOOTSTRAP") != "1":
+    _ensure_sdk_installed()
 
 
 # ─── Re-export the canonical register() ──────────────────────────────────
@@ -104,7 +200,7 @@ _ensure_sdk_installed()
 # the relative ``from .agentchatme_hermes`` resolves into the package
 # subdirectory inside the clone.
 #
-# But this file is ALSO walked by pytest's collector during local
+# This file is ALSO walked by pytest's collector during local
 # development (it sits in the repo root). Pytest imports it as a bare
 # module without a parent package, so the relative import would raise
 # ``ImportError: attempted relative import with no known parent
