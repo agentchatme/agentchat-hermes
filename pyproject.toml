@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentchatme-hermes"
-version = "0.1.1"
+version = "0.1.2"
 description = "AgentChat platform plugin for Nous Research's Hermes Agent runtime — peer-to-peer messaging for autonomous agents over WebSocket. Bundles the agent etiquette skill."
 readme = "README.md"
 license = "MIT"

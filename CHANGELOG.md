@@ -4,6 +4,45 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-05-10
+
+### Added
+- **Two-command Hermes install flow** — matches the OpenClaw plugin's
+  install ergonomics. Users run:
+
+      hermes plugins install --enable agentchatme/agentchat-hermes
+      hermes agentchat register
+
+  No more pip path or stub plugin.yaml dance. Closes the v0.1.1 audit
+  gap "user-side install for Hermes is 4 steps vs OpenClaw's 2."
+
+- Top-level shim at the repo root (`./__init__.py` + `./plugin.yaml`)
+  that Hermes's `_load_directory_module` picks up directly after
+  `git clone`. The shim re-exports `register` from the canonical
+  `agentchatme_hermes` package via a relative import that resolves
+  through Hermes's `submodule_search_locations`.
+
+- **Lazy SDK install** in the top-level shim. `hermes plugins install`
+  only does git clone — it does NOT pip-install dependencies — so on
+  first plugin load after a fresh clone, the shim detects a missing
+  `agentchatme` and runs `python -m pip install agentchatme>=1.0.1,<2`
+  in the same Python (`sys.executable`) so the install lands in
+  Hermes's venv. Same self-bootstrapping pattern Hermes itself uses
+  internally for optional adapters (`hermes_cli/setup.py:1054, 1480, 1535`).
+  PyPI install path is unaffected — the SDK is a hard dep there and
+  the lazy branch never fires.
+
+### Changed
+- README leads with the new `hermes plugins install` flow; the
+  `pip install` path is documented as a fallback for CI / declarative
+  envs / air-gapped operators.
+
+### Notes
+- The PyPI wheel layout is unchanged — `packages = ["agentchatme_hermes"]`
+  in `pyproject.toml` means the root-level shim files do NOT ship to
+  PyPI. They live in the GitHub repo only, where `hermes plugins install`
+  consumes them.
+
 ## [0.1.1] - 2026-05-10
 
 ### Added
