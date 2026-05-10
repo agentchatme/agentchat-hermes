@@ -1,0 +1,142 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentchatme-hermes"
+version = "0.1.0"
+description = "AgentChat platform plugin for Nous Research's Hermes Agent runtime — peer-to-peer messaging for autonomous agents over WebSocket. Bundles the agent etiquette skill."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{ name = "AgentChat" }]
+keywords = [
+    "agentchat",
+    "hermes",
+    "hermes-agent",
+    "nous-research",
+    "ai",
+    "agents",
+    "messaging",
+    "chat",
+    "plugin",
+    "platform",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    # The SDK already pins its own httpx / pydantic / websockets ranges and
+    # ships the RealtimeClient our adapter uses for inbound + the typed
+    # error hierarchy our send-side mapping branches on. We only depend on
+    # the SDK; everything transitive flows through it so a single SDK bump
+    # carries us forward without a coordinated release here.
+    "agentchatme>=1.0.1,<2",
+    # PyYAML for reading our bundled plugin.yaml at register-time. Hermes
+    # itself already depends on PyYAML (it parses every plugin.yaml in
+    # `~/.hermes/plugins/`) so this is effectively free at install time.
+    "PyYAML>=6.0,<7",
+]
+
+# Hermes Agent itself is NOT declared as a dependency. Users install Hermes
+# via the official `curl ... install.sh | bash` (or `irm ... install.ps1 |
+# iex` on Windows), which clones the repo and wires the `hermes` shim
+# outside of any pip environment. Pinning hermes-agent here would either
+# fail to resolve (it's not on PyPI under that name) or fight the user's
+# already-installed copy. The plugin loads via the `hermes_agent.plugins`
+# entry point declared below; if Hermes isn't installed, importing this
+# package on its own is harmless — the entry point just never fires.
+
+[project.entry-points."hermes_agent.plugins"]
+agentchat = "agentchatme_hermes:register"
+
+[project.urls]
+Homepage = "https://agentchat.me"
+Documentation = "https://agentchat.me/docs"
+Repository = "https://github.com/agentchatme/agentchat-hermes"
+Issues = "https://github.com/agentchatme/agentchat-hermes/issues"
+Changelog = "https://github.com/agentchatme/agentchat-hermes/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pyright>=1.1",
+]
+
+[tool.hatch.build.targets.wheel]
+# Ship the package source AND the bundled SKILL.md plus plugin.yaml so the
+# Hermes runtime can resolve them via importlib.resources at register time.
+packages = ["agentchatme_hermes"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"agentchatme_hermes/plugin.yaml" = "agentchatme_hermes/plugin.yaml"
+"agentchatme_hermes/skills" = "agentchatme_hermes/skills"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "agentchatme_hermes",
+    "tests",
+    "README.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
+markers = [
+    # Tests that hit the deployed AgentChat API. Skipped unless
+    # AGENTCHATME_LIVE_API_KEY is set in the environment. Mirrors the
+    # gating used in the agentchat-python SDK's tests/test_smoke_live.py.
+    "live: end-to-end smoke test against the live AgentChat API",
+]
+filterwarnings = [
+    "error",
+    "ignore::DeprecationWarning:pydantic.*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.pyright]
+include = ["agentchatme_hermes", "tests"]
+pythonVersion = "3.9"
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false
+# The Hermes runtime modules (gateway.platforms.base, hermes_cli.setup, …)
+# only exist when Hermes Agent is installed alongside this package. Static
+# analysis cannot resolve them in a fresh pip install, so we silence the
+# import-not-found noise rather than vendoring stubs we don't own. Runtime
+# imports happen lazily inside register() / connect() / setup_fn so the
+# package still imports cleanly without Hermes available.
+reportMissingImports = false
+
+[tool.mypy]
+python_version = "3.9"
+strict = false
+files = ["agentchatme_hermes"]
+ignore_missing_imports = true

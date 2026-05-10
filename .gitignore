@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+*.whl
+
+# Virtual envs
+.venv/
+venv/
+env/
+.python-version
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+*.cover
+.hypothesis/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Smoke-test fixtures with real keys
+.env
+.env.local
+.env.test
+.env.test-agents
+
+# OS junk
+.DS_Store
+Thumbs.db
