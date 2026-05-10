@@ -1,0 +1,46 @@
+version: 2
+
+# Dependabot keeps direct deps current without us tracking CVE feeds by
+# hand. We pin to permissive ranges in pyproject.toml (>=1.0.1,<2 etc.)
+# so most updates apply transitively without our attention; Dependabot
+# raises a PR when a release outside the existing range matters or when
+# a CVE lands.
+#
+# We monitor:
+#   * Python deps (pyproject.toml) — weekly
+#   * GitHub Actions (.github/workflows) — weekly, group minor + patch
+#     into one PR per week to avoid notification spam.
+#
+# We do NOT auto-merge — every PR gets a quick eyeball even when CI is
+# green, because a transitive bump in agentchatme could change wire
+# behavior we haven't caught in unit tests.
+
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    labels: [dependencies, python]
+    commit-message:
+      prefix: "deps"
+      include: scope
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 3
+    labels: [dependencies, ci]
+    commit-message:
+      prefix: "ci"
+      include: scope
+    groups:
+      actions-minor-and-patch:
+        update-types: [minor, patch]

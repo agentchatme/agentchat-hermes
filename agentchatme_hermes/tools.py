@@ -38,17 +38,78 @@ cleanly onto Hermes's JSON-only tool schemas; deferred to v0.1.x.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
+import time
 from collections.abc import Awaitable
 from typing import Any, Callable
 
+from . import metrics as _metrics_mod
+
 logger = logging.getLogger(__name__)
 
-# ─── Shared SDK client ─────────────────────────────────────────────────────
+# ─── Concurrency cap ───────────────────────────────────────────────────────
+#
+# Hermes runs sessions concurrently and can fire multiple tool handlers in
+# parallel for a single agent's turn. Without a cap, a busy LLM looping on
+# an agentchat_* tool can saturate the server-side per-second rate limit
+# (60 msg/sec for normal agents) and produce a stream of 429s the agent
+# then has to interpret. The semaphore queues calls past the cap so the
+# rate-limit budget is honored implicitly.
+#
+# Default 10 matches @agentchatme/mcp's AGENTCHAT_MAX_CONCURRENT_TOOLS.
+# Override per-deployment via the env var; values <1 are clamped to 1.
+
+_DEFAULT_MAX_CONCURRENT = 10
+
+
+def _max_concurrent() -> int:
+    raw = (os.getenv("AGENTCHATME_MAX_CONCURRENT_TOOLS") or "").strip()
+    if not raw:
+        return _DEFAULT_MAX_CONCURRENT
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return _DEFAULT_MAX_CONCURRENT
+
+
+_concurrency_sem: asyncio.Semaphore | None = None
+_inflight_count: int = 0
+
+
+def _get_semaphore() -> asyncio.Semaphore:
+    """Lazy-construct the concurrency semaphore.
+
+    Constructed lazily because :class:`asyncio.Semaphore` binds to the
+    running event loop at instantiation time on Python 3.9 (deprecated
+    in 3.10+, removed in 3.12). Lazy init lets us defer until we're
+    inside an event loop — handlers always are.
+    """
+    global _concurrency_sem
+    if _concurrency_sem is None:
+        _concurrency_sem = asyncio.Semaphore(_max_concurrent())
+    return _concurrency_sem
+
+
+# ─── Shared SDK client (with key-rotation invalidation) ───────────────────
+#
+# Tools share a single AsyncAgentChatClient to reuse the httpx connection
+# pool. We track the SHA-256 fingerprint of the API key the cached client
+# was built against; if the operator rotates the key mid-process via
+# `hermes agentchat register`, the next tool call sees the new key, sees
+# the fingerprint mismatch, disposes the old client, and rebuilds. Without
+# this, a rotated key would only take effect on the next process restart.
 
 _client: Any = None  # AsyncAgentChatClient — typed as Any for lazy import
+_client_key_fingerprint: str | None = None
 _client_lock: asyncio.Lock | None = None
+
+
+def _fingerprint(api_key: str) -> str:
+    """Stable, non-reversible fingerprint for cache identity. SHA-256 first
+    16 chars — short enough to hold in memory, long enough to be unique."""
+    return hashlib.sha256(api_key.encode("utf-8")).hexdigest()[:16]
 
 
 def _api_base() -> str:
@@ -63,32 +124,51 @@ def _api_key() -> str | None:
 async def _get_client() -> Any:
     """Return the module-level :class:`AsyncAgentChatClient`, lazy-initialized.
 
-    Tools share a single client across calls to reuse the httpx connection
-    pool. The lock guards the very first init under concurrent tool-call
-    bursts (Hermes runs handlers concurrently across sessions — see
-    ``base.py:2484-2853``). Cleanup happens implicitly at process exit.
+    Detects key rotation: if the env's current API-key fingerprint differs
+    from the cached client's, dispose the old one and build a fresh one.
+    The lock guards rebuild as well as first init under concurrent calls.
     """
-    global _client, _client_lock
-    if _client is not None:
+    global _client, _client_key_fingerprint, _client_lock
+
+    api_key = _api_key()
+    if not api_key:
+        raise _ToolConfigError(
+            "AGENTCHATME_API_KEY is not set. Run `hermes agentchat register` "
+            "to mint a fresh key."
+        )
+    current_fp = _fingerprint(api_key)
+
+    if _client is not None and _client_key_fingerprint == current_fp:
         return _client
 
-    from agentchatme import AsyncAgentChatClient  # type: ignore
+    from agentchatme import AsyncAgentChatClient  # type: ignore[import-not-found]
 
     if _client_lock is None:
         _client_lock = asyncio.Lock()
 
     async with _client_lock:
-        if _client is None:
-            api_key = _api_key()
-            if not api_key:
-                raise _ToolConfigError(
-                    "AGENTCHATME_API_KEY is not set. Run `hermes agentchat register` "
-                    "to mint a fresh key."
-                )
-            client = AsyncAgentChatClient(api_key=api_key, base_url=_api_base())
-            await client.__aenter__()
-            _client = client
-    return _client
+        # Re-check inside the lock — a concurrent rotation may have already
+        # rebuilt by the time we acquired.
+        if _client is not None and _client_key_fingerprint == current_fp:
+            return _client
+
+        # Dispose the stale client before rebuilding so the httpx pool is
+        # closed cleanly. Best-effort — a failed close shouldn't block the
+        # rebuild path.
+        if _client is not None:
+            try:
+                await _client.__aexit__(None, None, None)
+            except Exception:
+                logger.warning("agentchat tools: stale client cleanup failed", exc_info=True)
+            _client = None
+            _client_key_fingerprint = None
+
+        client = AsyncAgentChatClient(api_key=api_key, base_url=_api_base())
+        await client.__aenter__()
+        _client = client
+        _client_key_fingerprint = current_fp
+        logger.debug("agentchat tools: client rebuilt for fingerprint=%s", current_fp)
+        return _client
 
 
 class _ToolConfigError(Exception):
@@ -101,15 +181,32 @@ class _ToolConfigError(Exception):
 def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]:
     """Wrap an async tool handler so SDK errors render as structured results.
 
-    The agent's LLM decides what to do with the response, so we surface
-    every documented error class as ``{ok: false, code, message, ...extras}``
-    rather than raising. Unknown exceptions fall through with code
-    ``UNEXPECTED`` and a text message — never an unhandled traceback into
-    the tool registry.
+    Three layers of protection in order:
+
+    1. **Concurrency semaphore** caps in-flight tools at
+       ``AGENTCHATME_MAX_CONCURRENT_TOOLS`` (default 10) so a runaway agent
+       doesn't saturate the server-side rate-limit budget. Calls past the
+       cap queue and run as a slot frees.
+    2. **Error envelope** converts every documented SDK error class into
+       a stable ``{ok: false, code, message, request_id?, ...extras}``
+       shape. The LLM branches on ``code``; ``request_id`` is included
+       when the SDK provides one so an operator can correlate a failure
+       with server-side logs.
+    3. **Metrics** observe latency + outcome on every call, no-op if the
+       caller hasn't enabled a Prometheus recorder.
+
+    Unknown exceptions are caught with a broad ``except`` so a traceback
+    never reaches the Hermes tool dispatcher — the agent gets ``UNEXPECTED``
+    + the message and the operator sees a ``logger.exception`` with full
+    traceback in the gateway log.
     """
+    tool_name = getattr(handler, "__name__", "agentchat_unknown").lstrip("_")
+    if tool_name.startswith("h_"):
+        tool_name = "agentchat_" + tool_name[2:]
 
     async def wrapped(args: dict[str, Any]) -> dict[str, Any]:
-        from agentchatme.errors import (  # type: ignore
+        global _inflight_count
+        from agentchatme.errors import (  # type: ignore[import-not-found]
             AgentChatError,
             AwaitingReplyError,
             BlockedError,
@@ -124,81 +221,105 @@ def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[[dict
             UnauthorizedError,
             ValidationError,
         )
-        from agentchatme.errors import (
+        from agentchatme.errors import (  # type: ignore[import-not-found]
             ConnectionError as ACConnectionError,
         )
 
-        try:
-            value = await handler(args or {})
-        except _ToolConfigError as e:
-            return {"ok": False, "code": "CONFIG_ERROR", "message": str(e)}
-        except RateLimitedError as e:
-            return {
-                "ok": False,
-                "code": "RATE_LIMITED",
-                "message": str(e),
-                "retry_after_ms": getattr(e, "retry_after_ms", None),
-            }
-        except AwaitingReplyError as e:
-            return {
-                "ok": False,
-                "code": "AWAITING_REPLY",
-                "message": str(e),
-                "recipient_handle": getattr(e, "recipient_handle", None),
-            }
-        except BlockedError as e:
-            return {"ok": False, "code": "BLOCKED", "message": str(e)}
-        except SuspendedError as e:
-            return {"ok": False, "code": "SUSPENDED", "message": str(e)}
-        except RestrictedError as e:
-            return {"ok": False, "code": "RESTRICTED", "message": str(e)}
-        except ForbiddenError as e:
-            return {
-                "ok": False,
-                "code": getattr(e, "code", "FORBIDDEN") or "FORBIDDEN",
-                "message": str(e),
-            }
-        except GroupDeletedError as e:
-            return {
-                "ok": False,
-                "code": "GROUP_DELETED",
-                "message": str(e),
-                "deleted_by_handle": getattr(e, "deleted_by_handle", None),
-                "deleted_at": getattr(e, "deleted_at", None),
-            }
-        except RecipientBackloggedError as e:
-            return {
-                "ok": False,
-                "code": "RECIPIENT_BACKLOGGED",
-                "message": str(e),
-                "recipient_handle": getattr(e, "recipient_handle", None),
-                "undelivered_count": getattr(e, "undelivered_count", None),
-            }
-        except NotFoundError as e:
-            return {
-                "ok": False,
-                "code": getattr(e, "code", None) or "NOT_FOUND",
-                "message": str(e),
-            }
-        except ValidationError as e:
-            return {"ok": False, "code": "VALIDATION_ERROR", "message": str(e)}
-        except UnauthorizedError as e:
-            return {"ok": False, "code": "UNAUTHORIZED", "message": str(e)}
-        except (ServerError, ACConnectionError) as e:
-            return {"ok": False, "code": "SERVER_OR_NETWORK", "message": str(e)}
-        except AgentChatError as e:
-            return {
-                "ok": False,
-                "code": getattr(e, "code", "AGENTCHAT_ERROR") or "AGENTCHAT_ERROR",
-                "message": str(e),
-            }
-        except Exception as e:
-            logger.exception("agentchat tool: unexpected error")
-            return {"ok": False, "code": "UNEXPECTED", "message": str(e)}
+        recorder = _metrics_mod.get_recorder()
+        sem = _get_semaphore()
+        start = time.perf_counter()
 
+        async with sem:
+            _inflight_count += 1
+            recorder.set_inflight_depth(_inflight_count)
+            try:
+                value = await handler(args or {})
+            except _ToolConfigError as e:
+                recorder.observe_tool_call(tool_name, "CONFIG_ERROR", time.perf_counter() - start)
+                return {"ok": False, "code": "CONFIG_ERROR", "message": str(e)}
+            except RateLimitedError as e:
+                recorder.observe_tool_call(tool_name, "RATE_LIMITED", time.perf_counter() - start)
+                return _err("RATE_LIMITED", e, retry_after_ms=getattr(e, "retry_after_ms", None))
+            except AwaitingReplyError as e:
+                recorder.observe_tool_call(tool_name, "AWAITING_REPLY", time.perf_counter() - start)
+                return _err("AWAITING_REPLY", e, recipient_handle=getattr(e, "recipient_handle", None))
+            except BlockedError as e:
+                recorder.observe_tool_call(tool_name, "BLOCKED", time.perf_counter() - start)
+                return _err("BLOCKED", e)
+            except SuspendedError as e:
+                recorder.observe_tool_call(tool_name, "SUSPENDED", time.perf_counter() - start)
+                return _err("SUSPENDED", e)
+            except RestrictedError as e:
+                recorder.observe_tool_call(tool_name, "RESTRICTED", time.perf_counter() - start)
+                return _err("RESTRICTED", e)
+            except ForbiddenError as e:
+                code = getattr(e, "code", "FORBIDDEN") or "FORBIDDEN"
+                recorder.observe_tool_call(tool_name, code, time.perf_counter() - start)
+                return _err(code, e)
+            except GroupDeletedError as e:
+                recorder.observe_tool_call(tool_name, "GROUP_DELETED", time.perf_counter() - start)
+                return _err(
+                    "GROUP_DELETED",
+                    e,
+                    deleted_by_handle=getattr(e, "deleted_by_handle", None),
+                    deleted_at=getattr(e, "deleted_at", None),
+                )
+            except RecipientBackloggedError as e:
+                recorder.observe_tool_call(tool_name, "RECIPIENT_BACKLOGGED", time.perf_counter() - start)
+                return _err(
+                    "RECIPIENT_BACKLOGGED",
+                    e,
+                    recipient_handle=getattr(e, "recipient_handle", None),
+                    undelivered_count=getattr(e, "undelivered_count", None),
+                )
+            except NotFoundError as e:
+                code = getattr(e, "code", None) or "NOT_FOUND"
+                recorder.observe_tool_call(tool_name, code, time.perf_counter() - start)
+                return _err(code, e)
+            except ValidationError as e:
+                recorder.observe_tool_call(tool_name, "VALIDATION_ERROR", time.perf_counter() - start)
+                return _err("VALIDATION_ERROR", e)
+            except UnauthorizedError as e:
+                recorder.observe_tool_call(tool_name, "UNAUTHORIZED", time.perf_counter() - start)
+                return _err("UNAUTHORIZED", e)
+            except (ServerError, ACConnectionError) as e:
+                recorder.observe_tool_call(tool_name, "SERVER_OR_NETWORK", time.perf_counter() - start)
+                return _err("SERVER_OR_NETWORK", e)
+            except AgentChatError as e:
+                code = getattr(e, "code", "AGENTCHAT_ERROR") or "AGENTCHAT_ERROR"
+                recorder.observe_tool_call(tool_name, code, time.perf_counter() - start)
+                return _err(code, e)
+            except Exception as e:
+                logger.exception("agentchat tool: unexpected error in %s", tool_name)
+                recorder.observe_tool_call(tool_name, "UNEXPECTED", time.perf_counter() - start)
+                return {"ok": False, "code": "UNEXPECTED", "message": str(e)}
+            finally:
+                _inflight_count -= 1
+                recorder.set_inflight_depth(_inflight_count)
+
+        recorder.observe_tool_call(tool_name, "ok", time.perf_counter() - start)
         return {"ok": True, "result": value}
 
+    wrapped.__name__ = f"_safe_{tool_name}"
     return wrapped
+
+
+def _err(code: str, exc: Exception, **extras: Any) -> dict[str, Any]:
+    """Build a standard error envelope, surfacing request_id when available.
+
+    Every ``AgentChatError`` carries an ``request_id`` attribute (populated
+    from the server's ``X-Request-Id`` header when present). Threading it
+    into the envelope lets an operator paste the id straight into a
+    backend log search and find the exact failed request without ambiguity.
+    """
+    body: dict[str, Any] = {"ok": False, "code": code, "message": str(exc)}
+    request_id = getattr(exc, "request_id", None)
+    if request_id:
+        body["request_id"] = request_id
+    for k, v in extras.items():
+        if v is not None:
+            body[k] = v
+    return body
 
 
 # ─── Schema helpers ────────────────────────────────────────────────────────

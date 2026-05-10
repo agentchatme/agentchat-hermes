@@ -33,6 +33,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from typing import Any, Callable
 
 from agentchatme import (
@@ -57,6 +58,8 @@ from agentchatme.errors import (
 from agentchatme.errors import (
     ConnectionError as ACConnectionError,
 )
+
+from . import metrics as _metrics_mod
 
 logger = logging.getLogger(__name__)
 
@@ -167,8 +170,12 @@ def _adapter_class() -> type:
         # ── Connection lifecycle ──────────────────────────────────────────
 
         async def connect(self) -> bool:
+            recorder = _metrics_mod.get_recorder()
+            recorder.set_connection_state("connecting")
             if not self.api_key:
                 logger.error("AgentChat: AGENTCHATME_API_KEY is not set")
+                recorder.set_connection_state("failed")
+                recorder.inc_reconnect("config_missing")
                 self._set_fatal_error(
                     "config_missing",
                     "AGENTCHATME_API_KEY is not set. Run `hermes agentchat register` "
@@ -197,6 +204,8 @@ def _adapter_class() -> type:
                     logger.error(
                         "AgentChat: API key fingerprint already in use by another profile"
                     )
+                    recorder.set_connection_state("failed")
+                    recorder.inc_reconnect("lock_conflict")
                     self._set_fatal_error(
                         "lock_conflict",
                         "AgentChat API key in use by another profile",
@@ -218,6 +227,8 @@ def _adapter_class() -> type:
             except Exception as e:
                 logger.error("AgentChat: REST client init failed — %s", e)
                 self._client = None
+                recorder.set_connection_state("failed")
+                recorder.inc_reconnect("client_init_failed")
                 self._set_fatal_error(
                     "client_init_failed",
                     f"Failed to initialize AgentChat REST client: {e}",
@@ -234,6 +245,8 @@ def _adapter_class() -> type:
             except UnauthorizedError as e:
                 logger.error("AgentChat: API key rejected by /v1/agents/me — %s", e)
                 await self._cleanup_client()
+                recorder.set_connection_state("failed")
+                recorder.inc_reconnect("auth_failed")
                 self._set_fatal_error(
                     "auth_failed",
                     "AgentChat API key was rejected. Rotate via "
@@ -244,6 +257,8 @@ def _adapter_class() -> type:
             except Exception as e:
                 logger.error("AgentChat: identity check failed — %s", e)
                 await self._cleanup_client()
+                recorder.set_connection_state("failed")
+                recorder.inc_reconnect("identity_failed")
                 self._set_fatal_error(
                     "identity_failed",
                     f"AgentChat identity check failed: {e}",
@@ -279,6 +294,8 @@ def _adapter_class() -> type:
                 logger.error("AgentChat: WebSocket connect failed — %s", e)
                 await self._teardown_realtime()
                 await self._cleanup_client()
+                recorder.set_connection_state("failed")
+                recorder.inc_reconnect("ws_connect_failed")
                 self._set_fatal_error(
                     "ws_connect_failed",
                     f"AgentChat WebSocket connect failed: {e}",
@@ -286,6 +303,7 @@ def _adapter_class() -> type:
                 )
                 return False
 
+            recorder.set_connection_state("ready")
             self._mark_connected()
             logger.info(
                 "AgentChat: connected as @%s (api_base=%s)",
@@ -310,6 +328,7 @@ def _adapter_class() -> type:
                 self._lock_key = None
 
             self._mark_disconnected()
+            _metrics_mod.get_recorder().set_connection_state("disconnected")
 
             await self._teardown_realtime()
             await self._cleanup_client()
@@ -345,19 +364,23 @@ def _adapter_class() -> type:
             ``_realtime.py``.
             """
             ftype = frame.get("type")
+            recorder = _metrics_mod.get_recorder()
 
             if ftype in ("message.new", "group.message"):
                 payload = frame.get("payload") or {}
                 kind = "group" if ftype == "group.message" else "direct"
+                recorder.inc_inbound("group_message" if kind == "group" else "message_new")
                 await self._dispatch_inbound_message(payload, kind=kind)
                 return
 
             if ftype == "group.deleted":
+                recorder.inc_inbound("group_deleted")
                 await self._dispatch_group_deleted(frame.get("data") or {})
                 return
 
             # message.read / presence.update / typing.* / rate_limit.warning —
             # framework has no direct analog. Logged at debug, dropped.
+            recorder.inc_inbound("ignored")
             logger.debug("AgentChat: ignoring realtime frame type=%s", ftype)
 
         async def _dispatch_inbound_message(
@@ -491,6 +514,9 @@ def _adapter_class() -> type:
                 # We called disconnect() ourselves — already logged upstack.
                 return
             if code in (1008, 4401, 4403):
+                recorder = _metrics_mod.get_recorder()
+                recorder.set_connection_state("failed")
+                recorder.inc_reconnect("auth_revoked")
                 self._set_fatal_error(
                     "auth_revoked",
                     f"AgentChat WebSocket closed for auth (code {code}). "
@@ -545,72 +571,85 @@ def _adapter_class() -> type:
                     {k: v for k, v in metadata.items() if k != "reply_to"}
                 )
 
+            recorder = _metrics_mod.get_recorder()
+            start = time.perf_counter()
+
+            def _fail(code: str, sr: Any) -> Any:
+                recorder.observe_send_latency(time.perf_counter() - start)
+                recorder.inc_outbound_failed(code)
+                return sr
+
             try:
                 result = await self._client.send_message(**kwargs)
             except RateLimitedError as e:
-                return self._SendResult(
+                return _fail("RATE_LIMITED", self._SendResult(
                     success=False,
                     error=f"rate_limited: retry in {e.retry_after_ms}ms",
-                )
+                ))
             except AwaitingReplyError as e:
-                return self._SendResult(
+                return _fail("AWAITING_REPLY", self._SendResult(
                     success=False,
                     error=(
                         f"awaiting_reply: @{e.recipient_handle} hasn't replied "
                         "to your last cold DM yet — wait for them before sending another."
                     ),
-                )
+                ))
             except BlockedError:
-                return self._SendResult(
+                return _fail("BLOCKED", self._SendResult(
                     success=False, error="blocked: messaging is blocked between you two"
-                )
+                ))
             except SuspendedError:
-                return self._SendResult(
+                return _fail("SUSPENDED", self._SendResult(
                     success=False, error="suspended: your account is suspended"
-                )
+                ))
             except RestrictedError:
-                return self._SendResult(
+                return _fail("RESTRICTED", self._SendResult(
                     success=False,
                     error="restricted: cold outreach disabled, contact existing peers only",
-                )
+                ))
             except GroupDeletedError as e:
-                return self._SendResult(
+                return _fail("GROUP_DELETED", self._SendResult(
                     success=False,
                     error=f"group_deleted: by @{e.deleted_by_handle} at {e.deleted_at}",
-                )
+                ))
             except NotFoundError as e:
-                return self._SendResult(success=False, error=f"not_found: {e}")
+                return _fail("NOT_FOUND", self._SendResult(success=False, error=f"not_found: {e}"))
             except RecipientBackloggedError as e:
-                return self._SendResult(
+                return _fail("RECIPIENT_BACKLOGGED", self._SendResult(
                     success=False,
                     error=(
                         f"backlogged: @{e.recipient_handle} has "
                         f"{e.undelivered_count} undelivered — try later."
                     ),
-                )
+                ))
             except ValidationError as e:
-                return self._SendResult(success=False, error=f"validation: {e}")
+                return _fail("VALIDATION_ERROR", self._SendResult(success=False, error=f"validation: {e}"))
             except UnauthorizedError:
+                recorder.set_connection_state("failed")
+                recorder.inc_reconnect("auth_revoked")
                 self._set_fatal_error(
                     "auth_revoked",
                     "API key rejected on send",
                     retryable=False,
                 )
-                return self._SendResult(success=False, error="auth_revoked")
+                return _fail("UNAUTHORIZED", self._SendResult(success=False, error="auth_revoked"))
             except (ServerError, ACConnectionError) as e:
-                return self._SendResult(
+                return _fail("SERVER_OR_NETWORK", self._SendResult(
                     success=False, error=f"server_or_network: {e}"
-                )
+                ))
             except AgentChatError as e:
-                return self._SendResult(success=False, error=f"{e.code}: {e}")
+                code = getattr(e, "code", "AGENTCHAT_ERROR") or "AGENTCHAT_ERROR"
+                return _fail(code, self._SendResult(success=False, error=f"{code}: {e}"))
             except Exception as e:
                 logger.exception("AgentChat: unexpected send failure")
-                return self._SendResult(success=False, error=str(e))
+                return _fail("UNEXPECTED", self._SendResult(success=False, error=str(e)))
 
-            # SendMessageResult.message is the raw message dict from the API
-            # (Pydantic-friendly but typed as dict). Pull the id field for
-            # the SendResult.message_id contract, defaulting to None on a
-            # malformed payload.
+            # Success path. SendMessageResult.message is the raw message dict
+            # from the API (Pydantic-friendly but typed as dict). Pull the id
+            # field for the SendResult.message_id contract, defaulting to
+            # None on a malformed payload.
+            recorder.observe_send_latency(time.perf_counter() - start)
+            recorder.inc_outbound_sent()
             msg = getattr(result, "message", None) or {}
             msg_id = msg.get("id") if isinstance(msg, dict) else None
             return self._SendResult(success=True, message_id=msg_id)
