@@ -70,9 +70,22 @@ jobs:
       - name: Pytest
         run: python -m pytest -q
 
+  # End-to-end gate. Installs Hermes, mounts the checked-out plugin
+  # into ~/.hermes/plugins/agentchat/, runs `hermes plugins enable`,
+  # and asserts the CLI subcommand registered + the SDK was lazy-
+  # installed. This BLOCKS publish on a real plugin-load failure —
+  # `needs: [test, e2e]` on the publish job below.
+  #
+  # Reusable workflow call so e2e.yml stays the single source of
+  # truth — the same definition runs standalone (push to main,
+  # manual dispatch) and gating publish.
+  e2e:
+    needs: test
+    uses: ./.github/workflows/e2e.yml
+
   publish:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, e2e]
     steps:
       - uses: actions/checkout@v4
 

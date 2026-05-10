@@ -13,15 +13,20 @@ name: E2E (hermes plugins install)
 # plugin discovery contract in a way our unit tests don't see.
 #
 # Triggers:
-#   - tag push (`v*`) → runs before publish; if e2e fails, no publish
-#   - workflow_dispatch (manual) → on-demand validation
-#   - push to main → catches Hermes-upstream drift between tags
+#   - tag push (`v*`) — runs alongside publish; same-tag failure shows up
+#     as a separate workflow run for the same SHA.
+#   - push to main — catches Hermes-upstream drift between tags.
+#   - workflow_dispatch — on-demand validation.
+#   - workflow_call — invoked by publish.yml to gate the publish on
+#     e2e success. THIS is the production-grade hookup: a publish
+#     cannot ship past a failing plugins-install path.
 
 on:
   push:
     branches: [main]
     tags: ["v*"]
   workflow_dispatch:
+  workflow_call:
 
 concurrency:
   group: e2e-${{ github.ref }}
@@ -105,11 +110,23 @@ jobs:
       - name: Verify SDK was lazy-installed
         # The shim's `_ensure_sdk_installed` must have run during plugin
         # load (since Hermes's plugins install doesn't pip the deps).
-        # `agentchatme` should be importable from Hermes's venv now.
+        # `agentchatme` must be importable from the SAME Python that
+        # Hermes is running in. The install path varies between
+        # root-install (FHS layout: /usr/local/lib/hermes-agent/) and
+        # non-root install (~/.hermes-agent/ or similar), so we extract
+        # the canonical project directory from `hermes --version`'s
+        # `Project:` line and resolve the venv python from there.
         run: |
           set -euo pipefail
-          /usr/local/lib/hermes-agent/venv/bin/python -c \
-            "import agentchatme; print('agentchatme', agentchatme.__name__, 'imported OK')"
+          HERMES_PROJECT="$(hermes --version | awk -F': ' '/^Project:/ {print $2; exit}')"
+          if [ -z "$HERMES_PROJECT" ] || [ ! -d "$HERMES_PROJECT/venv" ]; then
+            echo "::error::could not resolve Hermes project dir from `hermes --version`"
+            hermes --version
+            exit 1
+          fi
+          HERMES_PYTHON="$HERMES_PROJECT/venv/bin/python"
+          echo "Hermes Python: $HERMES_PYTHON"
+          "$HERMES_PYTHON" -c "import agentchatme; print('agentchatme', agentchatme.__name__, 'imported OK from', agentchatme.__file__)"
 
       - name: Surface diagnostics on failure
         if: failure()

@@ -4,6 +4,27 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4] - 2026-05-10
+
+### Fixed
+- E2E workflow's "Verify SDK was lazy-installed" step had a hardcoded
+  `/usr/local/lib/hermes-agent/venv/bin/python` path that only resolves
+  when Hermes is installed as root (FHS layout). On GitHub Actions,
+  Hermes lands at a non-root location, so the verification step
+  failed even though the plugin loaded successfully (the prior steps
+  asserting `hermes plugins list` enabled + `hermes agentchat --help`
+  registered both passed). The path is now resolved dynamically from
+  `hermes --version`'s `Project:` line, which is correct regardless
+  of install layout.
+
+### Changed
+- **Publish is now gated on e2e.** `publish.yml` declares the e2e
+  workflow as a reusable workflow call (`uses: ./.github/workflows/
+  e2e.yml`) and the publish job's `needs:` includes `e2e`. A failed
+  end-to-end (broken plugin load, broken lazy install, broken CLI
+  subcommand registration) blocks the publish — the wheel cannot ship
+  to PyPI past a failing real-Hermes integration test.
+
 ## [0.1.3] - 2026-05-10
 
 ### Added
