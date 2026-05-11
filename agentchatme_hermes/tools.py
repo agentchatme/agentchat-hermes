@@ -256,7 +256,10 @@ def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[..., 
                 value = await handler(args or {})
             except _ToolConfigError as e:
                 recorder.observe_tool_call(tool_name, "CONFIG_ERROR", time.perf_counter() - start)
-                return _serialize({"ok": False, "code": "CONFIG_ERROR", "message": str(e)})
+                msg = str(e)
+                return _serialize(
+                    {"ok": False, "code": "CONFIG_ERROR", "message": msg, "error": msg}
+                )
             except RateLimitedError as e:
                 recorder.observe_tool_call(tool_name, "RATE_LIMITED", time.perf_counter() - start)
                 return _serialize(_err("RATE_LIMITED", e, retry_after_ms=getattr(e, "retry_after_ms", None)))
@@ -312,7 +315,10 @@ def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[..., 
             except Exception as e:
                 logger.exception("agentchat tool: unexpected error in %s", tool_name)
                 recorder.observe_tool_call(tool_name, "UNEXPECTED", time.perf_counter() - start)
-                return _serialize({"ok": False, "code": "UNEXPECTED", "message": str(e)})
+                msg = str(e)
+                return _serialize(
+                    {"ok": False, "code": "UNEXPECTED", "message": msg, "error": msg}
+                )
             finally:
                 _inflight_count -= 1
                 recorder.set_inflight_depth(_inflight_count)
@@ -344,8 +350,24 @@ def _err(code: str, exc: Exception, **extras: Any) -> dict[str, Any]:
     from the server's ``X-Request-Id`` header when present). Threading it
     into the envelope lets an operator paste the id straight into a
     backend log search and find the exact failed request without ambiguity.
+
+    The envelope carries the ``error`` key alongside our richer
+    ``{ok, code, message}`` shape so Hermes's documented contract
+    (``{"error": "..."}``) is satisfied for any downstream tooling
+    (``transform_tool_result`` hooks, ops inspectors, third-party
+    plugins) that introspects tool results by looking up ``error``.
+    Our bundled skill teaches the agent to read the richer shape;
+    the ``error`` field keeps doc-conformant tooling happy.
     """
-    body: dict[str, Any] = {"ok": False, "code": code, "message": str(exc)}
+    message = str(exc)
+    body: dict[str, Any] = {
+        "ok": False,
+        "code": code,
+        "message": message,
+        # Doc-conformant alias — Hermes docs say tool errors MUST be
+        # `{"error": "..."}`. Same string as `message`; both present.
+        "error": message,
+    }
     request_id = getattr(exc, "request_id", None)
     if request_id:
         body["request_id"] = request_id

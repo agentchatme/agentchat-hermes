@@ -30,10 +30,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import time
+import uuid
 from typing import Any, Callable
 
 from agentchatme import (
@@ -62,6 +64,44 @@ from agentchatme.errors import (
 from . import metrics as _metrics_mod
 
 logger = logging.getLogger(__name__)
+
+
+# ── Idempotency helper ──────────────────────────────────────────────────────
+#
+# Stable `client_msg_id` derived from the send tuple + a coarse time bucket.
+# See `AgentChatAdapter.send` for the contract rationale.
+#
+# Window of 120 seconds = 5x Hermes's worst-case retry ladder (1s/2s/4s).
+# Every attempt of one logical send lands in the same window → same id →
+# server dedupes. A legitimate re-send 2+ minutes later gets a new id and
+# is treated as a fresh message. UUIDv5 over a stable namespace yields a
+# canonical 36-char UUID string the SDK accepts as-is.
+
+_IDEMPOTENCY_WINDOW_SECONDS = 120
+# Derived from `uuid.uuid5(NAMESPACE_DNS, "agentchatme-hermes.agentchat.me")`.
+# Stable across releases; rotating it would change every existing id, which
+# is fine because ids are ephemeral (only meaningful inside one send
+# attempt's retry window).
+_IDEMPOTENCY_NAMESPACE = uuid.UUID("870db470-9f32-5e78-897e-d7c626fb60b0")
+
+
+def _stable_client_msg_id(
+    sender_handle: str,
+    chat_id: str,
+    content: str,
+    reply_to: str | None,
+) -> str:
+    """Stable per-attempt-window UUID for SDK send dedup.
+
+    Hashing inputs before UUIDv5 keeps content out of the namespace
+    string (avoids accidentally putting the message text in any log
+    that prints the namespace value).
+    """
+    bucket = int(time.time()) // _IDEMPOTENCY_WINDOW_SECONDS
+    digest = hashlib.sha256(
+        f"{sender_handle}|{chat_id}|{reply_to or ''}|{bucket}|{content}".encode()
+    ).hexdigest()
+    return str(uuid.uuid5(_IDEMPOTENCY_NAMESPACE, digest))
 
 
 # ─── Lazy framework imports ───────────────────────────────────────────────
@@ -451,11 +491,37 @@ def _adapter_class() -> type:
             # Render content as a single text string for the agent. The
             # raw payload is preserved on raw_message so an agent that
             # wants the structured shape can read it.
+            #
+            # MessageType inference: Hermes routes media-typed events to
+            # vision/file-aware pipelines downstream. Even without
+            # downloading the attachment (deferred — needs a fresh REST
+            # roundtrip we don't want to block the realtime handler on),
+            # tagging the event with the correct `MessageType` lets the
+            # framework apply the right session policy. The agent
+            # resolves the actual content via
+            # `agentchat_get_attachment_download_url`.
+            message_type = self._MessageType.TEXT
             if ac_type == "text":
                 text = content_obj.get("text", "")
             elif ac_type == "file":
                 att_id = content_obj.get("attachment_id", "")
-                text = f"[attachment {att_id}]"
+                # Best-effort MIME inference. AgentChat servers populate
+                # `mime_type` on `content` when available; older payloads
+                # may not. Default to DOCUMENT so the agent at least
+                # knows to call `agentchat_get_attachment_download_url`.
+                mime = (content_obj.get("mime_type") or "").lower()
+                if mime.startswith("image/"):
+                    message_type = self._MessageType.PHOTO
+                    text = f"[image attachment {att_id}]"
+                elif mime.startswith("video/"):
+                    message_type = self._MessageType.VIDEO
+                    text = f"[video attachment {att_id}]"
+                elif mime.startswith("audio/"):
+                    message_type = self._MessageType.AUDIO
+                    text = f"[audio attachment {att_id}]"
+                else:
+                    message_type = self._MessageType.DOCUMENT
+                    text = f"[attachment {att_id}]"
             elif ac_type == "system":
                 # System messages from the platform itself (group joined,
                 # member kicked, etc.) — render the data as JSON so the
@@ -482,7 +548,7 @@ def _adapter_class() -> type:
 
             event = self._MessageEvent(
                 text=text,
-                message_type=self._MessageType.TEXT,
+                message_type=message_type,
                 source=source,
                 raw_message=payload,
                 message_id=message_id,
@@ -603,6 +669,28 @@ def _adapter_class() -> type:
                 kwargs.setdefault("metadata", {}).update(
                     {k: v for k, v in metadata.items() if k != "reply_to"}
                 )
+
+            # Idempotency. Hermes's `_send_with_retry` (`base.py:2315`)
+            # retries when `SendResult.retryable=True` — which we set on
+            # `RateLimitedError`, `ServerError`, `ACConnectionError`, and
+            # `RecipientBackloggedError`. Of those, `ACConnectionError`
+            # is ambiguous: the connection may have dropped AFTER the
+            # server accepted the message but BEFORE we got the 2xx
+            # response. Without a stable `client_msg_id`, the SDK
+            # auto-generates a fresh UUID per call and the server cannot
+            # dedupe — the retry delivers a second copy.
+            #
+            # We derive a stable id from (chat_id, content, reply_to,
+            # 120-second window). Hermes's retry ladder is 1s/2s/4s with
+            # 2 retries max — every attempt of one logical send lands in
+            # the same window. An intentional re-send of the same content
+            # 2+ minutes later gets a fresh id and is delivered as new.
+            #
+            # Discovered in v0.1.63 audit cross-match against
+            # `tools/send_message_tool.py:_send_with_retry`.
+            kwargs["client_msg_id"] = _stable_client_msg_id(
+                self.handle or "", cid, content, reply_to
+            )
 
             recorder = _metrics_mod.get_recorder()
             start = time.perf_counter()
@@ -799,6 +887,20 @@ async def _standalone_send(
                 "not deliverable from cron]"
             ),
         }
+
+    # Idempotency. Cron has its own retry-on-failure ladder
+    # (`cron/scheduler.py:_run_with_retries`). Without a stable
+    # `client_msg_id`, a retry after partial-success risks duplicate
+    # delivery. Same windowed-hash strategy as the in-gateway path.
+    # Sender handle isn't resolvable here (we'd need an extra REST
+    # roundtrip), so we use the api_key prefix as a stand-in
+    # discriminator — same key always produces same id contribution.
+    kwargs["client_msg_id"] = _stable_client_msg_id(
+        api_key[:16],
+        cid,
+        kwargs["content"].get("text", "") if isinstance(kwargs.get("content"), dict) else "",
+        kwargs.get("metadata", {}).get("reply_to") if isinstance(kwargs.get("metadata"), dict) else None,
+    )
 
     client = AsyncAgentChatClient(api_key=api_key, base_url=api_base)
     try:
@@ -1019,6 +1121,27 @@ def register(ctx: Any) -> None:
         logger.warning("AgentChat: failed to register bundled skill: %s", e)
 
     # Full feature parity tools.
+    #
+    # Hermes's `PluginManager` does NOT automatically deregister tools
+    # that a plugin partially-registered before raising
+    # (`hermes_cli/plugins.py:1069-1136` — the failure path leaves
+    # tool entries in the global `tools.registry` registry). So if
+    # `register_all_tools` raises midway through the 41-tool sweep
+    # (a programmer error in a new release), the surviving tools
+    # appear in the agent's tool list with no live handler implementing
+    # them — confusing for the agent and impossible to clean up
+    # without restarting the gateway.
+    #
+    # We snapshot the registry before the call and roll back our
+    # contributions on failure. This is the "defensive plugin"
+    # pattern documented at v0.13 in the upstream contracts research.
+    try:
+        from tools.registry import registry as _tool_registry  # type: ignore[import-not-found]
+        before = set(_tool_registry.get_all_tool_names())
+    except Exception:
+        _tool_registry = None  # type: ignore[assignment]
+        before = set()
+
     try:
         register_all_tools(ctx)
     except Exception as e:
@@ -1027,3 +1150,20 @@ def register(ctx: Any) -> None:
             "but the agentchat_* tool surface is unavailable: %s",
             e,
         )
+        # Roll back partial state so the agent never sees orphaned
+        # tool names. The registry's `deregister` is exposed at
+        # `tools/registry.py:303` (verified in the v0.13 audit).
+        if _tool_registry is not None:
+            try:
+                after = set(_tool_registry.get_all_tool_names())
+                orphans = sorted(t for t in (after - before) if t.startswith("agentchat_"))
+                for name in orphans:
+                    with contextlib.suppress(Exception):
+                        _tool_registry.deregister(name)
+                if orphans:
+                    logger.info(
+                        "AgentChat: deregistered %d partially-loaded tools after failure",
+                        len(orphans),
+                    )
+            except Exception:
+                logger.exception("AgentChat: rollback of partial tool registration failed")

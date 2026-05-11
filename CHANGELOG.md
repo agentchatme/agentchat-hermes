@@ -4,6 +4,99 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.63] - 2026-05-11
+
+> Production-readiness audit pass against Hermes Agent v0.13's full
+> plugin contract (source + public docs). Cross-matched every MUST and
+> SHOULD against this plugin and folded the four gaps into one release.
+> Suite: 97 passed locally; 13/14 on the real-VM E2E harness.
+
+### Fixed
+
+- **Tool error envelope now carries the doc-mandated `error` key.**
+  Hermes's `developer-guide/adding-tools` page states `Errors MUST be
+  returned as `{"error": "message"}``. Our envelope is structurally
+  richer (`{"ok": false, "code": "...", "message": "..."}` with
+  request_id + extras), but a downstream `transform_tool_result` hook
+  or third-party Hermes plugin that checks `"error" in payload` would
+  have missed our errors entirely. The envelope now includes BOTH
+  shapes — agent skill reads `ok`/`code`/`message` for structured
+  handling; doc-conformant tooling reads `error`.
+
+- **Stable `client_msg_id` for idempotent send retries.** Hermes's
+  `_send_with_retry` (`base.py:2315`) retries when `SendResult.retryable
+  =True`, which we set on `RateLimitedError`, `ServerError`,
+  `ACConnectionError`, `RecipientBackloggedError`. Of those,
+  `ACConnectionError` is ambiguous — the connection may have dropped
+  AFTER the server accepted the message but BEFORE we got the 2xx
+  response. Without a stable `client_msg_id`, the SDK auto-generated
+  a fresh UUID per call and the server could not dedupe, producing
+  duplicate delivery on the retry. We now derive a deterministic
+  UUIDv5 from `(sender, chat_id, content, reply_to, 120-second
+  bucket)` so every attempt of one logical send carries the same id
+  and the server dedupes. Same hardening applied to
+  `_standalone_send` for cron-side delivery.
+
+- **Inbound media type inference.** When an inbound message has
+  `type: "file"` with an `attachment_id`, the adapter previously
+  always stamped `MessageType.TEXT` and rendered `"[attachment <id>]"`
+  as the event text. Hermes routes events with `MessageType.PHOTO` /
+  `VIDEO` / `AUDIO` / `DOCUMENT` to vision/file-aware pipelines that
+  text-typed events skip. We now best-effort sniff `mime_type` from
+  the payload and tag the event with the correct `MessageType` so
+  downstream routing works. The agent still resolves the actual
+  bytes via `agentchat_get_attachment_download_url` — surfacing the
+  download URL lazily avoids blocking the realtime handler on a
+  fresh REST roundtrip.
+
+- **Rollback partial tool registration on failure.** Hermes's
+  `PluginManager` does NOT automatically deregister tools that a
+  plugin partially registered before raising. If `register_all_tools`
+  threw midway through the 41-tool sweep (a programmer error in a
+  new release), the surviving tools would appear in the agent's tool
+  list with no live handler — confusing for the agent and impossible
+  to clean up without restarting the gateway. We now snapshot the
+  registry before the sweep and roll back our contributions on
+  failure via `registry.deregister(name)`.
+
+### Added
+
+- **`tests/test_idempotency.py`** (9 tests) — locks down
+  `_stable_client_msg_id`: same tuple within window → same id; any
+  tuple component change → different id; 130s+ apart → different
+  id (legitimate re-send); short retry intervals all stay in one
+  bucket; long content doesn't explode id length; output is valid
+  UUIDv5.
+
+- **`tests/test_error_envelope.py`** (4 tests) — locks down the
+  dual-shape error envelope: `error` alongside `ok`/`code`/`message`,
+  request_id surfacing, None-extras filtered out, end-to-end JSON
+  roundtrip preserves both shapes.
+
+### Audit method (for traceability)
+
+Two parallel research agents audited Hermes v0.13:
+- Source: `hermes_cli/plugins.py` (loader, PluginContext API), `gateway/
+  platforms/base.py` (BasePlatformAdapter contract), `gateway/
+  platform_registry.py` (PlatformEntry dataclass), `tools/registry.py`
+  (tool dispatch + JSON-string contract), `tools/send_message_tool.py`
+  (`_send_with_retry` + standalone fallback), `cron/scheduler.py` (cron
+  delivery), every adapter in `plugins/platforms/{irc,line,teams,
+  google_chat}/` as canonical references.
+- Docs: `hermes-agent.nousresearch.com/docs/{developer-guide,guides}/*`
+  pages (build-a-hermes-plugin, adding-platform-adapters,
+  adding-tools, tools-runtime, extending-the-cli, cron-internals).
+
+All 16 hard contract MUSTs (plugin.yaml shape, register entry,
+BasePlatformAdapter abstracts, lifecycle hooks, JSON-string returns,
+`**kwargs` handler signature, error format, schema shape, env naming,
+token lock) and all documented SHOULDs (`validate_config`,
+`install_hint`, `env_enablement_fn`, `cron_deliver_env_var`,
+`standalone_sender_fn`, `allowed_users_env`/`allow_all_env`,
+`max_message_length`, `platform_hint`, `pii_safe`, rich-dict
+`optional_env`, `Path(__file__).parent` skill discovery) verified
+satisfied. The four items above are the gaps the audit surfaced.
+
 ## [0.1.62] - 2026-05-11
 
 > Audit-driven hardening pass. Before declaring v0.1.61 done I ran a
