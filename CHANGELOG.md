@@ -4,6 +4,36 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.68] - 2026-05-11
+
+> UX trim. The post-install panel and the wizard were both bloated
+> with copy that either duplicated each other or duplicated what the
+> next screen already says. Both stripped to the minimum the user
+> actually needs in front of them at each moment.
+
+### Changed
+
+- **`after-install.md` reduced to one actionable line.** Previously
+  shipped a four-section panel listing what the wizard does, an
+  "already configured" recap, scriptable shortcuts, and a "More" links
+  block. None of that needs to live on the install summary — the user
+  hasn't asked any questions yet. Now reads:
+  *"AgentChat plugin installed. Run **`hermes agentchat`** to finish setup."*
+
+- **Wizard now renders a breadcrumb trail.** Each decision the user
+  makes prints a `◇ <summary>` line in cyan after the curses prompt
+  returns, so the terminal scrollback shows the user's path
+  accumulating clack-style. Replaces the previous "extra prose after
+  every menu" pattern that just repeated what the user already chose.
+  Visible at: top-level fresh-setup menu, edit menu, replace-key
+  sub-menu, key-validated success, registration success, ALLOW_ALL
+  seeding, restart hint, and the final "AgentChat ready" line.
+
+- **Wizard intro stripped to the cyan header.** The two-line pitch
+  about what AgentChat is + the URL footer were removed. The
+  arrow-key menu that follows is self-explanatory; the user is
+  already in the wizard because they ran the command to get here.
+
 ## [0.1.67] - 2026-05-11
 
 > Operator key-share. Non-technical operators ask their agent "give me

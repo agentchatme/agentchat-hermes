@@ -189,6 +189,29 @@ def interactive_setup() -> None:
             print(f"AgentChat setup failed: {exc}", file=sys.stderr)
 
 
+def _step(message: str) -> None:
+    """Print a breadcrumb step in the wizard trail.
+
+    Mirrors clack/prompts' ``◇  step result`` style so the user can
+    glance at the terminal scrollback and see every decision they made
+    accumulating in order. Hermes's ``prompt_choice`` is curses-based and
+    its on-screen panel disappears when the user makes a selection — the
+    only way to preserve "what you just chose" in the final output is to
+    print our own one-line summary right after each step returns.
+
+    Style: cyan ``◇`` glyph + dim text body. Uses ANSI escapes directly
+    so we don't depend on a styled-print helper that adds the
+    ``print_info`` two-space indent (the trail looks cleaner flush-left).
+    """
+    import sys
+
+    if not sys.stdout.isatty():
+        print(f"  {message}")
+        return
+    # Cyan ◇ + dim body; reset at end.
+    print(f"\033[36m◇\033[0m  \033[2m{message}\033[0m")
+
+
 def _interactive_setup_body() -> None:
     """Actual wizard. Separated so `interactive_setup` can wrap it.
 
@@ -217,12 +240,6 @@ def _interactive_setup_body() -> None:
     )
 
     print_header("AgentChat")
-    print_info(
-        "AgentChat is a peer-to-peer messaging network for AI agents — your Hermes agent gets its own @handle and can DM other agents in real time."
-    )
-    print_info(
-        "https://agentchat.me  •  https://github.com/agentchatme/agentchat-hermes"
-    )
     print()
 
     existing_key = (get_env_value("AGENTCHATME_API_KEY") or "").strip()
@@ -298,12 +315,9 @@ def _edit_menu(
         default=0,
         description=description,
     )
+    _step(choices[idx])
 
     if idx == 0:
-        print_info(
-            "Leaving AgentChat configuration unchanged. Run `hermes agentchat` "
-            "again any time to make changes."
-        )
         return
     if idx == 1:
         _replace_key_branch(
@@ -344,9 +358,6 @@ def _fresh_setup_menu(
 ) -> None:
     """Top-level register-or-paste menu for fresh installs. Mirrors
     OpenClaw's ``channel.wizard.ts:618-633`` 3-option select."""
-    print_info("AgentChat is not configured yet.")
-    print()
-
     choices = [
         "Register a new AgentChat agent (email + 6-digit OTP, ~60s)",
         "I already have an API key (paste ac_live_…)",
@@ -359,11 +370,9 @@ def _fresh_setup_menu(
         default=0,
         description=description,
     )
+    _step(choices[idx])
 
     if idx == 2:
-        print_info(
-            "Skipping AgentChat setup. Run `hermes agentchat` to configure later."
-        )
         return
 
     if idx == 0:
@@ -387,10 +396,7 @@ def _fresh_setup_menu(
     # gateway-level deny-all. AgentChat enforces inbox_mode server-side
     # so the framework allowlist is redundant — see `_seed_allow_all_default`.
     if _seed_allow_all_default(save_env_value, get_env_value):
-        print_info(
-            "AGENTCHATME_ALLOW_ALL=true (AgentChat server enforces inbox_mode; "
-            "framework allowlist disabled)."
-        )
+        _step("Inbox open (server enforces inbox_mode)")
 
     # Advanced options — opt-in. Most users want defaults.
     print()
@@ -402,9 +408,8 @@ def _fresh_setup_menu(
             prompt, prompt_yes_no, print_info, print_warning, save_env_value, get_env_value
         )
 
-    print()
-    print_success("AgentChat configuration saved to ~/.hermes/.env")
-    print_info("Restart the gateway for changes to take effect: hermes gateway restart")
+    _step("Restart the gateway: hermes gateway restart")
+    print_success("AgentChat ready")
 
 
 def _replace_key_branch(
@@ -438,9 +443,9 @@ def _replace_key_branch(
         choices,
         default=0,
     )
+    _step(choices[idx])
 
     if idx == 2:
-        print_info("Cancelled. Existing key retained.")
         return
 
     if idx == 0:
@@ -458,13 +463,9 @@ def _replace_key_branch(
         )
 
     if ok:
-        # Same default-allow-all seeding as the fresh-setup path.
         if _seed_allow_all_default(save_env_value, get_env_value):
-            print_info(
-                "AGENTCHATME_ALLOW_ALL=true (AgentChat server enforces "
-                "inbox_mode; framework allowlist disabled)."
-            )
-        print_info("Restart the gateway for changes to take effect: hermes gateway restart")
+            _step("Inbox open (server enforces inbox_mode)")
+        _step("Restart the gateway: hermes gateway restart")
 
 
 def _change_api_base_flow(
@@ -575,7 +576,7 @@ def _paste_existing_key_flow(prompt, print_info, print_success, print_warning, s
 
     save_env_value("AGENTCHATME_API_KEY", api_key)
     save_env_value("AGENTCHATME_HANDLE", handle)
-    print_success(f"AgentChat key validated. You are @{handle}.")
+    _step(f"Key validated — you are @{handle}")
     return True
 
 
@@ -686,9 +687,7 @@ def _register_new_agent_flow(
     save_env_value("AGENTCHATME_API_KEY", api_key)
     save_env_value("AGENTCHATME_HANDLE", resolved_handle)
     masked = _mask_key(api_key)
-    print_success(
-        f"Registered as @{resolved_handle}. API key saved ({masked})."
-    )
+    _step(f"Registered as @{resolved_handle} (key {masked})")
     return True
 
 
