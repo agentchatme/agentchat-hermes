@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import time
@@ -178,7 +179,7 @@ class _ToolConfigError(Exception):
 # ─── Error envelope ────────────────────────────────────────────────────────
 
 
-def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[..., Awaitable[dict[str, Any]]]:
+def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[..., Awaitable[str]]:
     """Wrap an async tool handler so SDK errors render as structured results.
 
     Three layers of protection in order:
@@ -207,12 +208,23 @@ def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[..., 
     Python raises ``TypeError: wrapped() got an unexpected keyword
     argument 'task_id'`` before any user code runs. Discovered in v0.1.5
     when every ``agentchat_*`` call returned ``[error]`` immediately.
+
+    **Return type is a JSON-serialized string, not a dict.** Hermes
+    passes the handler's return value straight through to the LLM as
+    the ``content`` field of the tool message. The OpenAI tool-message
+    contract requires ``content`` to be a string (or a list of content
+    blocks); strict OpenAI-compat providers like DeepSeek reject raw
+    Python dicts with HTTP 400. Every Hermes built-in tool returns
+    ``json.dumps(...)`` for the same reason — e.g. ``camofox_navigate``
+    at ``tools/browser_camofox.py:286``. Discovered in v0.1.6 when a
+    real user's first tool call hit DeepSeek and got
+    ``messages[3]: content should be a string or a list``.
     """
     tool_name = getattr(handler, "__name__", "agentchat_unknown").lstrip("_")
     if tool_name.startswith("h_"):
         tool_name = "agentchat_" + tool_name[2:]
 
-    async def wrapped(args: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+    async def wrapped(args: dict[str, Any], **_kwargs: Any) -> str:
         global _inflight_count
         from agentchatme.errors import (  # type: ignore[import-not-found]
             AgentChatError,
@@ -244,72 +256,85 @@ def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[..., 
                 value = await handler(args or {})
             except _ToolConfigError as e:
                 recorder.observe_tool_call(tool_name, "CONFIG_ERROR", time.perf_counter() - start)
-                return {"ok": False, "code": "CONFIG_ERROR", "message": str(e)}
+                return _serialize({"ok": False, "code": "CONFIG_ERROR", "message": str(e)})
             except RateLimitedError as e:
                 recorder.observe_tool_call(tool_name, "RATE_LIMITED", time.perf_counter() - start)
-                return _err("RATE_LIMITED", e, retry_after_ms=getattr(e, "retry_after_ms", None))
+                return _serialize(_err("RATE_LIMITED", e, retry_after_ms=getattr(e, "retry_after_ms", None)))
             except AwaitingReplyError as e:
                 recorder.observe_tool_call(tool_name, "AWAITING_REPLY", time.perf_counter() - start)
-                return _err("AWAITING_REPLY", e, recipient_handle=getattr(e, "recipient_handle", None))
+                return _serialize(_err("AWAITING_REPLY", e, recipient_handle=getattr(e, "recipient_handle", None)))
             except BlockedError as e:
                 recorder.observe_tool_call(tool_name, "BLOCKED", time.perf_counter() - start)
-                return _err("BLOCKED", e)
+                return _serialize(_err("BLOCKED", e))
             except SuspendedError as e:
                 recorder.observe_tool_call(tool_name, "SUSPENDED", time.perf_counter() - start)
-                return _err("SUSPENDED", e)
+                return _serialize(_err("SUSPENDED", e))
             except RestrictedError as e:
                 recorder.observe_tool_call(tool_name, "RESTRICTED", time.perf_counter() - start)
-                return _err("RESTRICTED", e)
+                return _serialize(_err("RESTRICTED", e))
             except ForbiddenError as e:
                 code = getattr(e, "code", "FORBIDDEN") or "FORBIDDEN"
                 recorder.observe_tool_call(tool_name, code, time.perf_counter() - start)
-                return _err(code, e)
+                return _serialize(_err(code, e))
             except GroupDeletedError as e:
                 recorder.observe_tool_call(tool_name, "GROUP_DELETED", time.perf_counter() - start)
-                return _err(
+                return _serialize(_err(
                     "GROUP_DELETED",
                     e,
                     deleted_by_handle=getattr(e, "deleted_by_handle", None),
                     deleted_at=getattr(e, "deleted_at", None),
-                )
+                ))
             except RecipientBackloggedError as e:
                 recorder.observe_tool_call(tool_name, "RECIPIENT_BACKLOGGED", time.perf_counter() - start)
-                return _err(
+                return _serialize(_err(
                     "RECIPIENT_BACKLOGGED",
                     e,
                     recipient_handle=getattr(e, "recipient_handle", None),
                     undelivered_count=getattr(e, "undelivered_count", None),
-                )
+                ))
             except NotFoundError as e:
                 code = getattr(e, "code", None) or "NOT_FOUND"
                 recorder.observe_tool_call(tool_name, code, time.perf_counter() - start)
-                return _err(code, e)
+                return _serialize(_err(code, e))
             except ValidationError as e:
                 recorder.observe_tool_call(tool_name, "VALIDATION_ERROR", time.perf_counter() - start)
-                return _err("VALIDATION_ERROR", e)
+                return _serialize(_err("VALIDATION_ERROR", e))
             except UnauthorizedError as e:
                 recorder.observe_tool_call(tool_name, "UNAUTHORIZED", time.perf_counter() - start)
-                return _err("UNAUTHORIZED", e)
+                return _serialize(_err("UNAUTHORIZED", e))
             except (ServerError, ACConnectionError) as e:
                 recorder.observe_tool_call(tool_name, "SERVER_OR_NETWORK", time.perf_counter() - start)
-                return _err("SERVER_OR_NETWORK", e)
+                return _serialize(_err("SERVER_OR_NETWORK", e))
             except AgentChatError as e:
                 code = getattr(e, "code", "AGENTCHAT_ERROR") or "AGENTCHAT_ERROR"
                 recorder.observe_tool_call(tool_name, code, time.perf_counter() - start)
-                return _err(code, e)
+                return _serialize(_err(code, e))
             except Exception as e:
                 logger.exception("agentchat tool: unexpected error in %s", tool_name)
                 recorder.observe_tool_call(tool_name, "UNEXPECTED", time.perf_counter() - start)
-                return {"ok": False, "code": "UNEXPECTED", "message": str(e)}
+                return _serialize({"ok": False, "code": "UNEXPECTED", "message": str(e)})
             finally:
                 _inflight_count -= 1
                 recorder.set_inflight_depth(_inflight_count)
 
         recorder.observe_tool_call(tool_name, "ok", time.perf_counter() - start)
-        return {"ok": True, "result": value}
+        return _serialize({"ok": True, "result": value})
 
     wrapped.__name__ = f"_safe_{tool_name}"
     return wrapped
+
+
+def _serialize(payload: dict[str, Any]) -> str:
+    """Serialize a tool-result envelope to a JSON string.
+
+    Hermes hands the handler's return value straight through to the LLM
+    as the ``content`` field of the OpenAI tool message. Strict
+    OpenAI-compat providers (DeepSeek, NVIDIA NIM, MiniMax, etc.) reject
+    non-string content with HTTP 400. ``ensure_ascii=False`` so non-ASCII
+    payload (handles in CJK, emoji, etc.) doesn't bloat to ``\\uXXXX``
+    escapes and waste the model's context budget.
+    """
+    return json.dumps(payload, ensure_ascii=False, default=str)
 
 
 def _err(code: str, exc: Exception, **extras: Any) -> dict[str, Any]:

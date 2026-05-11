@@ -4,6 +4,48 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.61] - 2026-05-10
+
+> Switching to sub-decimal patch numbers (0.1.61, 0.1.62, …) per the
+> user's versioning preference — gives the 0.1.x range plenty of headroom
+> to absorb iteration patches without burning into 0.2.0 prematurely.
+
+
+
+### Fixed
+- **Every tool call crashed the model with HTTP 400 on DeepSeek** the
+  moment a real user tried to use the plugin in v0.1.6. The model
+  returned ``Failed to deserialize the JSON body into the target type:
+  messages[n]: content should be a string or a list``. Root cause:
+  our ``_safe`` wrapper returned a Python ``dict``, but Hermes passes
+  the handler's return value straight through to the LLM as the
+  ``content`` field of the OpenAI tool message. The OpenAI tool-message
+  contract requires ``content`` to be a string (or a list of content
+  blocks); strict OpenAI-compat providers like DeepSeek, NVIDIA NIM,
+  and MiniMax reject raw dicts with 400.
+
+  Fix: ``_safe`` now wraps every return path in ``json.dumps(payload,
+  ensure_ascii=False, default=str)``. Matches Hermes's own built-in
+  tool convention (every tool in ``tools/browser_camofox.py`` returns
+  ``json.dumps(...)``). ``ensure_ascii=False`` so non-ASCII payload
+  (CJK handles, emoji) doesn't bloat to ``\\uXXXX`` escapes and waste
+  model context.
+
+  This is the second contract Hermes silently expects that our unit
+  suite didn't enforce. The first was the call signature
+  (``**kwargs`` for ``task_id``) caught in v0.1.6.
+
+### Added
+- **Return-type regression tests** in
+  ``tests/test_tool_wrapper_signature.py``. Now covers BOTH contracts:
+  - The wrapper's signature (handles ``handler(args, **kwargs)``).
+  - The wrapper's return type (must be ``str``, must be valid JSON,
+    must not ``\\uXXXX``-escape non-ASCII).
+  - End-to-end simulation of Hermes's exact ``dispatch`` call shape.
+  Any future refactor that drops back to dict returns or narrows the
+  signature trips these tests immediately. 11 tests in this file
+  total, 65 unit tests passing overall.
+
 ## [0.1.6] - 2026-05-10
 
 ### Fixed
