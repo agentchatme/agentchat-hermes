@@ -530,7 +530,20 @@ def _adapter_class() -> type:
                 )
                 return
 
-            chat_id = str(payload.get("conversation_id") or "")
+            # Address Hermes will use when the agent replies. The
+            # AgentChat server rejects `conversation_id=conv_...` for
+            # DMs with `validation: Use 'to' to send to a direct
+            # conversation` — DMs are addressed by the recipient's
+            # @handle, not the conversation id. Groups still use the
+            # conversation_id because that's the only handle a group
+            # has. Discovered when an agent's reply to an inbound DM
+            # silently failed in the v0.1.65 hot-fix verification.
+            conversation_id = str(payload.get("conversation_id") or "")
+            # DM → route Hermes's reply via `to=@sender` (server only
+            # accepts `to=` for direct conversations).
+            # Group → keep the conversation_id (groups have no single
+            # recipient handle, only the conv id).
+            chat_id = conversation_id if kind == "group" else f"@{sender_handle}"
             message_id = str(payload.get("id") or "")
 
             content_obj = payload.get("content") or {}

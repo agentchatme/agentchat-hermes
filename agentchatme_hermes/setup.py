@@ -383,6 +383,15 @@ def _fresh_setup_menu(
     if not ok:
         return
 
+    # Default ALLOW_ALL=true so inbound DMs aren't dropped by Hermes's
+    # gateway-level deny-all. AgentChat enforces inbox_mode server-side
+    # so the framework allowlist is redundant — see `_seed_allow_all_default`.
+    if _seed_allow_all_default(save_env_value, get_env_value):
+        print_info(
+            "AGENTCHATME_ALLOW_ALL=true (AgentChat server enforces inbox_mode; "
+            "framework allowlist disabled)."
+        )
+
     # Advanced options — opt-in. Most users want defaults.
     print()
     if prompt_yes_no(
@@ -449,6 +458,12 @@ def _replace_key_branch(
         )
 
     if ok:
+        # Same default-allow-all seeding as the fresh-setup path.
+        if _seed_allow_all_default(save_env_value, get_env_value):
+            print_info(
+                "AGENTCHATME_ALLOW_ALL=true (AgentChat server enforces "
+                "inbox_mode; framework allowlist disabled)."
+            )
         print_info("Restart the gateway for changes to take effect: hermes gateway restart")
 
 
@@ -513,6 +528,33 @@ def _logout_flow(prompt_yes_no, print_info, print_success, save_env_value) -> No
 
 
 # ─── Wizard sub-flows ──────────────────────────────────────────────────────
+
+
+def _seed_allow_all_default(save_env_value, get_env_value) -> bool:
+    """Set ``AGENTCHATME_ALLOW_ALL=true`` if the operator hasn't already
+    chosen a different setting.
+
+    Why this default exists: Hermes's gateway-level ``_is_user_authorized``
+    (``gateway/run.py:3320-3324``) defaults to DENY when no allowlist is
+    configured — a sensible safety default for platforms like Telegram
+    where strangers can DM your bot. But AgentChat already enforces
+    who-can-DM-you on the server side via the agent's ``inbox_mode``
+    (open / contacts_only). Double-gating just blocks legitimate messages.
+
+    We default ALLOW_ALL=true on first key save so the agent actually
+    receives inbound DMs. If the operator has manually set
+    ``AGENTCHATME_ALLOW_ALL`` or ``AGENTCHATME_ALLOWED_HANDLES`` to a
+    different value, we leave it alone — they've made a choice.
+
+    Returns True if we seeded the default, False if we left an existing
+    setting in place.
+    """
+    existing_allow_all = (get_env_value("AGENTCHATME_ALLOW_ALL") or "").strip().lower()
+    existing_allowlist = (get_env_value("AGENTCHATME_ALLOWED_HANDLES") or "").strip()
+    if existing_allow_all or existing_allowlist:
+        return False
+    save_env_value("AGENTCHATME_ALLOW_ALL", "true")
+    return True
 
 
 def _paste_existing_key_flow(prompt, print_info, print_success, print_warning, save_env_value) -> bool:
@@ -729,6 +771,16 @@ def _advanced_options_flow(
             default=get_env_value("AGENTCHATME_ALLOWED_HANDLES") or "",
         ).strip()
         save_env_value("AGENTCHATME_ALLOWED_HANDLES", allowed.replace(" ", ""))
+        # An explicit allowlist must override the ALLOW_ALL=true default
+        # we seed on first key save — otherwise Hermes's per-platform
+        # ALLOW_ALL check short-circuits the allowlist (`gateway/run.py`
+        # auth order: ALLOW_ALL → ALLOWED_USERS → default-deny). Clear
+        # it so the operator's explicit choice takes effect.
+        if allowed:
+            save_env_value("AGENTCHATME_ALLOW_ALL", "")
+            print_info(
+                "AGENTCHATME_ALLOW_ALL cleared — your allowlist will be enforced."
+            )
 
     if prompt_yes_no("Set a cron home conversation (where deliver=agentchat sends by default)?", False):
         home = prompt(
@@ -970,6 +1022,7 @@ def _parse_error(resp) -> tuple[str | None, str | None]:
 def cli_register(email: str | None, handle: str | None, display_name: str | None) -> int:
     """Backend for `hermes agentchat register`. Returns shell exit code."""
     from hermes_cli.setup import (  # type: ignore[import-not-found]
+        get_env_value,
         print_header,
         print_info,
         print_success,
@@ -1038,6 +1091,10 @@ def cli_register(email: str | None, handle: str | None, display_name: str | None
 
     save_env_value("AGENTCHATME_API_KEY", api_key)
     save_env_value("AGENTCHATME_HANDLE", resolved)
+    if _seed_allow_all_default(save_env_value, get_env_value):
+        print_info(
+            "AGENTCHATME_ALLOW_ALL=true (server enforces inbox_mode; framework allowlist disabled)."
+        )
     print_success(f"Registered as @{resolved}. API key saved to ~/.hermes/.env.")
     print_info("Restart the gateway: hermes gateway restart")
     return 0
@@ -1046,6 +1103,7 @@ def cli_register(email: str | None, handle: str | None, display_name: str | None
 def cli_login(api_key: str | None) -> int:
     """Backend for `hermes agentchat login` — paste an existing key."""
     from hermes_cli.setup import (  # type: ignore[import-not-found]
+        get_env_value,
         print_header,
         print_info,
         print_success,
@@ -1071,6 +1129,10 @@ def cli_login(api_key: str | None) -> int:
 
     save_env_value("AGENTCHATME_API_KEY", api_key)
     save_env_value("AGENTCHATME_HANDLE", handle)
+    if _seed_allow_all_default(save_env_value, get_env_value):
+        print_info(
+            "AGENTCHATME_ALLOW_ALL=true (server enforces inbox_mode; framework allowlist disabled)."
+        )
     print_success(f"Key validated. You are @{handle}.")
     print_info("Restart the gateway: hermes gateway restart")
     return 0

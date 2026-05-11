@@ -4,6 +4,77 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.66] - 2026-05-11
+
+> Round-trip fix. v0.1.65 fixed the WebSocket connection so inbound
+> frames started arriving, which immediately exposed two new bugs
+> downstream — surfaced by a real user sending a test reply and the
+> agent never responding. Both fixed and verified live on the VM:
+> messages now round-trip end-to-end (inbound → session → outbound).
+
+### Fixed
+
+- **DM reply routing.** When an inbound DM arrived, we set
+  ``MessageEvent.source.chat_id = conv_<conversation_id>`` from the
+  server payload. Hermes preserved that through the agent loop, then
+  called our ``send(chat_id="conv_…")``, which routed via
+  ``conversation_id=`` on the SDK send. The AgentChat server rejects
+  that for DMs with ``validation: Use 'to' to send to a direct
+  conversation`` — DMs are addressed by the recipient's **@handle**,
+  not the conversation id. Groups are the opposite: only the
+  conversation_id is valid because there's no single recipient.
+
+  Fix: ``_dispatch_inbound_message`` now sets
+  ``chat_id = f"@{sender_handle}"`` for DMs and keeps
+  ``chat_id = conversation_id`` for groups. The agent's reply
+  naturally routes via the correct SDK kwarg. The
+  ``conversation_id`` is preserved on ``raw_message`` for callers
+  that need it.
+
+- **AGENTCHATME_ALLOW_ALL=true seeded by default.** Hermes's
+  gateway-level ``_is_user_authorized`` (``gateway/run.py:3320-3324``)
+  denies inbound from any sender not on the per-platform allowlist
+  when no allowlist is configured — a sensible safety default for
+  Telegram / Discord, but redundant for AgentChat which enforces
+  inbox_mode server-side. Double-gating just dropped legitimate
+  messages with ``WARNING Unauthorized user: <handle> on agentchat``
+  and no agent response.
+
+  Fix: the wizard's success paths (register, paste-existing-key, and
+  the matching ``cli_register`` / ``cli_login`` backends) now seed
+  ``AGENTCHATME_ALLOW_ALL=true`` if the operator hasn't explicitly
+  chosen a different setting. If the operator later configures
+  ``AGENTCHATME_ALLOWED_HANDLES`` via advanced options, we clear
+  ``ALLOW_ALL`` so the explicit allowlist takes effect (Hermes auth
+  order: ``ALLOW_ALL`` short-circuits ``ALLOWED_USERS``).
+
+### Added
+
+- **``tests/test_dm_routing.py``** (3 tests) — locks down chat_id
+  routing: DM inbound → ``@<sender>``, group inbound →
+  ``conv_<id>``, case-normalized sender handle on DM.
+
+- **``tests/test_allow_all_default.py``** (5 tests) — locks down
+  ``_seed_allow_all_default``: writes ``true`` on a clean install,
+  skips when ``ALLOW_ALL`` is already set, skips when
+  ``ALLOWED_HANDLES`` is set, idempotent on existing ``true``,
+  treats whitespace-only existing as unset.
+
+### VM verification
+
+After patching the VM and restarting the gateway, a test message from
+``@vibecoder-vinny`` round-tripped successfully:
+
+```
+INFO gateway.run: inbound message: platform=agentchat user=@vibecoder-vinny chat=@vibecoder-vinny msg='…'
+INFO run_agent: conversation turn: session=… platform=agentchat
+INFO gateway.run: response ready: platform=agentchat chat=@vibecoder-vinny time=8.1s api_calls=1 response=438 chars
+INFO gateway.platforms.base: [AgentChat] Sending response (438 chars) to @vibecoder-vinny
+```
+
+No ``Send failed`` line. Inbound, session spawn, and outbound all
+working end-to-end.
+
 ## [0.1.65] - 2026-05-11
 
 > **Critical hot-fix.** Inbound has been silently broken on every
