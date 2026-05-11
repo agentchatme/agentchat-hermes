@@ -85,6 +85,34 @@ _IDEMPOTENCY_WINDOW_SECONDS = 120
 _IDEMPOTENCY_NAMESPACE = uuid.UUID("870db470-9f32-5e78-897e-d7c626fb60b0")
 
 
+def _rest_base_to_ws_base(rest_base: str) -> str:
+    """Convert a REST base URL (``https://…`` / ``http://…``) into a
+    WebSocket base URL (``wss://…`` / ``ws://…``).
+
+    The agentchatme SDK's ``RealtimeClient`` constructs the WebSocket
+    URL via ``f"{base_url}/v1/ws"`` (``agentchatme/_realtime.py:228``)
+    without any scheme normalization. Passing the same URL the REST
+    client uses (``https://…``) makes the underlying ``websockets``
+    library reject the URI with ``scheme isn't ws or wss``.
+
+    Pass-through for already-WS schemes so an operator who sets
+    ``AGENTCHATME_API_BASE`` to a ``wss://…`` value still works.
+    Falls back to the default if the input is empty.
+    """
+    if not rest_base:
+        return "wss://api.agentchat.me"
+    s = rest_base.rstrip("/")
+    lowered = s.lower()
+    if lowered.startswith("https://"):
+        return "wss://" + s[len("https://"):]
+    if lowered.startswith("http://"):
+        return "ws://" + s[len("http://"):]
+    if lowered.startswith("wss://") or lowered.startswith("ws://"):
+        return s
+    # No scheme at all — assume the operator meant the secure variant.
+    return "wss://" + s
+
+
 def _stable_client_msg_id(
     sender_handle: str,
     chat_id: str,
@@ -343,12 +371,32 @@ def _adapter_class() -> type:
                 )
                 return False
 
-            # Wire realtime. The SDK accepts the same base URL as REST and
-            # rewrites http→ws / https→wss internally.
+            # Wire realtime.
+            #
+            # CRITICAL: the agentchatme SDK's `RealtimeClient` does NOT
+            # rewrite the scheme. At `agentchatme/_realtime.py:228` it
+            # constructs the WebSocket URL as `f"{base_url}/v1/ws"`
+            # via raw string concatenation, then hands it straight to
+            # the `websockets` library. Pass it `https://…` and the WS
+            # connect dies with `URI: scheme isn't ws or wss`.
+            #
+            # The default `base_url` on `RealtimeOptions` is
+            # `"wss://api.agentchat.me"` (verified at
+            # `agentchatme/_realtime.py:82`). REST and realtime live on
+            # the same host but use different schemes, so we convert
+            # https→wss / http→ws here. ws/wss are passed through
+            # untouched so an operator who already configured
+            # `AGENTCHATME_API_BASE=wss://…` (unlikely but defensible)
+            # still works.
+            #
+            # Inbound has been silently broken on every version of this
+            # plugin since v0.1.0 because the original comment claimed
+            # the SDK auto-rewrites. It does not. Discovered when a
+            # real user noticed their agent never received replies.
             self._realtime = RealtimeClient(
                 RealtimeOptions(
                     api_key=self.api_key,
-                    base_url=self.api_base,
+                    base_url=_rest_base_to_ws_base(self.api_base),
                     client=self._client,  # enables gap-fill + offline drain
                 )
             )

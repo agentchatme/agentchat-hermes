@@ -4,6 +4,63 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.65] - 2026-05-11
+
+> **Critical hot-fix.** Inbound has been silently broken on every
+> version of this plugin since v0.1.0. Outbound works (`agentchat_send_message`
+> rides REST/HTTPS, fine), so the bug wasn't detected by the E2E
+> harness or local tests — both validate the live adapter via REST
+> and never exercised the WebSocket path. Discovered by a real user
+> when their agent sent a message, the peer replied, and the user
+> never reacted.
+
+### Fixed
+
+- **WebSocket connection scheme.** The agentchatme SDK's
+  `RealtimeClient` does NOT auto-rewrite the URL scheme — at
+  `agentchatme/_realtime.py:228` it builds the WebSocket URL via
+  `f"{base_url}/v1/ws"` and hands it straight to the `websockets`
+  library. The library correctly rejected our `https://api.agentchat.me/v1/ws`
+  with `URI: scheme isn't ws or wss`. Hermes's reconnect watcher
+  retried every 60 seconds, the user's outbound kept working, but
+  inbound frames never arrived.
+
+  Root cause: a v0.1.0 code comment claimed "the SDK accepts the
+  same base URL as REST and rewrites http→ws / https→wss
+  internally." The SDK never did that. The default
+  `RealtimeOptions.base_url` is `"wss://api.agentchat.me"`
+  (`agentchatme/_realtime.py:82`) — a `wss://` URL is the expected
+  input, not the REST `https://` URL we were passing.
+
+  Fix: new `_rest_base_to_ws_base` helper does the scheme conversion
+  in our adapter before constructing `RealtimeOptions`. Pure
+  string-level rewrite — `https://` → `wss://`, `http://` → `ws://`,
+  `wss://` / `ws://` pass through unchanged, bare host (no scheme)
+  defaults to `wss://`. Works for default + self-hosted +
+  local-HTTP-dev scenarios.
+
+  VM verification: gateway log on the patched plugin shows
+  `AgentChat: connected as @fyi-john-4321 (api_base=https://api.agentchat.me)`
+  and `gateway_state.json` flipped from `"state": "retrying"` /
+  `ws_connect_failed` to `"state": "connected"`.
+
+### Added
+
+- **`tests/test_ws_url_conversion.py`** (10 tests) — locks down
+  the scheme conversion: https→wss, http→ws, trailing-slash strip,
+  wss/ws pass-through, case-insensitive scheme, no-scheme default,
+  paths preserved, ports preserved, empty falls back to default.
+
+### Engineering note
+
+The E2E harness exercised tool dispatch through `registry.dispatch`
+but never connected the real WebSocket inside Hermes's gateway
+lifecycle. A "fix" for that gap is on the punch list — the harness
+should at minimum check `gateway_state.json` after a Hermes-managed
+start to catch `ws_connect_failed` regressions in CI. Not in this
+release because it requires the harness to manage a Hermes gateway
+process, but the gap is now known.
+
 ## [0.1.64] - 2026-05-11
 
 > OpenClaw UX-parity pass. Two parallel research deep dives — every file
