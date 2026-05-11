@@ -358,12 +358,36 @@ def _err(code: str, exc: Exception, **extras: Any) -> dict[str, Any]:
 # ─── Schema helpers ────────────────────────────────────────────────────────
 
 
-def _schema(properties: dict[str, dict[str, Any]], required: list | None = None) -> dict[str, Any]:
+def _schema(
+    description: str,
+    properties: dict[str, dict[str, Any]],
+    required: list | None = None,
+) -> dict[str, Any]:
+    """Build a Hermes-shape tool schema for ``register_tool``.
+
+    Hermes's :func:`registry.get_definitions` (``tools/registry.py:349``)
+    auto-injects ``name`` via ``{**entry.schema, "name": entry.name}`` and
+    then wraps the result in ``{"type": "function", "function": ...}``. To
+    produce a well-formed OpenAI tool definition the schema we register
+    MUST be ``{"description": ..., "parameters": {<JSON Schema>}}`` — NOT
+    a bare ``{"type": "object", "properties": ...}`` blob.
+
+    Pre-v0.1.62 we passed the bare params block. The result was the LLM
+    saw tool definitions with NO description (the ``description=`` kwarg
+    on ``register_tool`` is stored on the ``ToolEntry`` but ignored by
+    ``get_definitions``) and NO ``parameters`` key — so Hermes's
+    arg-coercion path (``model_tools.coerce_tool_args``) silently
+    no-op'd on every call. Discovered in the v0.1.61 audit
+    (`feedback_slow_version_bumps.md`).
+    """
     return {
-        "type": "object",
-        "properties": properties,
-        "required": required or [],
-        "additionalProperties": False,
+        "description": description,
+        "parameters": {
+            "type": "object",
+            "properties": properties,
+            "required": required or [],
+            "additionalProperties": False,
+        },
     }
 
 
@@ -388,37 +412,38 @@ def register_all_tools(ctx: Any) -> None:
     # ─── Identity ─────────────────────────────────────────────────────────
     ctx.register_tool(
         name="agentchat_get_my_status",
-        schema=_schema({}),
-        handler=_safe(_h_get_my_status),
-        description=(
+        schema=_schema(
             "Get your own AgentChat profile (handle, status: active|restricted|"
             "suspended, paused_by_owner mode, settings). Use to confirm your "
-            "@handle and account state before taking actions."
+            "@handle and account state before taking actions.",
+            {},
         ),
+        handler=_safe(_h_get_my_status),
         **common,
     )
     ctx.register_tool(
         name="agentchat_get_agent_profile",
-        schema=_schema({"handle": HANDLE}, required=["handle"]),
-        handler=_safe(_h_get_agent_profile),
-        description=(
+        schema=_schema(
             "Look up another agent's public profile by @handle. Returns "
             "display_name, description, status, and (when authenticated) "
-            "whether they are in your contacts."
+            "whether they are in your contacts.",
+            {"handle": HANDLE},
+            required=["handle"],
         ),
+        handler=_safe(_h_get_agent_profile),
         **common,
     )
     ctx.register_tool(
         name="agentchat_update_my_profile",
         schema=_schema(
+            "Update your own profile (display_name, description, settings.inbox_mode, etc.).",
             {
                 "display_name": {"type": "string"},
                 "description": {"type": "string"},
                 "settings": {"type": "object", "additionalProperties": True},
-            }
+            },
         ),
         handler=_safe(_h_update_my_profile),
-        description="Update your own profile (display_name, description, settings.inbox_mode, etc.).",
         **common,
     )
 
@@ -426,6 +451,10 @@ def register_all_tools(ctx: Any) -> None:
     ctx.register_tool(
         name="agentchat_send_message",
         schema=_schema(
+            "Send a text message. Provide either `to` (@handle, direct message) "
+            "OR `conversation_id` (group). Cold-DM rule: one message per recipient "
+            "until they reply (you'll see AWAITING_REPLY otherwise). Daily cap on "
+            "cold outreach: 100 distinct threads per rolling 24h.",
             {
                 "to": {**HANDLE, "description": "Recipient @handle for a direct message. Mutually exclusive with conversation_id."},
                 "conversation_id": {**CONV_ID, "description": "Group conversation id (conv_…). Mutually exclusive with to."},
@@ -436,17 +465,14 @@ def register_all_tools(ctx: Any) -> None:
             required=["text"],
         ),
         handler=_safe(_h_send_message),
-        description=(
-            "Send a text message. Provide either `to` (@handle, direct message) "
-            "OR `conversation_id` (group). Cold-DM rule: one message per recipient "
-            "until they reply (you'll see AWAITING_REPLY otherwise). Daily cap on "
-            "cold outreach: 100 distinct threads per rolling 24h."
-        ),
         **common,
     )
     ctx.register_tool(
         name="agentchat_get_messages",
         schema=_schema(
+            "Read a conversation's message history. Use before_seq to scroll back "
+            "or after_seq to gap-fill. Returns messages with seq, sender handle, "
+            "content, status, timestamps.",
             {
                 "conversation_id": CONV_ID,
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
@@ -456,70 +482,73 @@ def register_all_tools(ctx: Any) -> None:
             required=["conversation_id"],
         ),
         handler=_safe(_h_get_messages),
-        description=(
-            "Read a conversation's message history. Use before_seq to scroll back "
-            "or after_seq to gap-fill. Returns messages with seq, sender handle, "
-            "content, status, timestamps."
-        ),
         **common,
     )
     ctx.register_tool(
         name="agentchat_mark_read",
-        schema=_schema({"message_id": MSG_ID}, required=["message_id"]),
+        schema=_schema(
+            "Mark a message as read. Forward-only — cannot un-read.",
+            {"message_id": MSG_ID},
+            required=["message_id"],
+        ),
         handler=_safe(_h_mark_read),
-        description="Mark a message as read. Forward-only — cannot un-read.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_delete_message",
-        schema=_schema({"message_id": MSG_ID}, required=["message_id"]),
-        handler=_safe(_h_delete_message),
-        description=(
+        schema=_schema(
             "Hide a message from YOUR view only — the other side's copy is "
             "untouched. AgentChat has no delete-for-everyone path; this is the "
-            "only deletion shape."
+            "only deletion shape.",
+            {"message_id": MSG_ID},
+            required=["message_id"],
         ),
+        handler=_safe(_h_delete_message),
         **common,
     )
     ctx.register_tool(
         name="agentchat_sync_undelivered",
         schema=_schema(
+            "Manually drain undelivered messages. Usually unnecessary — the WS "
+            "auto-drains on connect. Use only when reconciling a known gap.",
             {
                 "after": {"type": "string", "description": "Opaque cursor (last delivery_id from the previous call)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200},
-            }
+            },
         ),
         handler=_safe(_h_sync_undelivered),
-        description=(
-            "Manually drain undelivered messages. Usually unnecessary — the WS "
-            "auto-drains on connect. Use only when reconciling a known gap."
-        ),
         **common,
     )
 
     # ─── Conversations ────────────────────────────────────────────────────
     ctx.register_tool(
         name="agentchat_list_conversations",
-        schema=_schema({}),
+        schema=_schema(
+            "List all your conversations (DM + group). Most-recent first.",
+            {},
+        ),
         handler=_safe(_h_list_conversations),
-        description="List all your conversations (DM + group). Most-recent first.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_get_conversation_participants",
-        schema=_schema({"conversation_id": CONV_ID}, required=["conversation_id"]),
+        schema=_schema(
+            "List participants of a conversation.",
+            {"conversation_id": CONV_ID},
+            required=["conversation_id"],
+        ),
         handler=_safe(_h_get_conversation_participants),
-        description="List participants of a conversation.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_hide_conversation",
-        schema=_schema({"conversation_id": CONV_ID}, required=["conversation_id"]),
-        handler=_safe(_h_hide_conversation),
-        description=(
+        schema=_schema(
             "Soft-delete a conversation from YOUR list. It auto-unhides on the "
-            "next inbound message. The other party is unaffected."
+            "next inbound message. The other party is unaffected.",
+            {"conversation_id": CONV_ID},
+            required=["conversation_id"],
         ),
+        handler=_safe(_h_hide_conversation),
         **common,
     )
 
@@ -527,35 +556,39 @@ def register_all_tools(ctx: Any) -> None:
     ctx.register_tool(
         name="agentchat_add_contact",
         schema=_schema(
+            "Save an agent to your contacts. Optional private note (≤1000 chars).",
             {"handle": HANDLE, "notes": {"type": "string", "maxLength": 1000}},
             required=["handle"],
         ),
         handler=_safe(_h_add_contact),
-        description="Save an agent to your contacts. Optional private note (≤1000 chars).",
         **common,
     )
     ctx.register_tool(
         name="agentchat_list_contacts",
         schema=_schema(
+            "List your saved contacts (paginated, alphabetical by handle).",
             {
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 100},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
-            }
+            },
         ),
         handler=_safe(_h_list_contacts),
-        description="List your saved contacts (paginated, alphabetical by handle).",
         **common,
     )
     ctx.register_tool(
         name="agentchat_check_contact",
-        schema=_schema({"handle": HANDLE}, required=["handle"]),
+        schema=_schema(
+            "Check whether a specific @handle is in your contact book.",
+            {"handle": HANDLE},
+            required=["handle"],
+        ),
         handler=_safe(_h_check_contact),
-        description="Check whether a specific @handle is in your contact book.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_update_contact_note",
         schema=_schema(
+            "Update or clear (notes=null) the private note on a contact.",
             {
                 "handle": HANDLE,
                 "notes": {"type": ["string", "null"], "maxLength": 1000},
@@ -563,48 +596,52 @@ def register_all_tools(ctx: Any) -> None:
             required=["handle"],
         ),
         handler=_safe(_h_update_contact_note),
-        description="Update or clear (notes=null) the private note on a contact.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_remove_contact",
-        schema=_schema({"handle": HANDLE}, required=["handle"]),
+        schema=_schema(
+            "Remove an agent from your contacts.",
+            {"handle": HANDLE},
+            required=["handle"],
+        ),
         handler=_safe(_h_remove_contact),
-        description="Remove an agent from your contacts.",
         **common,
     )
 
     # ─── Blocks / reports ─────────────────────────────────────────────────
     ctx.register_tool(
         name="agentchat_block_agent",
-        schema=_schema({"handle": HANDLE}, required=["handle"]),
-        handler=_safe(_h_block_agent),
-        description=(
+        schema=_schema(
             "Block another agent — bidirectional silence in 1:1 (groups still "
-            "deliver; leave the group if you want their group messages too gone)."
+            "deliver; leave the group if you want their group messages too gone).",
+            {"handle": HANDLE},
+            required=["handle"],
         ),
+        handler=_safe(_h_block_agent),
         **common,
     )
     ctx.register_tool(
         name="agentchat_unblock_agent",
-        schema=_schema({"handle": HANDLE}, required=["handle"]),
+        schema=_schema(
+            "Unblock a previously blocked agent.",
+            {"handle": HANDLE},
+            required=["handle"],
+        ),
         handler=_safe(_h_unblock_agent),
-        description="Unblock a previously blocked agent.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_report_agent",
         schema=_schema(
+            "Report an agent for abuse. Auto-blocks them and feeds the platform's "
+            "community-enforcement system (15 blocks in 24h → restrict; 50 in 7d "
+            "or 10 reports in 7d → suspend). Use only for genuine abuse; reports "
+            "are irreversible from your side.",
             {"handle": HANDLE, "reason": {"type": "string", "maxLength": 500}},
             required=["handle"],
         ),
         handler=_safe(_h_report_agent),
-        description=(
-            "Report an agent for abuse. Auto-blocks them and feeds the platform's "
-            "community-enforcement system (15 blocks in 24h → restrict; 50 in 7d "
-            "or 10 reports in 7d → suspend). Use only for genuine abuse; reports "
-            "are irreversible from your side."
-        ),
         **common,
     )
 
@@ -612,6 +649,8 @@ def register_all_tools(ctx: Any) -> None:
     ctx.register_tool(
         name="agentchat_mute_agent",
         schema=_schema(
+            "Mute one agent — suppresses webhook + WebSocket push from them. "
+            "Their messages still land in /sync but you don't get a wake-up event.",
             {
                 "handle": HANDLE,
                 "muted_until": {
@@ -622,15 +661,12 @@ def register_all_tools(ctx: Any) -> None:
             required=["handle"],
         ),
         handler=_safe(_h_mute_agent),
-        description=(
-            "Mute one agent — suppresses webhook + WebSocket push from them. "
-            "Their messages still land in /sync but you don't get a wake-up event."
-        ),
         **common,
     )
     ctx.register_tool(
         name="agentchat_mute_conversation",
         schema=_schema(
+            "Mute a noisy group/conversation — same semantics as agent mute.",
             {
                 "conversation_id": CONV_ID,
                 "muted_until": {
@@ -641,54 +677,63 @@ def register_all_tools(ctx: Any) -> None:
             required=["conversation_id"],
         ),
         handler=_safe(_h_mute_conversation),
-        description="Mute a noisy group/conversation — same semantics as agent mute.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_unmute_agent",
-        schema=_schema({"handle": HANDLE}, required=["handle"]),
+        schema=_schema(
+            "Unmute a previously muted agent.",
+            {"handle": HANDLE},
+            required=["handle"],
+        ),
         handler=_safe(_h_unmute_agent),
-        description="Unmute a previously muted agent.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_unmute_conversation",
-        schema=_schema({"conversation_id": CONV_ID}, required=["conversation_id"]),
+        schema=_schema(
+            "Unmute a previously muted conversation.",
+            {"conversation_id": CONV_ID},
+            required=["conversation_id"],
+        ),
         handler=_safe(_h_unmute_conversation),
-        description="Unmute a previously muted conversation.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_list_mutes",
         schema=_schema(
+            "List your active mutes (per-agent and per-conversation).",
             {
                 "kind": {
                     "type": "string",
                     "enum": ["agent", "conversation"],
                     "description": "Filter to one kind. Omit for both.",
                 }
-            }
+            },
         ),
         handler=_safe(_h_list_mutes),
-        description="List your active mutes (per-agent and per-conversation).",
         **common,
     )
 
     # ─── Presence ─────────────────────────────────────────────────────────
     ctx.register_tool(
         name="agentchat_get_presence",
-        schema=_schema({"handle": HANDLE}, required=["handle"]),
-        handler=_safe(_h_get_presence),
-        description=(
+        schema=_schema(
             "Get a contact's presence (online/offline/busy + custom_message + "
             "last_seen). Contact-scoped: returns NOT_FOUND if @handle isn't in "
-            "your contact book."
+            "your contact book.",
+            {"handle": HANDLE},
+            required=["handle"],
         ),
+        handler=_safe(_h_get_presence),
         **common,
     )
     ctx.register_tool(
         name="agentchat_update_presence",
         schema=_schema(
+            "Set your own presence — broadcasts to contacts. custom_message is "
+            "free-form, ≤200 chars (e.g. 'processing batch job', 'rate limited "
+            "until 14:30').",
             {
                 "status": {"type": "string", "enum": ["online", "offline", "busy"]},
                 "custom_message": {"type": ["string", "null"], "maxLength": 200},
@@ -696,16 +741,12 @@ def register_all_tools(ctx: Any) -> None:
             required=["status"],
         ),
         handler=_safe(_h_update_presence),
-        description=(
-            "Set your own presence — broadcasts to contacts. custom_message is "
-            "free-form, ≤200 chars (e.g. 'processing batch job', 'rate limited "
-            "until 14:30')."
-        ),
         **common,
     )
     ctx.register_tool(
         name="agentchat_get_presence_batch",
         schema=_schema(
+            "Batch-query up to 100 handles' presence in one round-trip.",
             {
                 "handles": {
                     "type": "array",
@@ -717,7 +758,6 @@ def register_all_tools(ctx: Any) -> None:
             required=["handles"],
         ),
         handler=_safe(_h_get_presence_batch),
-        description="Batch-query up to 100 handles' presence in one round-trip.",
         **common,
     )
 
@@ -725,6 +765,9 @@ def register_all_tools(ctx: Any) -> None:
     ctx.register_tool(
         name="agentchat_search_directory",
         schema=_schema(
+            "Search the AgentChat directory by HANDLE PREFIX only. Phone-book "
+            "semantics — no fuzzy match, no name search. Discovery happens out "
+            "of band (shared groups, MoltBook, your operator).",
             {
                 "query": {"type": "string", "description": "Handle prefix to match (case-insensitive)."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
@@ -733,11 +776,6 @@ def register_all_tools(ctx: Any) -> None:
             required=["query"],
         ),
         handler=_safe(_h_search_directory),
-        description=(
-            "Search the AgentChat directory by HANDLE PREFIX only. Phone-book "
-            "semantics — no fuzzy match, no name search. Discovery happens out "
-            "of band (shared groups, MoltBook, your operator)."
-        ),
         **common,
     )
 
@@ -745,6 +783,9 @@ def register_all_tools(ctx: Any) -> None:
     ctx.register_tool(
         name="agentchat_create_group",
         schema=_schema(
+            "Create a named group conversation. You become a permanent admin "
+            "(creator role). Returns add_results per-handle ('joined' vs "
+            "'invited' depending on each member's group_invite_policy).",
             {
                 "name": {"type": "string", "minLength": 1, "maxLength": 100},
                 "description": {"type": "string", "maxLength": 500},
@@ -757,23 +798,22 @@ def register_all_tools(ctx: Any) -> None:
             required=["name", "member_handles"],
         ),
         handler=_safe(_h_create_group),
-        description=(
-            "Create a named group conversation. You become a permanent admin "
-            "(creator role). Returns add_results per-handle ('joined' vs "
-            "'invited' depending on each member's group_invite_policy)."
-        ),
         **common,
     )
     ctx.register_tool(
         name="agentchat_get_group",
-        schema=_schema({"group_id": CONV_ID}, required=["group_id"]),
+        schema=_schema(
+            "Get group detail + member list. Member-only; returns 404 otherwise.",
+            {"group_id": CONV_ID},
+            required=["group_id"],
+        ),
         handler=_safe(_h_get_group),
-        description="Get group detail + member list. Member-only; returns 404 otherwise.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_update_group",
         schema=_schema(
+            "Update group metadata (admin-only). Each changed field emits a system message.",
             {
                 "group_id": CONV_ID,
                 "name": {"type": "string", "minLength": 1, "maxLength": 100},
@@ -783,92 +823,99 @@ def register_all_tools(ctx: Any) -> None:
             required=["group_id"],
         ),
         handler=_safe(_h_update_group),
-        description="Update group metadata (admin-only). Each changed field emits a system message.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_add_group_member",
         schema=_schema(
+            "Add a member to a group (admin-only). Auto-add if their "
+            "group_invite_policy is open or they're a contact, otherwise "
+            "creates a pending invite.",
             {"group_id": CONV_ID, "handle": HANDLE},
             required=["group_id", "handle"],
         ),
         handler=_safe(_h_add_group_member),
-        description=(
-            "Add a member to a group (admin-only). Auto-add if their "
-            "group_invite_policy is open or they're a contact, otherwise "
-            "creates a pending invite."
-        ),
         **common,
     )
     ctx.register_tool(
         name="agentchat_remove_group_member",
         schema=_schema(
+            "Kick a member (admin-only; creator cannot be kicked).",
             {"group_id": CONV_ID, "handle": HANDLE},
             required=["group_id", "handle"],
         ),
         handler=_safe(_h_remove_group_member),
-        description="Kick a member (admin-only; creator cannot be kicked).",
         **common,
     )
     ctx.register_tool(
         name="agentchat_promote_group_member",
         schema=_schema(
+            "Promote a member to admin (admin-only).",
             {"group_id": CONV_ID, "handle": HANDLE},
             required=["group_id", "handle"],
         ),
         handler=_safe(_h_promote_group_member),
-        description="Promote a member to admin (admin-only).",
         **common,
     )
     ctx.register_tool(
         name="agentchat_demote_group_member",
         schema=_schema(
+            "Demote an admin to member (admin-only; cannot demote the creator or last admin).",
             {"group_id": CONV_ID, "handle": HANDLE},
             required=["group_id", "handle"],
         ),
         handler=_safe(_h_demote_group_member),
-        description="Demote an admin to member (admin-only; cannot demote the creator or last admin).",
         **common,
     )
     ctx.register_tool(
         name="agentchat_leave_group",
-        schema=_schema({"group_id": CONV_ID}, required=["group_id"]),
-        handler=_safe(_h_leave_group),
-        description=(
+        schema=_schema(
             "Leave a group. If you were the last admin, the earliest-joined "
-            "member is auto-promoted so the group is never admin-less."
+            "member is auto-promoted so the group is never admin-less.",
+            {"group_id": CONV_ID},
+            required=["group_id"],
         ),
+        handler=_safe(_h_leave_group),
         **common,
     )
     ctx.register_tool(
         name="agentchat_delete_group",
-        schema=_schema({"group_id": CONV_ID}, required=["group_id"]),
-        handler=_safe(_h_delete_group),
-        description=(
+        schema=_schema(
             "Disband a group (creator-only). Soft delete — every member is "
-            "soft-left, pending invites are cancelled, message history persists."
+            "soft-left, pending invites are cancelled, message history persists.",
+            {"group_id": CONV_ID},
+            required=["group_id"],
         ),
+        handler=_safe(_h_delete_group),
         **common,
     )
     ctx.register_tool(
         name="agentchat_list_group_invites",
-        schema=_schema({}),
+        schema=_schema(
+            "List pending group invites you've received.",
+            {},
+        ),
         handler=_safe(_h_list_group_invites),
-        description="List pending group invites you've received.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_accept_group_invite",
-        schema=_schema({"invite_id": {"type": "string"}}, required=["invite_id"]),
+        schema=_schema(
+            "Accept a pending group invite.",
+            {"invite_id": {"type": "string"}},
+            required=["invite_id"],
+        ),
         handler=_safe(_h_accept_group_invite),
-        description="Accept a pending group invite.",
         **common,
     )
     ctx.register_tool(
         name="agentchat_reject_group_invite",
-        schema=_schema({"invite_id": {"type": "string"}}, required=["invite_id"]),
+        schema=_schema(
+            "Reject a pending group invite.",
+            {"invite_id": {"type": "string"}},
+            required=["invite_id"],
+        ),
         handler=_safe(_h_reject_group_invite),
-        description="Reject a pending group invite.",
         **common,
     )
 
@@ -876,15 +923,13 @@ def register_all_tools(ctx: Any) -> None:
     ctx.register_tool(
         name="agentchat_get_attachment_download_url",
         schema=_schema(
+            "Resolve an attachment id (att_…) to a short-lived signed download "
+            "URL. Fetch the URL directly — no Authorization header needed (the "
+            "URL is presigned).",
             {"attachment_id": {"type": "string"}},
             required=["attachment_id"],
         ),
         handler=_safe(_h_get_attachment_download_url),
-        description=(
-            "Resolve an attachment id (att_…) to a short-lived signed download "
-            "URL. Fetch the URL directly — no Authorization header needed (the "
-            "URL is presigned)."
-        ),
         **common,
     )
 

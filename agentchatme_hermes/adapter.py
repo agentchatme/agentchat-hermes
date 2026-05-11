@@ -105,63 +105,71 @@ def _adapter_class() -> type:
         """
 
         def __init__(self, config: Any, **kwargs: Any) -> None:
-            platform = Platform("agentchat")  # auto-minted by Platform._missing_
-            super().__init__(config=config, platform=platform)
+            # Defensive __init__ contract: NEVER raise. Stash any failure
+            # in `self._init_error` and let `connect()` surface it via
+            # the framework's `_set_fatal_error` machinery (retryable=False).
+            # An exception bubbling out of the adapter factory short-
+            # circuits gateway.runner setup for EVERY platform, not just
+            # AgentChat — see plugin loading at
+            # `gateway/runner.py:2185`. Discovered in the v0.1.62 audit.
+            self._init_error: str | None = None
 
-            extra = getattr(config, "extra", {}) or {}
-
-            # Auth + endpoint. Env wins over config.yaml so an operator can
-            # rotate via `save_env_value` without rewriting profile config.
-            self.api_key: str = (
-                os.getenv("AGENTCHATME_API_KEY") or extra.get("api_key") or ""
-            ).strip()
-            self.api_base: str = (
-                os.getenv("AGENTCHATME_API_BASE")
-                or extra.get("api_base")
-                or "https://api.agentchat.me"
-            ).strip()
-
-            # Sender allowlist. The framework's _is_user_authorized() also
-            # consults AGENTCHATME_ALLOWED_HANDLES via the platform_registry
-            # entry; we mirror it inside the adapter so out-of-process
-            # senders (cron) and in-process inbound use the same gate.
-            allowed_raw = extra.get("allowed_handles") or []
-            if isinstance(allowed_raw, str):
-                allowed_raw = [h.strip() for h in allowed_raw.split(",") if h.strip()]
-            env_allowed = os.getenv("AGENTCHATME_ALLOWED_HANDLES", "")
-            if env_allowed:
-                allowed_raw = list(allowed_raw) + [
-                    h.strip() for h in env_allowed.split(",") if h.strip()
-                ]
-            self._allowed_handles_lower: set[str] = {
-                h.lstrip("@").lower() for h in allowed_raw if isinstance(h, str)
-            }
-
-            # SDK clients — instantiated in connect() so a failed config
-            # doesn't leak open sockets / file descriptors.
+            # Always-present attributes so disconnect() / repr() / metrics
+            # never NPE if we bail out mid-init. The pre-population mirrors
+            # the order things are first read in the rest of the adapter.
+            self.api_key: str = ""
+            self.api_base: str = "https://api.agentchat.me"
+            self._allowed_handles_lower: set[str] = set()
             self._client: AsyncAgentChatClient | None = None
             self._realtime: RealtimeClient | None = None
-
-            # Identity resolved from /v1/agents/me on connect. The handle
-            # is what we render to the agent in platform_hint and what we
-            # use to filter our own outbound out of the inbound stream.
             self.handle: str | None = None
             self._agent_id: str | None = None
-
-            # State guards. _lock_key prevents two profiles connecting
-            # with the same API key (race-free identity allocation,
-            # mirrors gateway/platforms/slack.py:2785-2790).
             self._lock_key: str | None = None
-            # Unsubscribers from RealtimeClient handler registration —
-            # called in disconnect() so a re-connect doesn't double-fire
-            # handlers from the previous connection.
             self._handler_unsubs: list[Callable[[], None]] = []
-
-            # MessageType reference for downstream code (so the adapter
-            # methods can refer to it without re-importing inside loops).
             self._MessageType = MessageType
             self._MessageEvent = MessageEvent
             self._SendResult = SendResult
+
+            try:
+                platform = Platform("agentchat")  # auto-minted by Platform._missing_
+                super().__init__(config=config, platform=platform)
+
+                extra = getattr(config, "extra", {}) or {}
+
+                # Auth + endpoint. Env wins over config.yaml so an operator can
+                # rotate via `save_env_value` without rewriting profile config.
+                self.api_key = (
+                    os.getenv("AGENTCHATME_API_KEY") or extra.get("api_key") or ""
+                ).strip()
+                self.api_base = (
+                    os.getenv("AGENTCHATME_API_BASE")
+                    or extra.get("api_base")
+                    or "https://api.agentchat.me"
+                ).strip()
+
+                # Sender allowlist. The framework's _is_user_authorized() also
+                # consults AGENTCHATME_ALLOWED_HANDLES via the platform_registry
+                # entry; we mirror it inside the adapter so out-of-process
+                # senders (cron) and in-process inbound use the same gate.
+                allowed_raw = extra.get("allowed_handles") or []
+                if isinstance(allowed_raw, str):
+                    allowed_raw = [h.strip() for h in allowed_raw.split(",") if h.strip()]
+                env_allowed = os.getenv("AGENTCHATME_ALLOWED_HANDLES", "")
+                if env_allowed:
+                    allowed_raw = list(allowed_raw) + [
+                        h.strip() for h in env_allowed.split(",") if h.strip()
+                    ]
+                self._allowed_handles_lower = {
+                    h.lstrip("@").lower() for h in allowed_raw if isinstance(h, str)
+                }
+            except Exception as e:
+                # Anything during init failed — record it and bail. connect()
+                # is the only consumer of `self._init_error`; it will fail-fast
+                # there with retryable=False and a clear operator-facing
+                # message rather than letting the framework see a raised
+                # exception and possibly mark the entire platform broken.
+                logger.exception("AgentChat: adapter __init__ failed")
+                self._init_error = f"AgentChat adapter init failed: {e}"
 
         @property
         def name(self) -> str:
@@ -172,6 +180,22 @@ def _adapter_class() -> type:
         async def connect(self) -> bool:
             recorder = _metrics_mod.get_recorder()
             recorder.set_connection_state("connecting")
+
+            # If __init__ recorded an error, surface it here as a clean
+            # non-retryable fatal — the framework would otherwise keep
+            # bouncing connect() with no useful signal. See defensive
+            # __init__ contract above.
+            if self._init_error:
+                logger.error("AgentChat: aborting connect — %s", self._init_error)
+                recorder.set_connection_state("failed")
+                recorder.inc_reconnect("init_error")
+                self._set_fatal_error(
+                    "init_error",
+                    self._init_error,
+                    retryable=False,
+                )
+                return False
+
             if not self.api_key:
                 logger.error("AgentChat: AGENTCHATME_API_KEY is not set")
                 recorder.set_connection_state("failed")
@@ -189,31 +213,44 @@ def _adapter_class() -> type:
             # lock prevents two profiles in the same Hermes process from
             # opening duplicate WebSockets to the same agent (which would
             # double the receive load and double-process messages).
+            #
+            # Use the base class's `_acquire_platform_lock` wrapper
+            # (`base.py:1408`) — it correctly unpacks the
+            # `(bool, dict|None)` return shape, sets a `<scope>_lock`
+            # fatal error on conflict with PID context, and pairs with
+            # `_release_platform_lock()` for teardown. The previous
+            # direct `acquire_scoped_lock(...)` call had a critical
+            # bug: tuples are always truthy, so the `if not (...)`
+            # never fired — silent double-connect was possible. Fixed
+            # in v0.1.62 audit.
+            import hashlib
+
+            # Don't put the full key in the lock id — leaks across logs.
+            # The first 16 hex chars of the SHA fingerprint is unique
+            # enough for the in-process lock and won't reveal the secret.
+            self._lock_key = hashlib.sha256(self.api_key.encode()).hexdigest()[:16]
+
             try:
-                # Don't put the full key in the lock id — leaks across logs.
-                # The first 16 hex chars of the SHA fingerprint is unique
-                # enough for the in-process lock and won't reveal the secret.
-                import hashlib
-
-                from gateway.status import (  # type: ignore[import-not-found]
-                    acquire_scoped_lock,
+                acquired = self._acquire_platform_lock(
+                    "agentchat", self._lock_key, "AgentChat API key"
                 )
+            except (ImportError, AttributeError):
+                # Base-class lock helper unavailable (very old Hermes or
+                # unit-test mocks) — proceed unlocked. The framework
+                # already supervises adapter lifecycle at a higher
+                # layer, so this is degraded but not broken.
+                self._lock_key = None
+                acquired = True
 
-                self._lock_key = hashlib.sha256(self.api_key.encode()).hexdigest()[:16]
-                if not acquire_scoped_lock("agentchat", self._lock_key):
-                    logger.error(
-                        "AgentChat: API key fingerprint already in use by another profile"
-                    )
-                    recorder.set_connection_state("failed")
-                    recorder.inc_reconnect("lock_conflict")
-                    self._set_fatal_error(
-                        "lock_conflict",
-                        "AgentChat API key in use by another profile",
-                        retryable=False,
-                    )
-                    return False
-            except ImportError:
-                self._lock_key = None  # status module absent (e.g. unit tests)
+            if not acquired:
+                # `_acquire_platform_lock` already called `_set_fatal_error`
+                # with `agentchat_lock`. Mirror the metrics emission and
+                # bail; teardown will be a no-op since we never opened
+                # the SDK clients.
+                recorder.set_connection_state("failed")
+                recorder.inc_reconnect("lock_conflict")
+                self._lock_key = None
+                return False
 
             # Open the REST client first so we can resolve identity before
             # opening the WebSocket — a bad key surfaces as a clean
@@ -313,18 +350,14 @@ def _adapter_class() -> type:
             return True
 
         async def disconnect(self) -> None:
-            # Release the scope lock first so a fresh adapter (e.g. on the
-            # framework's reconnect ladder) can acquire it without waiting
-            # for the rest of teardown.
+            # Release the scope lock first so a fresh adapter (e.g. on
+            # the framework's reconnect ladder) can acquire it without
+            # waiting for the rest of teardown. The base-class helper
+            # checks for the stored identity and is a no-op if no lock
+            # was acquired.
             if self._lock_key:
-                try:
-                    from gateway.status import (  # type: ignore[import-not-found]
-                        release_scoped_lock,
-                    )
-
-                    release_scoped_lock("agentchat", self._lock_key)
-                except Exception:
-                    pass
+                with contextlib.suppress(Exception):
+                    self._release_platform_lock()
                 self._lock_key = None
 
             self._mark_disconnected()
@@ -579,12 +612,24 @@ def _adapter_class() -> type:
                 recorder.inc_outbound_failed(code)
                 return sr
 
+            # ``retryable=True`` lets the framework's ``_send_with_retry``
+            # (``base.py:2315``) absorb transient failures via backoff
+            # instead of bouncing the error back to the agent on first
+            # try. Reserve True for genuinely transient classes:
+            #   * RateLimitedError — the per-second bucket drains
+            #   * ServerError / ACConnectionError — network blip, 5xx
+            #   * RecipientBackloggedError — peer drains as they sync
+            # Everything else (auth, validation, blocked, awaiting-reply,
+            # restricted, suspended, group-deleted, not-found) is a
+            # decision-class error the agent must see and react to, not
+            # a transient that retrying would fix.
             try:
                 result = await self._client.send_message(**kwargs)
             except RateLimitedError as e:
                 return _fail("RATE_LIMITED", self._SendResult(
                     success=False,
                     error=f"rate_limited: retry in {e.retry_after_ms}ms",
+                    retryable=True,
                 ))
             except AwaitingReplyError as e:
                 return _fail("AWAITING_REPLY", self._SendResult(
@@ -621,6 +666,7 @@ def _adapter_class() -> type:
                         f"backlogged: @{e.recipient_handle} has "
                         f"{e.undelivered_count} undelivered — try later."
                     ),
+                    retryable=True,
                 ))
             except ValidationError as e:
                 return _fail("VALIDATION_ERROR", self._SendResult(success=False, error=f"validation: {e}"))
@@ -635,7 +681,7 @@ def _adapter_class() -> type:
                 return _fail("UNAUTHORIZED", self._SendResult(success=False, error="auth_revoked"))
             except (ServerError, ACConnectionError) as e:
                 return _fail("SERVER_OR_NETWORK", self._SendResult(
-                    success=False, error=f"server_or_network: {e}"
+                    success=False, error=f"server_or_network: {e}", retryable=True,
                 ))
             except AgentChatError as e:
                 code = getattr(e, "code", "AGENTCHAT_ERROR") or "AGENTCHAT_ERROR"
@@ -674,6 +720,149 @@ def _adapter_class() -> type:
 
     _AdapterCls = AgentChatAdapter
     return _AdapterCls
+
+
+# ─── Out-of-process cron delivery ─────────────────────────────────────────
+#
+# Cron jobs configured with `deliver=agentchat` may run in a SEPARATE
+# process from the long-lived `hermes gateway` (e.g. `hermes cron run` on
+# its own systemd unit, or a CI matrix job firing a one-off). In that
+# process the live adapter is not available, so
+# `tools/send_message_tool._send_to_platform` falls through to the
+# `standalone_sender_fn` registered on our `PlatformEntry`
+# (`send_message_tool.py:478`). Without this hook, `deliver=agentchat`
+# cron tasks fail with `No live adapter for platform 'agentchat'`.
+#
+# The hook opens a one-shot REST client, sends, and closes. The SDK
+# routes via /v1/messages so no WebSocket is needed. Routing rules
+# mirror `AgentChatAdapter.send` so the agent's outbound contract is
+# identical whether running in-gateway or via cron.
+#
+# `thread_id` and `media_files` are accepted for signature parity with
+# the framework's `_standalone_send` shape but not meaningful here:
+# AgentChat threads are conversation-scoped (the `conv_*` chat_id IS
+# the thread), and out-of-process media upload requires a holding
+# session we don't have in this path.
+
+
+async def _standalone_send(
+    pconfig: Any,
+    chat_id: str,
+    message: str,
+    *,
+    thread_id: str | None = None,
+    media_files: list[str] | None = None,
+    force_document: bool = False,
+) -> dict[str, Any]:
+    """One-shot cron-side delivery via the AgentChat REST SDK.
+
+    Contract: returns ``{"success": True, "message_id": str|None}`` on a
+    successful send, or ``{"error": str}`` on failure. The cron pipeline
+    treats anything else as an invalid shape and surfaces a generic
+    error to the operator (see ``tools/send_message_tool.py:494``).
+    """
+    extra = getattr(pconfig, "extra", {}) or {}
+    api_key = (os.getenv("AGENTCHATME_API_KEY") or extra.get("api_key") or "").strip()
+    api_base = (
+        os.getenv("AGENTCHATME_API_BASE")
+        or extra.get("api_base")
+        or "https://api.agentchat.me"
+    ).strip()
+
+    if not api_key:
+        return {"error": "AgentChat standalone send: AGENTCHATME_API_KEY is not set"}
+    if not chat_id:
+        return {"error": "AgentChat standalone send: chat_id is required"}
+
+    cid = chat_id.strip()
+    kwargs: dict[str, Any] = {
+        "content": {"type": "text", "text": message or ""},
+    }
+    if cid.startswith("@"):
+        kwargs["to"] = cid
+    elif cid.startswith("conv_"):
+        kwargs["conversation_id"] = cid
+    elif cid and "/" not in cid and " " not in cid:
+        kwargs["to"] = "@" + cid
+    else:
+        kwargs["conversation_id"] = cid
+
+    # Media + thread are not supported via the cron-side path. Surface
+    # the deferral so the recipient (and the operator reading the log)
+    # know media wasn't delivered rather than silently dropping it.
+    if media_files:
+        kwargs["content"] = {
+            "type": "text",
+            "text": (
+                (kwargs["content"]["text"] or "")
+                + f"\n[{len(media_files)} attachment(s) generated; "
+                "not deliverable from cron]"
+            ),
+        }
+
+    client = AsyncAgentChatClient(api_key=api_key, base_url=api_base)
+    try:
+        await client.__aenter__()
+    except Exception as e:
+        return {"error": f"AgentChat standalone send: REST init failed: {e}"}
+
+    try:
+        try:
+            result = await asyncio.wait_for(
+                client.send_message(**kwargs), timeout=30.0
+            )
+        except asyncio.TimeoutError:
+            return {"error": "AgentChat standalone send: timed out after 30s"}
+        except UnauthorizedError:
+            return {"error": "AgentChat standalone send: API key rejected"}
+        except RateLimitedError as e:
+            return {"error": f"AgentChat standalone send: rate_limited (retry in {e.retry_after_ms}ms)"}
+        except AwaitingReplyError as e:
+            return {
+                "error": (
+                    f"AgentChat standalone send: awaiting_reply "
+                    f"(@{e.recipient_handle} hasn't replied yet)"
+                )
+            }
+        except BlockedError:
+            return {"error": "AgentChat standalone send: blocked between sender and recipient"}
+        except SuspendedError:
+            return {"error": "AgentChat standalone send: account suspended"}
+        except RestrictedError:
+            return {"error": "AgentChat standalone send: cold outreach restricted"}
+        except GroupDeletedError as e:
+            return {
+                "error": (
+                    f"AgentChat standalone send: group_deleted by "
+                    f"@{e.deleted_by_handle}"
+                )
+            }
+        except NotFoundError as e:
+            return {"error": f"AgentChat standalone send: not_found: {e}"}
+        except RecipientBackloggedError as e:
+            return {
+                "error": (
+                    f"AgentChat standalone send: recipient_backlogged "
+                    f"(@{e.recipient_handle}, {e.undelivered_count} undelivered)"
+                )
+            }
+        except ValidationError as e:
+            return {"error": f"AgentChat standalone send: validation: {e}"}
+        except (ServerError, ACConnectionError) as e:
+            return {"error": f"AgentChat standalone send: server_or_network: {e}"}
+        except AgentChatError as e:
+            code = getattr(e, "code", "AGENTCHAT_ERROR") or "AGENTCHAT_ERROR"
+            return {"error": f"AgentChat standalone send: {code}: {e}"}
+        except Exception as e:
+            logger.exception("AgentChat: standalone send unexpected failure")
+            return {"error": f"AgentChat standalone send: {e}"}
+
+        msg = getattr(result, "message", None) or {}
+        msg_id = msg.get("id") if isinstance(msg, dict) else None
+        return {"success": True, "message_id": msg_id}
+    finally:
+        with contextlib.suppress(Exception):
+            await client.__aexit__(None, None, None)
 
 
 # ─── Plugin entry point ────────────────────────────────────────────────────
@@ -724,6 +913,12 @@ def register(ctx: Any) -> None:
         setup_fn=interactive_setup,
         env_enablement_fn=env_enablement,
         cron_deliver_env_var="AGENTCHATME_HOME_CONVERSATION",
+        # Out-of-process cron delivery — `hermes cron run` may be detached
+        # from `hermes gateway`. Without this hook, `deliver=agentchat`
+        # cron jobs fail with `No live adapter for platform 'agentchat'`
+        # (`tools/send_message_tool.py:478-511`). See `_standalone_send`
+        # above for the implementation.
+        standalone_sender_fn=_standalone_send,
         # AgentChat handles are public addresses by design; no PII redaction.
         pii_safe=False,
         allow_update_command=True,
@@ -737,15 +932,21 @@ def register(ctx: Any) -> None:
         # the metadata budget on long messages. Hermes auto-splits.
         max_message_length=28_000,
         emoji="💬",
+        # `platform_hint` is appended VERBATIM to the system prompt at
+        # `run_agent.py:5800` — no `.format()` substitution happens. Don't
+        # use `{handle}` placeholders; instruct the agent to resolve its
+        # own identity via `agentchat_get_my_status` when it needs it.
         platform_hint=(
-            "You are reachable on AgentChat as @{handle} (resolve via "
-            "agentchat_get_my_status if unset). AgentChat is a peer-to-peer "
-            "messaging network for AI agents — you DM other agents by their "
-            "@handle, save contacts, join group chats, get presence. Cold-DM "
-            "rule: one message per recipient until they reply (you'll see "
-            "AWAITING_REPLY otherwise). Daily cap: 100 cold threads (rolling "
-            "24h, replies free a slot). Read the bundled `agentchat:agentchat` "
-            "skill before acting — it has the full etiquette and tool reference."
+            "You are reachable on AgentChat — a peer-to-peer messaging "
+            "network for AI agents. Call `agentchat_get_my_status` to "
+            "resolve your own @handle. You DM other agents by their "
+            "@handle, save contacts, join group chats, set presence. "
+            "Cold-DM rule: one message per recipient until they reply "
+            "(you'll see AWAITING_REPLY otherwise). Daily cap: 100 cold "
+            "threads (rolling 24h, replies free a slot). The bundled "
+            "skill `agentchat:agentchat` has the full etiquette and "
+            "tool reference — load it via `skill_view` before taking "
+            "non-trivial actions on the platform."
         ),
     )
 
@@ -761,19 +962,45 @@ def register(ctx: Any) -> None:
         ),
     )
 
-    # Bundled skill. Resolved via importlib.resources so it works from a
-    # wheel install (skill ends up under site-packages/agentchatme_hermes/),
-    # an editable install (-e .), and a Hermes-side checkout where the
-    # package contents live at plugins/platforms/agentchat/.
+    # Bundled skill. Three discovery modes, in priority order:
+    #
+    #   1. `importlib.resources.files("agentchatme_hermes")` — works for
+    #      a pip-installed wheel (site-packages) and editable installs.
+    #   2. `Path(__file__).parent / "skills/..."` — works when Hermes
+    #      loaded us via filesystem plugin discovery
+    #      (`~/.hermes/plugins/agentchat/agentchatme_hermes/adapter.py`)
+    #      where the package is NOT registered in `sys.modules` under
+    #      the importable name. Without this fallback the wheel-style
+    #      lookup fails and the agent has no etiquette manual to load.
+    #
+    # Discovered in v0.1.62 audit: VM e2e run printed twice the warning
+    # "AgentChat: failed to register bundled skill: No module named
+    # 'agentchatme_hermes'" because Hermes's `PluginManager` loads
+    # directory plugins by file path, not by package name.
     try:
-        from importlib.resources import files
         from pathlib import Path
 
-        skill_resource = files("agentchatme_hermes").joinpath(
-            "skills/agentchat/SKILL.md"
-        )
-        skill_path = Path(str(skill_resource))
-        if skill_path.exists():
+        skill_path: Path | None = None
+        try:
+            from importlib.resources import files
+            skill_resource = files("agentchatme_hermes").joinpath(
+                "skills/agentchat/SKILL.md"
+            )
+            candidate = Path(str(skill_resource))
+            if candidate.exists():
+                skill_path = candidate
+        except (ImportError, ModuleNotFoundError, FileNotFoundError):
+            # Fall through to the filesystem-relative fallback.
+            pass
+
+        if skill_path is None:
+            # `__file__` points at `.../agentchatme_hermes/adapter.py`,
+            # so `Path(__file__).parent` is the package root.
+            fs_candidate = Path(__file__).parent / "skills" / "agentchat" / "SKILL.md"
+            if fs_candidate.exists():
+                skill_path = fs_candidate
+
+        if skill_path is not None and skill_path.exists():
             ctx.register_skill(
                 name="agentchat",
                 path=skill_path,

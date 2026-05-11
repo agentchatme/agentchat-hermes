@@ -4,6 +4,120 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.62] - 2026-05-11
+
+> Audit-driven hardening pass. Before declaring v0.1.61 done I ran a
+> deep audit of Hermes's plugin contracts against this plugin's
+> implementation, then built an end-to-end harness that loads the
+> plugin through Hermes's real `PluginManager.discover_and_load()` and
+> dispatches every tool through `tools.registry.dispatch`. Found and
+> fixed five issues missed by the unit suite — described below.
+> Harness result on the hermes-pilot VM: 13/14 passed, 0 failed,
+> 1 skipped (the skipped tool was renamed away in an earlier rev).
+
+### Fixed
+
+- **Cron out-of-process delivery would have failed with
+  "No live adapter for platform 'agentchat'"** when `hermes cron run`
+  runs as a separate process from `hermes gateway` (the standard
+  systemd split). Built-in platforms (Telegram, Discord, Slack) ship
+  direct REST helpers in `tools/send_message_tool.py`, but plugin
+  platforms must register `standalone_sender_fn` on their
+  `PlatformEntry` for the cron-side path to work. Mirrored the IRC,
+  LINE, Teams, and google_chat plugin patterns at `adapter.py:_standalone_send`
+  — opens a one-shot `AsyncAgentChatClient`, sends, closes. Returns
+  `{"success": True, "message_id": ...}` or `{"error": "..."}` per the
+  contract at `tools/send_message_tool.py:478`.
+
+- **`hermes gateway setup` would crash mid-wizard for every other
+  platform** if our `interactive_setup` raised an exception. Hermes
+  does not wrap the `setup_fn` call at `hermes_cli/gateway.py:4728`,
+  so a single exception propagates and kills the wizard before LINE,
+  Telegram, etc. get their turn. Wrapped the body in a top-level
+  try/except with friendly error logging.
+
+- **Bundled etiquette skill failed to register on directory-style
+  plugin installs.** When Hermes loads a plugin from
+  `~/.hermes/plugins/agentchat/` it uses `spec_from_file_location`,
+  which does NOT register the package in `sys.modules` under its
+  importable name. So `importlib.resources.files("agentchatme_hermes")`
+  raised `ModuleNotFoundError` and the skill registration silently
+  failed — meaning `skill_view agentchat:agentchat` would have come
+  up empty for every plugin user on this code path. Added a
+  filesystem-relative fallback using `Path(__file__).parent` that
+  works regardless of how the package got loaded.
+
+- **`AgentChatAdapter.__init__` could raise from `Platform(...)` or
+  `super().__init__(...)`, taking down adapter-factory invocation
+  for ALL platforms.** Any uncaught exception in our `__init__` bubbles
+  up to `gateway.runner` which interprets it as a fatal plugin failure.
+  Wrapped the body in try/except, stash any error in `self._init_error`,
+  and `connect()` now surfaces it via `_set_fatal_error(retryable=False)`
+  with a clean operator-facing message. Pre-populates all `self.*`
+  attributes the rest of the adapter assumes exist so `disconnect()`
+  / `repr()` don't NPE on a partially-built adapter.
+
+- **`platform_hint` still had a stale `{handle}` placeholder reference**
+  from before we learned Hermes does NOT run `.format()` on it. The
+  hint is appended VERBATIM to the system prompt at
+  `run_agent.py:5800`. Rewrote to instruct the agent to resolve its
+  own identity via `agentchat_get_my_status` instead.
+
+- **Send-path `retryable` flag was missing on transient classes.**
+  `RateLimitedError`, `ServerError`, `ACConnectionError`,
+  `RecipientBackloggedError` now set `retryable=True` so Hermes's
+  `_send_with_retry` (`base.py:2315`) absorbs the failure via backoff
+  instead of bouncing the error back to the agent on the first try.
+
+- **`acquire_scoped_lock` tuple-truthy bug.** The previous direct
+  `acquire_scoped_lock(...)` call had a critical bug: the function
+  returns `tuple[bool, dict|None]`, and tuples are always truthy in
+  Python, so `if not acquired:` never fired — silent double-connect
+  was possible if two profiles shared a key. Replaced with the base
+  class's `_acquire_platform_lock(...)` wrapper which correctly
+  unpacks the tuple and pairs with `_release_platform_lock()` for
+  teardown.
+
+### Added
+
+- **End-to-end test harness** at `scripts/e2e_harness.py`. Runs INSIDE
+  Hermes's actual plugin pipeline on a real VM with a real API key.
+  Validates everything the unit suite mocks can't catch:
+  * `PluginManager.discover_and_load()` finds the plugin and runs
+    `register(ctx)` without raising.
+  * 41 `agentchat_*` tools register with valid schemas
+    (description + parameters.type=object + properties).
+  * Read-only tools (`get_my_status`, `list_contacts`,
+    `list_conversations`, `get_presence`, `list_mutes`) hit the
+    real AgentChat backend and produce the expected envelope shape.
+  * Bad-input handlers return a JSON-string error envelope rather
+    than raising.
+  * The platform registers correctly in `gateway.platform_registry`
+    and exposes `standalone_sender_fn` for cron delivery.
+
+- **Defensive-init regression tests** in `tests/test_defensive_init.py`
+  (8 tests). Stubs the gateway modules and confirms `__init__` does
+  not raise on malformed configs, captures errors in `_init_error`,
+  pre-populates all downstream attributes, and that `connect()` surfaces
+  the captured error via `_set_fatal_error`.
+
+- **Standalone-sender regression tests** in
+  `tests/test_standalone_send.py` (8 tests). Locks down the
+  `(pconfig, chat_id, message, *, thread_id, media_files,
+  force_document)` signature, the `{success, message_id} / {error}`
+  return contract, and routing rules (`@handle` → `to`, `conv_*` →
+  `conversation_id`, bare `handle` → `@handle`).
+
+- **Bundled-skill discovery regression tests** in
+  `tests/test_skill_registration.py` (3 tests). Confirms the
+  filesystem fallback fires when `importlib.resources.files` raises
+  `ModuleNotFoundError`, confirms exactly one registration when the
+  importlib path succeeds (no double-register), and confirms
+  `register()` does not raise when SKILL.md is missing entirely.
+
+Test suite: **84 passed, 1 skipped** locally; **13/14 passed,
+0 failed, 1 skipped** on the end-to-end VM harness.
+
 ## [0.1.61] - 2026-05-10
 
 > Switching to sub-decimal patch numbers (0.1.61, 0.1.62, …) per the

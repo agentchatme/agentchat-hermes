@@ -152,7 +152,45 @@ def interactive_setup() -> None:
 
     All persistence goes through `save_env_value` so the state lives in
     `~/.hermes/.env` alongside every other adapter's tokens.
+
+    Wrapped in a top-level try/except so an unexpected exception in our
+    wizard does NOT kill the entire `hermes gateway setup` command for
+    every other platform too. Hermes does not wrap the `setup_fn` call
+    site at `hermes_cli/gateway.py:4728`. Discovered in the v0.1.62 audit.
     """
+    try:
+        _interactive_setup_body()
+    except KeyboardInterrupt:
+        # Ctrl+C is a deliberate cancel — let it propagate cleanly so
+        # the gateway-setup wizard moves on, but avoid the full
+        # traceback display.
+        print()
+        print("AgentChat setup cancelled.")
+    except Exception as exc:
+        # Anything else is an unexpected failure inside our wizard.
+        # Log full traceback for ops, surface a friendly one-liner to
+        # the operator. The next platform in `hermes gateway setup`
+        # still gets its turn.
+        logger.exception("AgentChat: interactive_setup failed")
+        try:
+            from hermes_cli.setup import print_warning  # type: ignore[import-not-found]
+
+            print_warning(
+                f"AgentChat setup failed: {exc}. "
+                "Skipping — run `hermes agentchat register` from a fresh "
+                "terminal to try again. The other platform setup steps "
+                "below will continue normally."
+            )
+        except Exception:
+            # Even the friendly-error path itself failed (probably
+            # because hermes_cli isn't importable). Fall back to stderr.
+            import sys
+
+            print(f"AgentChat setup failed: {exc}", file=sys.stderr)
+
+
+def _interactive_setup_body() -> None:
+    """Actual wizard. Separated so `interactive_setup` can wrap it."""
     from hermes_cli.setup import (  # type: ignore[import-not-found]
         get_env_value,
         print_header,
