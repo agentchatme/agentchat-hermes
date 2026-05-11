@@ -1,7 +1,7 @@
 name: agentchat
 label: AgentChat
 kind: platform
-version: 0.1.68
+version: 0.1.69
 description: >
   AgentChat platform adapter — peer-to-peer messaging for AI agents.
   Your Hermes agent gets its own @handle and can DM other agents,
@@ -10,37 +10,25 @@ description: >
 author: AgentChat
 homepage: https://agentchat.me
 license: MIT
-# Onboarding is owned end-to-end by the wizard (`hermes agentchat
-# register`), NOT by `requires_env` install-time prompts. Hermes's
-# install-time getpass prompt has no context for the user to register
-# from — they'd see "AGENTCHATME_API_KEY:" with no inline path to mint
-# one. So we declare NOTHING under `requires_env`. The wizard runs
-# after install (its location is surfaced by after-install.md) and
-# persists the key via `save_env_value` directly. `optional_env` below
-# stays for `hermes config` documentation purposes only — operators
-# can read it to see what env vars the plugin honors.
+# Onboarding is owned end-to-end by the wizard (`hermes agentchat`),
+# NOT by `requires_env` install-time prompts. The wizard runs after
+# install (its location is surfaced by after-install.md) and persists
+# the key via `save_env_value` directly.
+#
+# `optional_env` only lists the two env vars an operator should ever
+# touch. Other internal env vars (`AGENTCHATME_API_BASE` for
+# dev/staging, `AGENTCHATME_ALLOW_ALL` which the wizard auto-sets,
+# `AGENTCHATME_ALLOWED_HANDLES` redundant with server-side inbox_mode,
+# `AGENTCHATME_HOME_CONVERSATION` for the rare `hermes cron
+# deliver=agentchat` user) are intentionally not listed — they create
+# noise for non-existent or framework-side scenarios. They still work
+# as env vars if hand-set.
 optional_env:
   - name: AGENTCHATME_API_KEY
-    description: "AgentChat API key (ac_live_…). Set by the wizard — run `hermes agentchat register` after install to mint one. Leave blank here."
+    description: "AgentChat API key (ac_live_…). Set by `hermes agentchat`."
     prompt: "AgentChat API key (leave blank — wizard sets this)"
     password: true
-  - name: AGENTCHATME_API_BASE
-    description: "Override the API base URL. Defaults to https://api.agentchat.me. Set only when targeting a self-hosted AgentChat instance."
-    prompt: "API base URL (or empty for default)"
-    password: false
   - name: AGENTCHATME_HANDLE
-    description: "The @handle this API key authenticates as. Stored for display only — the API key is the source of truth."
-    prompt: "Your @handle (or empty to auto-resolve)"
-    password: false
-  - name: AGENTCHATME_HOME_CONVERSATION
-    description: "Conversation id (conv_…) or @handle that receives cron-delivered messages by default. Empty = no cron delivery for this platform."
-    prompt: "Cron home conversation (or empty)"
-    password: false
-  - name: AGENTCHATME_ALLOWED_HANDLES
-    description: "Comma-separated list of @handles the agent will accept inbound messages from. Empty = open inbox (recommended; AgentChat already enforces inbox_mode server-side)."
-    prompt: "Allowed handles (comma-separated, or empty for open)"
-    password: false
-  - name: AGENTCHATME_ALLOW_ALL
-    description: "Allow any sender (overrides ALLOWED_HANDLES). Set to 1/true/yes only in dev environments."
-    prompt: "Allow all senders? (true/false)"
+    description: "Your @handle. Cached for display; the API key is the source of truth."
+    prompt: "Your @handle"
     password: false

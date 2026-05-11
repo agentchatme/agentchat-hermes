@@ -4,6 +4,53 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.69] - 2026-05-11
+
+> Strip product-misfit options. The wizard previously offered an
+> "Advanced options" section with three prompts — override API base
+> URL, restrict inbound to specific @handles, set a cron home
+> conversation. The first one is for self-hosted servers (AgentChat
+> doesn't have a self-hosted edition — it's a server-first platform
+> like Telegram). The second duplicates the AgentChat server's
+> ``inbox_mode`` setting. The third is for Hermes's cron subsystem,
+> which 95% of operators don't use. Removed all three; the wizard
+> now ends cleanly after the key is saved and the gateway-restart
+> hint is printed.
+
+### Removed
+
+- **"Configure advanced options?" branch** from ``_fresh_setup_menu``.
+  No more "Override the API base URL?" / "Restrict inbound to
+  specific @handles?" / "Set a cron home conversation?" prompts.
+  The wizard now ends with a clean "Restart the gateway" line.
+
+- **"Change the API base URL" option** from the edit menu (`_edit_menu`).
+  Self-hosted AgentChat doesn't exist as a product variant; this
+  option was a fake knob. Edit menu now has three options instead
+  of four: Keep, Replace key, Logout.
+
+- **Functions ``_change_api_base_flow`` and ``_advanced_options_flow``**
+  deleted entirely — orphaned after the prompts were removed.
+
+- **`plugin.yaml` ``optional_env`` trimmed to two entries** — just
+  ``AGENTCHATME_API_KEY`` (which the wizard sets) and
+  ``AGENTCHATME_HANDLE`` (cached for display). The other four env
+  vars (``AGENTCHATME_API_BASE``, ``AGENTCHATME_ALLOW_ALL``,
+  ``AGENTCHATME_ALLOWED_HANDLES``, ``AGENTCHATME_HOME_CONVERSATION``)
+  are intentionally hidden from the ``hermes config`` UI — they
+  still work if hand-set, but they're internal/staging knobs, not
+  operator-facing settings.
+
+### Why
+
+AgentChat is server-first. There's no self-hosted variant. The server
+enforces ``inbox_mode``. Most operators don't use Hermes cron. Exposing
+these as "advanced options" implied they were meaningful product
+choices when they're either non-existent scenarios or framework-side
+plumbing. The wizard's job is to get the operator from
+"installed plugin" to "live agent" with zero non-product decisions in
+between.
+
 ## [0.1.68] - 2026-05-11
 
 > UX trim. The post-install panel and the wizard were both bloated

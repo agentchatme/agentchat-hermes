@@ -303,7 +303,6 @@ def _edit_menu(
     choices = [
         "Keep current configuration",
         "Replace the API key (paste a new one, or register a new agent)",
-        "Change the API base URL (advanced — only for self-hosted)",
         "Logout (clear the saved key)",
     ]
     description = (
@@ -332,15 +331,6 @@ def _edit_menu(
         )
         return
     if idx == 2:
-        _change_api_base_flow(
-            prompt=prompt,
-            print_info=print_info,
-            print_warning=print_warning,
-            save_env_value=save_env_value,
-            get_env_value=get_env_value,
-        )
-        return
-    if idx == 3:
         _logout_flow(prompt_yes_no, print_info, print_success, save_env_value)
         return
 
@@ -397,16 +387,6 @@ def _fresh_setup_menu(
     # so the framework allowlist is redundant — see `_seed_allow_all_default`.
     if _seed_allow_all_default(save_env_value, get_env_value):
         _step("Inbox open (server enforces inbox_mode)")
-
-    # Advanced options — opt-in. Most users want defaults.
-    print()
-    if prompt_yes_no(
-        "Configure advanced options (API base, allowlist, cron home conversation)?",
-        False,
-    ):
-        _advanced_options_flow(
-            prompt, prompt_yes_no, print_info, print_warning, save_env_value, get_env_value
-        )
 
     _step("Restart the gateway: hermes gateway restart")
     print_success("AgentChat ready")
@@ -466,49 +446,6 @@ def _replace_key_branch(
         if _seed_allow_all_default(save_env_value, get_env_value):
             _step("Inbox open (server enforces inbox_mode)")
         _step("Restart the gateway: hermes gateway restart")
-
-
-def _change_api_base_flow(
-    *,
-    prompt,
-    print_info,
-    print_warning,
-    save_env_value,
-    get_env_value,
-) -> None:
-    """Edit ``AGENTCHATME_API_BASE``. Validates http(s) URL before persisting.
-
-    Mirrors OpenClaw's ``runChangeApiBaseFlow`` (``channel.wizard.ts:187-231``).
-    Blank input resets to the default. Invalid URLs are rejected synchronously
-    so the gateway doesn't have to flap reconnects against a typo.
-    """
-    from urllib.parse import urlparse
-
-    current = (get_env_value("AGENTCHATME_API_BASE") or "").strip()
-    print()
-    if current:
-        print_info(f"Current API base: {current}")
-    else:
-        print_info("API base is currently the default (https://api.agentchat.me).")
-    print_info("Enter a new URL, or leave blank to reset to default.")
-
-    raw = prompt("New API base URL").strip()
-    if not raw:
-        save_env_value("AGENTCHATME_API_BASE", "")
-        print_info("API base reset to default (https://api.agentchat.me).")
-        return
-
-    try:
-        parsed = urlparse(raw)
-    except Exception:
-        print_warning("That doesn't look like a valid URL.")
-        return
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        print_warning("API base must use http:// or https:// and include a host.")
-        return
-
-    save_env_value("AGENTCHATME_API_BASE", raw.rstrip("/"))
-    print_info(f"API base set to {raw.rstrip('/')}.")
 
 
 def _logout_flow(prompt_yes_no, print_info, print_success, save_env_value) -> None:
@@ -745,48 +682,6 @@ def _email_error_recovery(
     if code == "EMAIL_TAKEN":
         return ["paste", "retry-email", "cancel"][idx]
     return ["retry-email", "paste", "cancel"][idx]
-
-
-def _advanced_options_flow(
-    prompt, prompt_yes_no, print_info, print_warning, save_env_value, get_env_value
-) -> None:
-    """Optional self-hosted / allowlist / cron-home configuration."""
-    if prompt_yes_no("Override the API base URL (self-hosted AgentChat only)?", False):
-        api_base = prompt(
-            "API base URL (or empty to reset to https://api.agentchat.me)",
-            default=get_env_value("AGENTCHATME_API_BASE") or "",
-        ).strip()
-        if api_base:
-            save_env_value("AGENTCHATME_API_BASE", api_base)
-        else:
-            save_env_value("AGENTCHATME_API_BASE", "")
-
-    if prompt_yes_no(
-        "Restrict inbound to specific @handles (recommended: no — server enforces inbox_mode)?",
-        False,
-    ):
-        allowed = prompt(
-            "Allowed @handles (comma-separated, e.g. alice,bob,my-coordinator)",
-            default=get_env_value("AGENTCHATME_ALLOWED_HANDLES") or "",
-        ).strip()
-        save_env_value("AGENTCHATME_ALLOWED_HANDLES", allowed.replace(" ", ""))
-        # An explicit allowlist must override the ALLOW_ALL=true default
-        # we seed on first key save — otherwise Hermes's per-platform
-        # ALLOW_ALL check short-circuits the allowlist (`gateway/run.py`
-        # auth order: ALLOW_ALL → ALLOWED_USERS → default-deny). Clear
-        # it so the operator's explicit choice takes effect.
-        if allowed:
-            save_env_value("AGENTCHATME_ALLOW_ALL", "")
-            print_info(
-                "AGENTCHATME_ALLOW_ALL cleared — your allowlist will be enforced."
-            )
-
-    if prompt_yes_no("Set a cron home conversation (where deliver=agentchat sends by default)?", False):
-        home = prompt(
-            "Home conversation: a @handle for DM, or conv_… id for a group",
-            default=get_env_value("AGENTCHATME_HOME_CONVERSATION") or "",
-        ).strip()
-        save_env_value("AGENTCHATME_HOME_CONVERSATION", home)
 
 
 # ─── Prompt helpers ────────────────────────────────────────────────────────
