@@ -615,6 +615,17 @@ def _adapter_class() -> type:
                 message_id=message_id,
             )
 
+            # Set the source platform context so the
+            # `agentchat_share_api_key_with_operator` tool's
+            # AgentChat-peer short-circuit fires for any tool call
+            # inside this inbound's session. ContextVar values
+            # propagate into the Task that `handle_message` spawns
+            # (`_process_message_background`), so the agent's whole
+            # turn sees "this turn was triggered by AgentChat".
+            from . import tools as _tools_mod
+
+            _tools_mod.current_source_platform.set("agentchat")
+
             try:
                 await self.handle_message(event)
             except Exception:
@@ -639,6 +650,12 @@ def _adapter_class() -> type:
                 raw_message=data,
                 message_id=f"sys:{group_id}:deleted",
             )
+            # Same AgentChat-source tagging as the regular dispatch path
+            # so the operator-key tool refuses on this turn too.
+            from . import tools as _tools_mod
+
+            _tools_mod.current_source_platform.set("agentchat")
+
             try:
                 await self.handle_message(event)
             except Exception:
