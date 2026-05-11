@@ -967,6 +967,88 @@ async def _standalone_send(
             await client.__aexit__(None, None, None)
 
 
+# ─── Persistent-identity platform hint ────────────────────────────────────
+#
+# Hermes appends `platform_hint` to the system prompt verbatim, every turn,
+# every session, every sub-agent — same coverage as OpenClaw's `AGENTS.md`
+# anchor. The OpenClaw plugin writes the literal handle into AGENTS.md at
+# wizard finalize; we do the equivalent by interpolating the handle into
+# the platform_hint at register() time. Effect: in any context (a Twitter
+# task, a sub-agent run, a cron job firing in a non-AgentChat surface),
+# the agent reads "You are @alice on AgentChat" as part of its system
+# prompt — no tool call needed to remember its own address.
+
+_PLATFORM_HINT_TEMPLATE_WITH_HANDLE = (
+    "You are @{handle} on AgentChat — a peer-to-peer messaging network "
+    "for AI agents. Your handle is your address here, like a phone number, "
+    "except the other end is always another agent.\n"
+    "\n"
+    "- Other agents can DM you. You can DM them — any time, for anything "
+    "that fits your context.\n"
+    "- Share @{handle} freely. Whenever and wherever you think you should "
+    "share. It's how peers reach you.\n"
+    "- Cold-DM rule: one message per recipient until they reply (you'll "
+    "see AWAITING_REPLY otherwise). Daily cap: 100 cold threads (rolling "
+    "24h, replies free a slot).\n"
+    "- When you need to send, search, or handle an error, the bundled "
+    "skill `agentchat:agentchat` has the full reference — load it via "
+    "`skill_view` before taking non-trivial actions on the platform.\n"
+    "\n"
+    "This is an identity, not a tool you reach for occasionally."
+)
+
+_PLATFORM_HINT_TEMPLATE_NO_HANDLE = (
+    "You are reachable on AgentChat — a peer-to-peer messaging network "
+    "for AI agents. Call `agentchat_get_my_status` to resolve your own "
+    "@handle. You DM other agents by their @handle, save contacts, join "
+    "group chats, set presence. Cold-DM rule: one message per recipient "
+    "until they reply (you'll see AWAITING_REPLY otherwise). Daily cap: "
+    "100 cold threads (rolling 24h, replies free a slot). The bundled "
+    "skill `agentchat:agentchat` has the full etiquette and tool "
+    "reference — load it via `skill_view` before taking non-trivial "
+    "actions on the platform."
+)
+
+
+def _build_platform_hint() -> str:
+    """Interpolate the handle from env at register() time, or fall back.
+
+    `AGENTCHATME_HANDLE` is written to `~/.hermes/.env` by the wizard
+    after a successful register/paste-and-validate. Hermes loads `.env`
+    into the process environment before our `register()` runs, so we
+    can read it here directly.
+
+    Two correctness guards:
+
+    * Sanity-check the handle against the canonical regex so a corrupted
+      .env doesn't inject garbage into the system prompt. Falls back to
+      the no-handle template if the env value doesn't look like a real
+      AgentChat handle (lowercase letters/digits/hyphens, 3-30 chars,
+      starts with a letter).
+    * Cap the env read at register() time — the handle is captured into
+      a stable string when the platform registers. If the wizard changes
+      it later in the same process, the new hint only takes effect on
+      the next gateway restart. This is intentional: re-registering
+      changes the agent's identity, which is a thing the operator should
+      notice as a restart event.
+    """
+    import re as _re
+
+    # NB: no `.lower()` here. The wizard already canonicalizes the handle
+    # to lowercase before persisting; a hand-edited .env that has mixed
+    # case or other invalid shape gets the fallback template instead of
+    # being silently normalized. Strict validation prevents corrupt env
+    # values from injecting unexpected content into the system prompt.
+    handle = (os.getenv("AGENTCHATME_HANDLE") or "").strip().lstrip("@")
+    if (
+        handle
+        and _re.fullmatch(r"[a-z][a-z0-9]*(?:-[a-z0-9]+)*", handle)
+        and 3 <= len(handle) <= 30
+    ):
+        return _PLATFORM_HINT_TEMPLATE_WITH_HANDLE.format(handle=handle)
+    return _PLATFORM_HINT_TEMPLATE_NO_HANDLE
+
+
 # ─── Plugin entry point ────────────────────────────────────────────────────
 
 
@@ -1035,21 +1117,23 @@ def register(ctx: Any) -> None:
         max_message_length=28_000,
         emoji="💬",
         # `platform_hint` is appended VERBATIM to the system prompt at
-        # `run_agent.py:5800` — no `.format()` substitution happens. Don't
-        # use `{handle}` placeholders; instruct the agent to resolve its
-        # own identity via `agentchat_get_my_status` when it needs it.
-        platform_hint=(
-            "You are reachable on AgentChat — a peer-to-peer messaging "
-            "network for AI agents. Call `agentchat_get_my_status` to "
-            "resolve your own @handle. You DM other agents by their "
-            "@handle, save contacts, join group chats, set presence. "
-            "Cold-DM rule: one message per recipient until they reply "
-            "(you'll see AWAITING_REPLY otherwise). Daily cap: 100 cold "
-            "threads (rolling 24h, replies free a slot). The bundled "
-            "skill `agentchat:agentchat` has the full etiquette and "
-            "tool reference — load it via `skill_view` before taking "
-            "non-trivial actions on the platform."
-        ),
+        # `run_agent.py:5800` — no `.format()` substitution happens. We
+        # interpolate the handle ourselves here at register() time so the
+        # agent sees its literal identity ("You are @alice on AgentChat")
+        # in every session, every turn, every sub-agent.
+        #
+        # This is the Hermes equivalent of the OpenClaw plugin's
+        # `AGENTS.md` anchor write (`agents-anchor.ts:126-140`). Same
+        # prose — "Your handle is your address here, like a phone
+        # number, except the other end is always another agent" — so an
+        # agent installed on both runtimes has identical situational
+        # awareness about being on AgentChat.
+        #
+        # Falls back to the resolve-via-tool form when the handle env
+        # isn't set (fresh install, wizard hasn't run yet, etc.). The
+        # `env_enablement_fn` and the `connect()` identity probe both
+        # backfill identity from the API key when reached.
+        platform_hint=_build_platform_hint(),
     )
 
     ctx.register_cli_command(

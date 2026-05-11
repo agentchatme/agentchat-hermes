@@ -190,15 +190,29 @@ def interactive_setup() -> None:
 
 
 def _interactive_setup_body() -> None:
-    """Actual wizard. Separated so `interactive_setup` can wrap it."""
+    """Actual wizard. Separated so `interactive_setup` can wrap it.
+
+    Two import sources, deliberately split:
+
+    * ``hermes_cli.cli_output`` — ``prompt`` / ``prompt_yes_no`` from this
+      module are **graceful on Ctrl+C** (return empty / default). The
+      versions in ``hermes_cli.setup`` ``sys.exit(1)`` instead, which
+      kills the entire ``hermes gateway setup`` flow for sibling
+      platforms. Matches the Teams / Google Chat plugin pattern
+      (``plugins/platforms/{teams,google_chat}/adapter.py``).
+    * ``hermes_cli.setup`` — ``prompt_choice`` is the curses-driven
+      arrow-key menu primitive (``setup.py:236``). Plus the styled
+      print helpers and ``save_env_value`` / ``get_env_value`` which
+      only live there.
+    """
+    from hermes_cli.cli_output import prompt, prompt_yes_no  # type: ignore[import-not-found]
     from hermes_cli.setup import (  # type: ignore[import-not-found]
         get_env_value,
         print_header,
         print_info,
         print_success,
         print_warning,
-        prompt,
-        prompt_yes_no,
+        prompt_choice,
         save_env_value,
     )
 
@@ -212,67 +226,293 @@ def _interactive_setup_body() -> None:
     print()
 
     existing_key = (get_env_value("AGENTCHATME_API_KEY") or "").strip()
-    if existing_key:
-        masked = _mask_key(existing_key)
-        print_info(f"AgentChat: already configured with key {masked}")
-        if not prompt_yes_no("Reconfigure AgentChat?", False):
-            print_info(
-                "Leaving AgentChat configuration unchanged. "
-                "Run `hermes agentchat whoami` to confirm the key still authenticates."
-            )
-            return
+    existing_handle = (get_env_value("AGENTCHATME_HANDLE") or "").strip().lstrip("@")
 
-    choice = _choose_path(prompt, prompt_yes_no, has_existing=bool(existing_key))
-    if choice == "skip":
-        print_info("Skipping AgentChat setup.")
+    # Branch on detected state. The OpenClaw wizard distinguishes four
+    # states (`channel.wizard.ts:588-616`); we collapse "no handle"
+    # into "configured" because the gateway adapter resolves identity
+    # on connect via ``GET /v1/agents/me`` regardless.
+    if existing_key:
+        _edit_menu(
+            existing_key=existing_key,
+            existing_handle=existing_handle,
+            prompt=prompt,
+            prompt_yes_no=prompt_yes_no,
+            prompt_choice=prompt_choice,
+            print_info=print_info,
+            print_success=print_success,
+            print_warning=print_warning,
+            save_env_value=save_env_value,
+            get_env_value=get_env_value,
+        )
         return
 
-    if choice == "paste":
-        ok = _paste_existing_key_flow(prompt, print_info, print_success, print_warning, save_env_value)
-        if not ok:
-            return
-    else:  # "register"
-        ok = _register_new_agent_flow(prompt, print_info, print_success, print_warning, save_env_value)
-        if not ok:
-            return
+    _fresh_setup_menu(
+        prompt=prompt,
+        prompt_yes_no=prompt_yes_no,
+        prompt_choice=prompt_choice,
+        print_info=print_info,
+        print_success=print_success,
+        print_warning=print_warning,
+        save_env_value=save_env_value,
+        get_env_value=get_env_value,
+    )
 
-    # Optional refinements — apiBase override (self-hosted only), allowlist,
-    # home conversation. Skipped for users who answered "no" early.
+
+def _edit_menu(
+    *,
+    existing_key: str,
+    existing_handle: str,
+    prompt,
+    prompt_yes_no,
+    prompt_choice,
+    print_info,
+    print_success,
+    print_warning,
+    save_env_value,
+    get_env_value,
+) -> None:
+    """Already-configured edit menu. Mirrors OpenClaw's
+    ``channel.wizard.ts:588-616`` 4-option select."""
+    masked = _mask_key(existing_key)
+    identity_line = (
+        f"AgentChat: configured (@{existing_handle}) with key {masked}"
+        if existing_handle
+        else f"AgentChat: configured with key {masked} (handle not cached)"
+    )
+    print_info(identity_line)
     print()
-    if prompt_yes_no("Configure advanced options (API base, allowlist, cron home conversation)?", False):
-        _advanced_options_flow(prompt, prompt_yes_no, print_info, print_warning, save_env_value, get_env_value)
+
+    choices = [
+        "Keep current configuration",
+        "Replace the API key (paste a new one, or register a new agent)",
+        "Change the API base URL (advanced — only for self-hosted)",
+        "Logout (clear the saved key)",
+    ]
+    description = (
+        "ENTER to confirm a choice. ESC keeps the current configuration."
+    )
+    idx = prompt_choice(
+        "AgentChat is already configured. What would you like to do?",
+        choices,
+        default=0,
+        description=description,
+    )
+
+    if idx == 0:
+        print_info(
+            "Leaving AgentChat configuration unchanged. Run `hermes agentchat` "
+            "again any time to make changes."
+        )
+        return
+    if idx == 1:
+        _replace_key_branch(
+            prompt=prompt,
+            prompt_yes_no=prompt_yes_no,
+            prompt_choice=prompt_choice,
+            print_info=print_info,
+            print_success=print_success,
+            print_warning=print_warning,
+            save_env_value=save_env_value,
+            get_env_value=get_env_value,
+        )
+        return
+    if idx == 2:
+        _change_api_base_flow(
+            prompt=prompt,
+            print_info=print_info,
+            print_warning=print_warning,
+            save_env_value=save_env_value,
+            get_env_value=get_env_value,
+        )
+        return
+    if idx == 3:
+        _logout_flow(prompt_yes_no, print_info, print_success, save_env_value)
+        return
+
+
+def _fresh_setup_menu(
+    *,
+    prompt,
+    prompt_yes_no,
+    prompt_choice,
+    print_info,
+    print_success,
+    print_warning,
+    save_env_value,
+    get_env_value,
+) -> None:
+    """Top-level register-or-paste menu for fresh installs. Mirrors
+    OpenClaw's ``channel.wizard.ts:618-633`` 3-option select."""
+    print_info("AgentChat is not configured yet.")
+    print()
+
+    choices = [
+        "Register a new AgentChat agent (email + 6-digit OTP, ~60s)",
+        "I already have an API key (paste ac_live_…)",
+        "Skip for now",
+    ]
+    description = "Register is recommended for new users — it mints a fresh @handle."
+    idx = prompt_choice(
+        "How would you like to configure AgentChat?",
+        choices,
+        default=0,
+        description=description,
+    )
+
+    if idx == 2:
+        print_info(
+            "Skipping AgentChat setup. Run `hermes agentchat` to configure later."
+        )
+        return
+
+    if idx == 0:
+        ok = _register_new_agent_flow(
+            prompt=prompt,
+            prompt_choice=prompt_choice,
+            print_info=print_info,
+            print_success=print_success,
+            print_warning=print_warning,
+            save_env_value=save_env_value,
+        )
+    else:
+        ok = _paste_existing_key_flow(
+            prompt, print_info, print_success, print_warning, save_env_value
+        )
+
+    if not ok:
+        return
+
+    # Advanced options — opt-in. Most users want defaults.
+    print()
+    if prompt_yes_no(
+        "Configure advanced options (API base, allowlist, cron home conversation)?",
+        False,
+    ):
+        _advanced_options_flow(
+            prompt, prompt_yes_no, print_info, print_warning, save_env_value, get_env_value
+        )
 
     print()
     print_success("AgentChat configuration saved to ~/.hermes/.env")
     print_info("Restart the gateway for changes to take effect: hermes gateway restart")
 
 
-# ─── Wizard sub-flows ──────────────────────────────────────────────────────
+def _replace_key_branch(
+    *,
+    prompt,
+    prompt_yes_no,
+    prompt_choice,
+    print_info,
+    print_success,
+    print_warning,
+    save_env_value,
+    get_env_value,
+) -> None:
+    """Replace-key sub-flow reached from the edit menu. Same register-or-paste
+    menu as a fresh install, but with the explicit "going to overwrite"
+    framing so the user knows the current key will be replaced."""
+    print()
+    print_info(
+        "Replacing the saved API key. The current key will be overwritten "
+        "in ~/.hermes/.env."
+    )
+    print()
+
+    choices = [
+        "Paste a different API key (ac_live_…)",
+        "Register a new agent (mints a brand-new @handle)",
+        "Cancel — keep the current key",
+    ]
+    idx = prompt_choice(
+        "How would you like to replace it?",
+        choices,
+        default=0,
+    )
+
+    if idx == 2:
+        print_info("Cancelled. Existing key retained.")
+        return
+
+    if idx == 0:
+        ok = _paste_existing_key_flow(
+            prompt, print_info, print_success, print_warning, save_env_value
+        )
+    else:
+        ok = _register_new_agent_flow(
+            prompt=prompt,
+            prompt_choice=prompt_choice,
+            print_info=print_info,
+            print_success=print_success,
+            print_warning=print_warning,
+            save_env_value=save_env_value,
+        )
+
+    if ok:
+        print_info("Restart the gateway for changes to take effect: hermes gateway restart")
 
 
-def _choose_path(prompt, prompt_yes_no, *, has_existing: bool) -> str:
-    """Ask the user which path to take. Returns one of: register / paste / skip."""
-    if has_existing:
-        # Branch when we already have a key — assume reconfigure intent.
-        if prompt_yes_no(
-            "Replace the existing key by registering a brand new agent (mints a fresh @handle)?",
-            False,
-        ):
-            return "register"
-        if prompt_yes_no("Paste a different existing API key?", True):
-            return "paste"
-        return "skip"
+def _change_api_base_flow(
+    *,
+    prompt,
+    print_info,
+    print_warning,
+    save_env_value,
+    get_env_value,
+) -> None:
+    """Edit ``AGENTCHATME_API_BASE``. Validates http(s) URL before persisting.
 
-    # Fresh setup — register-by-default since the most common case is a
-    # brand-new user with no key yet (matches our distribution decision).
-    if prompt_yes_no(
-        "Register a new AgentChat agent now (email + 6-digit OTP, ~60 seconds)?",
-        True,
+    Mirrors OpenClaw's ``runChangeApiBaseFlow`` (``channel.wizard.ts:187-231``).
+    Blank input resets to the default. Invalid URLs are rejected synchronously
+    so the gateway doesn't have to flap reconnects against a typo.
+    """
+    from urllib.parse import urlparse
+
+    current = (get_env_value("AGENTCHATME_API_BASE") or "").strip()
+    print()
+    if current:
+        print_info(f"Current API base: {current}")
+    else:
+        print_info("API base is currently the default (https://api.agentchat.me).")
+    print_info("Enter a new URL, or leave blank to reset to default.")
+
+    raw = prompt("New API base URL").strip()
+    if not raw:
+        save_env_value("AGENTCHATME_API_BASE", "")
+        print_info("API base reset to default (https://api.agentchat.me).")
+        return
+
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        print_warning("That doesn't look like a valid URL.")
+        return
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        print_warning("API base must use http:// or https:// and include a host.")
+        return
+
+    save_env_value("AGENTCHATME_API_BASE", raw.rstrip("/"))
+    print_info(f"API base set to {raw.rstrip('/')}.")
+
+
+def _logout_flow(prompt_yes_no, print_info, print_success, save_env_value) -> None:
+    """Clear the saved key + handle. The agent on the AgentChat server is
+    untouched — only this Hermes profile loses access."""
+    print()
+    if not prompt_yes_no(
+        "Clear AGENTCHATME_API_KEY and AGENTCHATME_HANDLE from ~/.hermes/.env? "
+        "Your AgentChat agent will remain on the server — this only removes "
+        "credentials from THIS Hermes profile.",
+        False,
     ):
-        return "register"
-    if prompt_yes_no("Paste an existing AgentChat API key (ac_live_…)?", False):
-        return "paste"
-    return "skip"
+        print_info("Cancelled. Existing credentials retained.")
+        return
+    save_env_value("AGENTCHATME_API_KEY", "")
+    save_env_value("AGENTCHATME_HANDLE", "")
+    print_success("Logged out. Run `hermes agentchat` to reconfigure.")
+
+
+# ─── Wizard sub-flows ──────────────────────────────────────────────────────
 
 
 def _paste_existing_key_flow(prompt, print_info, print_success, print_warning, save_env_value) -> bool:
@@ -298,9 +538,29 @@ def _paste_existing_key_flow(prompt, print_info, print_success, print_warning, s
 
 
 def _register_new_agent_flow(
-    prompt, print_info, print_success, print_warning, save_env_value
+    *,
+    prompt,
+    prompt_choice,
+    print_info,
+    print_success,
+    print_warning,
+    save_env_value,
 ) -> bool:
-    """Email-OTP registration flow. Mirrors OpenClaw's `runRegisterFlow`."""
+    """Email-OTP registration flow. Mirrors OpenClaw's ``runRegisterFlow``
+    (``channel.wizard.ts:250-474``).
+
+    Two layers of recovery:
+
+    * **Field-scoped retry.** ``HANDLE_TAKEN`` / ``INVALID_HANDLE`` re-prompts
+      only the handle; ``EMAIL_TAKEN`` / ``EMAIL_EXHAUSTED`` re-prompts only
+      the offending field — email + display_name aren't touched by a handle
+      collision and vice versa.
+    * **Errors-as-navigation.** ``EMAIL_TAKEN`` and ``EMAIL_EXHAUSTED`` open
+      a 3-option ``prompt_choice`` recovery menu (the most-likely-correct
+      action defaults: paste-key when an account already exists, swap-email
+      when the quota is hit) instead of a flat retry. Cancel is always an
+      option.
+    """
     print()
     print_info("Registration mints a new AgentChat agent identity tied to your email.")
     print_info("You will receive a 6-digit code to verify — check your inbox (and spam).")
@@ -312,14 +572,16 @@ def _register_new_agent_flow(
     handle = _prompt_handle(prompt, print_warning)
     if handle is None:
         return False
-    display_name = prompt("Display name (shown next to your @handle, e.g. \"Alice\")").strip()
+    display_name = prompt(
+        "Display name (shown next to your @handle, e.g. \"Alice\")"
+    ).strip()
 
-    # Field-specific retry loop. handle-taken / invalid-handle re-prompts only
-    # the handle; email-exhausted re-prompts only email; everything else aborts.
     pending_id = None
     for attempt in range(1, _MAX_REGISTER_RETRIES + 1):
         try:
-            pending_id = _register_start(email=email, handle=handle, display_name=display_name)
+            pending_id = _register_start(
+                email=email, handle=handle, display_name=display_name
+            )
             break
         except _RegisterError as err:
             if err.field == "handle" and attempt < _MAX_REGISTER_RETRIES:
@@ -329,13 +591,32 @@ def _register_new_agent_flow(
                     return False
                 handle = new_handle
                 continue
+
             if err.field == "email" and attempt < _MAX_REGISTER_RETRIES:
-                print_warning(f"Email problem: {err}")
+                next_step = _email_error_recovery(
+                    code=err.code or "",
+                    message=str(err),
+                    prompt=prompt,
+                    prompt_choice=prompt_choice,
+                    print_info=print_info,
+                    print_warning=print_warning,
+                )
+                if next_step == "cancel":
+                    return False
+                if next_step == "paste":
+                    # User chose to switch paths — defer to paste flow with a
+                    # one-line break before that wizard's own intro.
+                    print()
+                    return _paste_existing_key_flow(
+                        prompt, print_info, print_success, print_warning, save_env_value
+                    )
+                # next_step == "retry-email" — re-prompt and loop.
                 new_email = _prompt_email(prompt, print_warning)
                 if new_email is None:
                     return False
                 email = new_email
                 continue
+
             print_warning(f"Registration failed: {err}")
             return False
         except Exception as e:
@@ -362,8 +643,67 @@ def _register_new_agent_flow(
 
     save_env_value("AGENTCHATME_API_KEY", api_key)
     save_env_value("AGENTCHATME_HANDLE", resolved_handle)
-    print_success(f"Registered as @{resolved_handle}. API key saved.")
+    masked = _mask_key(api_key)
+    print_success(
+        f"Registered as @{resolved_handle}. API key saved ({masked})."
+    )
     return True
+
+
+def _email_error_recovery(
+    *,
+    code: str,
+    message: str,
+    prompt,
+    prompt_choice,
+    print_info,
+    print_warning,
+) -> str:
+    """Render the OpenClaw-style errors-as-navigation menu for email-class
+    server NACKs. Returns one of ``"paste"``, ``"retry-email"``, ``"cancel"``.
+
+    ``EMAIL_TAKEN`` defaults to **paste-existing-key** because the most-likely
+    user is someone who registered before and forgot. ``EMAIL_EXHAUSTED``
+    defaults to **use-different-email** because the user has hit the quota
+    for that address — a different email is more likely to succeed than
+    digging up a key.
+    """
+    print_warning(message)
+
+    if code == "EMAIL_TAKEN":
+        choices = [
+            "Paste the existing API key for this agent (recommended if you own it)",
+            "Use a different email address",
+            "Cancel registration",
+        ]
+        default = 0
+        question = "That email is already registered. What now?"
+    elif code == "EMAIL_EXHAUSTED":
+        choices = [
+            "Use a different email address",
+            "Paste an existing API key instead",
+            "Cancel registration",
+        ]
+        default = 0
+        question = "Too many recent registrations for that email. What now?"
+    else:
+        # Generic email-class error (validation, unreachable, etc.) — same
+        # menu but no recommended-default leans either way.
+        choices = [
+            "Use a different email address",
+            "Paste an existing API key instead",
+            "Cancel registration",
+        ]
+        default = 0
+        question = "Couldn't register with that email. What now?"
+
+    idx = prompt_choice(question, choices, default=default)
+
+    # Map by position because the order of "paste" vs "retry-email" flips
+    # between EMAIL_TAKEN (paste first) and EMAIL_EXHAUSTED (retry first).
+    if code == "EMAIL_TAKEN":
+        return ["paste", "retry-email", "cancel"][idx]
+    return ["retry-email", "paste", "cancel"][idx]
 
 
 def _advanced_options_flow(
@@ -471,11 +811,26 @@ def _mask_key(key: str) -> str:
 
 
 class _RegisterError(Exception):
-    """Surface a server registration error with field-context for the wizard."""
+    """Surface a server registration error with field-context for the wizard.
 
-    def __init__(self, message: str, *, field: str | None = None) -> None:
+    ``field`` lets the wizard re-prompt only the offending input
+    (``handle``/``email``). ``code`` carries the canonical server error
+    code (``EMAIL_TAKEN``, ``EMAIL_EXHAUSTED``, ``HANDLE_TAKEN``,
+    ``INVALID_HANDLE``, ``RATE_LIMITED``, etc.) so the wizard can branch
+    into the OpenClaw-style errors-as-navigation recovery menus rather
+    than treating every server NACK as a flat retry.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        field: str | None = None,
+        code: str | None = None,
+    ) -> None:
         super().__init__(message)
         self.field = field
+        self.code = code
 
 
 def _api_base() -> str:
@@ -518,14 +873,16 @@ def _register_start(*, email: str, handle: str, display_name: str) -> str:
     # `{ code, message }` shapes — see `apps/api-server/src/routes/register.ts`.
     code, message = _parse_error(resp)
     if code in ("HANDLE_TAKEN", "INVALID_HANDLE", "RESERVED_HANDLE"):
-        raise _RegisterError(message or code, field="handle")
+        raise _RegisterError(message or code, field="handle", code=code)
     if code in ("EMAIL_TAKEN", "EMAIL_EXHAUSTED"):
-        raise _RegisterError(message or code, field="email")
+        raise _RegisterError(message or code, field="email", code=code)
     if code == "RATE_LIMITED":
         raise _RegisterError(
-            "rate-limited — wait a minute and try again", field=None
+            "rate-limited — wait a minute and try again", field=None, code=code
         )
-    raise _RegisterError(message or code or f"HTTP {resp.status_code}")
+    raise _RegisterError(
+        message or code or f"HTTP {resp.status_code}", code=code
+    )
 
 
 def _register_verify(*, pending_id: str, code: str) -> tuple[str, str]:

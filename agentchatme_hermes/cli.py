@@ -1,12 +1,16 @@
-"""`hermes agentchat <subcommand>` argparse wiring.
+"""`hermes agentchat [<subcommand>]` argparse wiring.
 
-Exposes four subcommands modeled on the OpenClaw plugin's `channels.add`
-flow but split out for scriptability:
+Two surfaces:
 
-* ``hermes agentchat register`` — email-OTP registration, mints a fresh key
-* ``hermes agentchat login`` — paste an existing ``ac_live_…`` key
-* ``hermes agentchat whoami`` — confirm the saved key still authenticates
-* ``hermes agentchat logout`` — clear the key from ``~/.hermes/.env``
+* **Bare ``hermes agentchat``** — launches the interactive wizard
+  (state-detection + arrow-key menu). This is the recommended entry point
+  for humans, mirrors ``openclaw channels add agentchat``'s UX.
+* **``hermes agentchat <subcommand>``** — scriptable shortcuts for CI /
+  power users:
+  * ``register`` — email-OTP registration, mints a fresh key
+  * ``login`` — paste an existing ``ac_live_…`` key
+  * ``whoami`` — confirm the saved key still authenticates
+  * ``logout`` — clear the key from ``~/.hermes/.env``
 
 The argparse setup is wired by Hermes's plugin context via
 ``register_cli_command`` (see ``adapter.register``); the dispatch handler
@@ -27,9 +31,10 @@ def setup_cli_argparse(parser: argparse.ArgumentParser) -> None:
     google_meet plugin's pattern (``plugins/google_meet/cli.py:35-100``).
     """
     parser.description = (
-        "Manage your AgentChat identity. Use `register` for first-time setup "
-        "(email + OTP, mints a fresh @handle) or `login` to paste an "
-        "existing ac_live_… key. Configuration is persisted to ~/.hermes/.env."
+        "Manage your AgentChat identity. Run `hermes agentchat` with no "
+        "subcommand to launch the interactive wizard (state-detection + "
+        "arrow-key menu). The named subcommands are scriptable shortcuts "
+        "for CI and power users. Configuration is persisted to ~/.hermes/.env."
     )
     sub = parser.add_subparsers(dest="action", metavar="<action>")
 
@@ -104,6 +109,11 @@ def dispatch_cli_command(args: Any) -> int:
     The handler returns the desired process exit code (0 success, 1
     server-side failure, 2 user input failure). Hermes's main CLI
     surfaces this as the shell return code.
+
+    **Bare ``hermes agentchat``** (no subcommand) launches the interactive
+    wizard — mirrors ``openclaw channels add agentchat``. The wizard
+    handles state detection internally, so this is the only command a
+    new user needs to know.
     """
     action = getattr(args, "action", None)
 
@@ -132,11 +142,10 @@ def dispatch_cli_command(args: Any) -> int:
 
         return cli_logout()
 
-    # No subcommand provided — print help. argparse can't do this directly
-    # with sub-sub-parsers absent so we print a friendly message.
-    print(
-        "Usage: hermes agentchat <register | login | whoami | logout>\n"
-        "\n"
-        "Run `hermes agentchat <action> --help` for details on a specific action."
-    )
-    return 2
+    # No subcommand → launch the interactive wizard. This is the canonical
+    # human entry point — `interactive_setup` handles state detection
+    # (configured vs fresh) and routes to the right sub-flow.
+    from .setup import interactive_setup
+
+    interactive_setup()
+    return 0
