@@ -111,6 +111,12 @@ markers = [
 filterwarnings = [
     "error",
     "ignore::DeprecationWarning:pydantic.*",
+    # ResourceWarnings from unittest.mock / pytest-asyncio cleanup are
+    # noise — the actual code under test doesn't leak. Pytest 9.x's
+    # unraisableexception plugin promotes them to PytestUnraisableException
+    # which fails CI even though every test passed.
+    "ignore::ResourceWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
 ]
 
 [tool.ruff]
