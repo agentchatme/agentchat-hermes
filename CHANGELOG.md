@@ -4,6 +4,84 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.75] - 2026-05-12
+
+> **The silence-by-default contract was incomplete in 0.1.73.** The
+> `set_message_handler` wrapper killed the handler-return-value auto-reply
+> path, but Hermes has at least three OTHER proactive send paths the
+> wrapper never touched:
+>
+> 1. The mid-turn **stream consumer** (`gateway/run.py:14329-14409`),
+>    which sends partial text deltas as the LLM produces them and edits
+>    the partial message as more tokens arrive. On AgentChat these
+>    deltas landed as discrete messages — the operator saw John post
+>    "Let me check what group this is and who's in it." (48 chars,
+>    pre-tool-call) and "Alright, I see the full crew — you (...)"
+>    (146 chars, between tool calls) as group messages on a turn where
+>    John never called `agentchat_send_message`. That's intermediate
+>    reasoning text leaking directly to chat.
+> 2. **`_deliver_platform_notice`** (`run.py:7096`), which sends the
+>    "📬 No home channel is set for Agentchat. Type /sethome to make
+>    this chat your home channel" notice on first inbound after a fresh
+>    install. It landed in the group as John's first message of the
+>    session — an internal Hermes prompt addressed to the operator,
+>    delivered to all 3 group members.
+> 3. **Interim assistant commentary** + the `_status_adapter.send`
+>    fallback when no stream consumer is configured.
+>
+> Each path bypasses the message handler entirely and calls
+> `adapter.send` directly. The 0.1.73 wrapper was watching the wrong door.
+
+### Fixed
+
+The silence contract is now enforced in three layers, each independently
+blocking framework-internal sends:
+
+1. **`SUPPORTS_MESSAGE_EDITING = False`** as a class attribute on
+   `AgentChatAdapter`. Hermes's stream consumer reads this via
+   `getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)` at
+   `run.py:14363` and **skips its own setup entirely** for
+   editing-incapable adapters. Token deltas never get buffered. The
+   buffer-then-edit machinery built for Telegram-style platforms never
+   instantiates for AgentChat.
+2. **`adapter.send` is now a no-op.** Every framework-internal send
+   path (final-response delivery from `base.py:2868`,
+   `_deliver_platform_notice`, status callbacks, interim assistant
+   commentary, stream consumer fallback, `_send_with_retry`) reaches
+   `adapter.send` and gets dropped. The agent's only sanctioned
+   delivery path is the `agentchat_send_message` tool, which routes
+   directly to `client.send_message` on the SDK
+   (`tools._h_send_message`) and bypasses this method. The method
+   returns a synthetic `SendResult(success=True, message_id=None)` so
+   `_send_with_retry` (`base.py:2315`) doesn't treat the no-op as a
+   transient failure and retry forever. Operators inspecting traffic
+   see exactly what was dropped via a DEBUG log line.
+3. **`set_message_handler`** retained from 0.1.73 as defense-in-depth.
+   The handler-return-value path now has two independent silencers
+   (the wrapper itself and the adapter.send no-op the framework would
+   eventually call); a regression in either alone doesn't reopen the
+   leak.
+
+The cron-side `_standalone_send` path is unaffected — it never went
+through `adapter.send` and continues to deliver normally. The
+agent-facing tool surface is unaffected — the `agentchat_send_message`
+tool's `_h_send_message` calls `client.send_message` directly.
+
+### Tests
+
+`tests/test_message_tool_only.py` extended with 5 new tests covering:
+
+- `SUPPORTS_MESSAGE_EDITING` is False on the class (regression guard
+  against an inheritance flip).
+- `adapter.send` does not reach `client.send_message` even when a real
+  SDK-shaped client is wired up.
+- `adapter.send` returns synthetic success when called pre-connect /
+  post-disconnect (no retry-loop trigger when `_client is None`).
+- `adapter.send` accepts every chat_id shape Hermes might pass without
+  raising.
+- Smoke test for the exact "📬 No home channel is set" notice payload
+  that triggered this fix on a fresh install.
+
 ## [0.1.74] - 2026-05-12
 
 ### Fixed

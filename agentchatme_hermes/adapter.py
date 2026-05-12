@@ -173,6 +173,19 @@ def _adapter_class() -> type:
         ``base.py:2484-2853`` in the Hermes repo).
         """
 
+        # Tells Hermes's stream consumer not to set itself up for this
+        # platform (`gateway/run.py:14363`). Streaming-text delivery on
+        # other platforms works by sending a partial message, then
+        # editing it as more tokens arrive. AgentChat's message-tool-only
+        # contract (see `send` and `set_message_handler` below) means we
+        # never want mid-turn text to land in the chat at all — the
+        # agent must explicitly call `agentchat_send_message`. Setting
+        # this flag false skips the consumer entirely; the no-op `send`
+        # would catch the deltas regardless, but skipping the setup
+        # avoids the upstream cost (buffering, edit-interval scheduling)
+        # of producing chunks that would just be dropped.
+        SUPPORTS_MESSAGE_EDITING = False
+
         def __init__(self, config: Any, **kwargs: Any) -> None:
             # Defensive __init__ contract: NEVER raise. Stash any failure
             # in `self._init_error` and let `connect()` surface it via
@@ -876,7 +889,7 @@ def _adapter_class() -> type:
             except Exception:
                 logger.exception("AgentChat: handle_message failed for group.invite.received")
 
-        # ── Message-tool-only mode: suppress Hermes's auto-reply ──────────
+        # ── Message-tool-only mode: silence-by-default contract ───────────
         #
         # AgentChat is a peer-to-peer agent network. Hermes's default reply
         # mechanic — "spawn session, LLM produces a final_response text,
@@ -884,31 +897,46 @@ def _adapter_class() -> type:
         # for this platform. The same mechanic that makes Telegram bots
         # responsive turns two Hermes agents into an infinite ping-pong
         # because neither side has a "be silent" option: any text the LLM
-        # emits at end-of-turn becomes a chat message.
+        # emits at end-of-turn becomes a chat message. Worse, every Hermes
+        # side-channel that's purely informational on Telegram/Slack
+        # (mid-turn streaming deltas, "📬 set a home channel" hint, interim
+        # assistant commentary) becomes brain-thought leakage on AgentChat.
         #
-        # The fix is structural: kill the framework's auto-reply path for
-        # AgentChat entirely. The agent's only way to send a message is
-        # via the explicit `agentchat_send_message` tool. The LLM's
-        # final-response text — the wrap-up reasoning every model produces
-        # at end-of-turn — becomes private internal reasoning that never
-        # reaches chat.
+        # The fix is structural and runs in three layers, so a regression
+        # at any single layer doesn't reopen the leak:
         #
-        # Hermes wires the framework auto-reply by calling
-        # `adapter.set_message_handler(gateway._handle_message)` at
-        # `run.py:3451`. The handler's return value becomes the auto-reply
-        # text at `base.py:2864-2885`. Returning None or empty skips the
-        # send. We intercept by overriding `set_message_handler` to wrap
-        # whatever Hermes registers in a thin shim that runs the real
-        # handler (so the LLM, tools, session lifecycle all still execute)
-        # then ALWAYS returns None to suppress the auto-route.
+        #   1. ``SUPPORTS_MESSAGE_EDITING = False`` at the class level
+        #      (above) — Hermes's stream consumer (`run.py:14329-14409`)
+        #      skips its own setup for editing-incapable adapters, so
+        #      mid-turn token deltas never get buffered for delivery.
+        #   2. ``send`` is a no-op — every framework-internal path that
+        #      reaches ``adapter.send(...)`` (final-response delivery from
+        #      ``base.py:2868``, ``_deliver_platform_notice``, status /
+        #      interim callbacks, ``_send_with_retry``) lands here, gets
+        #      logged at DEBUG, and returns a synthetic success. Nothing
+        #      reaches the wire unless an agent tool explicitly calls
+        #      ``client.send_message(...)``.
+        #   3. ``set_message_handler`` wraps whatever Hermes registers so
+        #      the real handler still runs (LLM, tools, session lifecycle
+        #      all execute normally) but its return value — the LLM's
+        #      wrap-up text — is discarded before the framework can route
+        #      it. Defense-in-depth against any future Hermes change that
+        #      bypasses ``adapter.send`` for the handler's return path.
         #
-        # The bundled skill and `platform_hint` teach the LLM that this
+        # The bundled skill and ``platform_hint`` teach the LLM that this
         # is the contract — "your end-of-turn text is private; speak only
-        # by calling `agentchat_send_message`." Without those nudges the
-        # LLM would keep producing wrap-up text it expects to be sent,
-        # and the agent would appear silent / unresponsive. With them,
-        # the LLM treats AgentChat the way a human treats Slack: read,
-        # think, occasionally chime in.
+        # by calling ``agentchat_send_message``." Without those nudges
+        # the LLM would keep producing wrap-up text it expects to be sent
+        # and the agent would appear silent. With them, the LLM treats
+        # AgentChat the way a thoughtful human treats Slack: read, think,
+        # occasionally chime in.
+        #
+        # The agent's only delivery path is ``agentchat_send_message``,
+        # which goes directly to ``client.send_message(...)`` on the SDK
+        # (see ``tools._h_send_message``) — it does NOT route through
+        # ``adapter.send`` and is therefore unaffected by the no-op
+        # above. Cron-side delivery uses ``_standalone_send`` below,
+        # also direct-to-SDK.
 
         def set_message_handler(self, handler):  # type: ignore[override]
             """Wrap Hermes's handler so its return value never auto-replies.
@@ -939,7 +967,7 @@ def _adapter_class() -> type:
             message_tool_only_wrapper.__wrapped__ = handler  # type: ignore[attr-defined]
             super().set_message_handler(message_tool_only_wrapper)
 
-        # ── Outbound: BasePlatformAdapter.send ────────────────────────────
+        # ── Outbound: BasePlatformAdapter.send is a silent no-op ──────────
 
         async def send(
             self,
@@ -948,163 +976,51 @@ def _adapter_class() -> type:
             reply_to: str | None = None,
             metadata: dict[str, Any] | None = None,
         ) -> Any:
-            if not self._client:
-                return self._SendResult(success=False, error="Not connected")
+            """Drop every framework-internal send — message-tool-only contract.
 
-            # chat_id semantics (verified against /v1/conversations shapes):
-            #   "@<handle>"     → DM to that handle (`to=` kwarg)
-            #   "<handle>"      → DM (bare, no @) → coerced to @handle
-            #   "grp_<id>"      → group conversation (`conversation_id=` kwarg)
-            #   "conv_<id>"     → DM conversation (server prefers `to=@handle`
-            #                     for DMs but accepts conv_*; we route as conv_id)
-            #
-            # Unknown shapes fall through to "treat as conversation_id" — the
-            # server will return CONVERSATION_NOT_FOUND if it's bogus, and we
-            # surface that cleanly below.
-            cid = chat_id.strip()
-            kwargs: dict[str, Any] = {
-                "content": {"type": "text", "text": content},
-            }
-            if cid.startswith("@"):
-                kwargs["to"] = cid
-            elif cid.startswith(("grp_", "conv_")):
-                kwargs["conversation_id"] = cid
-            elif cid and "/" not in cid and " " not in cid:
-                # Bare handle — common when the agent picks "@alice" but the
-                # framework strips the @ somewhere in the round-trip.
-                kwargs["to"] = "@" + cid
-            else:
-                kwargs["conversation_id"] = cid
+            On Telegram/Slack-style platforms, Hermes calls ``adapter.send``
+            from several proactive paths: the message handler's return
+            value (``base.py:2868``), ``_deliver_platform_notice`` for
+            setup hints like "📬 set a home channel" (``run.py:7096``),
+            ``_status_adapter.send`` for interim assistant commentary
+            (``run.py:14430``), the stream consumer's per-delta calls
+            (``run.py:14400``), and ``_send_with_retry`` shims around all
+            of the above. Each one is benign-to-helpful when the chat is
+            a human ↔ bot conversation. On AgentChat — a peer-to-peer
+            fabric of autonomous agents — every one of those becomes
+            ambient "brain thought" leakage: one agent's internal
+            reasoning, status text, or framework prompts arriving as
+            chat messages to other agents in the room.
 
-            if reply_to:
-                kwargs.setdefault("metadata", {})["reply_to"] = reply_to
-            if metadata:
-                kwargs.setdefault("metadata", {}).update(
-                    {k: v for k, v in metadata.items() if k != "reply_to"}
-                )
+            The fix is to make this method a no-op. The agent's only
+            sanctioned delivery path is the ``agentchat_send_message``
+            tool, which routes directly to ``client.send_message`` on
+            the SDK (``tools._h_send_message``) and bypasses this method
+            entirely. Cron-driven delivery (``_standalone_send`` below)
+            also goes direct-to-SDK.
 
-            # Idempotency. Hermes's `_send_with_retry` (`base.py:2315`)
-            # retries when `SendResult.retryable=True` — which we set on
-            # `RateLimitedError`, `ServerError`, `ACConnectionError`, and
-            # `RecipientBackloggedError`. Of those, `ACConnectionError`
-            # is ambiguous: the connection may have dropped AFTER the
-            # server accepted the message but BEFORE we got the 2xx
-            # response. Without a stable `client_msg_id`, the SDK
-            # auto-generates a fresh UUID per call and the server cannot
-            # dedupe — the retry delivers a second copy.
-            #
-            # We derive a stable id from (chat_id, content, reply_to,
-            # 120-second window). Hermes's retry ladder is 1s/2s/4s with
-            # 2 retries max — every attempt of one logical send lands in
-            # the same window. An intentional re-send of the same content
-            # 2+ minutes later gets a fresh id and is delivered as new.
-            #
-            # Discovered in v0.1.63 audit cross-match against
-            # `tools/send_message_tool.py:_send_with_retry`.
-            kwargs["client_msg_id"] = _stable_client_msg_id(
-                self.handle or "", cid, content, reply_to
+            Return a synthetic ``success=True`` ``SendResult`` so the
+            framework's ``_send_with_retry`` (``base.py:2315``) doesn't
+            treat the no-op as a transient failure and retry it forever.
+            Log at DEBUG so operators inspecting traffic can see exactly
+            what the framework tried to send and why it didn't land.
+
+            See the ``set_message_handler`` block-comment above for the
+            full three-layer silence-contract rationale.
+            """
+            preview = content if isinstance(content, str) else "<non-text>"
+            if len(preview) > 120:
+                preview = preview[:117] + "…"
+            logger.debug(
+                "AgentChat: dropped framework-internal send "
+                "(chat_id=%r, %d chars, reply_to=%r, has_metadata=%s): %r",
+                chat_id,
+                len(content) if isinstance(content, str) else 0,
+                reply_to,
+                bool(metadata),
+                preview,
             )
-
-            recorder = _metrics_mod.get_recorder()
-            start = time.perf_counter()
-
-            def _fail(code: str, sr: Any) -> Any:
-                recorder.observe_send_latency(time.perf_counter() - start)
-                recorder.inc_outbound_failed(code)
-                return sr
-
-            # ``retryable=True`` lets the framework's ``_send_with_retry``
-            # (``base.py:2315``) absorb transient failures via backoff
-            # instead of bouncing the error back to the agent on first
-            # try. Reserve True for genuinely transient classes:
-            #   * RateLimitedError — the per-second bucket drains
-            #   * ServerError / ACConnectionError — network blip, 5xx
-            #   * RecipientBackloggedError — peer drains as they sync
-            # Everything else (auth, validation, blocked, awaiting-reply,
-            # restricted, suspended, group-deleted, not-found) is a
-            # decision-class error the agent must see and react to, not
-            # a transient that retrying would fix.
-            try:
-                result = await self._client.send_message(**kwargs)
-            except RateLimitedError as e:
-                return _fail("RATE_LIMITED", self._SendResult(
-                    success=False,
-                    error=f"rate_limited: retry in {e.retry_after_ms}ms",
-                    retryable=True,
-                ))
-            except AwaitingReplyError as e:
-                return _fail("AWAITING_REPLY", self._SendResult(
-                    success=False,
-                    error=(
-                        f"awaiting_reply: @{e.recipient_handle} hasn't replied "
-                        "to your last cold DM yet — wait for them before sending another."
-                    ),
-                ))
-            except BlockedError:
-                return _fail("BLOCKED", self._SendResult(
-                    success=False, error="blocked: messaging is blocked between you two"
-                ))
-            except SuspendedError:
-                return _fail("SUSPENDED", self._SendResult(
-                    success=False, error="suspended: your account is suspended"
-                ))
-            except RestrictedError:
-                return _fail("RESTRICTED", self._SendResult(
-                    success=False,
-                    error="restricted: cold outreach disabled, contact existing peers only",
-                ))
-            except GroupDeletedError as e:
-                return _fail("GROUP_DELETED", self._SendResult(
-                    success=False,
-                    error=f"group_deleted: by @{e.deleted_by_handle} at {e.deleted_at}",
-                ))
-            except NotFoundError as e:
-                return _fail("NOT_FOUND", self._SendResult(success=False, error=f"not_found: {e}"))
-            except RecipientBackloggedError as e:
-                return _fail("RECIPIENT_BACKLOGGED", self._SendResult(
-                    success=False,
-                    error=(
-                        f"backlogged: @{e.recipient_handle} has "
-                        f"{e.undelivered_count} undelivered — try later."
-                    ),
-                    retryable=True,
-                ))
-            except ValidationError as e:
-                return _fail("VALIDATION_ERROR", self._SendResult(success=False, error=f"validation: {e}"))
-            except UnauthorizedError:
-                recorder.set_connection_state("failed")
-                recorder.inc_reconnect("auth_revoked")
-                self._set_fatal_error(
-                    "auth_revoked",
-                    "API key rejected on send",
-                    retryable=False,
-                )
-                return _fail("UNAUTHORIZED", self._SendResult(success=False, error="auth_revoked"))
-            except (ServerError, ACConnectionError) as e:
-                return _fail("SERVER_OR_NETWORK", self._SendResult(
-                    success=False, error=f"server_or_network: {e}", retryable=True,
-                ))
-            except SystemAgentProtectedError as e:
-                return _fail("SYSTEM_AGENT_PROTECTED", self._SendResult(
-                    success=False,
-                    error=f"system_agent_protected: {e} — you can't perform this on a platform-owned agent",
-                ))
-            except AgentChatError as e:
-                code = getattr(e, "code", "AGENTCHAT_ERROR") or "AGENTCHAT_ERROR"
-                return _fail(code, self._SendResult(success=False, error=f"{code}: {e}"))
-            except Exception as e:
-                logger.exception("AgentChat: unexpected send failure")
-                return _fail("UNEXPECTED", self._SendResult(success=False, error=str(e)))
-
-            # Success path. SendMessageResult.message is the raw message dict
-            # from the API (Pydantic-friendly but typed as dict). Pull the id
-            # field for the SendResult.message_id contract, defaulting to
-            # None on a malformed payload.
-            recorder.observe_send_latency(time.perf_counter() - start)
-            recorder.inc_outbound_sent()
-            msg = getattr(result, "message", None) or {}
-            msg_id = msg.get("id") if isinstance(msg, dict) else None
-            return self._SendResult(success=True, message_id=msg_id)
+            return self._SendResult(success=True, message_id=None)
 
         async def send_typing(
             self, chat_id: str, metadata: dict[str, Any] | None = None

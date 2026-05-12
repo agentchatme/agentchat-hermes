@@ -1,4 +1,4 @@
-"""Tests for the message-tool-only mode (the 0.1.73 silence-by-default fix).
+"""Tests for the message-tool-only mode (silence-by-default contract).
 
 AgentChat is peer-to-peer between agents. Hermes's framework default is
 "reactive bot" — every inbound spawns a session, the LLM's final text
@@ -7,17 +7,24 @@ bot talks to a human; it breaks AgentChat because two agents would both
 auto-reply to every message forever (and they'd auto-reply WITH their
 turn-end reasoning text, producing slop on top of the loop).
 
-The fix: override `set_message_handler` to wrap whatever Hermes
-registers in a shim that runs the real handler (so the LLM, tools,
-session lifecycle all still execute) and then ALWAYS returns None to
-suppress the framework's auto-reply. The agent's only path to chat
-becomes the explicit `agentchat_send_message` tool.
+The silence contract has three layers, each tested below:
 
-These tests pin down that:
-  * `set_message_handler` wraps Hermes's handler
-  * The wrapped handler returns None unconditionally
-  * Exceptions in the inner handler are caught (not propagated)
-  * The inner handler is still called (so tools / session still run)
+  1. ``SUPPORTS_MESSAGE_EDITING = False`` on the class — Hermes's stream
+     consumer (``run.py:14363``) skips setup for editing-incapable
+     adapters, killing mid-turn streaming-delta leakage at the source.
+     Added in 0.1.75 after 0.1.73's set_message_handler override alone
+     was found to miss the streaming path (and the per-turn intermediate
+     "Let me check ..." assistant text leaked into the group).
+  2. ``adapter.send`` is a no-op — every framework-internal proactive
+     send (final-response delivery, ``_deliver_platform_notice``, status
+     callbacks, interim assistant messages, stream consumer fallback)
+     reaches ``adapter.send`` and is dropped. The agent's only sanctioned
+     delivery path is the ``agentchat_send_message`` tool, which calls
+     ``client.send_message`` directly and bypasses this method.
+  3. ``set_message_handler`` wraps Hermes's handler so its return value
+     (the LLM's wrap-up text) is always ``None``. Defense-in-depth
+     against any future Hermes change that bypasses ``adapter.send``
+     for the handler's return path.
 """
 
 from __future__ import annotations
@@ -209,3 +216,114 @@ def test_platform_hint_no_handle_also_teaches_contract(monkeypatch):
     hint = _build_platform_hint()
     assert "silence" in hint.lower() or "silent" in hint.lower()
     assert "agentchat_send_message" in hint
+
+
+# ── Layer 1: stream consumer is skipped via SUPPORTS_MESSAGE_EDITING ────────
+
+
+def test_supports_message_editing_is_false(monkeypatch):
+    """The class attribute that gates Hermes's stream consumer must be
+    False. Hermes reads it via ``getattr(adapter, "SUPPORTS_MESSAGE_EDITING",
+    True)`` (``run.py:14363``); any truthy value reopens the streaming path
+    and intermediate "thinking" text starts leaking into chat again.
+
+    Pinned as a class attribute (not instance) so the value is queryable
+    without constructing the adapter and so subclasses inherit it."""
+    inst = _adapter(monkeypatch)
+    assert type(inst).SUPPORTS_MESSAGE_EDITING is False, (
+        "AgentChatAdapter must declare SUPPORTS_MESSAGE_EDITING = False "
+        "so Hermes skips stream consumer setup — otherwise mid-turn "
+        "token deltas leak into chat bypassing both the handler wrapper "
+        "and adapter.send"
+    )
+
+
+# ── Layer 2: adapter.send is a no-op for every Hermes-internal path ────────
+
+
+async def test_send_is_noop_and_returns_synthetic_success(monkeypatch):
+    """Every framework-internal call to ``adapter.send`` must drop the
+    message and return ``success=True`` so ``_send_with_retry``
+    (``base.py:2315``) doesn't retry forever. The agent's tool path uses
+    ``client.send_message`` directly and is unaffected by this no-op."""
+    inst = _adapter(monkeypatch)
+    # Sentinel client to assert it's never reached.
+    sent_calls: list = []
+
+    class _SentinelClient:
+        async def send_message(self, **kwargs):
+            sent_calls.append(kwargs)
+            raise AssertionError(
+                "adapter.send must NOT reach the SDK — it's a no-op "
+                "to enforce message-tool-only silence"
+            )
+
+    inst._client = _SentinelClient()
+
+    result = await inst.send("grp_abc", "this would be framework-internal text")
+
+    assert sent_calls == [], "SDK send_message must not be invoked"
+    assert getattr(result, "success", None) is True, (
+        "no-op must return synthetic success so Hermes doesn't retry"
+    )
+    assert getattr(result, "message_id", "missing") is None, (
+        "no message was sent, so message_id must be None — anything else "
+        "would lie to the framework"
+    )
+
+
+async def test_send_noop_works_when_client_not_initialized(monkeypatch):
+    """If Hermes calls ``adapter.send`` before/after the SDK client is
+    open (early-startup notice, post-disconnect drain), the no-op must
+    still return success — surfacing 'not connected' would just trigger
+    retry loops for a send we don't want to make anyway."""
+    inst = _adapter(monkeypatch)
+    inst._client = None  # simulate not-yet-connected / disconnected
+
+    result = await inst.send("@alice", "hi")
+    assert getattr(result, "success", None) is True
+    assert getattr(result, "message_id", "missing") is None
+
+
+async def test_send_noop_accepts_all_chat_id_shapes(monkeypatch):
+    """The no-op must not raise on any chat_id shape Hermes might pass
+    (DM @handle, conversation_id, group id, raw string). Hermes
+    auto-discovers chat ids from inbound events and from internal state
+    like ``home_channel`` — we don't get to dictate the shape."""
+    inst = _adapter(monkeypatch)
+    inst._client = object()  # any truthy non-SDK sentinel
+
+    for chat_id in [
+        "@alice",
+        "grp_HtQbKsui6aXtnYGB",
+        "conv_F8QIXjhXM4h1uCdM",
+        "bare-handle-no-prefix",
+        "weird/slashed/value",  # we just don't crash
+        "",                     # empty edge case
+    ]:
+        result = await inst.send(chat_id, "x")
+        assert getattr(result, "success", None) is True, (
+            f"no-op must accept chat_id={chat_id!r} without raising"
+        )
+
+
+async def test_send_noop_drops_platform_notice_payload(monkeypatch):
+    """Smoke test for the specific user-visible regression that prompted
+    this fix: Hermes's '📬 No home channel is set' notice
+    (``run.py:7090``) calls ``adapter.send`` with a multi-line setup
+    string. Without the no-op, this lands in the group on every fresh
+    install and is the first message the operator's agent sends — to
+    *other* agents — before the operator can say anything."""
+    inst = _adapter(monkeypatch)
+    inst._client = object()
+
+    notice = (
+        "📬 No home channel is set for Agentchat. "
+        "A home channel is where Hermes delivers cron job results "
+        "and cross-platform messages.\n\n"
+        "Type /sethome to make this chat your home channel, "
+        "or ignore to skip."
+    )
+    result = await inst.send("grp_abc", notice)
+    assert getattr(result, "success", None) is True
+    assert getattr(result, "message_id", "missing") is None
