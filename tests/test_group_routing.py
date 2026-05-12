@@ -162,6 +162,76 @@ async def test_message_new_with_dir_prefix_classifies_as_dm(monkeypatch):
     assert event.source.chat_id == "@alice"
 
 
+async def test_system_message_member_joined_is_dropped_not_dispatched(monkeypatch):
+    """Server-side `type: system` notifications (member_joined,
+    member_left, settings changes) must NOT spawn an agent turn.
+
+    Before this fix the adapter stringified them as `[system] {json}`
+    and dispatched through handle_message, so Hermes spawned a session,
+    the agent ran tool calls trying to interpret the JSON, and then
+    spammed the group with 1-2 messages per event. When the operator
+    added the bot to a group, multiple member_joined events fired
+    back-to-back; the agent posted ~10 messages in quick succession.
+
+    Now: log + metric, but no handle_message dispatch."""
+    inst = _adapter(monkeypatch)
+    frame = {
+        "type": "message.new",
+        "payload": {
+            "id": "msg_sys_1",
+            "sender": "@vibecoder-vinny",
+            "conversation_id": "grp_HtQbKsui6aXtnYGB",
+            "type": "system",
+            "content": {
+                "type": "system",
+                "data": {
+                    "event": "member_joined",
+                    "agent_handle": "fyi-john-4321",
+                },
+            },
+        },
+    }
+    await inst._on_realtime_frame(frame)
+    # Critical: handle_message must NOT have been called for a system event.
+    inst.handle_message.assert_not_called()
+
+
+async def test_system_message_settings_change_is_dropped(monkeypatch):
+    """Same protection for non-join system events."""
+    inst = _adapter(monkeypatch)
+    frame = {
+        "type": "message.new",
+        "payload": {
+            "id": "msg_sys_2",
+            "sender": "@admin",
+            "conversation_id": "grp_xyz",
+            "type": "system",
+            "content": {"type": "system", "data": {"event": "group_settings_changed"}},
+        },
+    }
+    await inst._on_realtime_frame(frame)
+    inst.handle_message.assert_not_called()
+
+
+async def test_text_message_still_dispatches_after_system_drop(monkeypatch):
+    """Sanity: dropping system events doesn't break the text path."""
+    inst = _adapter(monkeypatch)
+    frame = {
+        "type": "message.new",
+        "payload": {
+            "id": "msg_real",
+            "sender": "@vibecoder-vinny",
+            "conversation_id": "grp_xyz",
+            "type": "text",
+            "content": {"type": "text", "text": "hello group"},
+        },
+    }
+    await inst._on_realtime_frame(frame)
+    inst.handle_message.assert_awaited_once()
+    event = inst.handle_message.await_args.args[0]
+    assert event.text == "hello group"
+
+
 # ── Outbound routing ────────────────────────────────────────────────────────
 
 

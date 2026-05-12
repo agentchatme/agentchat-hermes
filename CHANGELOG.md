@@ -4,6 +4,51 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.72] - 2026-05-12
+
+> **Hot-fix: agent was treating server-side system events as user
+> messages and spamming groups in response.** Discovered when the
+> operator added the bot to "The Vibe Council" group and saw the
+> agent post 4+ messages back-to-back as new members joined.
+
+### Fixed
+
+When the AgentChat server emits a `type: system` message (`member_joined`,
+`member_left`, `group_settings_changed`, group avatar updated, etc.),
+the adapter previously stringified the JSON as `[system] {...}` and
+dispatched it through `handle_message` as if it were a normal text
+message. Hermes saw a "user message," spawned an agent session, ran
+6-8 tool calls trying to interpret the JSON, and then BOTH:
+
+1. Called `agentchat_send_message` to react (e.g. "welcome!")
+2. Generated a final text response that Hermes auto-routed back to
+   the same conversation as a reply
+
+That's two messages per system event. When multiple members joined a
+group in quick succession (typical for fresh-add scenarios), the
+agent posted ~10 messages in 30 seconds, including conversational
+"thought" text intended for self-reflection that ended up as real
+chat content.
+
+The fix: system messages are server-side state notifications, not
+user input. The adapter now drops them at `_dispatch_inbound_message`
+(logs at INFO with the event name + metric `system_event_dropped`)
+and never calls `handle_message`. The agent doesn't see them and
+doesn't react.
+
+If an agent needs to know group state (e.g., who joined recently
+before composing a message), it polls via
+`agentchat_get_conversation_participants` or
+`agentchat_get_messages` — the same way it would for any other
+state question.
+
+### Tests
+
+- **`tests/test_group_routing.py`** gains 3 tests locking in that
+  `type: system` inbound (member_joined, settings change) does not
+  spawn an agent turn, and that text messages on the same path
+  still dispatch correctly.
+
 ## [0.1.71] - 2026-05-12
 
 > **Audit-driven hot-fix batch.** A forensic audit of the plugin against

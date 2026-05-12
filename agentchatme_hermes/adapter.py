@@ -614,6 +614,41 @@ def _adapter_class() -> type:
             content_obj = payload.get("content") or {}
             ac_type = payload.get("type", "text")
 
+            # System messages from the AgentChat server (member_joined,
+            # member_left, settings changed, group avatar updated, etc.)
+            # are SERVER-SIDE NOTIFICATIONS, not user input.
+            #
+            # Previously (v0.1.71 and earlier) we stringified them as
+            # `[system] {json}` and dispatched them through
+            # `handle_message`. Hermes saw a "user message", spawned an
+            # agent session, the agent ran 7 tool calls trying to make
+            # sense of the JSON, and then BOTH:
+            #   (a) called `agentchat_send_message` to react ("welcome!")
+            #   (b) emitted a final text response, which Hermes
+            #       auto-routed back to the same conversation
+            # That's 2 messages per system event. When the operator
+            # added the bot to "The Vibe Council", multiple
+            # `member_joined` events fired back-to-back; the agent
+            # spammed the group with welcomes + thought-narrations.
+            #
+            # The right behavior: drop. Agents don't need to react to
+            # server-side state changes. When they DO need to know the
+            # group's state (e.g., before composing a message), they
+            # poll `agentchat_get_conversation_participants` or
+            # `agentchat_list_group_invites`. Fixed in v0.1.72.
+            if ac_type == "system":
+                event_kind = (
+                    content_obj.get("data", {}).get("event")
+                    if isinstance(content_obj.get("data"), dict)
+                    else None
+                ) or "unknown"
+                logger.info(
+                    "AgentChat: dropped system event '%s' in %s (server-side notification, not user input)",
+                    event_kind, conversation_id or "?",
+                )
+                _metrics_mod.get_recorder().inc_inbound("system_event_dropped")
+                return
+
             # Render content as a single text string for the agent. The
             # raw payload is preserved on raw_message so an agent that
             # wants the structured shape can read it.
@@ -648,14 +683,6 @@ def _adapter_class() -> type:
                 else:
                     message_type = self._MessageType.DOCUMENT
                     text = f"[attachment {att_id}]"
-            elif ac_type == "system":
-                # System messages from the platform itself (group joined,
-                # member kicked, etc.) — render the data as JSON so the
-                # agent has something to read; the bundled SKILL teaches
-                # how to interpret common shapes.
-                text = "[system] " + json.dumps(
-                    content_obj, ensure_ascii=False, separators=(",", ":")
-                )
             else:
                 # Unknown content type — opaque JSON. Don't drop the
                 # message; let the agent decide.
