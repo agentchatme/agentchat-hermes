@@ -904,9 +904,10 @@ def _adapter_class() -> type:
             cid = chat_id.strip()
             if cid.startswith("grp_"):
                 kind = "group"
-            elif cid.startswith(("conv_", "dir_")) or cid.startswith("@"):
-                kind = "dm"
-            elif cid and "/" not in cid and " " not in cid:
+            elif (
+                cid.startswith(("conv_", "dir_", "@"))
+                or (cid and "/" not in cid and " " not in cid)
+            ):
                 kind = "dm"
             else:
                 kind = "group"
