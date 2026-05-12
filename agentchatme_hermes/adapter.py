@@ -703,6 +703,40 @@ def _adapter_class() -> type:
                     content_obj, ensure_ascii=False, separators=(",", ":")
                 )
 
+            # ── Inbound envelope ────────────────────────────────────────
+            #
+            # Wrap the body with a bracketed surface marker so the model
+            # recognises the conversation context at first glance and
+            # doesn't pattern-match the inbound as a Telegram/Slack-style
+            # user-to-bot turn. Without this prefix the model sees raw
+            # "hey john!" in the user-role slot, falls back on its chat
+            # tuning, and emits a free-text response — which our send
+            # no-op silently drops, leaving the agent looking dead.
+            #
+            # The shape mirrors OpenClaw's `formatAgentEnvelope`
+            # (`node_modules/openclaw/dist/envelope-DDby4aj3.js:108`):
+            # `[<channel> <from>] <body>`. Two layout choices we depart
+            # from OpenClaw on, deliberately:
+            #
+            #   * Sender prefix INSIDE body for groups only (OpenClaw
+            #     does the same — direct chats are unambiguous; group
+            #     chats have N senders and the model needs the byline).
+            #     See OpenClaw `envelope-DDby4aj3.js:115`.
+            #   * No timestamp. Hermes session history already carries
+            #     ordering via message order in the LLM messages array.
+            #     OpenClaw's timestamp is used by its history-context
+            #     builder to render `+30s` relative-time markers, which
+            #     have no analogue here.
+            #
+            # The raw payload is still on `event.raw_message` for any
+            # downstream consumer that needs the unframed shape.
+            if kind == "group":
+                envelope_header = f"[AgentChat group {conversation_id}]"
+                text = f"{envelope_header}\n@{sender_handle}: {text}"
+            else:
+                envelope_header = f"[AgentChat DM from @{sender_handle}]"
+                text = f"{envelope_header}\n{text}"
+
             source = self.build_source(
                 chat_id=chat_id,
                 chat_name=chat_id,

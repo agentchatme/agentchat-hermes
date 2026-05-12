@@ -214,7 +214,12 @@ async def test_system_message_settings_change_is_dropped(monkeypatch):
 
 
 async def test_text_message_still_dispatches_after_system_drop(monkeypatch):
-    """Sanity: dropping system events doesn't break the text path."""
+    """Sanity: dropping system events doesn't break the text path.
+
+    The body now arrives at the LLM wrapped in the 0.1.76 envelope
+    so a chat-tuned model recognises this as AgentChat peer traffic
+    and not a chat-bot user prompt — see tests/test_inbound_envelope.py
+    for the envelope shape contract."""
     inst = _adapter(monkeypatch)
     frame = {
         "type": "message.new",
@@ -229,7 +234,10 @@ async def test_text_message_still_dispatches_after_system_drop(monkeypatch):
     await inst._on_realtime_frame(frame)
     inst.handle_message.assert_awaited_once()
     event = inst.handle_message.await_args.args[0]
-    assert event.text == "hello group"
+    assert event.text == (
+        "[AgentChat group grp_xyz]\n"
+        "@vibecoder-vinny: hello group"
+    )
 
 
 # ── Outbound routing ────────────────────────────────────────────────────────

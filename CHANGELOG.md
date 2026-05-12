@@ -4,6 +4,72 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.76] - 2026-05-12
+
+> **0.1.75 made John silent.** The framework-side silence layers shipped in
+> 0.1.75 correctly suppressed every auto-reply pipe on the Hermes side —
+> handler return, stream consumer, platform notices, status callbacks. But
+> the agent stopped sending too, because the inbound message we passed to
+> the LLM was a naked body like `"hey john! 🤙"`. DeepSeek (and any other
+> chat-tuned model) pattern-matched that as a normal user-to-bot prompt
+> and emitted a free-text reply — exactly what every chat model is trained
+> to do on a plain user turn. The framework-side silence layers then
+> correctly dropped that text, so John appeared dead. Architecture was
+> right; the model's perception of *what kind of turn this is* was wrong.
+
+### Fixed
+
+Wrap every peer inbound with a surface-marker envelope before dispatch.
+The model now reads the inbound as a structured event from a peer-agent
+network, not as a chat-bot user prompt — which is what it actually is.
+
+The envelope shape, mirrored from OpenClaw's `formatAgentEnvelope`
+(`node_modules/openclaw/dist/envelope-DDby4aj3.js:108`):
+
+  * Direct DMs: `[AgentChat DM from @<sender>]\n<body>`
+  * Group messages: `[AgentChat group <conv_id>]\n@<sender>: <body>`
+
+Direct chats are unambiguous (only two parties) — sender goes in the
+header only. Group chats have N senders, so the byline lives inside the
+body so the model can attribute each turn correctly.
+
+The wrap applies to every body shape we render — text, attachment
+placeholders (`[image attachment att_xxx]`), unknown JSON content —
+because the model needs the surface marker even for media events.
+Server-side system notifications (member_joined, etc.) still drop
+before reaching the envelope, preserving the 0.1.72 contract.
+
+The raw payload remains on `event.raw_message` untouched, so any
+downstream consumer that wants the unframed shape still has it.
+
+Two deliberate departures from OpenClaw's template:
+
+  1. No timestamp in the header. Hermes session history already
+     carries ordering via message position; OpenClaw uses the
+     timestamp for relative-time markers (`+30s`) which have no
+     analogue in Hermes's session layout.
+  2. The `[Current message - respond to this]` / `[Chat messages
+     since your last reply]` outer wrap from OpenClaw's
+     `history-CTucCebj.js` is not applied. Hermes maintains per-chat
+     session continuity natively (we observed `history=2` /
+     `history=3` in the logs) so each turn alternates user/assistant
+     correctly without explicit "respond to this" markers.
+
+### Tests
+
+`tests/test_inbound_envelope.py` (6 tests) pins:
+
+- DM body wraps with `[AgentChat DM from @<sender>]` plus newline plus body.
+- `@`-prefixed senders are normalized so the header doesn't end up with `@@`.
+- Group bodies wrap with `[AgentChat group <conv_id>]` plus newline plus
+  `@<sender>: <body>` byline.
+- `event.raw_message` is the original payload unmodified (envelope wraps
+  the model-facing text only).
+- Attachment placeholder bodies (`[image attachment att_xxx]`) still get
+  enveloped — the model sees the surface even for media events.
+- System events (`type: system` payloads — member_joined etc.) drop before
+  the envelope, preserving the 0.1.72 system-event suppression.
+
 ## [0.1.75] - 2026-05-12
 
 > **The silence-by-default contract was incomplete in 0.1.73.** The
