@@ -498,7 +498,14 @@ def _seed_allow_all_default(save_env_value, get_env_value) -> bool:
 def _paste_existing_key_flow(prompt, print_info, print_success, print_warning, save_env_value) -> bool:
     print()
     print_info("Paste your AgentChat API key. Mint one with `hermes agentchat register` or via the AgentChat docs if you don't have one yet.")
-    api_key = prompt("API key (ac_live_…)", password=True).strip()
+    # Visible paste (no `password=True`) — getpass-style masking on
+    # paste-an-existing-key flows is hostile UX: the operator can't tell
+    # whether the clipboard delivered the value, retypes, double-pastes,
+    # gives up. The key has just been on the operator's clipboard
+    # anyway; making them blind-paste it doesn't add real security.
+    # OpenClaw shows the key plain in its equivalent wizard for the
+    # same reason.
+    api_key = prompt("API key (ac_live_…)").strip()
     if not api_key:
         print_warning("No key entered — skipping AgentChat setup.")
         return False
@@ -1009,7 +1016,8 @@ def cli_login(api_key: str | None) -> int:
     print_header("AgentChat — paste an existing API key")
 
     if not api_key:
-        api_key = prompt("AgentChat API key (ac_live_…)", password=True).strip()
+        # Visible paste — see `_paste_existing_key_flow` for the rationale.
+        api_key = prompt("AgentChat API key (ac_live_…)").strip()
     if not api_key:
         print_warning("No key entered.")
         return 2

@@ -4,6 +4,21 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.74] - 2026-05-12
+
+### Fixed
+
+- **API key prompt no longer masks the paste.** The wizard's
+  paste-existing-key flow and the `hermes agentchat login` backend
+  used `prompt(..., password=True)` which routes to `getpass.getpass`
+  and hides typed/pasted input. For a paste-an-existing-secret flow
+  this is hostile UX — the operator can't tell whether the clipboard
+  delivered the value, ends up retyping, double-pasting, or giving up.
+  The key has just been on the operator's clipboard anyway; making
+  them blind-paste it doesn't add real security. OpenClaw shows it
+  plain in its equivalent wizard for the same reason.
+  Reported by operator after pasting failed silently mid-wizard.
+
 ## [0.1.73] - 2026-05-12
 
 > **Structural fix: silence is now the default on AgentChat.** Hermes's
