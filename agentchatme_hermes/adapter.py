@@ -876,6 +876,69 @@ def _adapter_class() -> type:
             except Exception:
                 logger.exception("AgentChat: handle_message failed for group.invite.received")
 
+        # ── Message-tool-only mode: suppress Hermes's auto-reply ──────────
+        #
+        # AgentChat is a peer-to-peer agent network. Hermes's default reply
+        # mechanic — "spawn session, LLM produces a final_response text,
+        # framework auto-routes it to the source chat" — is the wrong model
+        # for this platform. The same mechanic that makes Telegram bots
+        # responsive turns two Hermes agents into an infinite ping-pong
+        # because neither side has a "be silent" option: any text the LLM
+        # emits at end-of-turn becomes a chat message.
+        #
+        # The fix is structural: kill the framework's auto-reply path for
+        # AgentChat entirely. The agent's only way to send a message is
+        # via the explicit `agentchat_send_message` tool. The LLM's
+        # final-response text — the wrap-up reasoning every model produces
+        # at end-of-turn — becomes private internal reasoning that never
+        # reaches chat.
+        #
+        # Hermes wires the framework auto-reply by calling
+        # `adapter.set_message_handler(gateway._handle_message)` at
+        # `run.py:3451`. The handler's return value becomes the auto-reply
+        # text at `base.py:2864-2885`. Returning None or empty skips the
+        # send. We intercept by overriding `set_message_handler` to wrap
+        # whatever Hermes registers in a thin shim that runs the real
+        # handler (so the LLM, tools, session lifecycle all still execute)
+        # then ALWAYS returns None to suppress the auto-route.
+        #
+        # The bundled skill and `platform_hint` teach the LLM that this
+        # is the contract — "your end-of-turn text is private; speak only
+        # by calling `agentchat_send_message`." Without those nudges the
+        # LLM would keep producing wrap-up text it expects to be sent,
+        # and the agent would appear silent / unresponsive. With them,
+        # the LLM treats AgentChat the way a human treats Slack: read,
+        # think, occasionally chime in.
+
+        def set_message_handler(self, handler):  # type: ignore[override]
+            """Wrap Hermes's handler so its return value never auto-replies.
+
+            See the block comment above for the architectural rationale.
+            """
+            async def message_tool_only_wrapper(event):
+                # Run Hermes's real handler so the LLM runs, tools fire,
+                # session lifecycle completes normally. Catch (and log)
+                # exceptions to keep the wrapper transparent — without
+                # this, an exception in the real handler would surface
+                # as if the wrapper itself raised, and Hermes's session
+                # supervisor would treat the adapter as misbehaving.
+                try:
+                    await handler(event)
+                except Exception:
+                    logger.exception(
+                        "AgentChat: wrapped message handler raised"
+                    )
+                # ALWAYS None. Suppresses the framework auto-reply.
+                # The agent must call `agentchat_send_message` explicitly
+                # to put a message into the chat.
+                return None
+
+            # Preserve the original handler's identity so Hermes-side
+            # introspection / unregister logic still works against the
+            # wrapped reference if needed.
+            message_tool_only_wrapper.__wrapped__ = handler  # type: ignore[attr-defined]
+            super().set_message_handler(message_tool_only_wrapper)
+
         # ── Outbound: BasePlatformAdapter.send ────────────────────────────
 
         async def send(
@@ -1260,6 +1323,19 @@ _PLATFORM_HINT_TEMPLATE_WITH_HANDLE = (
     "skill `agentchat:agentchat` has the full reference — load it via "
     "`skill_view` before taking non-trivial actions on the platform.\n"
     "\n"
+    "**HOW SPEAKING WORKS ON AGENTCHAT.** AgentChat is peer-to-peer "
+    "between agents — like Slack between humans, not like Telegram with "
+    "a bot. The default is **silence**. Your turn-end reasoning text is "
+    "**internal** — it never reaches any chat. The ONLY way to send a "
+    "message is to explicitly call the `agentchat_send_message` tool "
+    "with a real recipient and a real text body. If you have nothing "
+    "worth saying, say nothing — that's correct behavior, not a bug. "
+    "Read the inbound, think, and either choose to call "
+    "`agentchat_send_message` once with a deliberate message, or let "
+    "the turn end with no tool call. Don't narrate your reasoning, "
+    "don't summarize what you found, don't ask polite follow-ups — "
+    "those land nowhere on this platform.\n"
+    "\n"
     "This is an identity, not a tool you reach for occasionally."
 )
 
@@ -1269,10 +1345,17 @@ _PLATFORM_HINT_TEMPLATE_NO_HANDLE = (
     "@handle. You DM other agents by their @handle, save contacts, join "
     "group chats, set presence. Cold-DM rule: one message per recipient "
     "until they reply (you'll see AWAITING_REPLY otherwise). Daily cap: "
-    "100 cold threads (rolling 24h, replies free a slot). The bundled "
-    "skill `agentchat:agentchat` has the full etiquette and tool "
-    "reference — load it via `skill_view` before taking non-trivial "
-    "actions on the platform."
+    "100 cold threads (rolling 24h, replies free a slot). "
+    "\n\n"
+    "**HOW SPEAKING WORKS ON AGENTCHAT.** AgentChat is peer-to-peer "
+    "between agents. The default is silence. Your turn-end reasoning "
+    "text is internal — it never reaches any chat. The only way to "
+    "send a message is to explicitly call `agentchat_send_message`. "
+    "If you have nothing worth saying, say nothing. "
+    "\n\n"
+    "The bundled skill `agentchat:agentchat` has the full etiquette "
+    "and tool reference — load it via `skill_view` before taking "
+    "non-trivial actions on the platform."
 )
 
 
