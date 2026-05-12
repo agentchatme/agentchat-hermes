@@ -4,6 +4,67 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.70] - 2026-05-12
+
+> **Critical hot-fix.** Group messages were broken on every previous
+> version of the plugin. Inbound group messages were misclassified as
+> DMs, the agent's reply was routed back to the sender's private DM
+> instead of the group, and the group appeared silent to everyone
+> else. Discovered when the operator added the bot to "The Vibe
+> Council" group and saw replies arriving in DM.
+
+### Fixed
+
+Three cascading bugs in the same routing path:
+
+- **Inbound classification ignored the conversation_id.** The adapter
+  listened for a ``group.message`` realtime frame type — which the
+  AgentChat SDK does **not** emit (verified at
+  ``agentchatme/_realtime.py:563``: *"Invariant: for any conversation_id,
+  handlers see message.new envelopes"*). Every inbound, DM or group,
+  arrives as ``message.new``. Distinguishing DM from group requires
+  inspecting the payload's ``conversation_id`` prefix:
+  ``grp_*`` → group, ``conv_*`` / ``dir_*`` → direct. Fixed in
+  ``_on_realtime_frame`` to classify by prefix.
+
+- **Outbound send() didn't recognize the ``grp_*`` prefix.** Our
+  routing logic accepted ``conv_*`` as a conversation id and routed it
+  to the SDK's ``conversation_id=`` kwarg, but ``grp_*`` (the actual
+  group id shape) fell through to the bare-handle branch and got
+  sent as ``to=@grp_…`` — guaranteed reject. Fixed to recognize
+  ``grp_*``, ``conv_*``, ``dir_*`` as the canonical conversation-id
+  prefixes. Same fix applied to ``_standalone_send`` for cron.
+
+- **``get_chat_info`` had the classification backwards.** Said
+  ``conv_*`` was a group and ``grp_*`` was a DM. Fixed to match the
+  server convention.
+
+### How this slipped through previous versions
+
+The E2E harness on the VM tested REST tool dispatch and a single DM
+inbound. It never exercised a group inbound. Local unit tests had
+``kind="group"`` setups but they tested the dispatch helper directly,
+not the realtime frame router — so the bug in ``_on_realtime_frame``'s
+``kind = "group" if ftype == "group.message" else "direct"`` (always
+``"direct"`` because the SDK doesn't emit ``group.message``) was
+invisible to the test suite. The new ``tests/test_group_routing.py``
+exercises the full path: frame in → classification → chat_id routing
+→ outbound kwargs. 11 new regression tests.
+
+### VM verification
+
+After patching the running plugin and restarting the gateway,
+``gateway_state.json`` shows ``state: connected`` and the connect log
+fires cleanly. The operator can now retest the Vibe Council group
+exchange end-to-end.
+
+### Tests
+
+- **``tests/test_group_routing.py``** (11 tests) — locks down inbound
+  classification (``grp_*`` → group, ``conv_*`` / ``dir_*`` → direct,
+  via ``message.new`` frame type only), outbound routing (``grp_*`` →
+  ``conversation_id=``), and ``get_chat_info`` classification.
+
 ## [0.1.69] - 2026-05-11
 
 > Strip product-misfit options. The wizard previously offered an

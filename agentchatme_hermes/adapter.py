@@ -487,9 +487,26 @@ def _adapter_class() -> type:
             ftype = frame.get("type")
             recorder = _metrics_mod.get_recorder()
 
-            if ftype in ("message.new", "group.message"):
+            # The SDK's contract (`agentchatme/_realtime.py:563`) is:
+            # **every inbound message — DM or group — arrives as a
+            # `message.new` frame**. The `group.message` frame type we
+            # used to listen for does NOT exist in the SDK and never
+            # fires. To distinguish DM from group, we inspect the
+            # payload's `conversation_id` prefix: `grp_*` = group,
+            # anything else (`conv_*`, `dir_*`, etc.) = direct.
+            #
+            # Verified against `/v1/conversations` shapes:
+            #   DM:    {"id": "conv_IcwG…",  "type": "direct"}
+            #   Group: {"id": "grp_HtQb…",   "type": "group"}
+            #
+            # Before this fix every group message was misclassified as
+            # a DM, the agent's reply was routed via `to=@<sender>`
+            # back to the sender's private DM instead of the group, and
+            # the group appeared silent to everyone else.
+            if ftype == "message.new":
                 payload = frame.get("payload") or {}
-                kind = "group" if ftype == "group.message" else "direct"
+                conv_id = str(payload.get("conversation_id") or "")
+                kind = "group" if conv_id.startswith("grp_") else "direct"
                 recorder.inc_inbound("group_message" if kind == "group" else "message_new")
                 await self._dispatch_inbound_message(payload, kind=kind)
                 return
@@ -718,10 +735,13 @@ def _adapter_class() -> type:
             if not self._client:
                 return self._SendResult(success=False, error="Not connected")
 
-            # chat_id semantics:
-            #   "@<handle>"     → direct message to that handle
-            #   "<handle>"      → direct (handle without @, must look like a handle)
-            #   "conv_<id>"     → group conversation by canonical conversation_id
+            # chat_id semantics (verified against /v1/conversations shapes):
+            #   "@<handle>"     → DM to that handle (`to=` kwarg)
+            #   "<handle>"      → DM (bare, no @) → coerced to @handle
+            #   "grp_<id>"      → group conversation (`conversation_id=` kwarg)
+            #   "conv_<id>"     → DM conversation (`conversation_id=` also accepted,
+            #                     though the server prefers `to=@handle` for DMs)
+            #   "dir_<id>"      → DM conversation alias (same as conv_)
             #
             # Unknown shapes fall through to "treat as conversation_id" — the
             # server will return CONVERSATION_NOT_FOUND if it's bogus, and we
@@ -732,7 +752,7 @@ def _adapter_class() -> type:
             }
             if cid.startswith("@"):
                 kwargs["to"] = cid
-            elif cid.startswith("conv_"):
+            elif cid.startswith(("grp_", "conv_", "dir_")):
                 kwargs["conversation_id"] = cid
             elif cid and "/" not in cid and " " not in cid:
                 # Bare handle — common when the agent picks "@alice" but the
@@ -875,13 +895,21 @@ def _adapter_class() -> type:
             return None
 
         async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+            # Classification rules (server convention):
+            #   grp_*        → group
+            #   conv_*/dir_* → dm
+            #   @handle      → dm
+            #   bare handle  → dm
+            #   anything else → fallback to group (best-effort)
             cid = chat_id.strip()
-            if cid.startswith("conv_"):
+            if cid.startswith("grp_"):
                 kind = "group"
-            elif cid.startswith("@"):
+            elif cid.startswith(("conv_", "dir_")) or cid.startswith("@"):
+                kind = "dm"
+            elif cid and "/" not in cid and " " not in cid:
                 kind = "dm"
             else:
-                kind = "dm" if cid and "/" not in cid and " " not in cid else "group"
+                kind = "group"
             return {"name": cid, "type": kind}
 
     _AdapterCls = AgentChatAdapter
@@ -946,7 +974,7 @@ async def _standalone_send(
     }
     if cid.startswith("@"):
         kwargs["to"] = cid
-    elif cid.startswith("conv_"):
+    elif cid.startswith(("grp_", "conv_", "dir_")):
         kwargs["conversation_id"] = cid
     elif cid and "/" not in cid and " " not in cid:
         kwargs["to"] = "@" + cid
