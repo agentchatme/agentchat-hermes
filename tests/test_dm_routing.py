@@ -118,7 +118,7 @@ async def test_dm_inbound_sets_chat_id_to_sender_handle(monkeypatch):
 
     payload = {
         "id": "msg_abc",
-        "from": "@vibecoder-vinny",
+        "sender": "@vibecoder-vinny",
         "conversation_id": "conv_IcwGWLdUTRrTrdcN",
         "type": "text",
         "content": {"type": "text", "text": "hi there"},
@@ -142,7 +142,7 @@ async def test_group_inbound_keeps_conversation_id_as_chat_id(monkeypatch):
 
     payload = {
         "id": "msg_xyz",
-        "from": "@vibecoder-vinny",
+        "sender": "@vibecoder-vinny",
         "conversation_id": "conv_GroupRoom123",
         "type": "text",
         "content": {"type": "text", "text": "ping group"},
@@ -161,7 +161,7 @@ async def test_dm_inbound_normalizes_sender_handle_case(monkeypatch):
 
     payload = {
         "id": "msg_q",
-        "from": "@Vibecoder-Vinny",
+        "sender": "@Vibecoder-Vinny",
         "conversation_id": "conv_abc",
         "type": "text",
         "content": {"type": "text", "text": "yo"},

@@ -108,7 +108,7 @@ async def test_message_new_with_grp_conv_id_classifies_as_group(monkeypatch):
         "type": "message.new",
         "payload": {
             "id": "msg_g1",
-            "from": "@vibecoder-vinny",
+            "sender": "@vibecoder-vinny",
             "conversation_id": "grp_HtQbKsui6aXtnYGB",
             "type": "text",
             "content": {"type": "text", "text": "welcome to The Vibe Council"},
@@ -130,7 +130,7 @@ async def test_message_new_with_conv_id_classifies_as_dm(monkeypatch):
         "type": "message.new",
         "payload": {
             "id": "msg_d1",
-            "from": "@vibecoder-vinny",
+            "sender": "@vibecoder-vinny",
             "conversation_id": "conv_IcwGWLdUTRrTrdcN",
             "type": "text",
             "content": {"type": "text", "text": "hi john"},
@@ -150,7 +150,7 @@ async def test_message_new_with_dir_prefix_classifies_as_dm(monkeypatch):
         "type": "message.new",
         "payload": {
             "id": "msg_d2",
-            "from": "@alice",
+            "sender": "@alice",
             "conversation_id": "dir_xyz789",
             "type": "text",
             "content": {"type": "text", "text": "yo"},

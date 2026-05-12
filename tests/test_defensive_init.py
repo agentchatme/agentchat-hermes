@@ -221,7 +221,6 @@ def test_init_pre_populates_all_attributes_even_on_error(monkeypatch):
         assert inst._client is None
         assert inst._realtime is None
         assert inst.handle is None
-        assert inst._agent_id is None
         assert inst._lock_key is None
         assert inst._handler_unsubs == []
     finally:

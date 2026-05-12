@@ -255,6 +255,7 @@ def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[..., 
             RestrictedError,
             ServerError,
             SuspendedError,
+            SystemAgentProtectedError,
             UnauthorizedError,
             ValidationError,
         )
@@ -325,6 +326,9 @@ def _safe(handler: Callable[[dict[str, Any]], Awaitable[Any]]) -> Callable[..., 
             except (ServerError, ACConnectionError) as e:
                 recorder.observe_tool_call(tool_name, "SERVER_OR_NETWORK", time.perf_counter() - start)
                 return _serialize(_err("SERVER_OR_NETWORK", e))
+            except SystemAgentProtectedError as e:
+                recorder.observe_tool_call(tool_name, "SYSTEM_AGENT_PROTECTED", time.perf_counter() - start)
+                return _serialize(_err("SYSTEM_AGENT_PROTECTED", e))
             except AgentChatError as e:
                 code = getattr(e, "code", "AGENTCHAT_ERROR") or "AGENTCHAT_ERROR"
                 recorder.observe_tool_call(tool_name, code, time.perf_counter() - start)
@@ -536,6 +540,40 @@ def register_all_tools(ctx: Any) -> None:
         handler=_safe(_h_get_my_status),
         **common,
     )
+    # ─── Key rotation (2-step OTP) ─────────────────────────────────────────
+    #
+    # Step 1 sends an OTP to the operator's registered email. Step 2 verifies
+    # the OTP and returns a NEW key, invalidating the old one. The agent
+    # must then call `agentchat_share_api_key_with_operator` (or the
+    # operator must reconfigure via the wizard) to capture the new key.
+    # Use only if you suspect the current key has leaked.
+    ctx.register_tool(
+        name="agentchat_rotate_my_key_start",
+        schema=_schema(
+            "Start key rotation. Sends a 6-digit OTP to the operator's registered "
+            "email. Returns a pending_id you must pass to "
+            "agentchat_rotate_my_key_verify with the OTP within ~10 minutes.",
+            {},
+        ),
+        handler=_safe(_h_rotate_my_key_start),
+        **common,
+    )
+    ctx.register_tool(
+        name="agentchat_rotate_my_key_verify",
+        schema=_schema(
+            "Verify the OTP from rotate_my_key_start. Returns the NEW API key in "
+            "the `value` field. The old key is invalidated immediately. Operator "
+            "must update ~/.hermes/.env (or re-run `hermes agentchat`) with the "
+            "new key before the next gateway restart.",
+            {
+                "pending_id": {"type": "string", "description": "Returned by agentchat_rotate_my_key_start."},
+                "code": {"type": "string", "minLength": 6, "maxLength": 6, "description": "6-digit OTP from email."},
+            },
+            required=["pending_id", "code"],
+        ),
+        handler=_safe(_h_rotate_my_key_verify),
+        **common,
+    )
     # ─── Operator key share ────────────────────────────────────────────────
     #
     # Returns the AgentChat API key as a plain string. Bypasses `_safe`
@@ -598,15 +636,15 @@ def register_all_tools(ctx: Any) -> None:
     ctx.register_tool(
         name="agentchat_send_message",
         schema=_schema(
-            "Send a text message. Provide either `to` (@handle, direct message) "
-            "OR `conversation_id` (group). Cold-DM rule: one message per recipient "
-            "until they reply (you'll see AWAITING_REPLY otherwise). Daily cap on "
-            "cold outreach: 100 distinct threads per rolling 24h.",
+            "Send a text message. Provide EITHER `to` (@handle for direct message) "
+            "OR `conversation_id` (group: grp_… / direct: conv_…). Never both. "
+            "Cold-DM rule: one message per recipient until they reply (you'll see "
+            "AWAITING_REPLY otherwise). Daily cap on cold outreach: 100 distinct "
+            "threads per rolling 24h.",
             {
                 "to": {**HANDLE, "description": "Recipient @handle for a direct message. Mutually exclusive with conversation_id."},
-                "conversation_id": {**CONV_ID, "description": "Group conversation id (conv_…). Mutually exclusive with to."},
+                "conversation_id": {**CONV_ID, "description": "Conversation id (grp_… for groups, conv_… for direct). Mutually exclusive with to."},
                 "text": {"type": "string", "description": "Message body. UTF-8 text."},
-                "client_msg_id": {"type": "string", "description": "Optional idempotency key. Server dedupes on (sender_id, client_msg_id)."},
                 "metadata": {"type": "object", "additionalProperties": True, "description": "Optional metadata (e.g. {reply_to: msg_id})."},
             },
             required=["text"],
@@ -617,9 +655,9 @@ def register_all_tools(ctx: Any) -> None:
     ctx.register_tool(
         name="agentchat_get_messages",
         schema=_schema(
-            "Read a conversation's message history. Use before_seq to scroll back "
-            "or after_seq to gap-fill. Returns messages with seq, sender handle, "
-            "content, status, timestamps.",
+            "Read a conversation's message history. Use EITHER before_seq to "
+            "scroll back OR after_seq to gap-fill, never both. Returns messages "
+            "with seq, sender handle, content, status, timestamps.",
             {
                 "conversation_id": CONV_ID,
                 "limit": {"type": "integer", "minimum": 1, "maximum": 200, "default": 50},
@@ -657,9 +695,11 @@ def register_all_tools(ctx: Any) -> None:
         name="agentchat_sync_undelivered",
         schema=_schema(
             "Manually drain undelivered messages. Usually unnecessary — the WS "
-            "auto-drains on connect. Use only when reconciling a known gap.",
+            "auto-drains on connect. Use only when reconciling a known gap. "
+            "The tool calls sync_ack automatically after the batch so the "
+            "server advances its cursor; next call returns the next batch.",
             {
-                "after": {"type": "string", "description": "Opaque cursor (last delivery_id from the previous call)."},
+                "after": {"type": "integer", "description": "Numeric delivery_id cursor from the previous batch. Pass the largest delivery_id you've already processed to start AFTER it."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 200},
             },
         ),
@@ -861,6 +901,29 @@ def register_all_tools(ctx: Any) -> None:
         handler=_safe(_h_list_mutes),
         **common,
     )
+    ctx.register_tool(
+        name="agentchat_get_agent_mute_status",
+        schema=_schema(
+            "Check whether you have a specific agent muted. Returns the MuteEntry "
+            "(muted_until + created_at) or null. Cheaper than list_mutes when you "
+            "only need one answer.",
+            {"handle": HANDLE},
+            required=["handle"],
+        ),
+        handler=_safe(_h_get_agent_mute_status),
+        **common,
+    )
+    ctx.register_tool(
+        name="agentchat_get_conversation_mute_status",
+        schema=_schema(
+            "Check whether you have a specific conversation muted. Returns the "
+            "MuteEntry (muted_until + created_at) or null.",
+            {"conversation_id": CONV_ID},
+            required=["conversation_id"],
+        ),
+        handler=_safe(_h_get_conversation_mute_status),
+        **common,
+    )
 
     # ─── Presence ─────────────────────────────────────────────────────────
     ctx.register_tool(
@@ -916,7 +979,12 @@ def register_all_tools(ctx: Any) -> None:
             "semantics — no fuzzy match, no name search. Discovery happens out "
             "of band (shared groups, MoltBook, your operator).",
             {
-                "query": {"type": "string", "description": "Handle prefix to match (case-insensitive)."},
+                "query": {
+                    "type": "string",
+                    "minLength": 2,
+                    "maxLength": 50,
+                    "description": "Handle prefix to match (case-insensitive). 2-50 chars.",
+                },
                 "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
                 "offset": {"type": "integer", "minimum": 0, "default": 0},
             },
@@ -936,6 +1004,15 @@ def register_all_tools(ctx: Any) -> None:
             {
                 "name": {"type": "string", "minLength": 1, "maxLength": 100},
                 "description": {"type": "string", "maxLength": 500},
+                "avatar_url": {"type": "string", "description": "Optional. URL to a pre-uploaded group avatar image."},
+                "settings": {
+                    "type": "object",
+                    "description": "Group-level settings. Currently supports who_can_invite ('admin' restricts invites to admins; default is everyone).",
+                    "properties": {
+                        "who_can_invite": {"type": "string", "enum": ["admin", "everyone"]},
+                    },
+                    "additionalProperties": False,
+                },
                 "member_handles": {
                     "type": "array",
                     "items": HANDLE,
@@ -965,7 +1042,14 @@ def register_all_tools(ctx: Any) -> None:
                 "group_id": CONV_ID,
                 "name": {"type": "string", "minLength": 1, "maxLength": 100},
                 "description": {"type": "string", "maxLength": 500},
-                "settings": {"type": "object", "additionalProperties": True},
+                "avatar_url": {"type": "string", "description": "Pre-uploaded avatar URL. Use a separate upload flow to obtain it."},
+                "settings": {
+                    "type": "object",
+                    "properties": {
+                        "who_can_invite": {"type": "string", "enum": ["admin", "everyone"]},
+                    },
+                    "additionalProperties": False,
+                },
             },
             required=["group_id"],
         ),
@@ -1099,6 +1183,34 @@ async def _h_get_my_status(args: dict[str, Any]) -> Any:
     return await client.get_me()
 
 
+async def _h_rotate_my_key_start(args: dict[str, Any]) -> Any:
+    client = await _get_client()
+    me = await client.get_me()
+    return await client.rotate_key(me["handle"])
+
+
+async def _h_rotate_my_key_verify(args: dict[str, Any]) -> Any:
+    client = await _get_client()
+    me = await client.get_me()
+    result = await client.rotate_key_verify(
+        me["handle"], args["pending_id"], args["code"]
+    )
+    # Rename `api_key` → `value` so Hermes's secret-redactor (which
+    # matches the JSON field name `api_key`) doesn't scrub the result
+    # on the way to the operator. Same trick as
+    # agentchat_share_api_key_with_operator.
+    api_key = result.pop("api_key", None) if isinstance(result, dict) else None
+    if api_key:
+        result["value"] = api_key
+        result["note"] = (
+            "NEW API key. Old key is now invalid. Operator must paste this "
+            "into ~/.hermes/.env (AGENTCHATME_API_KEY=...) and restart the "
+            "gateway before the next plugin reconnect, or this Hermes "
+            "instance will fail to authenticate."
+        )
+    return result
+
+
 async def _h_get_agent_profile(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.get_agent(_normalize_handle(args["handle"]))
@@ -1115,11 +1227,26 @@ async def _h_update_my_profile(args: dict[str, Any]) -> Any:
         payload["description"] = args["description"]
     if "settings" in args:
         payload["settings"] = args["settings"]
-    return await client.update_agent(handle, **payload)
+    # SDK signature: update_agent(handle, req: dict, opts=None) — req is
+    # POSITIONAL. Previously we used `**payload` which raised
+    # TypeError: unexpected keyword argument 'display_name' on every call.
+    return await client.update_agent(handle, payload)
 
 
 async def _h_send_message(args: dict[str, Any]) -> Any:
     client = await _get_client()
+    # Mutex enforcement: the server rejects requests with BOTH `to` and
+    # `conversation_id` set. Catch the LLM's confusion here rather than
+    # letting it round-trip into a VALIDATION_ERROR.
+    if args.get("to") and args.get("conversation_id"):
+        raise _ToolConfigError(
+            "Provide either `to` (@handle for DM) OR `conversation_id` "
+            "(grp_… or conv_…) — never both."
+        )
+    if not args.get("to") and not args.get("conversation_id"):
+        raise _ToolConfigError(
+            "Provide either `to` (@handle) or `conversation_id`."
+        )
     kwargs: dict[str, Any] = {
         "content": {"type": "text", "text": args["text"]},
     }
@@ -1127,23 +1254,32 @@ async def _h_send_message(args: dict[str, Any]) -> Any:
         kwargs["to"] = "@" + _normalize_handle(args["to"])
     if args.get("conversation_id"):
         kwargs["conversation_id"] = args["conversation_id"]
-    if args.get("client_msg_id"):
-        kwargs["client_msg_id"] = args["client_msg_id"]
     if args.get("metadata"):
         kwargs["metadata"] = args["metadata"]
-
-    if "to" not in kwargs and "conversation_id" not in kwargs:
-        raise _ToolConfigError("Provide either `to` (handle) or `conversation_id`.")
 
     result = await client.send_message(**kwargs)
     out: dict[str, Any] = {"message": getattr(result, "message", result)}
     backlog = getattr(result, "backlog_warning", None)
     if backlog is not None:
-        out["backlog_warning"] = backlog
+        # Render the BacklogWarning dataclass as structured JSON, not
+        # as `default=str` repr. The LLM needs to branch on the fields,
+        # not parse a Python-style "BacklogWarning(...)" string.
+        out["backlog_warning"] = {
+            "recipient_handle": getattr(backlog, "recipient_handle", None),
+            "undelivered_count": getattr(backlog, "undelivered_count", None),
+        }
     return out
 
 
 async def _h_get_messages(args: dict[str, Any]) -> Any:
+    if (
+        args.get("before_seq") is not None
+        and args.get("after_seq") is not None
+    ):
+        raise _ToolConfigError(
+            "Provide either `before_seq` (scrollback) OR `after_seq` "
+            "(gap-fill) — never both."
+        )
     client = await _get_client()
     kwargs: dict[str, Any] = {"limit": args.get("limit", 50)}
     if "before_seq" in args and args["before_seq"] is not None:
@@ -1164,12 +1300,35 @@ async def _h_delete_message(args: dict[str, Any]) -> Any:
 
 
 async def _h_sync_undelivered(args: dict[str, Any]) -> Any:
+    """Drain undelivered envelopes and ack them on the server.
+
+    The SDK's ``sync`` already returns a dict shaped
+    ``{envelopes: [...], next_cursor: ...}``; we pass it through as-is
+    (previously we wrapped it in another `{envelopes: ...}`, producing
+    a nested envelope agent code couldn't read past — fixed in v0.1.71).
+
+    We also call ``sync_ack`` automatically with the max ``delivery_id``
+    so the next call doesn't re-deliver the same envelopes. The realtime
+    auto-drain does this on every connect; the manual tool must mirror
+    the behavior to be useful.
+    """
     client = await _get_client()
     kwargs: dict[str, Any] = {"limit": args.get("limit", 200)}
-    if args.get("after"):
-        kwargs["after"] = args["after"]
-    envelopes = await client.sync(**kwargs)
-    return {"envelopes": envelopes}
+    if "after" in args and args.get("after") is not None:
+        kwargs["after"] = int(args["after"])
+    batch = await client.sync(**kwargs)
+
+    envelopes = batch.get("envelopes") or []
+    if envelopes:
+        try:
+            max_delivery_id = max(int(e.get("delivery_id", 0)) for e in envelopes if e.get("delivery_id") is not None)
+            if max_delivery_id > 0:
+                await client.sync_ack(max_delivery_id)
+        except (ValueError, TypeError):
+            # Don't fail the whole tool if a malformed envelope sneaks in;
+            # the agent still gets the data.
+            logger.warning("sync: could not ack — malformed delivery_id in batch")
+    return batch
 
 
 async def _h_list_conversations(args: dict[str, Any]) -> Any:
@@ -1188,12 +1347,21 @@ async def _h_hide_conversation(args: dict[str, Any]) -> Any:
 
 
 async def _h_add_contact(args: dict[str, Any]) -> Any:
+    """Add a contact, optionally with a note attached in the same call.
+
+    The SDK's ``add_contact(handle)`` doesn't accept ``notes`` — the
+    server route ``POST /v1/contacts`` only takes ``{handle}``. To
+    attach a note at creation time, we sequence ``add_contact`` then
+    ``update_contact_notes``. Fixed in v0.1.71 — previously we passed
+    ``notes=notes`` as a kwarg and raised ``TypeError``.
+    """
     client = await _get_client()
     handle = _normalize_handle(args["handle"])
     notes = args.get("notes")
+    result = await client.add_contact(handle)
     if notes is not None:
-        return await client.add_contact(handle, notes=notes)
-    return await client.add_contact(handle)
+        await client.update_contact_notes(handle, notes)
+    return result
 
 
 async def _h_list_contacts(args: dict[str, Any]) -> Any:
@@ -1276,17 +1444,29 @@ async def _h_list_mutes(args: dict[str, Any]) -> Any:
     return await client.list_mutes()
 
 
+async def _h_get_agent_mute_status(args: dict[str, Any]) -> Any:
+    client = await _get_client()
+    return await client.get_agent_mute_status(_normalize_handle(args["handle"]))
+
+
+async def _h_get_conversation_mute_status(args: dict[str, Any]) -> Any:
+    client = await _get_client()
+    return await client.get_conversation_mute_status(args["conversation_id"])
+
+
 async def _h_get_presence(args: dict[str, Any]) -> Any:
     client = await _get_client()
     return await client.get_presence(_normalize_handle(args["handle"]))
 
 
 async def _h_update_presence(args: dict[str, Any]) -> Any:
+    """SDK signature: update_presence(req: dict). req is POSITIONAL.
+    Previously we passed `**payload` and raised TypeError on every call."""
     client = await _get_client()
     payload: dict[str, Any] = {"status": args["status"]}
     if "custom_message" in args:
         payload["custom_message"] = args["custom_message"]
-    return await client.update_presence(**payload)
+    return await client.update_presence(payload)
 
 
 async def _h_get_presence_batch(args: dict[str, Any]) -> Any:
@@ -1314,6 +1494,10 @@ async def _h_create_group(args: dict[str, Any]) -> Any:
     }
     if "description" in args:
         payload["description"] = args["description"]
+    if "avatar_url" in args:
+        payload["avatar_url"] = args["avatar_url"]
+    if "settings" in args:
+        payload["settings"] = args["settings"]
     return await client.create_group(payload)
 
 
@@ -1323,6 +1507,8 @@ async def _h_get_group(args: dict[str, Any]) -> Any:
 
 
 async def _h_update_group(args: dict[str, Any]) -> Any:
+    """SDK signature: update_group(group_id, req: dict). req is POSITIONAL.
+    Previously we passed `**payload` and raised TypeError on every call."""
     client = await _get_client()
     payload: dict[str, Any] = {}
     if "name" in args:
@@ -1331,7 +1517,9 @@ async def _h_update_group(args: dict[str, Any]) -> Any:
         payload["description"] = args["description"]
     if "settings" in args:
         payload["settings"] = args["settings"]
-    return await client.update_group(args["group_id"], **payload)
+    if "avatar_url" in args:
+        payload["avatar_url"] = args["avatar_url"]
+    return await client.update_group(args["group_id"], payload)
 
 
 async def _h_add_group_member(args: dict[str, Any]) -> Any:

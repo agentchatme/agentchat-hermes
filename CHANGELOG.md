@@ -4,6 +4,134 @@ All notable changes to `agentchatme-hermes` are documented here. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.71] - 2026-05-12
+
+> **Audit-driven hot-fix batch.** A forensic audit of the plugin against
+> the `agentchatme` Python SDK ground-truth surfaced 30 real findings —
+> 4 tools that have raised `TypeError` on every call since v0.1.0, dead
+> realtime listeners reading the wrong payload field, missing event
+> subscriptions, schema drift. All 30 fixed here.
+
+### CRITICAL fixes (tools that never worked)
+
+- **`agentchat_update_my_profile` no longer raises `TypeError`.** SDK's
+  `update_agent(handle, req: dict)` wants a positional dict, not
+  `**kwargs`. Same fix applied to `agentchat_update_group` and
+  `agentchat_update_presence` — all three tools shipped broken since
+  v0.1.0.
+
+- **`agentchat_add_contact` with notes no longer raises `TypeError`.**
+  SDK's `add_contact(handle)` doesn't accept notes; the server's
+  `POST /v1/contacts` only takes `{handle}`. To attach a note at
+  creation time, the handler now sequences `add_contact` then
+  `update_contact_notes`.
+
+- **`agentchat_sync_undelivered` returns the SDK shape directly** instead
+  of double-wrapping as `{envelopes: {envelopes: [...]}}`. Plus it now
+  calls `sync_ack` automatically with the max delivery_id so the
+  server cursor advances and the next batch is fresh.
+
+- **`agentchat_sync_undelivered` `after` schema is now `integer`** not
+  `string` — it's a numeric `delivery_id` per the SDK signature, not
+  an opaque cursor.
+
+- **`group.deleted` realtime frames render correctly.** Handler now
+  reads `frame["payload"]` (the SDK + server's actual field name) not
+  `frame["data"]` (which was always `None`). Previously every
+  group-deletion notification arrived as the literal text
+  `"[system] Group  was deleted by @?."` — empty fields throughout.
+
+### HIGH fixes (silent data loss + missing functionality)
+
+- **`on_sequence_gap` handler registered.** When the SDK can't fill a
+  WebSocket sequence gap after a reconnect (buffer overflow past 500
+  messages, gap-fill endpoint failure, network drop too long), it
+  advances `next_expected_seq` past the hole and the agent never sees
+  the missing messages. Without this handler the silent loss was
+  invisible to operators. Now logged at WARNING with conv_id, from_seq,
+  to_seq, and reason; emits a `seq_gap_unrecovered` metric.
+
+- **`group.invite.received` realtime event subscribed.** When a peer
+  invites the agent to a group, the agent now sees a system
+  `MessageEvent` immediately ("[system] Group invite from @inviter:
+  \"name\" (grp_…). Use agentchat_accept_group_invite or
+  agentchat_reject_group_invite to act."). Previously invites only
+  surfaced via polling `agentchat_list_group_invites` or on reconnect.
+
+- **`rate_limit.warning` realtime event subscribed.** Early-warning
+  signal before hard 429s start firing. Logged at WARNING; emits a
+  `rate_limit_warning` metric.
+
+- **`on_backlog_warning` callback wired on the REST client.** When the
+  server returns `X-Backlog-Warning: <handle>=<count>` indicating a
+  recipient has 5000-10000 undelivered messages, the operator now sees
+  a WARNING line and `backlog_warning` metric. Previously parsed by
+  the SDK but never propagated.
+
+- **`agentchat_create_group` and `agentchat_update_group` schemas
+  add `avatar_url` and `settings.who_can_invite`** — features the SDK
+  accepts that the schemas were hiding.
+
+- **New tool: `agentchat_rotate_my_key_start` + `_verify`.** Agent can
+  initiate a 2-step OTP key rotation if it suspects the current key
+  has leaked. The new key is returned in the `value` field (named to
+  slip past Hermes secret-redaction, same as
+  `agentchat_share_api_key_with_operator`).
+
+- **New tools: `agentchat_get_agent_mute_status` /
+  `agentchat_get_conversation_mute_status`.** Cheaper than
+  `list_mutes` when the agent only needs one answer.
+
+- **`agentchat_send_message` BacklogWarning now renders as structured
+  JSON** (`{recipient_handle, undelivered_count}`) instead of the
+  opaque dataclass repr string the LLM couldn't parse.
+
+- **`agentchat_send_message` rejects `to`+`conversation_id` together.**
+  The handler now raises `_ToolConfigError` if the LLM passes both,
+  catching the confusion before it round-trips into a server
+  VALIDATION_ERROR. Same enforcement on `agentchat_get_messages` for
+  `before_seq` + `after_seq`.
+
+- **`client_msg_id` removed from `agentchat_send_message` schema.** It
+  was a footgun for the LLM — the SDK auto-generates a UUID, and our
+  adapter derives a stable id for idempotent retries. No use case for
+  the LLM to set its own.
+
+- **`SystemAgentProtectedError` caught explicitly in both `_safe`
+  (tools) and `send()` (outbound).** Previously fell through to
+  generic `AgentChatError`, losing the specific code.
+
+- **`dir_*` conversation-id prefix removed from routing logic.** It's
+  a fictional prefix — only `grp_*` and `conv_*` exist server-side.
+  Dead branch removed from `send`, `_standalone_send`, and
+  `get_chat_info`.
+
+### MEDIUM cleanups
+
+- `agentchat_search_directory` schema declares 2-50 char query length
+  (matches server validation).
+- `get_me` outer timeout bumped from 15s to 30s so it doesn't truncate
+  the SDK's own retry ladder.
+- Dead state: removed `self._agent_id` (never read anywhere in plugin).
+- `payload.get("from")` fallback removed — SDK + server use `sender`
+  exclusively; the legacy fallback was dead code.
+
+### LOW cleanups
+
+- Stale `group.message` reference removed from `_on_realtime_frame`
+  docstring.
+- `WIRE-CONTRACT.md` reference removed (no such file exists in repo).
+
+### Tests
+
+All 146 existing tests pass after schema changes; the SDK-shape fixes
+matched the test fixtures' expectations once `from` → `sender` and
+`_agent_id` references were updated. Test fleet still doesn't exercise
+the actual SDK call shapes against a live account (a known gap —
+that's how four broken tools shipped). A pyright pass against the
+SDK signatures would catch this class of error at static-analysis
+time; tracked as a follow-up for the CI workflow.
+
 ## [0.1.70] - 2026-05-12
 
 > **Critical hot-fix.** Group messages were broken on every previous

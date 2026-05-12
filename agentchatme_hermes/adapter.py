@@ -54,6 +54,7 @@ from agentchatme.errors import (
     RestrictedError,
     ServerError,
     SuspendedError,
+    SystemAgentProtectedError,
     UnauthorizedError,
     ValidationError,
 )
@@ -191,7 +192,6 @@ def _adapter_class() -> type:
             self._client: AsyncAgentChatClient | None = None
             self._realtime: RealtimeClient | None = None
             self.handle: str | None = None
-            self._agent_id: str | None = None
             self._lock_key: str | None = None
             self._handler_unsubs: list[Callable[[], None]] = []
             self._MessageType = MessageType
@@ -324,8 +324,15 @@ def _adapter_class() -> type:
             # opening the WebSocket — a bad key surfaces as a clean
             # UnauthorizedError on /v1/agents/me rather than as a 1008 close
             # with no body during the WS handshake.
+            #
+            # `on_backlog_warning` lets us observe when a peer recipient is
+            # piling up (5000-10000 undelivered) BEFORE the hard
+            # RECIPIENT_BACKLOGGED 429 fires, so the operator gets a log
+            # heads-up rather than discovering it via failed sends.
             self._client = AsyncAgentChatClient(
-                api_key=self.api_key, base_url=self.api_base
+                api_key=self.api_key,
+                base_url=self.api_base,
+                on_backlog_warning=self._on_backlog_warning,
             )
             try:
                 await self._client.__aenter__()
@@ -342,9 +349,11 @@ def _adapter_class() -> type:
                 return False
 
             try:
-                me = await asyncio.wait_for(self._client.get_me(), timeout=15.0)
+                # 30s outer cap matches the SDK's default request timeout
+                # plus retry headroom (was 15s before v0.1.71, which
+                # truncated the SDK's own retry ladder).
+                me = await asyncio.wait_for(self._client.get_me(), timeout=30.0)
                 self.handle = me.get("handle")
-                self._agent_id = me.get("id")
                 if not self.handle:
                     raise RuntimeError("get_me() returned no handle")
             except UnauthorizedError as e:
@@ -398,16 +407,22 @@ def _adapter_class() -> type:
                     api_key=self.api_key,
                     base_url=_rest_base_to_ws_base(self.api_base),
                     client=self._client,  # enables gap-fill + offline drain
+                    on_sequence_gap=self._on_sequence_gap,
                 )
             )
 
             # Hook handlers BEFORE connect so the very first frame after
             # hello.ok dispatches through us. The SDK queues frames until
             # at least one handler is registered for that event name.
+            #
+            # `group.message` is NOT registered — the SDK never emits it.
+            # All inbound (DM + group) flows through `message.new` and we
+            # branch on conversation_id prefix. See _on_realtime_frame.
             self._handler_unsubs = [
                 self._realtime.on("message.new", self._on_realtime_frame),
-                self._realtime.on("group.message", self._on_realtime_frame),
                 self._realtime.on("group.deleted", self._on_realtime_frame),
+                self._realtime.on("group.invite.received", self._on_realtime_frame),
+                self._realtime.on("rate_limit.warning", self._on_realtime_frame),
                 self._realtime.on_connect(self._on_realtime_connect),
                 self._realtime.on_disconnect(self._on_realtime_disconnect),
                 self._realtime.on_error(self._on_realtime_error),
@@ -455,7 +470,6 @@ def _adapter_class() -> type:
             await self._cleanup_client()
 
             self.handle = None
-            self._agent_id = None
 
         async def _teardown_realtime(self) -> None:
             for off in self._handler_unsubs:
@@ -481,8 +495,11 @@ def _adapter_class() -> type:
             """Dispatch a realtime frame.
 
             The SDK passes the decoded JSON dict; we branch on ``type``.
-            Frame shapes are documented in WIRE-CONTRACT.md / the SDK's
-            ``_realtime.py``.
+            Frame shapes are defined in the SDK's ``_realtime.py`` and the
+            server-side emitter in ``apps/api-server/src/services/``.
+            Currently subscribed: ``message.new`` (DMs + group messages),
+            ``group.deleted``, ``group.invite.received``,
+            ``rate_limit.warning``.
             """
             ftype = frame.get("type")
             recorder = _metrics_mod.get_recorder()
@@ -512,8 +529,36 @@ def _adapter_class() -> type:
                 return
 
             if ftype == "group.deleted":
+                # Server emits the deleted-group info under `payload`, not
+                # `data` (fixed in v0.1.71). The SDK's WsMessage model
+                # declares `payload: dict[str, Any]` and the server emits
+                # via `payload: ctx.deletedPayload` (api-server's
+                # group-deletion-fanout-worker). The previous `data` read
+                # always returned None → handler showed empty group_id /
+                # "@?" deletor in the system message.
                 recorder.inc_inbound("group_deleted")
-                await self._dispatch_group_deleted(frame.get("data") or {})
+                await self._dispatch_group_deleted(frame.get("payload") or {})
+                return
+
+            if ftype == "group.invite.received":
+                # Realtime invite event — server pushes when someone
+                # invites this agent to a group. Without subscribing,
+                # the agent only learns about invites by polling
+                # `agentchat_list_group_invites` or on reconnect drain.
+                recorder.inc_inbound("group_invite_received")
+                await self._dispatch_group_invite_received(frame.get("payload") or {})
+                return
+
+            if ftype == "rate_limit.warning":
+                # Early-warning signal before the server starts firing
+                # hard 429s. The agent gets a chance to throttle
+                # proactively; the operator gets a log line.
+                recorder.inc_inbound("rate_limit_warning")
+                payload = frame.get("payload") or {}
+                logger.warning(
+                    "AgentChat: rate_limit.warning — %s",
+                    json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+                )
                 return
 
             # message.read / presence.update / typing.* / rate_limit.warning —
@@ -524,7 +569,10 @@ def _adapter_class() -> type:
         async def _dispatch_inbound_message(
             self, payload: dict[str, Any], *, kind: str
         ) -> None:
-            sender = payload.get("from") or payload.get("sender")
+            # SDK and server use `sender` exclusively; the legacy `from`
+            # fallback was dead code (verified against `types/message.py`
+            # and api-server in v0.1.71).
+            sender = payload.get("sender")
             if not isinstance(sender, str) or not sender:
                 logger.warning("AgentChat: inbound missing sender, dropping payload")
                 return
@@ -723,6 +771,84 @@ def _adapter_class() -> type:
             # SDK reconnect loop owns recovery.
             logger.warning("AgentChat: realtime error %s", exc)
 
+        async def _on_sequence_gap(
+            self,
+            conversation_id: str,
+            recovered: bool,
+            reason: str,
+            from_seq: int,
+            to_seq: int,
+        ) -> None:
+            """SDK callback when a per-conversation seq gap is detected.
+
+            When the SDK can't fill the gap (network down too long, buffer
+            overflowed past 500 messages, gap_fill endpoint failed), it
+            advances ``next_expected_seq`` past the hole and the agent
+            never sees the missing messages. Without this handler the
+            silent loss was invisible to operators.
+
+            We log at WARNING when ``recovered=False`` so the gap is
+            permanent and an operator can decide if a manual sync is
+            warranted.
+            """
+            recorder = _metrics_mod.get_recorder()
+            recorder.inc_inbound(
+                f"seq_gap_{'recovered' if recovered else 'unrecovered'}"
+            )
+            level = logger.info if recovered else logger.warning
+            level(
+                "AgentChat: sequence gap in %s — seqs %d..%d, recovered=%s, reason=%s",
+                conversation_id, from_seq, to_seq, recovered, reason,
+            )
+
+        async def _on_backlog_warning(self, warning: Any) -> None:
+            """SDK callback when the server sends X-Backlog-Warning header.
+
+            Recipient has 5000-10000 undelivered messages pending; the
+            next send will likely fail with RECIPIENT_BACKLOGGED. Surface
+            as a metric + log line so the operator sees the gathering
+            storm before the hard 429s start.
+            """
+            recipient = getattr(warning, "recipient_handle", "?")
+            count = getattr(warning, "undelivered_count", "?")
+            logger.warning(
+                "AgentChat: backlog warning — @%s has %s undelivered messages pending",
+                recipient, count,
+            )
+            _metrics_mod.get_recorder().inc_inbound("backlog_warning")
+
+        async def _dispatch_group_invite_received(
+            self, payload: dict[str, Any]
+        ) -> None:
+            """A peer invited us to a group. Surface as a system MessageEvent so
+            the agent can decide to accept/reject via the existing tools."""
+            group_id = str(payload.get("group_id") or payload.get("conversation_id") or "")
+            inviter = str(payload.get("inviter_handle") or "?").lstrip("@")
+            group_name = str(payload.get("group_name") or group_id or "(unnamed)")
+            text = (
+                f"[system] Group invite from @{inviter}: \"{group_name}\" "
+                f"({group_id}). Use agentchat_accept_group_invite or "
+                f"agentchat_reject_group_invite to act."
+            )
+            source = self.build_source(
+                chat_id=group_id,
+                chat_name=group_name,
+                chat_type="group",
+            )
+            event = self._MessageEvent(
+                text=text,
+                message_type=self._MessageType.TEXT,
+                source=source,
+                raw_message=payload,
+                message_id=f"sys:{group_id}:invite",
+            )
+            try:
+                from . import tools as _tools_mod
+                _tools_mod.current_source_platform.set("agentchat")
+                await self.handle_message(event)
+            except Exception:
+                logger.exception("AgentChat: handle_message failed for group.invite.received")
+
         # ── Outbound: BasePlatformAdapter.send ────────────────────────────
 
         async def send(
@@ -739,9 +865,8 @@ def _adapter_class() -> type:
             #   "@<handle>"     → DM to that handle (`to=` kwarg)
             #   "<handle>"      → DM (bare, no @) → coerced to @handle
             #   "grp_<id>"      → group conversation (`conversation_id=` kwarg)
-            #   "conv_<id>"     → DM conversation (`conversation_id=` also accepted,
-            #                     though the server prefers `to=@handle` for DMs)
-            #   "dir_<id>"      → DM conversation alias (same as conv_)
+            #   "conv_<id>"     → DM conversation (server prefers `to=@handle`
+            #                     for DMs but accepts conv_*; we route as conv_id)
             #
             # Unknown shapes fall through to "treat as conversation_id" — the
             # server will return CONVERSATION_NOT_FOUND if it's bogus, and we
@@ -752,7 +877,7 @@ def _adapter_class() -> type:
             }
             if cid.startswith("@"):
                 kwargs["to"] = cid
-            elif cid.startswith(("grp_", "conv_", "dir_")):
+            elif cid.startswith(("grp_", "conv_")):
                 kwargs["conversation_id"] = cid
             elif cid and "/" not in cid and " " not in cid:
                 # Bare handle — common when the agent picks "@alice" but the
@@ -869,6 +994,11 @@ def _adapter_class() -> type:
                 return _fail("SERVER_OR_NETWORK", self._SendResult(
                     success=False, error=f"server_or_network: {e}", retryable=True,
                 ))
+            except SystemAgentProtectedError as e:
+                return _fail("SYSTEM_AGENT_PROTECTED", self._SendResult(
+                    success=False,
+                    error=f"system_agent_protected: {e} — you can't perform this on a platform-owned agent",
+                ))
             except AgentChatError as e:
                 code = getattr(e, "code", "AGENTCHAT_ERROR") or "AGENTCHAT_ERROR"
                 return _fail(code, self._SendResult(success=False, error=f"{code}: {e}"))
@@ -905,7 +1035,7 @@ def _adapter_class() -> type:
             if cid.startswith("grp_"):
                 kind = "group"
             elif (
-                cid.startswith(("conv_", "dir_", "@"))
+                cid.startswith(("conv_", "@"))
                 or (cid and "/" not in cid and " " not in cid)
             ):
                 kind = "dm"
@@ -975,7 +1105,7 @@ async def _standalone_send(
     }
     if cid.startswith("@"):
         kwargs["to"] = cid
-    elif cid.startswith(("grp_", "conv_", "dir_")):
+    elif cid.startswith(("grp_", "conv_")):
         kwargs["conversation_id"] = cid
     elif cid and "/" not in cid and " " not in cid:
         kwargs["to"] = "@" + cid
@@ -1059,6 +1189,8 @@ async def _standalone_send(
             return {"error": f"AgentChat standalone send: validation: {e}"}
         except (ServerError, ACConnectionError) as e:
             return {"error": f"AgentChat standalone send: server_or_network: {e}"}
+        except SystemAgentProtectedError as e:
+            return {"error": f"AgentChat standalone send: system_agent_protected: {e}"}
         except AgentChatError as e:
             code = getattr(e, "code", "AGENTCHAT_ERROR") or "AGENTCHAT_ERROR"
             return {"error": f"AgentChat standalone send: {code}: {e}"}
