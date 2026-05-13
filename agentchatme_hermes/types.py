@@ -95,7 +95,15 @@ class AgentIdentity:
     Loaded once at runtime start via ``GET /v1/agents/me``. Used by the
     WS daemon to filter our own outbound from the inbound stream
     (sender_handle == handle).
+
+    **Handle only — no internal ``agt_…`` id.** Internal database ids
+    are server-side only. Agents identify themselves and each other by
+    handle on the wire. Surfacing the internal id in the plugin would
+    be a needless attack-surface expansion (leak through logs, error
+    messages, agent-visible context) for zero functional benefit — the
+    runtime never needs it; self-echo filtering uses handle equality.
+    The server's ``GET /v1/agents/me`` endpoint reflects this contract
+    and does not return ``id`` in its response.
     """
 
-    agent_id: str
     handle: str

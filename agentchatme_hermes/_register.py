@@ -55,10 +55,28 @@ def register(ctx: Any) -> None:
         )
         return
 
-    from .runtime import get_runtime
-
-    runtime = get_runtime(config)
-    runtime.start()
+    runtime = _try_start_runtime(config)
+    if runtime is None:
+        # Runtime failed to start. We deliberately do NOT raise the
+        # error up to the plugin loader — that would mark the whole
+        # plugin as failed-to-load and hide it from `hermes plugins
+        # list`, which then makes the issue invisible. Instead we log
+        # at ERROR level (so it shows up in ~/.hermes/logs/errors.log
+        # AND in journalctl), surface a status hint, and register the
+        # plugin in CLI-only mode. The user can then run `hermes
+        # agentchat status` to see a clear diagnostic and either
+        # rotate keys, re-login, or check connectivity. The tools and
+        # skill are NOT registered because they depend on the runtime
+        # client; better to omit them entirely than to register stubs
+        # that fail at call time.
+        logger.info(
+            "agentchat plugin registered in CLI-only mode (version=%s). "
+            "Tools, skill, and live inbound are disabled until the "
+            "runtime can start — run `hermes agentchat status` to "
+            "diagnose.",
+            __version__,
+        )
+        return
 
     # Non-interactive identity-activation hook. Wizard users
     # (`hermes agentchat register/login`) already got the SOUL.md
@@ -66,10 +84,6 @@ def register(ctx: Any) -> None:
     # backfill is the safety net for env-var-direct / scripted /
     # container setups where the user set AGENTCHATME_API_KEY without
     # running the wizard.
-    #
-    # Idempotent and respectful: if our markers are already in SOUL.md
-    # (even if the block content was hand-edited) we leave the file
-    # alone. Only writes when the anchor is genuinely absent.
     _ensure_soul_anchor(runtime)
 
     try:
@@ -93,6 +107,39 @@ def register(ctx: Any) -> None:
         __version__,
         config.api_base,
     )
+
+
+def _try_start_runtime(config: Any) -> Any:
+    """Construct + start the runtime. Returns the runtime or ``None`` on failure.
+
+    Reasons start can fail:
+    * Invalid API key (UnauthorizedError on /v1/agents/me)
+    * Network unreachable (ConnectionError)
+    * Server schema regression (RuntimeError from _resolve_identity)
+    * Hermes runtime helpers unimportable from inside this process
+
+    All of these are recoverable — the user fixes the underlying issue
+    and restarts the gateway. None of them should kill the whole plugin
+    load; we want the CLI subcommand to remain reachable so the user
+    can diagnose.
+    """
+    from .runtime import get_runtime
+
+    try:
+        runtime = get_runtime(config)
+        runtime.start()
+    except Exception as exc:
+        logger.error(
+            "agentchat plugin: runtime startup failed — the plugin will "
+            "be inactive (no live inbound, no tools, no skill). Reason: %s. "
+            "See ~/.hermes/logs/errors.log for the full traceback. "
+            "Try `hermes agentchat status` to diagnose, or `hermes "
+            "agentchat login` to rotate to a known-good key.",
+            exc,
+            exc_info=True,
+        )
+        return None
+    return runtime
 
 
 def _ensure_soul_anchor(runtime: Any) -> None:

@@ -193,11 +193,7 @@ class WSDaemon:
     # -- SDK callbacks ------------------------------------------------------
 
     def _on_connect(self) -> None:
-        logger.info(
-            "WSDaemon: connected as @%s (id=%s)",
-            self._identity.handle,
-            self._identity.agent_id,
-        )
+        logger.info("WSDaemon: connected as @%s", self._identity.handle)
 
     def _on_disconnect(self, info: dict[str, Any]) -> None:
         logger.info(

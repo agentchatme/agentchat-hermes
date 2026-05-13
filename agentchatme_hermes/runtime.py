@@ -2,8 +2,9 @@
 
 One :class:`Runtime` per Hermes process. Owns:
 
-* The resolved :class:`AgentIdentity` (handle + agent_id, loaded
-  once via ``GET /v1/agents/me``).
+* The resolved :class:`AgentIdentity` (handle only — internal id is
+  server-side, we never extract it) loaded via ``GET /v1/agents/me``
+  at start.
 * The :class:`MessageQueue` between WS daemon and invoker.
 * The :class:`WSDaemon` background thread (inbound).
 * The :class:`AgentInvoker` thread pool (Mechanism A turns).
@@ -106,9 +107,8 @@ class Runtime:
                 self._ws_daemon.start()
 
                 logger.info(
-                    "agentchat runtime started: handle=@%s id=%s ws=%s",
+                    "agentchat runtime started: handle=@%s ws=%s",
                     self._identity.handle,
-                    self._identity.agent_id,
                     self._config.ws_url,
                 )
             except Exception:
@@ -161,23 +161,22 @@ class Runtime:
     def _resolve_identity(self, client: AgentChatClient) -> AgentIdentity:
         """Look up our own handle via ``GET /v1/agents/me``.
 
-        Surfaces auth errors immediately so a bad API key fails fast
-        at plugin start rather than silently producing an unauthenticated
-        WS that gets closed by the server.
+        Only ``handle`` is extracted — internal database ids are
+        server-side per the platform's identity model and are not
+        present in this response. Surfaces auth errors immediately
+        so a bad API key fails fast at plugin start rather than
+        silently producing an unauthenticated WS that gets closed by
+        the server.
         """
         me = client.get_me()
-        # SDK returns a plain dict. Pull id+handle defensively so a
-        # forward-compat field rename in the SDK doesn't crash us
-        # silently — we surface a clear RuntimeError instead.
-        agent_id = me.get("id") if isinstance(me, dict) else None
         handle_raw = me.get("handle") if isinstance(me, dict) else None
-
-        if not isinstance(agent_id, str) or not isinstance(handle_raw, str):
+        if not isinstance(handle_raw, str) or not handle_raw:
             raise RuntimeError(
-                "agentchat runtime: /v1/agents/me response missing id or handle"
+                "agentchat runtime: /v1/agents/me returned no handle — "
+                "refusing to start without a confirmed identity. "
+                "Check that AGENTCHATME_API_KEY is valid."
             )
-
-        return AgentIdentity(agent_id=agent_id, handle=handle_raw.lstrip("@").lower())
+        return AgentIdentity(handle=handle_raw.lstrip("@").lower())
 
     def _teardown_partial(self) -> None:
         """Best-effort cleanup after a failed :meth:`start`.
