@@ -60,6 +60,18 @@ def register(ctx: Any) -> None:
     runtime = get_runtime(config)
     runtime.start()
 
+    # Non-interactive identity-activation hook. Wizard users
+    # (`hermes agentchat register/login`) already got the SOUL.md
+    # anchor written by cli._install_soul_anchor at that step. This
+    # backfill is the safety net for env-var-direct / scripted /
+    # container setups where the user set AGENTCHATME_API_KEY without
+    # running the wizard.
+    #
+    # Idempotent and respectful: if our markers are already in SOUL.md
+    # (even if the block content was hand-edited) we leave the file
+    # alone. Only writes when the anchor is genuinely absent.
+    _ensure_soul_anchor(runtime)
+
     try:
         from .tools import register_tools
 
@@ -81,6 +93,50 @@ def register(ctx: Any) -> None:
         __version__,
         config.api_base,
     )
+
+
+def _ensure_soul_anchor(runtime: Any) -> None:
+    """Backfill the SOUL.md identity anchor when absent.
+
+    The wizard writes the anchor on register/login (``cli.py``). This
+    is the non-wizard path: a user who set ``AGENTCHATME_API_KEY``
+    directly (env var, hand-edited ``~/.hermes/.env``, container
+    secrets, scripted setup) reaches the plugin's startup with a
+    valid runtime + resolved handle but no anchor in SOUL.md. We
+    write it on their behalf.
+
+    Respectful — checks for the marker pair first and skips when
+    present. If a user explicitly removed the block while keeping
+    their key, we do not silently re-add it on every restart.
+
+    Non-fatal — anchor failures are logged as warnings, not raised.
+    The plugin's primary mechanics (WS, tools, skill) work
+    independent of SOUL.md content.
+    """
+    try:
+        from .soul_anchor import AnchorError, has_anchor, write_soul_anchor
+    except ImportError:
+        logger.debug("agentchatme_hermes.soul_anchor not importable; skipping backfill")
+        return
+
+    try:
+        if has_anchor():
+            return
+        path = write_soul_anchor(runtime.identity.handle)
+        logger.info(
+            "agentchat plugin: SOUL.md identity anchor backfilled for "
+            "non-wizard install path (handle=@%s, path=%s)",
+            runtime.identity.handle,
+            path,
+        )
+    except (AnchorError, OSError) as exc:
+        logger.warning(
+            "agentchat plugin: SOUL.md anchor backfill failed (%s). The "
+            "agent will lack AgentChat awareness outside AgentChat-"
+            "triggered turns. Run `hermes agentchat login` to invoke the "
+            "wizard's anchor write, or hand-edit SOUL.md.",
+            exc,
+        )
 
 
 def _on_session_end(**_kwargs: Any) -> None:

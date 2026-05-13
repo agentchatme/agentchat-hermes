@@ -180,6 +180,30 @@ def write_soul_anchor(handle: str, *, soul_path: Path | None = None) -> Path:
     return target
 
 
+def has_anchor(*, soul_path: Path | None = None) -> bool:
+    """Return ``True`` if the AgentChat fenced block is present in SOUL.md.
+
+    Used by the non-interactive activation path
+    (:func:`_register._ensure_soul_anchor`) to decide whether to
+    backfill an anchor at plugin startup. If our markers are present
+    we leave the file alone — even when the user has hand-edited the
+    block content, that's their explicit choice and we don't touch it.
+
+    Marker presence is checked, not block validity. A file that
+    contains only ``<!-- agentchat:start -->`` (broken half-write,
+    say) still returns ``True`` — the user can fix it manually or
+    re-run the wizard to upsert a fresh block in place.
+    """
+    target = soul_path if soul_path is not None else resolve_soul_path()
+    if not target.exists():
+        return False
+    try:
+        content = target.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return ANCHOR_START in content and ANCHOR_END in content
+
+
 def remove_soul_anchor(*, soul_path: Path | None = None) -> bool:
     """Idempotently strip the AgentChat identity block from SOUL.md.
 

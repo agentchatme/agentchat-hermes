@@ -17,6 +17,7 @@ from agentchatme_hermes.soul_anchor import (
     AnchorError,
     _strip_anchor_block,
     _upsert_anchor_block,
+    has_anchor,
     remove_soul_anchor,
     render_anchor_block,
     write_soul_anchor,
@@ -305,6 +306,44 @@ class TestStripAnchorBlock:
         result = _strip_anchor_block(full)
         # No 3+ consecutive newlines
         assert "\n\n\n" not in result
+
+
+# ───────────────────────── has_anchor (backfill probe) ─────────────────────────
+
+
+class TestHasAnchor:
+    def test_returns_false_when_file_absent(self, tmp_path: Path) -> None:
+        assert has_anchor(soul_path=tmp_path / "SOUL.md") is False
+
+    def test_returns_false_when_markers_absent(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text("# Just user content, no markers.\n", encoding="utf-8")
+        assert has_anchor(soul_path=soul) is False
+
+    def test_returns_true_after_write(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        write_soul_anchor("alice", soul_path=soul)
+        assert has_anchor(soul_path=soul) is True
+
+    def test_returns_false_after_remove(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        write_soul_anchor("alice", soul_path=soul)
+        remove_soul_anchor(soul_path=soul)
+        assert has_anchor(soul_path=soul) is False
+
+    def test_returns_true_even_if_block_was_hand_edited(self, tmp_path: Path) -> None:
+        """Marker presence is what we check, not block content validity.
+
+        A user who deliberately edited the block between the markers
+        keeps that edit — the backfill code path uses this function
+        to decide whether to leave the file alone.
+        """
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(
+            f"{ANCHOR_START}\n## On AgentChat\n\nHand-edited.\n{ANCHOR_END}\n",
+            encoding="utf-8",
+        )
+        assert has_anchor(soul_path=soul) is True
 
 
 # ───────────────────────── handle-verify defense ─────────────────────────
