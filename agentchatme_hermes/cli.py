@@ -126,13 +126,19 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
 
 
 def _dispatch_wizard(_args: argparse.Namespace) -> int:
-    """No-subcommand entry: register if unconfigured, otherwise status."""
-    saved_key = _read_saved_key()
-    if saved_key:
-        _printline("AgentChat key already configured. Running status check.")
-        return _dispatch_status(_args)
-    _printline("Welcome to AgentChat. Let's register your agent.")
-    return _dispatch_register(_args)
+    """No-subcommand entry → the interactive wizard.
+
+    External UX (menus, prompts, styled text, arrow-key picker via
+    ``prompt_choice``) is the same shape the 0.1.x line had — see
+    :mod:`agentchatme_hermes.wizard` for the body and the rationale
+    for re-using the engineered text verbatim. The named subcommands
+    (``register``/``login``/``status``/``logout``) remain in this file
+    as scriptable shortcuts; the wizard is the human-facing entry.
+    """
+    from .wizard import interactive_setup
+
+    interactive_setup()
+    return _EXIT_OK
 
 
 def _dispatch_register(args: argparse.Namespace) -> int:
