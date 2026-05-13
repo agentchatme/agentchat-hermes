@@ -60,6 +60,13 @@ _DRAIN_GRACE_SECONDS = 30.0
 # conversation accumulates history under one session row.
 _FALLBACK_MODEL = "claude-sonnet-4-6"
 
+# How many prior messages to rehydrate as conversation_history on
+# each wake. 30 is empirically enough for a typical back-and-forth
+# to make sense without bloating the prompt for long conversations.
+# Power users with chatty groups can scroll further via the
+# agentchat_get_conversation_messages tool.
+_HISTORY_FETCH_LIMIT = 30
+
 
 class AgentInvoker:
     """Drives Mechanism A.
@@ -188,9 +195,16 @@ class AgentInvoker:
                 return  # already logged inside _build_agent
 
             prompt = build_notification_prompt(event)
+            history = self._build_conversation_history(
+                conversation_id=event.conversation_id,
+                conversation_kind=event.conversation_kind,
+                trigger_message_id=event.message_id,
+            )
 
             try:
-                result = agent.run_conversation(prompt)
+                result = agent.run_conversation(
+                    prompt, conversation_history=history
+                )
             except Exception:
                 logger.exception(
                     "AgentInvoker: run_conversation raised for conv=%s msg=%s",
@@ -208,11 +222,99 @@ class AgentInvoker:
                 result.get("final_response") if isinstance(result, dict) else None
             )
             logger.info(
-                "AgentInvoker: turn complete conv=%s msg=%s final_chars=%d",
+                "AgentInvoker: turn complete conv=%s msg=%s history_len=%d final_chars=%d",
                 event.conversation_id,
                 event.message_id,
+                len(history),
                 len(final) if isinstance(final, str) else 0,
             )
+
+    # -- conversation-history rehydration -----------------------------------
+
+    def _build_conversation_history(
+        self,
+        *,
+        conversation_id: str,
+        conversation_kind: str,
+        trigger_message_id: str,
+    ) -> list[dict[str, Any]]:
+        """Fetch and translate recent messages into Hermes turn shape.
+
+        Mirrors ``gateway/run.py:15074-15113`` upstream — the agent
+        wakes up with the full thread rehydrated as alternating
+        ``user``/``assistant`` turns, just like every other Hermes
+        channel. Without this, the agent acts on a single line of text
+        with no prior context.
+
+        Translation rules:
+
+        * The triggering message (``trigger_message_id``) is excluded —
+          it lands as the new ``user_message`` via the notification
+          prompt, not duplicated inside history.
+        * Each AgentChat message becomes one Hermes turn:
+          ``is_own=True`` → ``role: assistant``, otherwise
+          ``role: user``. For groups, non-self messages are prefixed
+          with ``[@sender_handle] `` so the agent can tell speakers
+          apart in a multi-party thread.
+        * Non-text messages are skipped (Hermes' multi-modal pipeline
+          would need adapter work to surface them properly; deferred).
+        * On transport failure the history is empty — best-effort,
+          logged, and the turn still runs (with the notification alone
+          as the user-message). Better to wake the agent without
+          context than to fail to wake it at all.
+        """
+        try:
+            from agentchatme import AgentChatError
+        except ImportError:
+            # SDK is a hard dependency; this branch is theoretically
+            # unreachable, but defensive in case a partial install
+            # lands here before the runtime can fail-fast.
+            logger.warning("AgentInvoker: agentchatme SDK not importable")
+            return []
+
+        try:
+            result = self._runtime_client_get_messages(conversation_id)
+        except AgentChatError as exc:
+            logger.warning(
+                "AgentInvoker: history fetch failed for conv=%s — running "
+                "without prior context. (%s)",
+                conversation_id,
+                exc,
+            )
+            return []
+
+        messages = _extract_messages_list(result)
+        if not messages:
+            return []
+
+        return _translate_messages_to_history(
+            messages,
+            own_handle=self._identity.handle,
+            conversation_kind=conversation_kind,
+            trigger_message_id=trigger_message_id,
+        )
+
+    def _runtime_client_get_messages(self, conversation_id: str) -> Any:
+        """Indirection layer so tests can stub the SDK fetch cleanly."""
+        return self._runtime.client.get_messages(
+            conversation_id, limit=_HISTORY_FETCH_LIMIT
+        )
+
+    @property
+    def _runtime(self) -> Any:
+        """Lazy accessor — the runtime singleton may not exist at construct time
+        (we hold `_identity` separately, which is all the invoker truly needs).
+        Resolved via the get_existing_runtime singleton at call time.
+        """
+        from .runtime import get_existing_runtime
+
+        rt = get_existing_runtime()
+        if rt is None:
+            raise RuntimeError(
+                "AgentInvoker: runtime singleton missing — invoker called "
+                "before Runtime.start() completed"
+            )
+        return rt
 
     # -- AIAgent construction (lazy Hermes import) --------------------------
 
@@ -298,3 +400,83 @@ class AgentInvoker:
             if value is not None:
                 runtime_kwargs[key] = value
         return model, runtime_kwargs
+
+
+# ─── pure helpers (extracted for unit-testability) ─────────────────────────
+
+
+def _extract_messages_list(result: Any) -> list[dict[str, Any]]:
+    """Pull the message list out of a ``get_messages`` response shape.
+
+    The SDK returns ``dict[str, Any]`` with a ``messages`` key holding
+    the list. Defensive against shape drift — anything we don't
+    recognise yields an empty list rather than raising.
+    """
+    if isinstance(result, list):
+        return [m for m in result if isinstance(m, dict)]
+    if isinstance(result, dict):
+        messages = result.get("messages")
+        if isinstance(messages, list):
+            return [m for m in messages if isinstance(m, dict)]
+    return []
+
+
+def _translate_messages_to_history(
+    messages: list[dict[str, Any]],
+    *,
+    own_handle: str,
+    conversation_kind: str,
+    trigger_message_id: str,
+) -> list[dict[str, Any]]:
+    """Translate AgentChat messages into Hermes ``{role, content}`` turns.
+
+    Pure function — no SDK, no runtime, no IO. The translation rules:
+
+    * ``is_own`` (server-precomputed) decides role; falls back to a
+      sender-handle compare if the server didn't precompute it.
+    * Group messages prefix non-self speakers with ``[@handle]`` so
+      the agent can attribute lines in a multi-party thread. Direct
+      conversations stay unprefixed — the alternation in the turn
+      list already encodes who said what.
+    * The trigger message is excluded — it lands as ``user_message``
+      via the notification prompt, not duplicated in history.
+    * Non-text messages are skipped (multi-modal handling is deferred).
+    * Empty content is skipped.
+
+    Output is ordered oldest-first, matching how Hermes' AIAgent
+    expects ``conversation_history`` (it appends the new ``user``
+    turn at the end).
+    """
+    own_handle_norm = own_handle.lstrip("@").lower()
+    is_group = conversation_kind == "group"
+    out: list[dict[str, Any]] = []
+
+    for msg in messages:
+        if msg.get("id") == trigger_message_id:
+            continue
+        if msg.get("type", "text") != "text":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, dict):
+            continue
+        text = content.get("text")
+        if not isinstance(text, str) or not text:
+            continue
+
+        is_own = msg.get("is_own")
+        if not isinstance(is_own, bool):
+            sender = (
+                msg.get("from") or msg.get("sender_handle") or ""
+            )
+            is_own = sender.lstrip("@").lower() == own_handle_norm
+
+        if is_own:
+            out.append({"role": "assistant", "content": text})
+        elif is_group:
+            sender = msg.get("from") or msg.get("sender_handle") or "?"
+            sender = sender.lstrip("@")
+            out.append({"role": "user", "content": f"[@{sender}] {text}"})
+        else:
+            out.append({"role": "user", "content": text})
+
+    return out
