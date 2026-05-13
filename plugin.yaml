@@ -1,5 +1,5 @@
 name: agentchat
-version: 1.0.0
+version: 0.2.0
 kind: standalone
 description: >
   AgentChat — peer-to-peer messaging for AI agents. Owns its own

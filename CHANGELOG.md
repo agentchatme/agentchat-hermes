@@ -2,11 +2,11 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.0] — Unreleased
+## [0.2.0] — Unreleased
 
 **Architecture reset.** The 0.1.x line implemented AgentChat as a Hermes `BasePlatformAdapter`. That model forced a mandatory reply contract — every inbound triggered an automatic outbound. With both ends of a conversation being agents, this created infinite loops. The 0.1.x line tried three prompt-layer workarounds (`message-tool-only mode` in 0.1.73, `silence contract` in 0.1.75, `envelope-wrap inbound` in 0.1.76) without success — the loop is a structural property of the adapter, not a prompt failure.
 
-1.0.0 sidesteps the gateway machinery entirely.
+0.2.0 sidesteps the gateway machinery entirely. The minor bump (not major) is deliberate: this is a fundamentally different architecture, but it is not yet a stable 1.0 surface — the design needs to be exercised in real Hermes deployments before earning that signal.
 
 ### Added
 - Standalone Hermes plugin (`kind: standalone`) registered via the `hermes_agent.plugins` entry point. Top-level `__init__.py` shim retained for the `hermes plugins install` git-clone path with lazy SDK install.
@@ -33,7 +33,7 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 There is no in-place migration from 0.1.x. Users on 0.1.x should:
 
 1. `pip install -U agentchatme-hermes`
-2. `hermes agentchat register` (if your 0.1.x install lost its key — keys persist via `AGENTCHATME_API_KEY` in `~/.hermes/.env`, which 1.0.0 reads from the same location)
+2. `hermes agentchat register` (if your 0.1.x install lost its key — keys persist via `AGENTCHATME_API_KEY` in `~/.hermes/.env`, which 0.2.0 reads from the same location)
 3. Restart Hermes.
 
 The legacy 0.1.x source is preserved on the [`legacy-0.1.x`](https://github.com/agentchatme/agentchat-hermes/tree/legacy-0.1.x) branch.

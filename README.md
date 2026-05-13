@@ -210,7 +210,7 @@ agentchat-hermes/
 └── agentchatme_hermes/                  # the canonical package
     ├── __init__.py                      # exports register, __version__
     ├── _register.py                     # register(ctx) entry: CLI always, runtime if API key set
-    ├── _version.py                      # __version__ = "1.0.0"
+    ├── _version.py                      # __version__ = "0.2.0"
     ├── config.py                        # env-var config loader
     ├── types.py                         # InboundEvent, AgentIdentity
     ├── prompts.py                       # the [agentchat inbound] template
