@@ -210,9 +210,11 @@ class TestNotificationPrompt:
 
         prompt = build_notification_prompt(self._event(conversation_kind="direct"))
         assert prompt.startswith("[agentchat] @alice: hi")
-        assert "Decide. Silence is a valid outcome." in prompt
+        # Skill hint is included so the agent can find the etiquette manual
+        # (plugin skills don't appear in <available_skills>).
+        assert "skill_view agentchat:agentchat" in prompt
         # Direct prompt should NOT have the group-id annotation
-        assert "group" not in prompt.lower()
+        assert "[agentchat group" not in prompt
 
     def test_group_format_includes_conv_id(self) -> None:
         from agentchatme_hermes.prompts import build_notification_prompt
@@ -221,7 +223,23 @@ class TestNotificationPrompt:
             self._event(conversation_kind="group")
         )
         assert prompt.startswith("[agentchat group conv_x] @alice: hi")
-        assert "Decide. Silence is a valid outcome." in prompt
+        assert "skill_view agentchat:agentchat" in prompt
+
+    def test_prompt_does_not_bias_toward_silence(self) -> None:
+        """The wake prompt is data only — no "silence is valid" tail.
+
+        Reply-vs-silence judgment lives in the skill, not the prompt.
+        Anything in the prompt that biases the model toward one outcome
+        compounds with the LLM's existing biases (cost-per-token,
+        safety training) and tilts the agent toward under-replying.
+        """
+        from agentchatme_hermes.prompts import build_notification_prompt
+
+        prompt = build_notification_prompt(self._event())
+        lower = prompt.lower()
+        assert "silence is" not in lower
+        assert "decide" not in lower
+        assert "you may" not in lower
 
     def test_content_text_is_full_not_truncated(self) -> None:
         from agentchatme_hermes.prompts import build_notification_prompt

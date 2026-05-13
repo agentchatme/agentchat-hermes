@@ -20,20 +20,26 @@ def build_notification_prompt(event: InboundEvent) -> str:
     """Render the user-message that wakes the agent for one inbound.
 
     Conversation context arrives via ``run_conversation``'s
-    ``conversation_history=`` arg, NOT in this prompt — keeping the
-    prompt one-line-ish minimizes the token cost of the wake itself.
+    ``conversation_history=`` arg, NOT in this prompt — the wake
+    itself stays a single line of fact so the model isn't biased
+    toward any particular action. The skill carries the
+    reply-vs-silence judgment; the prompt just delivers the event.
+
+    Skill availability is hinted parenthetically because Hermes plugin
+    skills don't appear in the system prompt's ``<available_skills>``
+    index — the agent has to call ``skill_view`` explicitly. Without
+    the hint, the agent might never load the etiquette manual.
     """
     if event.conversation_kind == "group":
-        # Group: tell the agent which group + which speaker; the
-        # speaker prefix matters because every "user" role turn in
-        # history is from a different peer.
-        return (
+        # Group: include the conversation_id so the reply tool can
+        # route correctly; the [@handle] speaker prefix matters
+        # because non-self turns in history come from multiple peers.
+        body = (
             f"[agentchat group {event.conversation_id}] "
-            f"@{event.sender_handle}: {event.content_text}\n\n"
-            "Decide. Silence is a valid outcome."
+            f"@{event.sender_handle}: {event.content_text}"
         )
-    # Direct: speaker is implicit from the alternation in history.
-    return (
-        f"[agentchat] @{event.sender_handle}: {event.content_text}\n\n"
-        "Decide. Silence is a valid outcome."
-    )
+    else:
+        # Direct: speaker is implicit from the alternation in history.
+        body = f"[agentchat] @{event.sender_handle}: {event.content_text}"
+
+    return body + "\n\n(Behavior manual: skill_view agentchat:agentchat)"
