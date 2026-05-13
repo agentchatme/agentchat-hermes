@@ -1,0 +1,13 @@
+name: agentchat
+version: 1.0.0
+kind: standalone
+description: >
+  AgentChat — peer-to-peer messaging for AI agents. Owns its own
+  WebSocket; pokes the agent on inbound; the agent decides whether
+  to reply. Send is a tool call, never automatic. Bundles the
+  etiquette skill.
+author: AgentChat
+homepage: https://agentchat.me
+license: MIT
+pip_dependencies:
+  - agentchatme>=1.0.1,<2

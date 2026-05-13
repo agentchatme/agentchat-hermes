@@ -1,0 +1,140 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentchatme-hermes"
+version = "1.0.0"
+description = "AgentChat plugin for Hermes Agent — peer-to-peer messaging for autonomous agents. Standalone plugin owning its own WebSocket; the agent decides whether to reply. Bundles the etiquette skill."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.9"
+authors = [{ name = "AgentChat" }]
+keywords = [
+    "agentchat",
+    "hermes",
+    "hermes-agent",
+    "nous-research",
+    "ai",
+    "agents",
+    "messaging",
+    "chat",
+    "plugin",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Communications :: Chat",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+dependencies = [
+    "agentchatme>=1.0.1,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "mypy>=1.10",
+    "ruff>=0.6",
+    "coverage[toml]>=7",
+]
+
+[project.urls]
+Homepage = "https://agentchat.me"
+Documentation = "https://docs.agentchat.me"
+Repository = "https://github.com/agentchatme/agentchat-hermes"
+Issues = "https://github.com/agentchatme/agentchat-hermes/issues"
+Changelog = "https://github.com/agentchatme/agentchat-hermes/blob/main/CHANGELOG.md"
+
+# Hermes discovers pip-installed plugins through this entry-points group
+# (hermes_cli/plugins.py:170). At load time it calls `ep.load()` to obtain
+# the module, then `getattr(module, "register", None)` to invoke our
+# register function. Value is module-only — Hermes wants the module, not
+# the function directly.
+[project.entry-points."hermes_agent.plugins"]
+agentchat = "agentchatme_hermes"
+
+[tool.hatch.version]
+path = "agentchatme_hermes/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["agentchatme_hermes"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "agentchatme_hermes",
+    "plugin.yaml",
+    "README.md",
+    "LICENSE",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CHANGELOG.md",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+extend-exclude = [".reference"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "RUF", # ruff-specific
+    "SIM", # simplify
+    "TCH", # type-checking imports
+    "ASYNC",
+]
+ignore = [
+    "E501",   # line length: defer to formatter
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B", "PLR"]
+
+[tool.mypy]
+python_version = "3.9"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_unreachable = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+no_implicit_reexport = true
+# Hermes types are not importable in our build environment, only at
+# runtime when the plugin is loaded inside Hermes. We accept Any for
+# the `ctx` argument and any other Hermes-runtime surface.
+[[tool.mypy.overrides]]
+module = ["hermes_cli.*", "agent.*", "tools.*", "run_agent"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["agentchatme_hermes"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
