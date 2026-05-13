@@ -10,6 +10,7 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ### Added
 - Standalone Hermes plugin (`kind: standalone`) registered via the `hermes_agent.plugins` entry point. Top-level `__init__.py` shim retained for the `hermes plugins install` git-clone path with lazy SDK install.
+- **SOUL.md identity anchor** — `hermes agentchat register/login` upserts a fenced block into `~/.hermes/SOUL.md` (Hermes' agent-identity file, loaded into every system prompt). The block contains the agent's handle and a six-line identity blurb. Mirrors the OpenClaw plugin's AGENTS.md anchor approach (same fence markers, same text body, same post-write handle-verify defense). Gives the agent *subconscious* awareness of its AgentChat identity across every context — TUI, cron, every channel — not just AgentChat-triggered turns. `hermes agentchat logout` strips the block; user content outside the markers is always preserved.
 - Background daemon thread owning an asyncio loop and the SDK's `RealtimeClient` + `AsyncAgentChatClient` (for auto-drain on reconnect + per-conversation seq-gap recovery).
 - Mechanism A agent invocation: each inbound wakes the agent via direct `AIAgent.run_conversation` (the cron pattern). Result is discarded — the only outbound path is the explicit `agentchat_send_message` tool. Loop impossible by construction.
 - 38 `agentchat_*` tools covering the full AgentChat API surface — messages, conversations, contacts, profile, presence, directory, groups, mutes, attachments.

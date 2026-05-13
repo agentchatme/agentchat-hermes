@@ -31,6 +31,7 @@ from getpass import getpass
 from typing import TYPE_CHECKING, Any, Callable
 
 from ._version import __version__
+from .soul_anchor import AnchorError, remove_soul_anchor, write_soul_anchor
 
 if TYPE_CHECKING:
     import argparse
@@ -210,6 +211,7 @@ def _dispatch_register(args: argparse.Namespace) -> int:
         logger.debug("auth_client close raised", exc_info=True)
 
     _persist_credentials(api_key=api_key, handle=handle, api_base=api_base)
+    _install_soul_anchor(handle)
     _print_registration_success(handle=handle, api_key=api_key)
     return _EXIT_OK
 
@@ -260,6 +262,7 @@ def _dispatch_login(args: argparse.Namespace) -> int:
         )
 
     _persist_credentials(api_key=api_key, handle=handle, api_base=api_base)
+    _install_soul_anchor(handle)
     _printline(f"Saved AgentChat key for @{handle}.")
     return _EXIT_OK
 
@@ -315,11 +318,53 @@ def _dispatch_logout(_args: argparse.Namespace) -> int:
 
     save_env_value(_ENV_API_KEY, "")
     save_env_value(_ENV_HANDLE, "")
+    _uninstall_soul_anchor()
     _printline(
         "AgentChat key cleared from ~/.hermes/.env. Your account on the "
         "server is unchanged."
     )
     return _EXIT_OK
+
+
+def _install_soul_anchor(handle: str) -> None:
+    """Upsert the AgentChat identity block into SOUL.md.
+
+    Failure is non-fatal: credentials are already persisted, the account
+    is fully operational, and the anchor is the "subconscious identity
+    everywhere" enhancement. Surface a clear warning so the operator can
+    repair it later — mirrors the OpenClaw plugin's posture at
+    ``channel.wizard.ts:749``.
+    """
+    try:
+        path = write_soul_anchor(handle)
+    except (AnchorError, OSError) as exc:
+        sys.stderr.write(
+            "Warning: failed to update ~/.hermes/SOUL.md with your "
+            f"AgentChat identity. Your account is configured, but the "
+            "agent will not be told about its handle outside of "
+            "AgentChat-triggered turns until this is repaired. "
+            f"(Reason: {exc})\n"
+        )
+        sys.stderr.flush()
+        return
+    _printline(f"Identity anchor written to {path}")
+
+
+def _uninstall_soul_anchor() -> None:
+    """Strip the AgentChat identity block from SOUL.md (idempotent)."""
+    try:
+        removed = remove_soul_anchor()
+    except OSError as exc:
+        sys.stderr.write(
+            f"Warning: could not remove the AgentChat block from SOUL.md "
+            f"({exc}). You can delete the block between "
+            "`<!-- agentchat:start -->` and `<!-- agentchat:end -->` "
+            "manually if needed.\n"
+        )
+        sys.stderr.flush()
+        return
+    if removed:
+        _printline("Identity anchor removed from ~/.hermes/SOUL.md")
 
 
 # ───────────────────────── prompts ─────────────────────────
