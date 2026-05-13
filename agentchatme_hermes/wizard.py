@@ -650,42 +650,92 @@ def _api_base() -> str:
 
 
 def _register_start(*, email: str, handle: str, display_name: str) -> str:
-    """POST /v1/register via the SDK — returns ``pending_id``.
+    """POST /v1/register via raw httpx, omitting null fields.
 
-    Maps SDK error codes onto field hints so the wizard's retry loop can
-    re-prompt the right field.
+    Bypasses the SDK's static :meth:`AgentChatClient.register` because that
+    method sends ``description: null`` unconditionally; the server's strict
+    Zod validation rejects nulls with ``Expected string, received null``,
+    and the SDK swallows the helpful ``details.fieldErrors`` into a generic
+    ``Invalid request`` exception message — both of which are SDK bugs to
+    fix in ``agentchatme`` proper, but until that ships we work around in
+    the plugin. Httpx is already a transitive dep via the SDK, so no new
+    package on the dependency closure.
+
+    Returns the ``pending_id`` for the OTP verify step. Maps server error
+    codes onto field hints so the wizard's retry loop re-prompts the
+    correct field.
     """
-    from agentchatme import AgentChatClient
+    import httpx
+
+    body: dict[str, Any] = {"email": email, "handle": handle}
+    if display_name:
+        body["display_name"] = display_name
 
     try:
-        resp = AgentChatClient.register(
-            email=email,
-            handle=handle,
-            display_name=display_name or None,
-            base_url=_api_base(),
+        resp = httpx.post(
+            f"{_api_base()}/v1/register",
+            json=body,
+            timeout=15.0,
         )
-    except Exception as exc:
-        # The SDK raises specific subclasses of AgentChatError; we
-        # inspect .code to route on field-scoped recovery.
-        code = getattr(exc, "code", None)
-        message = str(exc)
+    except httpx.HTTPError as exc:
+        raise _RegisterError(f"network error: {exc}") from exc
 
-        if code in {"HANDLE_TAKEN", "INVALID_HANDLE", "RESERVED_HANDLE"}:
-            raise _RegisterError(message or code, field="handle", code=code) from exc
-        if code in {"EMAIL_TAKEN", "EMAIL_EXHAUSTED"}:
-            raise _RegisterError(message or code, field="email", code=code) from exc
-        if code == "RATE_LIMITED":
-            raise _RegisterError(
-                "rate-limited — wait a minute and try again", code=code
-            ) from exc
-        raise _RegisterError(message or (code or "registration failed"), code=code) from exc
+    if resp.status_code in (200, 201):
+        try:
+            data = resp.json()
+        except ValueError as exc:
+            raise _RegisterError("invalid server response") from exc
+        pending_id = data.get("pending_id")
+        if not isinstance(pending_id, str) or not pending_id:
+            raise _RegisterError("server did not return a pending_id")
+        return pending_id
 
-    if not isinstance(resp, dict):
-        raise _RegisterError("invalid server response")
-    pending_id = resp.get("pending_id")
-    if not isinstance(pending_id, str) or not pending_id:
-        raise _RegisterError("server did not return a pending_id")
-    return pending_id
+    code, message = _parse_register_error(resp)
+    if code in {"HANDLE_TAKEN", "INVALID_HANDLE", "RESERVED_HANDLE"}:
+        raise _RegisterError(message or code, field="handle", code=code)
+    if code in {"EMAIL_TAKEN", "EMAIL_EXHAUSTED"}:
+        raise _RegisterError(message or code, field="email", code=code)
+    if code == "RATE_LIMITED":
+        raise _RegisterError(
+            "rate-limited — wait a minute and try again", code=code
+        )
+    raise _RegisterError(
+        message or code or f"HTTP {resp.status_code}", code=code
+    )
+
+
+def _parse_register_error(resp: Any) -> tuple[str | None, str | None]:
+    """Pull ``(code, message)`` from a JSON error response.
+
+    Surfaces ``details.fieldErrors`` when present so the user sees what
+    was actually wrong instead of the generic top-level ``message`` —
+    fixes the "Invalid request" black-box UX the SDK has.
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        return None, None
+    code = data.get("code") if isinstance(data, dict) else None
+    message = data.get("message") if isinstance(data, dict) else None
+
+    # If validation failed with field-specific errors, splice them onto
+    # the message so the user can see which field broke.
+    details = data.get("details") if isinstance(data, dict) else None
+    if isinstance(details, dict):
+        field_errors = details.get("fieldErrors")
+        if isinstance(field_errors, dict) and field_errors:
+            parts = []
+            for field, errors in field_errors.items():
+                if isinstance(errors, list) and errors:
+                    parts.append(f"{field}: {errors[0]}")
+            if parts:
+                detail = "; ".join(parts)
+                message = f"{message} ({detail})" if message else detail
+
+    return (
+        code if isinstance(code, str) else None,
+        message if isinstance(message, str) else None,
+    )
 
 
 def _register_verify(*, pending_id: str, code: str) -> tuple[str, str]:

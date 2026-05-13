@@ -153,39 +153,29 @@ def _dispatch_register(args: argparse.Namespace) -> int:
     api_base = _api_base()
 
     try:
-        from agentchatme import (
-            AgentChatClient,
-            AgentChatError,
-            ValidationError,
-        )
+        from agentchatme import AgentChatClient, AgentChatError
     except ImportError:
         return _exit_with(
             "The `agentchatme` SDK is not installed. Run "
             "`pip install agentchatme` and try again.",
         )
 
-    display_name = getattr(args, "display_name", None)
+    from .wizard import _register_start, _RegisterError
+
+    display_name = getattr(args, "display_name", None) or ""
 
     _printline(f"Sending verification code to {email}…")
+    # Route through wizard._register_start so this path shares the same
+    # null-field workaround for the SDK's strict-validation bug. Both
+    # entry points use the same registration mechanics; the wizard adds
+    # field-scoped retry logic on top, which the named subcommand doesn't
+    # need (the operator either succeeds or runs the command again).
     try:
-        register_resp = AgentChatClient.register(
-            email=email,
-            handle=handle,
-            display_name=display_name,
-            base_url=api_base,
+        pending_id = _register_start(
+            email=email, handle=handle, display_name=display_name
         )
-    except ValidationError as exc:
-        return _exit_with(f"Server rejected the request: {exc}")
-    except AgentChatError as exc:
+    except _RegisterError as exc:
         return _exit_with(f"Registration request failed: {exc}")
-
-    pending_id = (
-        register_resp.get("pending_id") if isinstance(register_resp, dict) else None
-    )
-    if not isinstance(pending_id, str):
-        return _exit_with(
-            "Registration server response did not include pending_id"
-        )
 
     _printline("Check your email — a 6-digit code will arrive shortly.")
     try:
