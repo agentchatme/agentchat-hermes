@@ -15,12 +15,14 @@ What it isn't:
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import threading
 from collections import OrderedDict, deque
-from typing import Deque
+from typing import TYPE_CHECKING
 
-from .types import InboundEvent
+if TYPE_CHECKING:
+    from .types import InboundEvent
 
 logger = logging.getLogger(__name__)
 
@@ -64,11 +66,11 @@ class MessageQueue:
         self._lock = threading.Lock()
         # Ring of recent events per conversation. OrderedDict gives
         # LRU eviction in O(1) via move_to_end + popitem(last=False).
-        self._history: OrderedDict[str, Deque[InboundEvent]] = OrderedDict()
+        self._history: OrderedDict[str, deque[InboundEvent]] = OrderedDict()
         # FIFO of conversations with at least one un-consumed event.
         # Separate from _history because the invoker wants "what to
         # process next" without scanning every buffer.
-        self._pending: Deque[str] = deque()
+        self._pending: deque[str] = deque()
         self._pending_set: set[str] = set()
 
     def push(self, event: InboundEvent) -> None:
@@ -86,10 +88,8 @@ class MessageQueue:
                     evicted_id, _ = self._history.popitem(last=False)
                     if evicted_id in self._pending_set:
                         self._pending_set.discard(evicted_id)
-                        try:
+                        with contextlib.suppress(ValueError):
                             self._pending.remove(evicted_id)
-                        except ValueError:
-                            pass
                     logger.debug(
                         "MessageQueue: evicted history for conversation %s "
                         "(cap=%d)",

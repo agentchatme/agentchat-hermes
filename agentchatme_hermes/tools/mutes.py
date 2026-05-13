@@ -29,19 +29,19 @@ MUTE_AGENT_SCHEMA = {
     "description": (
         "Mute notifications from a specific agent. Their messages still "
         "arrive (you can still read and reply via tools) — only the live "
-        "WS push is suppressed for muted senders. Pass `duration` for a "
-        "time-limited mute (e.g. 'pt1h' for 1h, 'pt30m' for 30m); omit for "
-        "an indefinite mute. Reversible via agentchat_unmute_agent."
+        "WS push is suppressed for muted senders. Pass `muted_until` (ISO "
+        "8601 timestamp like '2026-05-13T14:00:00Z') for a time-limited "
+        "mute; omit for indefinite. Reversible via agentchat_unmute_agent."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "handle": {"type": "string", "description": "Agent @handle to mute."},
-            "duration": {
+            "muted_until": {
                 "type": "string",
                 "description": (
-                    "Optional ISO 8601 duration ('pt1h', 'pt30m', 'p1d'). "
-                    "Omit for indefinite."
+                    "Optional ISO 8601 timestamp at which the mute auto-expires "
+                    "(e.g. '2026-05-13T14:00:00Z'). Omit for indefinite."
                 ),
             },
         },
@@ -80,14 +80,11 @@ def _build_mute_agent(runtime: Runtime) -> Callable[..., str]:
 
         try:
             handle = normalize_handle(require_str(args, "handle"))
-            duration = optional_str(args, "duration", max_len=32)
+            muted_until = optional_str(args, "muted_until", max_len=64)
         except ToolArgError as exc:
             return handle_arg_error(exc)
         try:
-            body: dict[str, Any] = {}
-            if duration:
-                body["duration"] = duration
-            result = runtime.client.mute_agent(handle, body) if body else runtime.client.mute_agent(handle)
+            result = runtime.client.mute_agent(handle, muted_until=muted_until)
         except AgentChatError as exc:
             return format_sdk_error(exc)
         return ok({"mute": result})
@@ -105,13 +102,6 @@ def _build_unmute_agent(runtime: Runtime) -> Callable[..., str]:
             return handle_arg_error(exc)
         try:
             runtime.client.unmute_agent(handle)
-        except AttributeError:
-            # Older SDK may expose the unmute under a different name —
-            # fall back to the inverse path through delete on the mute
-            # endpoint via the SDK's lower-level helpers.
-            return format_sdk_error(
-                _make_method_missing("unmute_agent")
-            )
         except AgentChatError as exc:
             return format_sdk_error(exc)
         return ok({"unmuted_handle": handle})
@@ -130,21 +120,6 @@ def _build_list_mutes(runtime: Runtime) -> Callable[..., str]:
         return ok({"mutes": result})
 
     return _handler
-
-
-def _make_method_missing(method_name: str) -> Any:
-    """Synthesize an SDK-shaped error for missing-method paths.
-
-    Lets us surface a forward-compat error through the standard
-    :func:`format_sdk_error` envelope instead of leaking AttributeError
-    detail.
-    """
-    from agentchatme import ServerError
-
-    return ServerError(
-        f"This SDK version does not expose `{method_name}`. "
-        "Upgrade `agentchatme` to the latest release."
-    )
 
 
 TOOLS = (

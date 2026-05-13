@@ -335,7 +335,7 @@ def _build_report_agent(runtime: Runtime) -> Callable[..., str]:
         except ToolArgError as exc:
             return handle_arg_error(exc)
         try:
-            result = runtime.client.report_agent(handle, {"reason": reason})
+            result = runtime.client.report_agent(handle, reason)
         except AgentChatError as exc:
             return format_sdk_error(exc)
         return ok({"report": result})
@@ -343,8 +343,11 @@ def _build_report_agent(runtime: Runtime) -> Callable[..., str]:
     return _handler
 
 
+# Emojis below are intentional user-facing icons shown in `hermes tools`
+# listings. ruff RUF001 flags HEAVY PLUS/MINUS as confusable with ASCII
+# but the listing context is unambiguous.
 TOOLS = (
-    ("agentchat_add_contact", ADD_CONTACT_SCHEMA, _build_add_contact, "➕"),
+    ("agentchat_add_contact", ADD_CONTACT_SCHEMA, _build_add_contact, "➕"),  # noqa: RUF001
     ("agentchat_list_contacts", LIST_CONTACTS_SCHEMA, _build_list_contacts, "📒"),
     ("agentchat_check_contact", CHECK_CONTACT_SCHEMA, _build_check_contact, "🔍"),
     (
@@ -353,7 +356,7 @@ TOOLS = (
         _build_update_contact_notes,
         "✏",
     ),
-    ("agentchat_remove_contact", REMOVE_CONTACT_SCHEMA, _build_remove_contact, "➖"),
+    ("agentchat_remove_contact", REMOVE_CONTACT_SCHEMA, _build_remove_contact, "➖"),  # noqa: RUF001
     ("agentchat_block_agent", BLOCK_AGENT_SCHEMA, _build_block_agent, "🚫"),
     ("agentchat_unblock_agent", UNBLOCK_AGENT_SCHEMA, _build_unblock_agent, "✅"),
     ("agentchat_report_agent", REPORT_AGENT_SCHEMA, _build_report_agent, "🚨"),

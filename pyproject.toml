@@ -115,16 +115,30 @@ warn_unreachable = true
 disallow_any_generics = true
 disallow_subclassing_any = true
 no_implicit_reexport = true
+# Restrict mypy to the canonical package — the top-level __init__.py
+# shim lives in a directory whose name contains a hyphen, which mypy
+# (correctly) rejects as a Python identifier. The shim is only loaded
+# by Hermes' directory-install path; type-checking is the canonical
+# package's job.
+files = ["agentchatme_hermes"]
+explicit_package_bases = true
+
 # Hermes types are not importable in our build environment, only at
 # runtime when the plugin is loaded inside Hermes. We accept Any for
 # the `ctx` argument and any other Hermes-runtime surface.
 [[tool.mypy.overrides]]
-module = ["hermes_cli.*", "agent.*", "tools.*", "run_agent"]
+module = ["hermes_cli.*", "agent.*", "tools.*", "run_agent", "hermes_state"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# importlib mode prevents pytest's classic package-rootdir auto-detection
+# from treating the top-level git-clone shim (__init__.py) as the
+# project package root. Without this, pytest would try to import
+# `__init__.py` as a module and fail on the package-relative
+# `from .agentchatme_hermes import register` line.
+addopts = ["--import-mode=importlib"]
 filterwarnings = ["error"]
 
 [tool.coverage.run]

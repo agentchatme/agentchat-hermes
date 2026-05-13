@@ -165,21 +165,18 @@ def _build_send_message(runtime: Runtime) -> Callable[..., str]:
                     "Provide either `to` or `conversation_id`, not both"
                 )
 
-            request: dict[str, Any] = {
-                "type": "text",
-                "content": {"text": text},
-            }
-            if to_raw is not None:
-                request["to"] = normalize_handle(to_raw, field="to")
-            if conv_id:
-                request["conversation_id"] = conv_id
-            if client_msg_id:
-                request["client_msg_id"] = client_msg_id
+            to_handle = normalize_handle(to_raw, field="to") if to_raw is not None else None
         except ToolArgError as exc:
             return handle_arg_error(exc)
 
         try:
-            result = runtime.client.send_message(request)
+            result = runtime.client.send_message(
+                to=to_handle,
+                conversation_id=conv_id,
+                text=text,
+                type="text",
+                client_msg_id=client_msg_id,
+            )
         except AgentChatError as exc:
             return format_sdk_error(exc)
         return ok({"message": result})
@@ -229,8 +226,6 @@ def _build_get_conversation_messages(runtime: Runtime) -> Callable[..., str]:
             except AgentChatError as exc:
                 return format_sdk_error(exc)
             for conv in conversations:
-                if not isinstance(conv, dict):
-                    continue
                 if conv.get("kind") != "direct":
                     continue
                 peer = conv.get("peer") or {}

@@ -28,6 +28,7 @@ one long-lived loop, one daemon thread.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from typing import TYPE_CHECKING, Any, Callable
@@ -162,11 +163,10 @@ class WSDaemon:
 
         # Park forever — the SDK owns the connection lifecycle. Exit
         # path is through :meth:`stop` cancelling this coroutine.
-        try:
-            while not self._stopped.is_set():
-                await asyncio.sleep(3600)
-        except asyncio.CancelledError:
-            pass
+        # Awaiting a never-resolved Future is the asyncio-idiomatic
+        # "block until cancelled."
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.Future()
 
     async def _shutdown(self) -> None:
         rt = self._rt_client

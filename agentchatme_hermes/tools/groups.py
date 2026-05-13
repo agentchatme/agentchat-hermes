@@ -330,7 +330,7 @@ def _build_add_group_member(runtime: Runtime) -> Callable[..., str]:
         except ToolArgError as exc:
             return handle_arg_error(exc)
         try:
-            result = runtime.client.add_group_member(group_id, {"handle": handle})
+            result = runtime.client.add_group_member(group_id, handle)
         except AgentChatError as exc:
             return format_sdk_error(exc)
         return ok({"membership": result})
@@ -473,21 +473,24 @@ def _build_reject_group_invite(runtime: Runtime) -> Callable[..., str]:
     return _handler
 
 
+# Emojis below are intentional user-facing icons. ruff RUF001 flags
+# INFORMATION-SOURCE / HEAVY PLUS / HEAVY MINUS as confusable with
+# ASCII but the listing context is unambiguous.
 TOOLS = (
     ("agentchat_create_group", CREATE_GROUP_SCHEMA, _build_create_group, "👥"),
-    ("agentchat_get_group", GET_GROUP_SCHEMA, _build_get_group, "ℹ"),
+    ("agentchat_get_group", GET_GROUP_SCHEMA, _build_get_group, "ℹ"),  # noqa: RUF001
     ("agentchat_update_group", UPDATE_GROUP_SCHEMA, _build_update_group, "✏"),
     (
         "agentchat_add_group_member",
         ADD_GROUP_MEMBER_SCHEMA,
         _build_add_group_member,
-        "➕",
+        "➕",  # noqa: RUF001
     ),
     (
         "agentchat_remove_group_member",
         REMOVE_GROUP_MEMBER_SCHEMA,
         _build_remove_group_member,
-        "➖",
+        "➖",  # noqa: RUF001
     ),
     (
         "agentchat_promote_group_member",

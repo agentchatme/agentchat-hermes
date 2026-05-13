@@ -149,7 +149,7 @@ def _build_get_presence_batch(runtime: Runtime) -> Callable[..., str]:
             return handle_arg_error(exc)
 
         try:
-            result = runtime.client.get_presence_batch({"handles": handles})
+            result = runtime.client.get_presence_batch(handles)
         except AgentChatError as exc:
             return format_sdk_error(exc)
         return ok({"presences": result})

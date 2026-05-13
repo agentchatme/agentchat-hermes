@@ -6,7 +6,10 @@ notification just delivers the new fact: a message landed.
 """
 from __future__ import annotations
 
-from .types import InboundEvent
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .types import InboundEvent
 
 # The notification prompt is intentionally minimal — no instructions,
 # no "you may", no "please consider". The skill teaches what to do

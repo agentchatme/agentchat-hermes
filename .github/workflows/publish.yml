@@ -1,0 +1,59 @@
+name: publish
+
+# Triggered manually from the Actions tab. Single source of truth for
+# the published version is pyproject.toml + agentchatme_hermes/_version.py;
+# we don't take a version input — we tag whatever the repo says.
+#
+# Publish flow uses a long-lived PyPI token (per repo memory: OIDC was
+# decorative on the 0.x line — every release was uploaded manually).
+# Reuse the same NPM_TOKEN-style explicit-token pattern via the secrets
+# block below. Rotate the token whenever the maintainer changes.
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build but do not upload"
+        type: boolean
+        default: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # to attach the built sdist + wheel to a release later
+    environment:
+      name: pypi
+      url: https://pypi.org/project/agentchatme-hermes/
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade build twine
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Inspect dist
+        run: |
+          ls -la dist/
+          python -m twine check dist/*
+
+      - name: Publish to PyPI
+        if: ${{ !inputs.dry_run }}
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: python -m twine upload dist/*
+
+      - name: Upload dist artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error

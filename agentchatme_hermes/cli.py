@@ -24,14 +24,16 @@ their secrets.
 """
 from __future__ import annotations
 
-import argparse
 import logging
 import re
 import sys
 from getpass import getpass
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from ._version import __version__
+
+if TYPE_CHECKING:
+    import argparse
 
 logger = logging.getLogger(__name__)
 

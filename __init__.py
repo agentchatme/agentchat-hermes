@@ -51,6 +51,17 @@ def _ensure_sdk_installed() -> None:
 
 _ensure_sdk_installed()
 
-from .agentchatme_hermes import __version__, register
+# Re-export from the canonical package. The relative import only
+# resolves when this file is loaded as part of a package (which is
+# how Hermes' directory-install loader sets it up via
+# ``submodule_search_locations``). In other import contexts (pytest
+# crawling the repo root, ad-hoc ``python -c "import __init__"``),
+# the import would fail with "attempted relative import with no known
+# parent package" — we tolerate that silently because non-Hermes
+# contexts have no business with these symbols.
+try:
+    from .agentchatme_hermes import __version__, register  # type: ignore[no-redef]
 
-__all__ = ["__version__", "register"]
+    __all__ = ["__version__", "register"]
+except ImportError:
+    __all__ = []

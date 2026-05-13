@@ -123,12 +123,17 @@ def format_sdk_error(exc: AgentChatError) -> str:
 
 
 def _extract_retry_after(exc: RateLimitedError) -> int | None:
-    """Pull ``Retry-After`` out of the SDK error, if present."""
-    value = getattr(exc, "retry_after_seconds", None)
-    if value is None:
-        value = getattr(exc, "retry_after", None)
-    if isinstance(value, (int, float)):
-        return int(value)
+    """Pull ``Retry-After`` out of the SDK error, normalized to seconds.
+
+    The SDK stores the header in milliseconds on
+    :attr:`RateLimitedError.retry_after_ms`. We surface seconds to the
+    LLM because every existing AgentChat error message references
+    seconds (and humans / models reason in seconds, not ms).
+    """
+    ms = getattr(exc, "retry_after_ms", None)
+    if isinstance(ms, (int, float)) and not isinstance(ms, bool):
+        # Ceil-divide so a 500ms wait surfaces as 1s, not 0.
+        return max(1, int((ms + 999) // 1000))
     return None
 
 
