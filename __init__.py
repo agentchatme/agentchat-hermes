@@ -25,6 +25,8 @@ loader invokes :mod:`agentchatme_hermes` directly via the
 from __future__ import annotations
 
 import logging
+import os
+import shutil
 import subprocess
 import sys
 
@@ -37,16 +39,67 @@ _SDK_REQUIREMENT = "agentchatme>=1.0.1,<2"
 def _ensure_sdk_installed() -> None:
     """Install agentchatme if importing it would fail.
 
-    Idempotent. Pip runs as a subprocess of the current interpreter so
-    the install lands in the same environment Hermes is running in.
+    Idempotent. Tries ``pip`` first (the universal path); falls back
+    to ``uv pip`` if the venv was built with uv and doesn't ship pip
+    — which is the case for the standard Hermes install (verified
+    against the upstream installer script).
+
+    The install always lands in the same environment ``sys.executable``
+    points at, regardless of which tool runs it.
     """
     try:
         import agentchatme  # noqa: F401
+        return
     except ImportError:
-        logger.info("agentchatme SDK not installed; installing %s", _SDK_REQUIREMENT)
+        pass
+
+    logger.info("agentchatme SDK not installed; installing %s", _SDK_REQUIREMENT)
+
+    # Path 1: pip via the current interpreter. Works on any venv that
+    # has pip available (most do; the uv-built ones do not).
+    try:
         subprocess.check_call(
-            [sys.executable, "-m", "pip", "install", "--quiet", _SDK_REQUIREMENT]
+            [sys.executable, "-m", "pip", "install", "--quiet", _SDK_REQUIREMENT],
+            stderr=subprocess.DEVNULL,
         )
+        return
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    # Path 2: uv. Hermes' canonical installer builds the venv with uv
+    # (see scripts/install.sh upstream), so pip is unavailable but uv
+    # itself exists at ~/.local/bin/uv. Search the standard locations
+    # since plugin loaders may strip PATH.
+    uv_bin = (
+        shutil.which("uv")
+        or _existing_path("/root/.local/bin/uv")
+        or _existing_path(os.path.expanduser("~/.local/bin/uv"))
+        or _existing_path("/usr/local/bin/uv")
+    )
+    if uv_bin is not None:
+        subprocess.check_call(
+            [
+                uv_bin,
+                "pip",
+                "install",
+                "--quiet",
+                "--python",
+                sys.executable,
+                _SDK_REQUIREMENT,
+            ]
+        )
+        return
+
+    raise RuntimeError(
+        f"Could not install {_SDK_REQUIREMENT} — neither pip nor uv is "
+        "available to the plugin loader. Install the SDK manually via "
+        f"`uv pip install --python {sys.executable} '{_SDK_REQUIREMENT}'`, "
+        "then restart Hermes."
+    )
+
+
+def _existing_path(path: str) -> str | None:
+    return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
 
 
 _ensure_sdk_installed()
