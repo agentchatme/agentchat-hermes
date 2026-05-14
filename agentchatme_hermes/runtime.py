@@ -34,10 +34,26 @@ logger = logging.getLogger(__name__)
 
 
 class Runtime:
-    """Coordinator for the plugin's stateful subsystems."""
+    """Coordinator for the plugin's stateful subsystems.
 
-    def __init__(self, config: Config) -> None:
+    Has two operational modes, chosen at construction:
+
+    * ``gateway_mode=True`` — full runtime: sync HTTP client +
+      identity resolution + WSDaemon background thread + AgentInvoker
+      thread pool. The long-lived ``hermes gateway`` process uses
+      this; live inbound delivery lives here.
+    * ``gateway_mode=False`` — light runtime: sync HTTP client +
+      identity resolution only. No WS connection opened, no invoker
+      thread pool. Used by short-lived CLI / TUI / utility processes
+      where the agent might call ``agentchat_*`` tools (via the
+      shared sync client) but the live inbound stream stays
+      exclusively in the gateway. This eliminates the multiple-WS-
+      per-machine churn the first spike exposed.
+    """
+
+    def __init__(self, config: Config, *, gateway_mode: bool) -> None:
         self._config = config
+        self._gateway_mode = gateway_mode
 
         self._started = False
         self._stopped = False
@@ -88,29 +104,41 @@ class Runtime:
             self._started = True
 
             try:
+                # Always needed — the sync client backs every tool
+                # handler, and the resolved handle anchors SOUL.md +
+                # gates the WS self-echo filter when one runs.
                 self._client = self._build_sync_client()
                 self._identity = self._resolve_identity(self._client)
-                self._queue = MessageQueue()
-                self._invoker = AgentInvoker(
-                    config=self._config,
-                    identity=self._identity,
-                    queue=self._queue,
-                )
-                self._ws_daemon = WSDaemon(
-                    config=self._config,
-                    identity=self._identity,
-                    queue=self._queue,
-                    on_new_event=self._invoker.on_new_event,
-                )
 
-                self._invoker.start()
-                self._ws_daemon.start()
+                if self._gateway_mode:
+                    self._queue = MessageQueue()
+                    self._invoker = AgentInvoker(
+                        config=self._config,
+                        identity=self._identity,
+                        queue=self._queue,
+                    )
+                    self._ws_daemon = WSDaemon(
+                        config=self._config,
+                        identity=self._identity,
+                        queue=self._queue,
+                        on_new_event=self._invoker.on_new_event,
+                    )
 
-                logger.info(
-                    "agentchat runtime started: handle=@%s ws=%s",
-                    self._identity.handle,
-                    self._config.ws_url,
-                )
+                    self._invoker.start()
+                    self._ws_daemon.start()
+
+                    logger.info(
+                        "agentchat runtime started: handle=@%s ws=%s mode=gateway",
+                        self._identity.handle,
+                        self._config.ws_url,
+                    )
+                else:
+                    logger.info(
+                        "agentchat runtime started: handle=@%s mode=cli "
+                        "(no WS, no invoker — live inbound runs in the "
+                        "gateway process)",
+                        self._identity.handle,
+                    )
             except Exception:
                 logger.exception("agentchat runtime: start failed")
                 # Best-effort cleanup so subsequent get_runtime() calls
@@ -223,18 +251,24 @@ _singleton: Runtime | None = None
 _singleton_lock = threading.Lock()
 
 
-def get_runtime(config: Config) -> Runtime:
+def get_runtime(config: Config, *, gateway_mode: bool) -> Runtime:
     """Return the process-wide runtime, constructing if needed.
 
     Idempotent within a process — the same Config typically resolves
     to the same Runtime. Construction is lock-guarded so concurrent
     register() calls (which shouldn't happen, but defensive) don't
     spawn two daemons.
+
+    ``gateway_mode`` is honored only on first construction; subsequent
+    calls within the same process return the existing singleton
+    regardless. That's the intended behavior — Hermes calls
+    ``register(ctx)`` once per process and the mode is fixed for the
+    process lifetime.
     """
     global _singleton
     with _singleton_lock:
         if _singleton is None:
-            _singleton = Runtime(config)
+            _singleton = Runtime(config, gateway_mode=gateway_mode)
         return _singleton
 
 

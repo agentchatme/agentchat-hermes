@@ -45,6 +45,10 @@ logger = logging.getLogger(__name__)
 _THREAD_NAME = "agentchat-ws-daemon"
 _STOP_GRACE_SECONDS = 5.0
 
+# Heartbeat interval. Long enough to not spam the log, short enough
+# that "is the daemon alive?" is a question with an answer ≤60s old.
+_HEARTBEAT_INTERVAL_S = 60.0
+
 
 class WSDaemon:
     """Owns the long-lived AgentChat WebSocket.
@@ -74,6 +78,19 @@ class WSDaemon:
         self._started = threading.Event()
         self._stopped = threading.Event()
         self._lock = threading.Lock()
+
+        # Set by ``_main`` once the loop is running. ``_shutdown``
+        # signals this to cleanly unblock ``_main``'s park-forever
+        # await, replacing the older ``await asyncio.Future()`` pattern
+        # that needed task cancellation to unwind.
+        self._stop_event: asyncio.Event | None = None
+
+        # Operational counters for the periodic heartbeat log. Bumped
+        # atomically inside :meth:`_on_message_frame` so the heartbeat
+        # can report what's flowing without coordinating locks.
+        self._frames_seen = 0
+        self._frames_self_filtered = 0
+        self._frames_queued = 0
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -155,20 +172,76 @@ class WSDaemon:
         self._rt_client.on_disconnect(self._on_disconnect)
         self._rt_client.on_error(self._on_error)
 
+        # Stop-event lives on this loop. ``_shutdown`` (scheduled
+        # cross-thread) sets it, which unblocks the park-forever wait
+        # below — cleaner than the old "await never-resolved Future
+        # + cancel" pattern, which left a "thread did not exit within
+        # 5.0s grace" warning on most shutdowns.
+        self._stop_event = asyncio.Event()
+
         try:
             await self._rt_client.connect()
         except Exception:
             logger.exception("WSDaemon: initial connect failed")
             return
 
-        # Park forever — the SDK owns the connection lifecycle. Exit
-        # path is through :meth:`stop` cancelling this coroutine.
-        # Awaiting a never-resolved Future is the asyncio-idiomatic
-        # "block until cancelled."
-        with contextlib.suppress(asyncio.CancelledError):
-            await asyncio.Future()
+        # Start the heartbeat alongside the park-forever wait so the
+        # daemon emits a "still alive" signal every minute even when
+        # no traffic is flowing. Both run concurrently; either ending
+        # unblocks the main coroutine.
+        heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        try:
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._stop_event.wait()
+        finally:
+            heartbeat_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await heartbeat_task
+
+    async def _heartbeat_loop(self) -> None:
+        """Periodic 'WSDaemon alive' signal with counters.
+
+        Bridges the visibility gap that the first spike exposed: a
+        silent daemon could be alive-and-idle or dead-and-stuck, and
+        from outside the process there was no way to tell. The
+        heartbeat distinguishes the two: while this log line is
+        appearing every 60s the daemon thread is alive; if it stops
+        appearing while the gateway is still running, the daemon is
+        wedged.
+        """
+        rt_client = self._rt_client
+        while True:
+            try:
+                await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
+            except asyncio.CancelledError:
+                return
+            try:
+                connected = bool(rt_client.is_connected) if rt_client else False
+                logger.info(
+                    "WSDaemon heartbeat: connected=%s handle=@%s "
+                    "frames=%d self_filtered=%d queued=%d pending_convs=%d",
+                    connected,
+                    self._identity.handle,
+                    self._frames_seen,
+                    self._frames_self_filtered,
+                    self._frames_queued,
+                    self._queue.pending_count(),
+                )
+            except Exception:
+                # The heartbeat must never crash the daemon. Log and
+                # keep ticking — diagnostic noise is far less harmful
+                # than a silent dead loop.
+                logger.exception("WSDaemon: heartbeat-log raised")
 
     async def _shutdown(self) -> None:
+        # Signal the park-forever wait in ``_main`` to unblock cleanly.
+        # The Event-based approach (vs the old task-cancellation dance)
+        # lets the loop drain pending tasks and exit on its own without
+        # the 5.0s grace timeout firing.
+        stop_event = self._stop_event
+        if stop_event is not None:
+            stop_event.set()
+
         rt = self._rt_client
         if rt is not None:
             try:
@@ -185,6 +258,9 @@ class WSDaemon:
 
         loop = self._loop
         if loop is not None:
+            # Cancel any background tasks the SDK might still have
+            # (reconnect timers, hello-ack watchdogs) so the loop can
+            # exit. Don't cancel the current task — that's us.
             for task in asyncio.all_tasks(loop):
                 if task is not asyncio.current_task():
                     task.cancel()
@@ -217,30 +293,84 @@ class WSDaemon:
         {...}}``. The SDK guarantees seq-ordered, deduplicated
         delivery — we don't need to defend against either at this
         layer.
+
+        Every frame is logged at INFO. The first spike had us
+        unable to tell whether a peer's message had reached our
+        plugin or not, because the only log signal was a turn
+        completing at the far end of the pipeline. With per-frame
+        logging the receipt is visible the instant it arrives.
+
+        Defensive try/except around the queue push and the wake
+        callback — a single bad frame must NOT take down the daemon.
         """
         from .types import InboundEvent
 
+        self._frames_seen += 1
+
         payload = frame.get("payload")
         if not isinstance(payload, dict):
-            logger.debug("WSDaemon: dropping message.new without payload")
+            logger.warning(
+                "WSDaemon: received message.new without dict payload "
+                "(seen=%d, type=%s) — dropping",
+                self._frames_seen,
+                type(payload).__name__,
+            )
             return
 
         sender = (payload.get("from") or payload.get("sender") or "").lstrip("@").lower()
+        msg_id = payload.get("id", "<no-id>")
+        conv_id = payload.get("conversation_id", "<no-conv>")
+
         if sender == self._identity.handle:
             # Own outbound, echoed back by server-side fan-out. Suppress
             # so we don't wake the agent on its own reply.
+            self._frames_self_filtered += 1
+            logger.debug(
+                "WSDaemon: filtered own echo conv=%s msg=%s",
+                conv_id,
+                msg_id,
+            )
             return
 
         event = InboundEvent.from_ws_message(payload)
         if event is None:
-            logger.debug(
-                "WSDaemon: dropping malformed payload keys=%s",
+            logger.warning(
+                "WSDaemon: dropping malformed payload conv=%s msg=%s keys=%s",
+                conv_id,
+                msg_id,
                 sorted(payload.keys()),
             )
             return
 
-        self._queue.push(event)
+        logger.info(
+            "WSDaemon: received message.new conv=%s msg=%s from=@%s "
+            "kind=%s text_chars=%d",
+            event.conversation_id,
+            event.message_id,
+            event.sender_handle,
+            event.conversation_kind,
+            len(event.content_text),
+        )
+
+        try:
+            self._queue.push(event)
+            self._frames_queued += 1
+        except Exception:
+            logger.exception(
+                "WSDaemon: queue.push raised for conv=%s msg=%s — "
+                "dropping (daemon survives, future frames continue)",
+                event.conversation_id,
+                event.message_id,
+            )
+            return
+
         try:
             self._on_new_event()
         except Exception:
-            logger.exception("WSDaemon: on_new_event callback raised")
+            logger.exception(
+                "WSDaemon: on_new_event callback raised for conv=%s — "
+                "daemon survives, but the invoker may not have woken; "
+                "the next frame's wake signal will pick up this event "
+                "from the queue.",
+                event.conversation_id,
+            )

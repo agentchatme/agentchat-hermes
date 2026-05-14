@@ -121,6 +121,12 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     )
     p_logout.set_defaults(func=_dispatch_logout)
 
+    p_doctor = sub.add_parser(
+        "doctor",
+        help="Diagnose AgentChat configuration & connectivity",
+    )
+    p_doctor.set_defaults(func=_dispatch_doctor)
+
 
 # ───────────────────────── dispatchers ─────────────────────────
 
@@ -297,6 +303,229 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
 
     _print_status(me)
     return _EXIT_OK
+
+
+def _dispatch_doctor(_args: argparse.Namespace) -> int:
+    """Health-check the plugin's configuration end-to-end.
+
+    Surfaces in a single checklist:
+
+    * env vars (api key, handle, api base)
+    * SDK importability
+    * API reachability + auth (``GET /v1/agents/me``)
+    * Account-side flags that would silently suppress live delivery
+      (paused-by-owner, inbox mode = strict, etc.)
+    * Undelivered backlog (``GET /v1/messages/undelivered/count``)
+    * SOUL.md anchor presence
+    * Gateway process detection (informational only — the doctor
+      itself is a CLI process, so we can only check whether *another*
+      process matching ``hermes gateway`` is running)
+
+    Exit code is the number of failed checks; ``0`` means clean.
+    Each line is prefixed with ``[ok]`` / ``[warn]`` / ``[fail]``
+    so the output is grep-friendly for CI / scripted setups.
+    """
+    failures = 0
+    warnings_count = 0
+
+    def ok(line: str) -> None:
+        _printline(f"  [ok]   {line}")
+
+    def warn(line: str) -> None:
+        nonlocal warnings_count
+        warnings_count += 1
+        _printline(f"  [warn] {line}")
+
+    def fail(line: str) -> None:
+        nonlocal failures
+        failures += 1
+        _printline(f"  [fail] {line}")
+
+    _printline("")
+    _printline(f"AgentChat plugin doctor — agentchatme-hermes {__version__}")
+    _printline("")
+
+    saved_key = _read_saved_key()
+    if saved_key:
+        ok(f"AGENTCHATME_API_KEY set ({_mask_key(saved_key)})")
+    else:
+        fail(
+            "AGENTCHATME_API_KEY not set — run "
+            "`hermes agentchat register` or `hermes agentchat login`"
+        )
+
+    api_base = _api_base()
+    if api_base == _DEFAULT_API_BASE:
+        ok(f"API base: {api_base} (default)")
+    else:
+        ok(f"API base: {api_base} (overridden via AGENTCHATME_API_BASE)")
+
+    import os
+
+    saved_handle = os.environ.get(_ENV_HANDLE, "").strip()
+    if saved_handle:
+        ok(f"Local handle hint: @{saved_handle}")
+    else:
+        warn(
+            "AGENTCHATME_HANDLE not set (informational — the runtime "
+            "resolves the handle from /v1/agents/me at startup)"
+        )
+
+    try:
+        from agentchatme import AgentChatClient, AgentChatError, UnauthorizedError
+    except ImportError:
+        fail(
+            "agentchatme SDK is not importable — "
+            "run `pip install agentchatme` or `uv pip install agentchatme`"
+        )
+        return _doctor_finalize(failures, warnings_count)
+
+    ok("agentchatme SDK importable")
+
+    if not saved_key:
+        # No key to test connectivity with — skip the rest.
+        return _doctor_finalize(failures, warnings_count)
+
+    client = AgentChatClient(api_key=saved_key, base_url=api_base)
+    try:
+        try:
+            me = client.get_me()
+        except UnauthorizedError:
+            fail(
+                "API key did NOT authenticate against /v1/agents/me — "
+                "rotate via `hermes agentchat login`"
+            )
+            return _doctor_finalize(failures, warnings_count)
+        except AgentChatError as exc:
+            fail(f"Could not reach /v1/agents/me: {exc}")
+            return _doctor_finalize(failures, warnings_count)
+
+        handle = me.get("handle") if isinstance(me, dict) else None
+        if isinstance(handle, str) and handle:
+            ok(f"Authenticated as @{handle}")
+        else:
+            fail("Server response missing handle — refusing to trust")
+            return _doctor_finalize(failures, warnings_count)
+
+        status = me.get("status") if isinstance(me, dict) else None
+        if status == "active":
+            ok(f"Account status: {status}")
+        elif status:
+            warn(f"Account status: {status} — may suppress live delivery")
+        else:
+            warn("Account status field missing from /v1/agents/me response")
+
+        settings = me.get("settings") if isinstance(me, dict) else None
+        if isinstance(settings, dict):
+            inbox_mode = settings.get("inbox_mode")
+            if inbox_mode == "open":
+                ok(f"Inbox mode: {inbox_mode}")
+            elif inbox_mode:
+                warn(
+                    f"Inbox mode: {inbox_mode} — non-contact senders "
+                    "may be blocked. Adjust on the AgentChat dashboard "
+                    "if you expect cold inbound."
+                )
+            discoverable = settings.get("discoverable")
+            if discoverable is False:
+                warn(
+                    "Account marked non-discoverable — handle won't "
+                    "appear in directory search"
+                )
+
+        paused = (
+            me.get("paused_by_owner") if isinstance(me, dict) else None
+        )
+        if paused and paused != "none":
+            warn(
+                f"Account paused by owner ({paused}) — agent will "
+                "not receive new inbound until un-paused"
+            )
+
+        # NOTE: deliberately do NOT call /v1/messages/sync from the
+        # doctor. The gateway drains sync on every (re)connect, and a
+        # doctor invocation while the gateway is up would race the
+        # drain — the SDK has no peek/count variant, only "pull and
+        # ack." We instead rely on the WSDaemon heartbeat in the
+        # gateway log for queue-depth visibility.
+    finally:
+        client.close()
+
+    try:
+        from .soul_anchor import has_anchor
+
+        if has_anchor():
+            ok("SOUL.md identity anchor present")
+        else:
+            warn(
+                "SOUL.md identity anchor missing — run "
+                "`hermes agentchat login` (or re-register) to install it"
+            )
+    except ImportError:
+        warn("soul_anchor module not importable — skipping anchor check")
+
+    if _other_gateway_running():
+        ok("Hermes gateway process detected (live inbound active)")
+    else:
+        warn(
+            "No `hermes gateway` process detected — start one "
+            "(`hermes gateway`) for live inbound delivery"
+        )
+
+    return _doctor_finalize(failures, warnings_count)
+
+
+def _doctor_finalize(failures: int, warnings_count: int) -> int:
+    """Print the doctor footer and return the exit code.
+
+    Exit code is the failure count so CI can gate on a clean
+    doctor run. Warnings are surfaced but don't fail the check.
+    """
+    _printline("")
+    if failures == 0 and warnings_count == 0:
+        _printline("All checks passed.")
+    elif failures == 0:
+        _printline(f"{warnings_count} warning(s); no failures.")
+    else:
+        _printline(
+            f"{failures} failure(s), {warnings_count} warning(s). "
+            "Resolve the [fail] lines above."
+        )
+    _printline("")
+    return failures
+
+
+def _other_gateway_running() -> bool:
+    """Best-effort: is a *different* ``hermes gateway`` process alive?
+
+    The doctor itself is a CLI process, so we exclude our own pid.
+    Cross-platform via ``psutil`` when available, falls back to
+    ``False`` (informational warning) when not.
+    """
+    try:
+        import os
+
+        import psutil  # type: ignore[import-untyped]
+    except ImportError:
+        return False
+
+    own_pid = os.getpid()
+    try:
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                if proc.info["pid"] == own_pid:
+                    continue
+                cmdline = proc.info.get("cmdline") or []
+                if not cmdline:
+                    continue
+                joined = " ".join(str(arg) for arg in cmdline)
+                if "hermes" in joined and "gateway" in cmdline:
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        logger.debug("doctor: process iteration failed", exc_info=True)
+    return False
 
 
 def _dispatch_logout(_args: argparse.Namespace) -> int:

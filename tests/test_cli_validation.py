@@ -136,3 +136,84 @@ class TestArgparseWiring:
         args = parser.parse_args([])
         assert args.action is None
         assert args.func is _dispatch_wizard
+
+    def test_setup_argparse_wires_doctor(self) -> None:
+        """Regression guard: ``doctor`` is referenced from
+        ``_register.py``'s error hint, so it must exist."""
+        import argparse
+
+        from agentchatme_hermes.cli import _dispatch_doctor, setup_argparse
+
+        parser = argparse.ArgumentParser(prog="hermes-agentchat")
+        setup_argparse(parser)
+
+        args = parser.parse_args(["doctor"])
+        assert args.action == "doctor"
+        assert args.func is _dispatch_doctor
+
+
+class TestDoctor:
+    """End-to-end doctor on a clean / broken config.
+
+    We intercept ``_read_saved_key`` so tests don't depend on the
+    runner's actual env, and stub the SDK so no network IO happens.
+    """
+
+    def test_doctor_reports_missing_key(
+        self, monkeypatch: object, capsys: object
+    ) -> None:
+        import argparse
+
+        from agentchatme_hermes import cli
+
+        monkeypatch.setattr(cli, "_read_saved_key", lambda: None)  # type: ignore[attr-defined]
+        # Doctor short-circuits after the env-var check when no key,
+        # so SDK import doesn't need to be stubbed.
+        rc = cli._dispatch_doctor(argparse.Namespace())
+        captured = capsys.readouterr()  # type: ignore[attr-defined]
+        assert rc >= 1
+        assert "AGENTCHATME_API_KEY not set" in captured.out
+
+    def test_doctor_returns_zero_on_clean_config(
+        self, monkeypatch: object, capsys: object
+    ) -> None:
+        import argparse
+        from unittest.mock import MagicMock
+
+        from agentchatme_hermes import cli
+
+        monkeypatch.setattr(cli, "_read_saved_key", lambda: "ac_live_xyz")  # type: ignore[attr-defined]
+
+        fake_client = MagicMock()
+        fake_client.get_me.return_value = {
+            "handle": "alice",
+            "status": "active",
+            "settings": {"inbox_mode": "open", "discoverable": True},
+            "paused_by_owner": "none",
+        }
+        fake_client_cls = MagicMock(return_value=fake_client)
+
+        import sys
+        import types as _types
+
+        fake_sdk = _types.ModuleType("agentchatme")
+        fake_sdk.AgentChatClient = fake_client_cls  # type: ignore[attr-defined]
+        fake_sdk.AgentChatError = Exception  # type: ignore[attr-defined]
+        fake_sdk.UnauthorizedError = Exception  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "agentchatme", fake_sdk)  # type: ignore[attr-defined]
+
+        # SOUL anchor + gateway check — let the soul_anchor module work
+        # normally (no file means warn), and force gateway-detection
+        # off so the test doesn't depend on host process state.
+        monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)  # type: ignore[attr-defined]
+
+        rc = cli._dispatch_doctor(argparse.Namespace())
+        captured = capsys.readouterr()  # type: ignore[attr-defined]
+        assert "Authenticated as @alice" in captured.out
+        # Exit code reflects failures only (warnings allowed). Two
+        # plausible warns from a fresh checkout: no gateway process,
+        # no SOUL.md anchor. Both warnings, neither a failure.
+        assert rc == 0, (
+            f"doctor returned non-zero exit code {rc} on a clean "
+            f"config; output:\n{captured.out}"
+        )

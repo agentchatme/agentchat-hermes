@@ -138,31 +138,84 @@ class AgentInvoker:
             executor.shutdown(wait=True, cancel_futures=False)
 
     def on_new_event(self) -> None:
-        """Signal-only — called by the WS daemon when something landed."""
+        """Signal-only — called by the WS daemon when something landed.
+
+        Logs at DEBUG (not INFO) because this fires on every frame
+        and the ws_daemon already logs the receipt. INFO would
+        duplicate signal without adding information.
+        """
+        logger.debug("AgentInvoker: wake signal received")
         self._wake.set()
 
     # -- dispatcher ---------------------------------------------------------
 
     def _dispatch_loop(self) -> None:
-        while not self._stopped.is_set():
-            self._wake.wait(timeout=60.0)
-            self._wake.clear()
-            if self._stopped.is_set():
-                return
-            self._drain_queue()
+        logger.info("AgentInvoker: dispatcher loop started")
+        try:
+            while not self._stopped.is_set():
+                self._wake.wait(timeout=60.0)
+                if self._stopped.is_set():
+                    return
+                # Clear AFTER the stopped check so a stop()+wake set
+                # in the same instant doesn't get swallowed below.
+                woke_by_event = self._wake.is_set()
+                self._wake.clear()
+                if woke_by_event:
+                    logger.debug("AgentInvoker: dispatcher woke (event-driven)")
+                self._drain_queue()
+        except Exception:
+            # The dispatcher thread is the only path from WS to agent
+            # — losing it silently is exactly the "gateway runtime
+            # appears dead" failure mode the first spike hit. Re-raise
+            # here is not useful (thread is daemonic, no one's
+            # joining), so log loudly instead. A future enhancement
+            # could restart the loop from a supervisor, but the
+            # diagnostic comes first.
+            logger.exception(
+                "AgentInvoker: dispatcher loop crashed — no more turns "
+                "will be triggered until the gateway restarts. Check "
+                "the error and restart `hermes gateway`."
+            )
+        finally:
+            logger.info("AgentInvoker: dispatcher loop exiting")
 
     def _drain_queue(self) -> None:
         executor = self._executor
         if executor is None:
             return
 
+        drained = 0
         while True:
             event = self._queue.pop()
             if event is None:
+                if drained:
+                    logger.info(
+                        "AgentInvoker: drained %d event(s) from queue",
+                        drained,
+                    )
                 return
 
+            drained += 1
+            logger.info(
+                "AgentInvoker: dispatching turn conv=%s msg=%s from=@%s",
+                event.conversation_id,
+                event.message_id,
+                event.sender_handle,
+            )
             conv_lock = self._lock_for(event.conversation_id)
-            executor.submit(self._run_one, event, conv_lock)
+            try:
+                executor.submit(self._run_one, event, conv_lock)
+            except RuntimeError:
+                # ThreadPoolExecutor refuses submissions after shutdown.
+                # Happens during stop() if a queued event was still
+                # waiting — not a bug, but worth a debug line.
+                logger.debug(
+                    "AgentInvoker: executor refused submission "
+                    "(shutdown in progress?) for conv=%s msg=%s",
+                    event.conversation_id,
+                    event.message_id,
+                )
+                return
 
     def _lock_for(self, conversation_id: str) -> threading.Lock:
         with self._conv_locks_guard:
@@ -181,17 +234,54 @@ class AgentInvoker:
         per-conversation lock for the duration of the turn so a
         second event on the same conversation queues behind it
         instead of racing.
+
+        Per-stage logging makes turn failures debuggable post-facto:
+        the operator can see whether the turn started, where it got
+        in the pipeline, and what failed. Without these logs the only
+        signal was "turn complete" at the very end — a turn that
+        crashed in build-agent looked identical to one that never
+        ran at all.
         """
         from .prompts import build_notification_prompt
 
-        with conv_lock:
+        # Record contention so a slow conversation is observable.
+        # ``acquire(blocking=False)`` first to distinguish uncontested
+        # vs queued-behind-prior-turn — the latter is normal but
+        # worth marking when chasing latency regressions.
+        if not conv_lock.acquire(blocking=False):
+            logger.info(
+                "AgentInvoker: turn queued behind prior turn for "
+                "conv=%s msg=%s",
+                event.conversation_id,
+                event.message_id,
+            )
+            conv_lock.acquire()
+        try:
             if self._stopped.is_set():
+                logger.debug(
+                    "AgentInvoker: skipping turn — runtime stopping (conv=%s)",
+                    event.conversation_id,
+                )
                 return
+
+            logger.info(
+                "AgentInvoker: turn start conv=%s msg=%s from=@%s kind=%s",
+                event.conversation_id,
+                event.message_id,
+                event.sender_handle,
+                event.conversation_kind,
+            )
 
             self._ensure_hermes_resolved()
 
             agent = self._build_agent(event.conversation_id)
             if agent is None:
+                logger.warning(
+                    "AgentInvoker: agent construction returned None for "
+                    "conv=%s msg=%s — turn dropped",
+                    event.conversation_id,
+                    event.message_id,
+                )
                 return  # already logged inside _build_agent
 
             prompt = build_notification_prompt(event)
@@ -228,6 +318,8 @@ class AgentInvoker:
                 len(history),
                 len(final) if isinstance(final, str) else 0,
             )
+        finally:
+            conv_lock.release()
 
     # -- conversation-history rehydration -----------------------------------
 
