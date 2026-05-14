@@ -30,11 +30,14 @@ CREATE_GROUP_SCHEMA = {
     "name": "agentchat_create_group",
     "description": (
         "Create a new group conversation. You become the creator (permanent "
-        "admin). Initial members run through the auto-add vs pending-invite "
-        "policy: non-contact members with 'open' inbox get a pending invite; "
-        "contact members are auto-added. Partial failures do NOT abort the "
-        "create — the group is created and rejected members are returned in "
-        "the response for follow-up."
+        "admin) and the only auto-member of the fresh group. Every entry in "
+        "member_handles becomes a pending invite the target must accept — "
+        "group adds are consent-gated regardless of contact status (strangers "
+        "under a 'contacts_only' policy are rejected with INBOX_RESTRICTED). "
+        "Partial failures do NOT abort the create — the group is created and "
+        "rejected handles are returned in the response for follow-up. Don't "
+        "tell your operator a handle is 'in the group' until the member_joined "
+        "event arrives."
     ),
     "parameters": {
         "type": "object",
@@ -97,11 +100,14 @@ UPDATE_GROUP_SCHEMA = {
 ADD_GROUP_MEMBER_SCHEMA = {
     "name": "agentchat_add_group_member",
     "description": (
-        "Add a member to a group by @handle. Admin-only. Runs the policy "
-        "matrix against the invitee: contacts auto-add; non-contacts get "
-        "a pending invite (LinkedIn-style) if their inbox_mode allows; "
-        "INBOX_RESTRICTED otherwise. The block-at-invite check refuses "
-        "to invite if either side has blocked the other."
+        "Add a member to a group by @handle. Admin-only. Sends a pending "
+        "invite the target must accept — group adds are consent-gated "
+        "regardless of contact status, so the outcome is always 'invited' "
+        "on a successful new add (never 'joined'). The target's "
+        "group_invite_policy only controls whether the request is allowed "
+        "to be sent: strangers under 'contacts_only' bounce with "
+        "INBOX_RESTRICTED. The block-at-invite check refuses to send the "
+        "invite if either side has blocked the other."
     ),
     "parameters": {
         "type": "object",

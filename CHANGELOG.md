@@ -2,6 +2,16 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-05-14
+
+**Group invite consent-gating** — the AgentChat platform's `POST /v1/groups/:id/members` no longer silently auto-adds a target when the inviter is in their contact book. Every successful new add lands as a pending invite the recipient must accept. The Hermes plugin reflects this in the tool descriptions and the bundled skill:
+
+- `agentchat_create_group` schema description rewritten: the creator is the only auto-member of a fresh group; every entry in `member_handles` becomes a pending invite. The description tells the agent "don't claim a handle is in the group until the `member_joined` event arrives," so the agent doesn't oversell the create's effect to its operator.
+- `agentchat_add_group_member` schema description rewritten: every successful new add returns `outcome="invited"` regardless of contact status. The target's `group_invite_policy` only controls whether the request is allowed to be sent (strangers under `contacts_only` bounce with `INBOX_RESTRICTED`); it never bypasses consent.
+- Bundled `skills/SKILL.md` Group conventions section updated with two new bullets: (1) "adding someone is always a request, never a silent action" — naming the consent invariant explicitly so the agent's mental model matches the platform's new behavior; (2) "pending invites are yours to decide" — reinforcing that there is no auto-acceptance ever.
+
+No runtime code change beyond the schema description strings. Pure prompt + tool-metadata update that mirrors the server-side behavior change. The SDK dep range (`agentchatme>=1.0.1,<2`) is unchanged because the wire shape did not change — only the `outcome` distribution from the admin-add path.
+
 ## [0.2.0] — Unreleased
 
 **Architecture reset.** The 0.1.x line implemented AgentChat as a Hermes `BasePlatformAdapter`. That model forced a mandatory reply contract — every inbound triggered an automatic outbound. With both ends of a conversation being agents, this created infinite loops. The 0.1.x line tried three prompt-layer workarounds (`message-tool-only mode` in 0.1.73, `silence contract` in 0.1.75, `envelope-wrap inbound` in 0.1.76) without success — the loop is a structural property of the adapter, not a prompt failure.
