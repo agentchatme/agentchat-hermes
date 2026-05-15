@@ -547,7 +547,29 @@ class AgentInvoker:
         )
 
     def _resolve_model_and_runtime(self) -> tuple[str, dict[str, Any]]:
-        """Pull the user's default model + provider creds from Hermes config."""
+        """Pull the user's default model + provider creds from Hermes config.
+
+        Hermes' ``config.yaml`` has a NESTED ``model:`` block::
+
+            model:
+              default: deepseek-v4-flash
+              provider: deepseek
+              model: deepseek-v4-flash
+
+        So ``cfg["model"]`` is a dict, not a string. Earlier versions of
+        this helper treated it as a string and passed the dict straight
+        into ``AIAgent(model=...)``. Hermes accepted the dict at
+        construction, then exploded much later in
+        ``_anthropic_prompt_cache_policy`` with
+        ``'dict' object has no attribute 'lower'`` — and the exception
+        was swallowed by ThreadPoolExecutor, so it took three release
+        cycles to surface.
+
+        We now extract a clean string. Order of preference: ``default``,
+        then ``model``, then the fallback. Also tolerant of a flat
+        string shape in case Hermes ever exposes ``model: deepseek-...``
+        directly (older configs / alternative layouts).
+        """
         try:
             from hermes_cli.config import load_config
             from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -561,7 +583,7 @@ class AgentInvoker:
 
         try:
             cfg = load_config()
-            model = cfg.get("model") or _FALLBACK_MODEL
+            model = _coerce_model_string(cfg.get("model"))
             runtime = resolve_runtime_provider(target_model=model)
         except Exception:
             logger.exception(
@@ -580,6 +602,34 @@ class AgentInvoker:
 
 
 # ─── pure helpers (extracted for unit-testability) ─────────────────────────
+
+
+def _coerce_model_string(value: Any) -> str:
+    """Normalize whatever ``config.yaml`` gave us for ``model:`` into a string.
+
+    Accepts:
+
+    * ``{"default": "deepseek-v4-flash", ...}`` → ``"deepseek-v4-flash"``
+      (preferred — the canonical Hermes shape).
+    * ``{"model": "deepseek-v4-flash", ...}`` → ``"deepseek-v4-flash"``
+      (older / alternative key inside the dict).
+    * ``"deepseek-v4-flash"`` → ``"deepseek-v4-flash"``
+      (flat-string shape, defensive).
+    * Anything else / missing → ``_FALLBACK_MODEL``.
+
+    Type-narrowing is essential because Hermes' ``AIAgent`` does not
+    validate ``model`` at construction; it dies later in
+    ``_anthropic_prompt_cache_policy`` with a cryptic AttributeError
+    on the wrong shape.
+    """
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, dict):
+        for key in ("default", "model"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate:
+                return candidate
+    return _FALLBACK_MODEL
 
 
 def _extract_messages_list(result: Any) -> list[dict[str, Any]]:

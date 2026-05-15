@@ -10,6 +10,8 @@ from __future__ import annotations
 from typing import Any
 
 from agentchatme_hermes.agent_invoker import (
+    _FALLBACK_MODEL,
+    _coerce_model_string,
     _extract_messages_list,
     _translate_messages_to_history,
 )
@@ -33,6 +35,64 @@ def _msg(
     if is_own is not None:
         payload["is_own"] = is_own
     return payload
+
+
+# ──────────────────────── _coerce_model_string ────────────────────────
+
+
+class TestCoerceModelString:
+    """Pin down the model-config shape handling.
+
+    The 0.2.1 production hang came from this helper not existing:
+    ``cfg.get("model")`` returned the nested dict
+    ``{"default": "deepseek-v4-flash", "provider": "deepseek", ...}``,
+    which was passed straight into ``AIAgent(model=...)`` and crashed
+    deep inside Hermes' ``_anthropic_prompt_cache_policy`` with
+    ``'dict' object has no attribute 'lower'``.
+    """
+
+    def test_nested_dict_with_default(self) -> None:
+        cfg_value = {
+            "default": "deepseek-v4-flash",
+            "provider": "deepseek",
+            "model": "deepseek-v4-flash",
+        }
+        assert _coerce_model_string(cfg_value) == "deepseek-v4-flash"
+
+    def test_nested_dict_default_takes_precedence_over_model(self) -> None:
+        cfg_value = {"default": "primary-model", "model": "fallback-model"}
+        assert _coerce_model_string(cfg_value) == "primary-model"
+
+    def test_nested_dict_falls_back_to_model_when_no_default(self) -> None:
+        cfg_value = {"model": "the-model", "provider": "deepseek"}
+        assert _coerce_model_string(cfg_value) == "the-model"
+
+    def test_flat_string(self) -> None:
+        assert _coerce_model_string("deepseek-v4-flash") == "deepseek-v4-flash"
+
+    def test_empty_string_falls_back(self) -> None:
+        assert _coerce_model_string("") == _FALLBACK_MODEL
+
+    def test_none_falls_back(self) -> None:
+        assert _coerce_model_string(None) == _FALLBACK_MODEL
+
+    def test_empty_dict_falls_back(self) -> None:
+        assert _coerce_model_string({}) == _FALLBACK_MODEL
+
+    def test_dict_without_recognizable_keys_falls_back(self) -> None:
+        # Dict shape but neither ``default`` nor ``model`` is set —
+        # we cannot guess what string the operator intended.
+        assert _coerce_model_string({"provider": "deepseek"}) == _FALLBACK_MODEL
+
+    def test_dict_with_non_string_default_falls_back(self) -> None:
+        # Defensive: a numeric or None value where a string was
+        # expected must not silently get passed through.
+        assert _coerce_model_string({"default": 42}) == _FALLBACK_MODEL
+        assert _coerce_model_string({"default": None, "model": "real"}) == "real"
+
+    def test_completely_unknown_shape_falls_back(self) -> None:
+        assert _coerce_model_string(42) == _FALLBACK_MODEL
+        assert _coerce_model_string(["a", "b"]) == _FALLBACK_MODEL
 
 
 # ──────────────────────── _extract_messages_list ────────────────────────
