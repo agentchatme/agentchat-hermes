@@ -204,7 +204,7 @@ class AgentInvoker:
             )
             conv_lock = self._lock_for(event.conversation_id)
             try:
-                executor.submit(self._run_one, event, conv_lock)
+                future = executor.submit(self._run_one, event, conv_lock)
             except RuntimeError:
                 # ThreadPoolExecutor refuses submissions after shutdown.
                 # Happens during stop() if a queued event was still
@@ -216,6 +216,30 @@ class AgentInvoker:
                     event.message_id,
                 )
                 return
+            # Future done-callback: belt-and-suspenders catch for
+            # any exception that escaped `_run_one`'s own outer
+            # try/except. Without this, a silent crash inside an
+            # exception handler itself (rare, but possible) would
+            # vanish into ThreadPoolExecutor's future without ever
+            # being logged. We learned this the hard way after the
+            # 0.2.1 inbound silently failed at the AIAgent build
+            # stage and produced no log line, no traceback, no
+            # visible error.
+            # Bind ids as default args so the callback captures THIS
+            # event's ids, not the loop-final values (B023 late-binding).
+            # Pulling the ids into locals first lets mypy narrow them
+            # away from ``InboundEvent | None``.
+            ev_conv = event.conversation_id
+            ev_msg = event.message_id
+
+            def _callback(
+                f: Any,
+                _conv: str = ev_conv,
+                _msg: str = ev_msg,
+            ) -> None:
+                self._log_future_outcome(f, _conv, _msg)
+
+            future.add_done_callback(_callback)
 
     def _lock_for(self, conversation_id: str) -> threading.Lock:
         with self._conv_locks_guard:
@@ -235,12 +259,16 @@ class AgentInvoker:
         second event on the same conversation queues behind it
         instead of racing.
 
-        Per-stage logging makes turn failures debuggable post-facto:
-        the operator can see whether the turn started, where it got
-        in the pipeline, and what failed. Without these logs the only
-        signal was "turn complete" at the very end — a turn that
-        crashed in build-agent looked identical to one that never
-        ran at all.
+        Wraps the entire body in an outer ``try/except Exception`` —
+        ``ThreadPoolExecutor.submit()`` silently captures unhandled
+        exceptions into the future, and we don't ``.result()`` (can't
+        — it'd block the dispatcher). Without this outer handler an
+        exception in :meth:`_build_agent`, :meth:`_build_conversation_history`,
+        or :meth:`_ensure_hermes_resolved` vanishes into the void.
+        The 0.2.1 production hang was exactly this: ``AIAgent.__init__``
+        raised AFTER our "turn start" log but BEFORE the inner
+        ``run_conversation`` try-block; the exception escaped silently
+        and no operator-visible signal existed.
         """
         from .prompts import build_notification_prompt
 
@@ -257,69 +285,126 @@ class AgentInvoker:
             )
             conv_lock.acquire()
         try:
-            if self._stopped.is_set():
-                logger.debug(
-                    "AgentInvoker: skipping turn — runtime stopping (conv=%s)",
-                    event.conversation_id,
-                )
-                return
-
-            logger.info(
-                "AgentInvoker: turn start conv=%s msg=%s from=@%s kind=%s",
-                event.conversation_id,
-                event.message_id,
-                event.sender_handle,
-                event.conversation_kind,
-            )
-
-            self._ensure_hermes_resolved()
-
-            agent = self._build_agent(event.conversation_id)
-            if agent is None:
-                logger.warning(
-                    "AgentInvoker: agent construction returned None for "
-                    "conv=%s msg=%s — turn dropped",
-                    event.conversation_id,
-                    event.message_id,
-                )
-                return  # already logged inside _build_agent
-
-            prompt = build_notification_prompt(event)
-            history = self._build_conversation_history(
-                conversation_id=event.conversation_id,
-                conversation_kind=event.conversation_kind,
-                trigger_message_id=event.message_id,
-            )
-
             try:
-                result = agent.run_conversation(
-                    prompt, conversation_history=history
-                )
+                self._run_one_inner(event, build_notification_prompt)
             except Exception:
+                # Outer catch — covers _build_agent, history fetch,
+                # Hermes imports, anything else above the inner
+                # run_conversation try/except. Logs with traceback so
+                # the next time this fails we see exactly where.
                 logger.exception(
-                    "AgentInvoker: run_conversation raised for conv=%s msg=%s",
+                    "AgentInvoker: turn FAILED with unhandled exception "
+                    "(outer catch) conv=%s msg=%s — the agent did not "
+                    "produce a reply. See traceback for the failing call.",
                     event.conversation_id,
                     event.message_id,
                 )
-                return
-
-            # We deliberately do NOT route the agent's final_response
-            # anywhere. Any actual outbound went through the
-            # agentchat_send_message tool during the turn. The text
-            # here is the model's post-tool reasoning — useful for
-            # operator visibility, not for transmission.
-            final = (
-                result.get("final_response") if isinstance(result, dict) else None
-            )
-            logger.info(
-                "AgentInvoker: turn complete conv=%s msg=%s history_len=%d final_chars=%d",
-                event.conversation_id,
-                event.message_id,
-                len(history),
-                len(final) if isinstance(final, str) else 0,
-            )
         finally:
             conv_lock.release()
+
+    def _run_one_inner(
+        self,
+        event: InboundEvent,
+        build_notification_prompt: Any,
+    ) -> None:
+        """Inner turn body, separated so the outer wrapper can catch."""
+        if self._stopped.is_set():
+            logger.debug(
+                "AgentInvoker: skipping turn — runtime stopping (conv=%s)",
+                event.conversation_id,
+            )
+            return
+
+        logger.info(
+            "AgentInvoker: turn start conv=%s msg=%s from=@%s kind=%s",
+            event.conversation_id,
+            event.message_id,
+            event.sender_handle,
+            event.conversation_kind,
+        )
+
+        self._ensure_hermes_resolved()
+
+        agent = self._build_agent(event.conversation_id)
+        if agent is None:
+            logger.warning(
+                "AgentInvoker: agent construction returned None for "
+                "conv=%s msg=%s — turn dropped",
+                event.conversation_id,
+                event.message_id,
+            )
+            return  # already logged inside _build_agent
+
+        prompt = build_notification_prompt(event)
+        history = self._build_conversation_history(
+            conversation_id=event.conversation_id,
+            conversation_kind=event.conversation_kind,
+            trigger_message_id=event.message_id,
+        )
+
+        try:
+            result = agent.run_conversation(
+                prompt, conversation_history=history
+            )
+        except Exception:
+            logger.exception(
+                "AgentInvoker: run_conversation raised for conv=%s msg=%s",
+                event.conversation_id,
+                event.message_id,
+            )
+            return
+
+        # We deliberately do NOT route the agent's final_response
+        # anywhere. Any actual outbound went through the
+        # agentchat_send_message tool during the turn. The text
+        # here is the model's post-tool reasoning — useful for
+        # operator visibility, not for transmission.
+        final = (
+            result.get("final_response") if isinstance(result, dict) else None
+        )
+        logger.info(
+            "AgentInvoker: turn complete conv=%s msg=%s history_len=%d final_chars=%d",
+            event.conversation_id,
+            event.message_id,
+            len(history),
+            len(final) if isinstance(final, str) else 0,
+        )
+
+    def _log_future_outcome(
+        self, future: Any, conversation_id: str, message_id: str
+    ) -> None:
+        """Done-callback on the submitted future.
+
+        Belt-and-suspenders: if ``_run_one``'s outer except itself
+        crashed (e.g. logger blew up), the exception would still go
+        into the future. This callback fires when the future
+        finishes — failure or success — and surfaces any remaining
+        hidden exception. The cost is one callback invocation per
+        turn; the benefit is "never silently lose a turn failure
+        again."
+        """
+        try:
+            exc = future.exception()
+        except Exception:
+            # The future was cancelled, or .exception() itself raised.
+            # Either way, nothing more we can do — log and move on.
+            logger.exception(
+                "AgentInvoker: future.exception() raised for conv=%s msg=%s",
+                conversation_id,
+                message_id,
+            )
+            return
+        if exc is not None:
+            logger.error(
+                "AgentInvoker: turn FAILED (future-callback catch) "
+                "conv=%s msg=%s exc=%r — this should already have been "
+                "logged with traceback by the outer except in _run_one; "
+                "if you only see this line, the outer handler itself "
+                "failed.",
+                conversation_id,
+                message_id,
+                exc,
+            )
 
     # -- conversation-history rehydration -----------------------------------
 
