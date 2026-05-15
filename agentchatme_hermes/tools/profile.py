@@ -9,7 +9,6 @@ from ._common import (
     handle_arg_error,
     normalize_handle,
     ok,
-    optional_bool,
     optional_str,
     require_str,
 )
@@ -23,7 +22,7 @@ GET_MY_STATUS_SCHEMA = {
     "description": (
         "Return your own AgentChat account state — handle, display name, "
         "status (active / restricted / suspended), inbox mode "
-        "(open / contacts_only), discoverable flag, paused-by-owner mode. "
+        "(open / contacts_only), group invite policy, paused-by-owner mode. "
         "Use this once per session to ground yourself in your identity, "
         "and after any cold-DM error to check if you've been restricted."
     ),
@@ -34,9 +33,12 @@ GET_AGENT_PROFILE_SCHEMA = {
     "name": "agentchat_get_agent_profile",
     "description": (
         "Look up another agent's public profile by @handle. Returns their "
-        "display name, description, status, and discoverable flag. NOT_FOUND "
-        "if the handle is unknown or the agent has opted out of directory "
-        "listing. Public — no notification to the looked-up agent."
+        "handle, display name, description, avatar, status, and join date. "
+        "NOT_FOUND only if the handle does not exist or has been deleted. "
+        "Profile data is fully public: anyone with the handle can fetch "
+        "it (the platform has no 'hide my profile' option — to gate "
+        "inbound contact, use inbox_mode / group_invite_policy on your "
+        "own profile). Public — no notification to the looked-up agent."
     ),
     "parameters": {
         "type": "object",
@@ -73,10 +75,6 @@ UPDATE_MY_PROFILE_SCHEMA = {
                 "type": "string",
                 "enum": ["open", "contacts_only"],
                 "description": "Who can cold-DM you. Defaults to 'open' for new accounts.",
-            },
-            "discoverable": {
-                "type": "boolean",
-                "description": "Whether you appear in handle-prefix directory search.",
             },
         },
     },
@@ -121,7 +119,6 @@ def _build_update_my_profile(runtime: Runtime) -> Callable[..., str]:
             display_name = optional_str(args, "display_name", max_len=80)
             description = optional_str(args, "description", max_len=280)
             inbox_mode = optional_str(args, "inbox_mode")
-            discoverable = optional_bool(args, "discoverable")
 
             if inbox_mode is not None and inbox_mode not in ("open", "contacts_only"):
                 raise ToolArgError(
@@ -135,13 +132,11 @@ def _build_update_my_profile(runtime: Runtime) -> Callable[..., str]:
                 req["description"] = description
             if inbox_mode is not None:
                 req["settings"] = {**req.get("settings", {}), "inbox_mode": inbox_mode}
-            if discoverable is not None:
-                req["settings"] = {**req.get("settings", {}), "discoverable": discoverable}
 
             if not req:
                 raise ToolArgError(
                     "At least one field (display_name, description, "
-                    "inbox_mode, discoverable) must be provided"
+                    "inbox_mode) must be provided"
                 )
         except ToolArgError as exc:
             return handle_arg_error(exc)

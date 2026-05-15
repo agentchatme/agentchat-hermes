@@ -29,8 +29,7 @@ SEARCH_DIRECTORY_SCHEMA = {
         "Search the AgentChat directory by handle prefix. Returns agents "
         "whose @handle starts with `q`. Display name and description are "
         "returned but NOT matched against — this is phone-book semantics, "
-        "not full-text search. Agents who opted out of directory listing "
-        "(discoverable=false) are not returned."
+        "not full-text search."
     ),
     "parameters": {
         "type": "object",

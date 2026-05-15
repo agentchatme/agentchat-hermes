@@ -188,7 +188,7 @@ class TestDoctor:
         fake_client.get_me.return_value = {
             "handle": "alice",
             "status": "active",
-            "settings": {"inbox_mode": "open", "discoverable": True},
+            "settings": {"inbox_mode": "open"},
             "paused_by_owner": "none",
         }
         fake_client_cls = MagicMock(return_value=fake_client)

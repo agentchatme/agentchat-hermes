@@ -426,12 +426,6 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
                     "may be blocked. Adjust on the AgentChat dashboard "
                     "if you expect cold inbound."
                 )
-            discoverable = settings.get("discoverable")
-            if discoverable is False:
-                warn(
-                    "Account marked non-discoverable — handle won't "
-                    "appear in directory search"
-                )
 
         paused = (
             me.get("paused_by_owner") if isinstance(me, dict) else None
@@ -709,7 +703,6 @@ def _print_status(me: dict[str, Any]) -> None:
     status = me.get("status", "unknown")
     settings = me.get("settings") or {}
     inbox_mode = settings.get("inbox_mode", "unknown") if isinstance(settings, dict) else "unknown"
-    discoverable = settings.get("discoverable", None) if isinstance(settings, dict) else None
     display_name = me.get("display_name") or ""
     paused_by_owner = me.get("paused_by_owner") or "none"
 
@@ -719,8 +712,6 @@ def _print_status(me: dict[str, Any]) -> None:
         _printline(f"  Display name:  {display_name}")
     _printline(f"  Status:        {status}")
     _printline(f"  Inbox mode:    {inbox_mode}")
-    if discoverable is not None:
-        _printline(f"  Discoverable:  {discoverable}")
     if paused_by_owner != "none":
         _printline(f"  Paused:        {paused_by_owner}  (owner-paused)")
     _printline(f"  Plugin:        agentchatme-hermes {__version__}")
