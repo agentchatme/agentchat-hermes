@@ -21,6 +21,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from .agent_invoker import AgentInvoker
+from .leader_lock import release_leader_lock, try_acquire_ws_leader_lock
 from .message_queue import MessageQueue
 from .types import AgentIdentity
 from .ws_daemon import WSDaemon
@@ -36,24 +37,35 @@ logger = logging.getLogger(__name__)
 class Runtime:
     """Coordinator for the plugin's stateful subsystems.
 
-    Has two operational modes, chosen at construction:
+    Has two operational modes, resolved at :meth:`start` time:
 
-    * ``gateway_mode=True`` — full runtime: sync HTTP client +
-      identity resolution + WSDaemon background thread + AgentInvoker
-      thread pool. The long-lived ``hermes gateway`` process uses
-      this; live inbound delivery lives here.
-    * ``gateway_mode=False`` — light runtime: sync HTTP client +
-      identity resolution only. No WS connection opened, no invoker
-      thread pool. Used by short-lived CLI / TUI / utility processes
-      where the agent might call ``agentchat_*`` tools (via the
-      shared sync client) but the live inbound stream stays
-      exclusively in the gateway. This eliminates the multiple-WS-
-      per-machine churn the first spike exposed.
+    * **Leader mode** — full runtime: sync HTTP client + identity
+      resolution + WSDaemon background thread + AgentInvoker thread
+      pool. Reached only when the constructor was called with
+      ``gateway_mode=True`` AND this process successfully acquired
+      the per-machine WS leader lock (see :mod:`.leader_lock`).
+    * **Follower mode** — light runtime: sync HTTP client + identity
+      resolution only. No WS connection opened, no invoker thread
+      pool. Used by TUI/REPL, named CLI subcommands, one-shot agents,
+      AND gateway-class processes that lost the leader-lock race.
+      Tool surface remains available so the agent can still call
+      ``agentchat_*`` tools; only the live inbound stream is
+      leader-only.
+
+    The two-gate design (env var + flock) eliminates every flavor
+    of multi-WS-per-machine: the gateway env var blocks TUI/CLI/
+    oneshot, and the flock blocks concurrent gateway invocations.
     """
 
     def __init__(self, config: Config, *, gateway_mode: bool) -> None:
         self._config = config
-        self._gateway_mode = gateway_mode
+        self._gateway_mode_requested = gateway_mode
+
+        # Resolved at :meth:`start` time after the leader-lock attempt.
+        # ``True`` only when both the env-var check AND the lock acquire
+        # succeeded. Tools and the doctor command read this to report
+        # the real operational mode (not just what was requested).
+        self._is_leader = False
 
         self._started = False
         self._stopped = False
@@ -64,6 +76,12 @@ class Runtime:
         self._queue: MessageQueue | None = None
         self._ws_daemon: WSDaemon | None = None
         self._invoker: AgentInvoker | None = None
+
+        # File-descriptor for the leader lock when held. ``None`` when
+        # not the leader (or before :meth:`start`). Held open for the
+        # process lifetime — POSIX flock auto-releases on close, so we
+        # explicitly close in :meth:`stop`/:meth:`_teardown_partial`.
+        self._leader_lock_fd: int | None = None
 
     # -- accessors ----------------------------------------------------------
 
@@ -95,6 +113,18 @@ class Runtime:
             raise RuntimeError("Runtime.start() has not completed")
         return self._queue
 
+    @property
+    def is_leader(self) -> bool:
+        """``True`` iff this process holds the WS leader lock.
+
+        ``False`` in follower modes (CLI/TUI/oneshot) AND in
+        gateway-class processes that lost the lock race. Tool handlers
+        and the doctor command read this to surface the real
+        operational mode — not just whether the constructor was given
+        ``gateway_mode=True``.
+        """
+        return self._is_leader
+
     # -- lifecycle ----------------------------------------------------------
 
     def start(self) -> None:
@@ -110,7 +140,16 @@ class Runtime:
                 self._client = self._build_sync_client()
                 self._identity = self._resolve_identity(self._client)
 
-                if self._gateway_mode:
+                # Leader election. Only attempt when the caller asked
+                # for gateway mode (i.e. ``_HERMES_GATEWAY=1`` was set).
+                # The follower path covers TUI/CLI/oneshot AND
+                # gateway-class processes that lost the flock race.
+                self._is_leader = (
+                    self._gateway_mode_requested
+                    and self._try_acquire_leader()
+                )
+
+                if self._is_leader:
                     self._queue = MessageQueue()
                     self._invoker = AgentInvoker(
                         config=self._config,
@@ -128,15 +167,29 @@ class Runtime:
                     self._ws_daemon.start()
 
                     logger.info(
-                        "agentchat runtime started: handle=@%s ws=%s mode=gateway",
+                        "agentchat runtime started: handle=@%s ws=%s "
+                        "mode=leader (this process owns the live WS)",
                         self._identity.handle,
                         self._config.ws_url,
                     )
+                elif self._gateway_mode_requested:
+                    # Gateway-class process that lost the lock race.
+                    # Loud warning so the operator can see why their
+                    # second-gateway invocation isn't getting messages.
+                    logger.warning(
+                        "agentchat runtime started: handle=@%s "
+                        "mode=follower-gateway "
+                        "(another process holds the WS leader lock — "
+                        "this process will register tools and skill but "
+                        "will NOT receive live inbound. If this is a "
+                        "stale gateway, stop it first.)",
+                        self._identity.handle,
+                    )
                 else:
                     logger.info(
-                        "agentchat runtime started: handle=@%s mode=cli "
-                        "(no WS, no invoker — live inbound runs in the "
-                        "gateway process)",
+                        "agentchat runtime started: handle=@%s "
+                        "mode=follower-cli (no WS, no invoker — live "
+                        "inbound runs in the gateway process)",
                         self._identity.handle,
                     )
             except Exception:
@@ -146,6 +199,14 @@ class Runtime:
                 self._teardown_partial()
                 self._started = False
                 raise
+
+    def _try_acquire_leader(self) -> bool:
+        """Attempt the leader-lock acquire. Stores fd on success."""
+        fd = try_acquire_ws_leader_lock()
+        if fd is None:
+            return False
+        self._leader_lock_fd = fd
+        return True
 
     def stop(self) -> None:
         with self._lock:
@@ -173,6 +234,14 @@ class Runtime:
                 self._client.close()
             except Exception:
                 logger.debug("agentchat runtime: client close raised", exc_info=True)
+
+        # Release the leader lock last — only after WS + invoker are
+        # gone, so any next-elected leader doesn't briefly see two
+        # active WS daemons during the handoff.
+        if self._leader_lock_fd is not None:
+            release_leader_lock(self._leader_lock_fd)
+            self._leader_lock_fd = None
+            self._is_leader = False
 
         logger.info("agentchat runtime stopped")
 
@@ -238,11 +307,16 @@ class Runtime:
                     exc_info=True,
                 )
 
+        if self._leader_lock_fd is not None:
+            release_leader_lock(self._leader_lock_fd)
+            self._leader_lock_fd = None
+
         self._identity = None
         self._client = None
         self._queue = None
         self._ws_daemon = None
         self._invoker = None
+        self._is_leader = False
 
 
 # Module-level singleton. Hermes calls register(ctx) once per process,

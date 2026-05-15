@@ -466,6 +466,33 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
             "(`hermes gateway`) for live inbound delivery"
         )
 
+    # Report the WS leader-lock state. The doctor itself never holds
+    # the lock (it's a one-shot CLI invocation), so the meaningful
+    # states are "held" (gateway running — good), "free" (no leader —
+    # bad if a gateway should be running), or "not present" (file
+    # never created — gateway hasn't run since last cleanup).
+    try:
+        from .leader_lock import default_lock_path, describe_lock_holder
+
+        state = describe_lock_holder()
+        lock_path = default_lock_path()
+        if state == "held":
+            ok(f"WS leader lock held ({lock_path})")
+        elif state == "free":
+            warn(
+                f"WS leader lock file present but no holder ({lock_path}) — "
+                "gateway is not running"
+            )
+        elif state == "not present":
+            warn(
+                f"WS leader lock file missing ({lock_path}) — gateway "
+                "has not run since the last cleanup"
+            )
+        else:
+            warn(f"WS leader lock state: {state}")
+    except ImportError:
+        warn("leader_lock module not importable — skipping lock check")
+
     return _doctor_finalize(failures, warnings_count)
 
 

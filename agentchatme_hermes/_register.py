@@ -3,18 +3,38 @@
 Called once per Hermes process by the plugin loader. Two registration
 modes, chosen based on which Hermes process is loading us:
 
-* **Gateway mode** (the long-lived ``hermes gateway run`` process):
+* **Gateway mode** (the long-lived ``hermes gateway run`` process,
+  AND it successfully grabbed the per-machine WS leader lock):
   full runtime — sync HTTP client, background WS daemon for live
   inbound delivery, agent invoker thread pool for waking the agent
   on each ``message.new`` frame, tools, skill.
 
-* **CLI mode** (any short-lived ``hermes <subcommand>`` invocation
-  — TUI, register wizard, status, doctor, etc.): light runtime —
+* **CLI mode** (every other Hermes process — TUI/REPL, named
+  subcommands, one-shot agents, Hermes-spawned child Python that
+  inherits ``_HERMES_GATEWAY=1`` from its parent, or even a second
+  gateway whose flock acquisition lost the race): light runtime —
   sync HTTP client and identity only, no WS, no invoker. Tools and
-  skill are still registered so the agent inside a TUI session can
-  call ``agentchat_send_message`` etc., but the WS-driven inbound
-  flow stays exclusively in the gateway. This avoids the redundant
-  WS connections + race conditions that the first spike exposed.
+  skill are still registered so the agent can call
+  ``agentchat_send_message`` etc., but live inbound stays exclusively
+  with the leader-lock holder. This is the production-grade fix for
+  the multi-WS-per-machine bug.
+
+Mode selection has two layered signals (see :mod:`.leader_lock`):
+
+1. ``_HERMES_GATEWAY=1`` env var, set by ``gateway/run.py:370`` at
+   module load (before plugin discovery), and used by Hermes' own
+   ``cli.py:538``. This is the authoritative "am I the gateway?"
+   marker.
+2. ``fcntl.flock(LOCK_EX | LOCK_NB)`` on
+   ``~/.hermes/agentchat-ws.lock``. Even with the env var set, only
+   one process can hold this OS-level lock at a time. Losers fall
+   back to CLI mode.
+
+The earlier 0.2.0 detector used ``ctx._manager._cli_ref is None``,
+which silently misfired: Hermes sets ``_cli_ref`` *after* plugin
+discovery, so it's ``None`` in both gateway and TUI processes when
+``register()`` runs. That's why every TUI invocation was opening a
+second WS. Fixed in 0.2.1.
 
 There is NO ``on_session_end`` hook. Hermes fires that on every
 individual session ending (TUI sessions, cron jobs, adapter chats —
@@ -28,11 +48,11 @@ module-level singleton.
 from __future__ import annotations
 
 import logging
-import sys
 from typing import Any
 
 from ._version import __version__
 from .config import ConfigError, load_config
+from .leader_lock import is_hermes_gateway_process
 
 logger = logging.getLogger(__name__)
 
@@ -119,39 +139,30 @@ def register(ctx: Any) -> None:
 
 
 def _is_gateway_context(ctx: Any) -> bool:
-    """Decide whether this Hermes process should host the live WS.
+    """Decide whether this Hermes process is the gateway candidate.
 
-    Two layered detection signals, both cheap:
+    Returns ``True`` iff ``_HERMES_GATEWAY=1`` is set in the process
+    environment. That marker is set by :mod:`gateway.run` at module
+    load (``gateway/run.py:370``), before any plugin discovery, and
+    is the same signal Hermes' own ``cli.py:538`` uses internally to
+    detect gateway context. It is the only reliable signal at
+    ``register()`` time — Hermes' ``PluginManager._cli_ref`` is set
+    by ``HermesCLI.__init__`` AFTER discovery and is ``None`` in both
+    gateway and TUI processes when this code runs.
 
-    1. **Hermes' own gateway-mode marker.** ``PluginManager._cli_ref``
-       is the CLI runner instance, ``None`` in gateway processes
-       (the ``inject_message`` helper in ``hermes_cli/plugins.py``
-       uses this exact check). The attribute is private and may be
-       renamed; we treat absence as inconclusive and fall through.
-    2. **Argv inspection.** ``hermes gateway run`` / ``hermes gateway
-       start`` puts ``gateway`` somewhere in ``sys.argv``; no CLI
-       subcommand does. Argv survives entry-point wrappers and
-       module-execution alike.
+    The ``ctx`` parameter is unused but kept for signature stability
+    and so callers can be confident the decision is per-process, not
+    per-context.
 
-    Returns ``True`` only when one of these signals indicates gateway
-    mode. CLI/TUI/utility processes default to ``False`` and run with
-    a light runtime (no WS, no invoker).
+    A ``True`` return here makes this process a *candidate* leader.
+    The actual WS opens only if it also acquires the leader-lock
+    (see :class:`runtime.Runtime` and :mod:`.leader_lock`). That
+    second gate handles the edge case of two ``_HERMES_GATEWAY=1``
+    processes coexisting (concurrent restart, ``--replace`` drain
+    overlap, or a Hermes child that inherited the env var).
     """
-    # Signal 1: ctx._manager._cli_ref is None → gateway mode.
-    try:
-        manager = getattr(ctx, "_manager", None)
-        if manager is not None and hasattr(manager, "_cli_ref"):
-            return manager._cli_ref is None
-    except Exception:
-        # Hermes private API might shift — fall through to argv.
-        logger.debug(
-            "_is_gateway_context: ctx._manager._cli_ref unreachable, falling "
-            "back to argv inspection",
-            exc_info=True,
-        )
-
-    # Signal 2: argv contains "gateway".
-    return any(arg == "gateway" for arg in sys.argv)
+    del ctx  # decision is process-level, not ctx-level
+    return is_hermes_gateway_process()
 
 
 def _try_start_runtime(config: Any, *, gateway_mode: bool) -> Any:
