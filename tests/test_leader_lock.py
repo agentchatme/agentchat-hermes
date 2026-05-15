@@ -24,45 +24,128 @@ import pytest
 if TYPE_CHECKING:
     from pathlib import Path
 
-if sys.platform == "win32":
-    pytest.skip("leader_lock is POSIX-only", allow_module_level=True)
-
 from agentchatme_hermes.leader_lock import (
     GATEWAY_ENV_MARKER,
+    _argv_matches_gateway_run,
     describe_lock_holder,
     is_hermes_gateway_process,
     release_leader_lock,
     try_acquire_ws_leader_lock,
 )
 
+# The fcntl-using tests only run on POSIX. The is_hermes_gateway_process
+# and argv-detection tests are platform-independent and run everywhere.
+_posix_only = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="fcntl is POSIX-only",
+)
+
 
 class TestIsHermesGatewayProcess:
-    def test_unset_returns_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_unset_env_and_innocent_argv_returns_false(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         monkeypatch.delenv(GATEWAY_ENV_MARKER, raising=False)
+        monkeypatch.setattr(sys, "argv", ["hermes"])
         assert is_hermes_gateway_process() is False
 
-    def test_set_to_one_returns_true(
+    def test_env_set_to_one_returns_true(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(GATEWAY_ENV_MARKER, "1")
+        monkeypatch.setattr(sys, "argv", ["hermes"])
         assert is_hermes_gateway_process() is True
 
-    def test_set_to_other_value_returns_false(
+    def test_argv_gateway_run_returns_true_even_without_env(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Hermes only writes the literal "1". Anything else is not the
-        # canonical marker — defensive against a future setting of
-        # "true" / "0" / etc.
+        """Critical regression guard.
+
+        Hermes' ``hermes_cli/main.py`` runs ``discover_plugins()``
+        BEFORE ``gateway/run.py`` gets a chance to set the env var,
+        so at ``register()`` time the env is unset even in the real
+        gateway process. The argv fallback handles this case — 0.2.1
+        without argv shipped a gateway-that-never-opens-a-WS bug.
+        """
+        monkeypatch.delenv(GATEWAY_ENV_MARKER, raising=False)
+        monkeypatch.setattr(
+            sys, "argv", ["hermes", "gateway", "run", "--replace"]
+        )
+        assert is_hermes_gateway_process() is True
+
+    def test_env_set_to_other_value_falls_through_to_argv(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # "1" is the only canonical value. With argv also innocent,
+        # we're not a gateway.
         monkeypatch.setenv(GATEWAY_ENV_MARKER, "true")
+        monkeypatch.setattr(sys, "argv", ["hermes"])
         assert is_hermes_gateway_process() is False
 
-    def test_empty_string_returns_false(
+    def test_empty_env_falls_through_to_argv(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv(GATEWAY_ENV_MARKER, "")
+        monkeypatch.setattr(sys, "argv", ["hermes"])
         assert is_hermes_gateway_process() is False
 
 
+class TestArgvMatchesGatewayRun:
+    """Exhaustive coverage of the argv detection logic."""
+
+    def test_bare_hermes_is_not_gateway(self) -> None:
+        assert _argv_matches_gateway_run(["hermes"]) is False
+
+    def test_hermes_gateway_run(self) -> None:
+        assert _argv_matches_gateway_run(["hermes", "gateway", "run"]) is True
+
+    def test_hermes_gateway_run_with_replace(self) -> None:
+        assert (
+            _argv_matches_gateway_run(
+                ["hermes", "gateway", "run", "--replace"]
+            )
+            is True
+        )
+
+    def test_python_dash_m_form(self) -> None:
+        """Hermes can also be invoked via ``python -m hermes_cli.main``."""
+        argv = ["hermes_cli.main", "gateway", "run", "--replace"]
+        assert _argv_matches_gateway_run(argv) is True
+
+    def test_flag_between_gateway_and_run_matches(self) -> None:
+        """``hermes gateway -p profile run`` matches.
+
+        Any argv containing ``gateway`` is treated as gateway-class.
+        Hermes only routes long-lived commands through plugin
+        discovery, so we don't need finer parsing.
+        """
+        assert (
+            _argv_matches_gateway_run(
+                ["hermes", "gateway", "-p", "myprofile", "run"]
+            )
+            is True
+        )
+
+    def test_named_subcommand_is_not_gateway(self) -> None:
+        assert (
+            _argv_matches_gateway_run(["hermes", "agentchat", "status"])
+            is False
+        )
+
+    def test_chat_is_not_gateway(self) -> None:
+        assert _argv_matches_gateway_run(["hermes", "chat"]) is False
+
+    def test_oneshot_is_not_gateway(self) -> None:
+        assert _argv_matches_gateway_run(["hermes", "oneshot", "do"]) is False
+
+    def test_no_gateway_token_is_false(self) -> None:
+        """Absence of the token is the False signal."""
+        assert _argv_matches_gateway_run(["hermes", "cron", "tick"]) is False
+        assert _argv_matches_gateway_run(["hermes", "mcp", "serve"]) is False
+        assert _argv_matches_gateway_run([]) is False
+
+
+@_posix_only
 class TestTryAcquireLeaderLock:
     def test_first_caller_acquires(self, tmp_path: Path) -> None:
         lock = tmp_path / "agentchat-ws.lock"
@@ -126,6 +209,7 @@ class TestTryAcquireLeaderLock:
         assert fd is None
 
 
+@_posix_only
 class TestDescribeLockHolder:
     def test_not_present_when_file_missing(self, tmp_path: Path) -> None:
         lock = tmp_path / "agentchat-ws.lock"
@@ -171,6 +255,7 @@ class TestDescribeLockHolder:
             release_leader_lock(holder_fd)
 
 
+@_posix_only
 class TestReleaseLeaderLock:
     def test_release_invalid_fd_does_not_raise(self) -> None:
         """Double-release / release of closed fd must be silent."""

@@ -69,22 +69,76 @@ _IS_POSIX = sys.platform != "win32"
 GATEWAY_ENV_MARKER = "_HERMES_GATEWAY"
 GATEWAY_ENV_VALUE = "1"
 
+# Argv tokens that identify the long-lived gateway-run command. Hermes
+# accepts ``hermes gateway run`` (and ``hermes gateway run --replace``);
+# the ``run`` subcommand is the only one that starts a persistent
+# gateway process. ``hermes gateway stop`` / ``status`` / ``list``
+# must NOT be treated as gateway-class — they're short-lived CLI ops.
+_GATEWAY_RUN_ARGV_TOKENS = ("gateway", "run")
+
 
 def is_hermes_gateway_process() -> bool:
     """Return ``True`` iff this process is the long-lived Hermes gateway.
 
-    Checks ``_HERMES_GATEWAY=1`` in the environment — the marker set
-    inside :mod:`gateway.run` at module import. Reliable across every
-    Hermes process class because:
+    Two signals, either alone sufficient to mark the process as a
+    gateway *candidate* (the actual WS leader is then decided by the
+    file-lock layer):
 
-    * Gateway sets it before plugin discovery.
-    * TUI / one-shot / named CLI subcommands never set it.
-    * Subprocesses spawned by the gateway DO inherit it — those are
-      then filtered by the file-lock layer (see
-      :func:`try_acquire_ws_leader_lock`), which they will fail to
-      acquire because the parent already holds it.
+    1. **Argv inspection** — the operator invoked
+       ``hermes gateway run`` (or ``--replace`` / ``--profile`` etc.).
+       Reliable at ``register()`` time, which is critical because
+       Hermes calls ``discover_plugins()`` in ``hermes_cli/main.py``
+       **before** ``gateway/run.py:370`` gets a chance to set the env
+       marker. The 0.2.0/0.2.1 detectors that relied on the env var
+       alone failed here: our ``register()`` saw the unset env, fell
+       through to CLI mode, and the gateway started without a WS.
+
+    2. **Env var ``_HERMES_GATEWAY=1``** — set by ``gateway/run.py``
+       at module-import time. Catches:
+
+       * Subsequent same-process calls to ``register()`` once the
+         gateway code has loaded (rare; ``discover_plugins`` is
+         idempotent by ``force=False``).
+       * Hermes-spawned child Python processes that inherit the env
+         from the parent gateway. These won't have ``gateway run`` in
+         their own argv, but they should still try to be candidates
+         (and lose the flock race) rather than silently doing nothing.
+
+    The file-lock layer (:func:`try_acquire_ws_leader_lock`) is the
+    real arbiter — even if both signals lie, only one process per
+    machine can hold the lock at a time.
     """
-    return os.environ.get(GATEWAY_ENV_MARKER) == GATEWAY_ENV_VALUE
+    if os.environ.get(GATEWAY_ENV_MARKER) == GATEWAY_ENV_VALUE:
+        return True
+
+    return _argv_matches_gateway_run(sys.argv)
+
+
+def _argv_matches_gateway_run(argv: list[str]) -> bool:
+    """Return True iff argv contains the ``gateway`` subcommand token.
+
+    Returns True for any ``hermes gateway *`` invocation. We don't
+    further filter for ``run`` vs ``stop``/``status``/``list``
+    because Hermes' ``hermes_cli/main.py`` only calls
+    ``discover_plugins()`` for command dispatches that produce a
+    long-running agent context — specifically ``chat``, ``acp``,
+    ``rl``, ``cron run/tick``, ``gateway run``, and ``mcp serve``
+    (per the ``_AGENT_SUBCOMMANDS`` table). ``hermes gateway stop``
+    et al. never reach our ``register()``, so we don't need to
+    distinguish them from ``gateway run`` at argv level.
+
+    Robust against:
+
+    * ``hermes gateway run`` (canonical)
+    * ``hermes gateway run --replace`` (flag after run)
+    * ``hermes gateway -p profile run`` (flag-between-subcommands —
+      argparse-style, value-bearing flags)
+    * ``python -m hermes_cli.main gateway run`` (module form)
+
+    Returns False for anything without ``gateway`` (TUI, named CLI
+    subcommands like ``hermes agentchat status``, oneshot, cron, etc.).
+    """
+    return any(arg == "gateway" for arg in argv)
 
 
 def default_lock_path() -> Path:
