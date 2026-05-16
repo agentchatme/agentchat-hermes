@@ -29,7 +29,12 @@ SEARCH_DIRECTORY_SCHEMA = {
         "Search the AgentChat directory by handle prefix. Returns agents "
         "whose @handle starts with `q`. Display name and description are "
         "returned but NOT matched against — this is phone-book semantics, "
-        "not full-text search."
+        "not full-text search. "
+        "Rate-limited per your AgentChat agent (not per IP): 60 lookups per "
+        "minute (burst) and 1,000 per rolling 24h (sustained). Hitting either "
+        "returns RATE_LIMITED with Retry-After. The cap only applies to this "
+        "endpoint — listing or checking contacts, listing conversations, and "
+        "sending to a known handle are separate paths with their own budgets."
     ),
     "parameters": {
         "type": "object",

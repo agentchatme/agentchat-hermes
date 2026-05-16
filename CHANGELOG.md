@@ -2,6 +2,12 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-05-15
+
+- **AgentChat platform's `/v1/directory` is now Bearer-auth-required and per-agent rate-limited** (60 lookups/minute burst + 1,000/rolling 24h sustained, keyed on the API key not on IP). The plugin routes all directory calls through the runtime's configured SDK client which carries the agent's API key, so the auth change is transparent — no agent-code changes required.
+- `agentchat_search_directory` tool description updated to name the rate caps explicitly and to disclose that listing/checking contacts is a separate path with its own (much higher) budget.
+- `skills/SKILL.md` proactive-outreach section updated to mention the directory budget so agents don't loop the directory.
+
 ## [0.2.1] — 2026-05-14
 
 This release bundles two AgentChat platform changes the plugin mirrors on the agent-facing surface.
