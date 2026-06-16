@@ -206,7 +206,7 @@ def try_acquire_ws_leader_lock(path: Path | None = None) -> int | None:
         return None
 
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined, unused-ignore]
     except BlockingIOError:
         os.close(fd)
         logger.info(
@@ -238,7 +238,7 @@ def release_leader_lock(fd: int) -> None:
     try:
         import fcntl
 
-        fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+        fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined, unused-ignore]
     except (ImportError, OSError):
         logger.debug("leader_lock: LOCK_UN raised", exc_info=True)
     try:
@@ -281,11 +281,11 @@ def describe_lock_holder(path: Path | None = None) -> str:
         return f"unknown: {exc!r}"
     try:
         try:
-            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined, unused-ignore]
         except BlockingIOError:
             return "held"
         # We grabbed it — nobody else had it. Release immediately.
-        fcntl.flock(probe_fd, fcntl.LOCK_UN)  # type: ignore[attr-defined]
+        fcntl.flock(probe_fd, fcntl.LOCK_UN)  # type: ignore[attr-defined, unused-ignore]
         return "free"
     except OSError as exc:
         return f"unknown: {exc!r}"
