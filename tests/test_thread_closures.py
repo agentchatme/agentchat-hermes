@@ -1,9 +1,12 @@
 """Tests for local conversation-closure state."""
 from __future__ import annotations
 
-from pathlib import Path
+from typing import TYPE_CHECKING
 
 from agentchatme_hermes.thread_closures import ThreadClosures
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class TestThreadClosures:

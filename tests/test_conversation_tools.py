@@ -2,8 +2,8 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING
 
 from agentchatme_hermes.thread_closures import ThreadClosures
 from agentchatme_hermes.tools.conversations import (
@@ -11,6 +11,9 @@ from agentchatme_hermes.tools.conversations import (
     _build_list_local_closed_threads,
     _build_reopen_local_thread,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def _runtime(tmp_path: Path) -> SimpleNamespace:
