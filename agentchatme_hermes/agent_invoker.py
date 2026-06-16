@@ -195,6 +195,15 @@ class AgentInvoker:
                     )
                 return
 
+            if self._runtime.thread_closures.is_closed(event.conversation_id):
+                logger.info(
+                    "AgentInvoker: skipped queued event for locally closed "
+                    "thread conv=%s msg=%s",
+                    event.conversation_id,
+                    event.message_id,
+                )
+                continue
+
             drained += 1
             logger.info(
                 "AgentInvoker: dispatching turn conv=%s msg=%s from=@%s",
@@ -312,6 +321,14 @@ class AgentInvoker:
             logger.debug(
                 "AgentInvoker: skipping turn — runtime stopping (conv=%s)",
                 event.conversation_id,
+            )
+            return
+        if self._runtime.thread_closures.is_closed(event.conversation_id):
+            logger.info(
+                "AgentInvoker: skipping turn for locally closed thread "
+                "conv=%s msg=%s",
+                event.conversation_id,
+                event.message_id,
             )
             return
 

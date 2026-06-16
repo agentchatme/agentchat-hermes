@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
+from agentchatme_hermes.thread_closures import ThreadClosures
 from agentchatme_hermes.types import AgentIdentity
 from agentchatme_hermes.ws_daemon import WSDaemon
 
@@ -22,7 +23,7 @@ if TYPE_CHECKING:
     import pytest
 
 
-def _make_daemon(*, own_handle: str = "alice") -> tuple[WSDaemon, Any, Any]:
+def _make_daemon(*, own_handle: str = "alice") -> tuple[WSDaemon, Any, Any, Any]:
     """Construct a daemon with mocked queue + callback for unit testing.
 
     The daemon is NEVER started — we only exercise the synchronous
@@ -30,6 +31,8 @@ def _make_daemon(*, own_handle: str = "alice") -> tuple[WSDaemon, Any, Any]:
     machinery is integration territory.
     """
     queue = MagicMock()
+    thread_closures = MagicMock(spec=ThreadClosures)
+    thread_closures.is_closed.return_value = False
     on_new_event = MagicMock()
     daemon = WSDaemon(
         config=SimpleNamespace(
@@ -39,9 +42,10 @@ def _make_daemon(*, own_handle: str = "alice") -> tuple[WSDaemon, Any, Any]:
         ),
         identity=AgentIdentity(handle=own_handle),
         queue=queue,
+        thread_closures=thread_closures,
         on_new_event=on_new_event,
     )
-    return daemon, queue, on_new_event
+    return daemon, queue, on_new_event, thread_closures
 
 
 def _frame(
@@ -65,35 +69,43 @@ def _frame(
 
 class TestSelfEchoFilter:
     def test_self_echo_does_not_push(self) -> None:
-        daemon, queue, on_new_event = _make_daemon(own_handle="alice")
+        daemon, queue, on_new_event, _closures = _make_daemon(own_handle="alice")
         daemon._on_message_frame(_frame(sender="@alice"))
         queue.push.assert_not_called()
         on_new_event.assert_not_called()
 
     def test_self_echo_filter_is_case_insensitive(self) -> None:
-        daemon, queue, _on_new_event = _make_daemon(own_handle="alice")
+        daemon, queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
         daemon._on_message_frame(_frame(sender="@ALICE"))
         queue.push.assert_not_called()
 
     def test_self_echo_filter_strips_at_prefix(self) -> None:
-        daemon, queue, _on_new_event = _make_daemon(own_handle="alice")
+        daemon, queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
         daemon._on_message_frame(_frame(sender="alice"))
         queue.push.assert_not_called()
 
 
 class TestHappyPath:
     def test_peer_message_pushed_and_wakes_invoker(self) -> None:
-        daemon, queue, on_new_event = _make_daemon(own_handle="alice")
+        daemon, queue, on_new_event, _closures = _make_daemon(own_handle="alice")
         daemon._on_message_frame(_frame(sender="@bob"))
         queue.push.assert_called_once()
         on_new_event.assert_called_once()
+
+    def test_locally_closed_thread_is_suppressed(self) -> None:
+        daemon, queue, on_new_event, closures = _make_daemon(own_handle="alice")
+        closures.is_closed.return_value = True
+        daemon._on_message_frame(_frame(sender="@bob"))
+        queue.push.assert_not_called()
+        on_new_event.assert_not_called()
+        assert daemon._frames_thread_closed == 1
 
 
 class TestPerFrameLogging:
     def test_peer_message_logs_at_info(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        daemon, _queue, _on_new_event = _make_daemon(own_handle="alice")
+        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
         with caplog.at_level(logging.INFO, logger="agentchatme_hermes.ws_daemon"):
             daemon._on_message_frame(_frame(sender="@bob", text="hello"))
         # The INFO line should mention the message and conversation id.
@@ -105,7 +117,7 @@ class TestPerFrameLogging:
     def test_malformed_payload_logs_warning_and_drops(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        daemon, queue, _on_new_event = _make_daemon(own_handle="alice")
+        daemon, queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.ws_daemon"):
             # Missing the entire payload field.
             daemon._on_message_frame({"type": "message.new"})
@@ -127,7 +139,7 @@ class TestDefensiveHandling:
         here would kill the loop and silently end live inbound — the
         exact failure mode we are fixing.
         """
-        daemon, queue, on_new_event = _make_daemon(own_handle="alice")
+        daemon, queue, on_new_event, _closures = _make_daemon(own_handle="alice")
         queue.push.side_effect = RuntimeError("simulated queue failure")
 
         with caplog.at_level(logging.ERROR, logger="agentchatme_hermes.ws_daemon"):
@@ -142,7 +154,7 @@ class TestDefensiveHandling:
     def test_on_new_event_failure_does_not_propagate(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
-        daemon, queue, on_new_event = _make_daemon(own_handle="alice")
+        daemon, queue, on_new_event, _closures = _make_daemon(own_handle="alice")
         on_new_event.side_effect = RuntimeError("simulated wake failure")
 
         with caplog.at_level(logging.ERROR, logger="agentchatme_hermes.ws_daemon"):
@@ -159,7 +171,7 @@ class TestDefensiveHandling:
 
 class TestCounters:
     def test_counters_track_frames(self) -> None:
-        daemon, _queue, _on_new_event = _make_daemon(own_handle="alice")
+        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
 
         # 1 peer frame, 1 self-echo, 1 malformed → frames_seen=3,
         # filtered=1, queued=1.
@@ -170,3 +182,4 @@ class TestCounters:
         assert daemon._frames_seen == 3
         assert daemon._frames_self_filtered == 1
         assert daemon._frames_queued == 1
+        assert daemon._frames_thread_closed == 0
