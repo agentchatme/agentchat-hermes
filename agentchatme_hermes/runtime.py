@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 from .agent_invoker import AgentInvoker
 from .leader_lock import release_leader_lock, try_acquire_ws_leader_lock
 from .message_queue import MessageQueue
+from .thread_closures import ThreadClosures
 from .types import AgentIdentity
 from .ws_daemon import WSDaemon
 
@@ -74,6 +75,7 @@ class Runtime:
         self._identity: AgentIdentity | None = None
         self._client: AgentChatClient | None = None
         self._queue: MessageQueue | None = None
+        self._thread_closures = ThreadClosures()
         self._ws_daemon: WSDaemon | None = None
         self._invoker: AgentInvoker | None = None
 
@@ -112,6 +114,10 @@ class Runtime:
         if self._queue is None:
             raise RuntimeError("Runtime.start() has not completed")
         return self._queue
+
+    @property
+    def thread_closures(self) -> ThreadClosures:
+        return self._thread_closures
 
     @property
     def is_leader(self) -> bool:
@@ -160,6 +166,7 @@ class Runtime:
                         config=self._config,
                         identity=self._identity,
                         queue=self._queue,
+                        thread_closures=self._thread_closures,
                         on_new_event=self._invoker.on_new_event,
                     )
 

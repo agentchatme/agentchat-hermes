@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
     from .config import Config
     from .message_queue import MessageQueue
+    from .thread_closures import ThreadClosures
     from .types import AgentIdentity
 
 logger = logging.getLogger(__name__)
@@ -64,11 +65,13 @@ class WSDaemon:
         config: Config,
         identity: AgentIdentity,
         queue: MessageQueue,
+        thread_closures: ThreadClosures,
         on_new_event: Callable[[], None],
     ) -> None:
         self._config = config
         self._identity = identity
         self._queue = queue
+        self._thread_closures = thread_closures
         self._on_new_event = on_new_event
 
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -91,6 +94,7 @@ class WSDaemon:
         self._frames_seen = 0
         self._frames_self_filtered = 0
         self._frames_queued = 0
+        self._frames_thread_closed = 0
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -219,11 +223,12 @@ class WSDaemon:
                 connected = bool(rt_client.is_connected) if rt_client else False
                 logger.info(
                     "WSDaemon heartbeat: connected=%s handle=@%s "
-                    "frames=%d self_filtered=%d queued=%d pending_convs=%d",
+                    "frames=%d self_filtered=%d thread_closed=%d queued=%d pending_convs=%d",
                     connected,
                     self._identity.handle,
                     self._frames_seen,
                     self._frames_self_filtered,
+                    self._frames_thread_closed,
                     self._frames_queued,
                     self._queue.pending_count(),
                 )
@@ -351,6 +356,17 @@ class WSDaemon:
             event.conversation_kind,
             len(event.content_text),
         )
+
+        if self._thread_closures.is_closed(event.conversation_id):
+            self._frames_thread_closed += 1
+            logger.info(
+                "WSDaemon: suppressed inbound for locally closed thread "
+                "conv=%s msg=%s from=@%s",
+                event.conversation_id,
+                event.message_id,
+                event.sender_handle,
+            )
+            return
 
         try:
             self._queue.push(event)
