@@ -8,10 +8,8 @@ integration suite (planned for a later commit).
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 from agentchatme_hermes.agent_invoker import (
@@ -25,6 +23,8 @@ from agentchatme_hermes.thread_closures import ThreadClosures
 from agentchatme_hermes.types import AgentIdentity, InboundEvent
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import pytest
 
 
