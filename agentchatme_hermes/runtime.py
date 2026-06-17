@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING
 
 from .agent_invoker import AgentInvoker
 from .leader_lock import release_leader_lock, try_acquire_ws_leader_lock
+from .lookup_cache import LookupCache
 from .message_queue import MessageQueue
 from .thread_closures import ThreadClosures
 from .types import AgentIdentity
@@ -75,6 +76,7 @@ class Runtime:
         self._identity: AgentIdentity | None = None
         self._client: AgentChatClient | None = None
         self._queue: MessageQueue | None = None
+        self._lookup_cache = LookupCache()
         self._thread_closures = ThreadClosures()
         self._ws_daemon: WSDaemon | None = None
         self._invoker: AgentInvoker | None = None
@@ -114,6 +116,10 @@ class Runtime:
         if self._queue is None:
             raise RuntimeError("Runtime.start() has not completed")
         return self._queue
+
+    @property
+    def lookup_cache(self) -> LookupCache:
+        return self._lookup_cache
 
     @property
     def thread_closures(self) -> ThreadClosures:

@@ -24,6 +24,24 @@ if TYPE_CHECKING:
     from ..runtime import Runtime
 
 
+_CONTACT_LIST_TTL_SECONDS = 15.0
+_CONTACT_CHECK_TTL_SECONDS = 30.0
+
+
+def _contacts_list_cache_key(*, limit: int, cursor: str | None) -> str:
+    return f"contacts:list:{limit}:{cursor or ''}"
+
+
+def _contact_check_cache_key(handle: str) -> str:
+    return f"contacts:check:{handle}"
+
+
+def _invalidate_contact_cache(runtime: Runtime, *, handle: str | None = None) -> None:
+    runtime.lookup_cache.invalidate_prefix("contacts:list")
+    if handle is not None:
+        runtime.lookup_cache.invalidate(_contact_check_cache_key(handle))
+
+
 # -- schemas ----------------------------------------------------------------
 
 ADD_CONTACT_SCHEMA = {
@@ -212,6 +230,7 @@ def _build_add_contact(runtime: Runtime) -> Callable[..., str]:
             result = runtime.client.add_contact(handle)
         except AgentChatError as exc:
             return format_sdk_error(exc)
+        _invalidate_contact_cache(runtime, handle=handle)
         return ok({"contact": result})
 
     return _handler
@@ -231,7 +250,15 @@ def _build_list_contacts(runtime: Runtime) -> Callable[..., str]:
             kwargs: dict[str, Any] = {"limit": limit}
             if cursor:
                 kwargs["cursor"] = cursor
-            result = runtime.client.list_contacts(**kwargs)
+            cache_key = _contacts_list_cache_key(limit=limit, cursor=cursor)
+            cached = runtime.lookup_cache.get(cache_key)
+            if cached is None:
+                cached = runtime.lookup_cache.set(
+                    cache_key,
+                    runtime.client.list_contacts(**kwargs),
+                    ttl_seconds=_CONTACT_LIST_TTL_SECONDS,
+                )
+            result = cached
         except AgentChatError as exc:
             return format_sdk_error(exc)
         return ok({"contacts": result})
@@ -248,7 +275,15 @@ def _build_check_contact(runtime: Runtime) -> Callable[..., str]:
         except ToolArgError as exc:
             return handle_arg_error(exc)
         try:
-            result = runtime.client.check_contact(handle)
+            cache_key = _contact_check_cache_key(handle)
+            cached = runtime.lookup_cache.get(cache_key)
+            if cached is None:
+                cached = runtime.lookup_cache.set(
+                    cache_key,
+                    runtime.client.check_contact(handle),
+                    ttl_seconds=_CONTACT_CHECK_TTL_SECONDS,
+                )
+            result = cached
         except AgentChatError as exc:
             return format_sdk_error(exc)
         return ok({"contact": result})
@@ -269,6 +304,7 @@ def _build_update_contact_notes(runtime: Runtime) -> Callable[..., str]:
             result = runtime.client.update_contact_notes(handle, notes)
         except AgentChatError as exc:
             return format_sdk_error(exc)
+        _invalidate_contact_cache(runtime, handle=handle)
         return ok({"contact": result})
 
     return _handler
@@ -286,6 +322,7 @@ def _build_remove_contact(runtime: Runtime) -> Callable[..., str]:
             runtime.client.remove_contact(handle)
         except AgentChatError as exc:
             return format_sdk_error(exc)
+        _invalidate_contact_cache(runtime, handle=handle)
         return ok({"removed_handle": handle})
 
     return _handler
