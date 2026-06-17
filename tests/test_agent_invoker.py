@@ -7,14 +7,25 @@ integration suite (planned for a later commit).
 """
 from __future__ import annotations
 
-from typing import Any
+from datetime import datetime, timezone
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
+from unittest.mock import MagicMock
 
 from agentchatme_hermes.agent_invoker import (
     _FALLBACK_MODEL,
+    AgentInvoker,
     _coerce_model_string,
     _extract_messages_list,
     _translate_messages_to_history,
 )
+from agentchatme_hermes.thread_closures import ThreadClosures
+from agentchatme_hermes.types import AgentIdentity, InboundEvent
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    import pytest
 
 
 def _msg(
@@ -307,3 +318,71 @@ class TestNotificationPrompt:
         long_text = "x" * 5000
         prompt = build_notification_prompt(self._event(text=long_text))
         assert long_text in prompt
+
+
+class _FakeFuture:
+    def add_done_callback(self, _callback: Any) -> None:
+        return None
+
+    def exception(self) -> None:
+        return None
+
+
+class _FakeExecutor:
+    def __init__(self) -> None:
+        self.submitted: list[tuple[Any, tuple[Any, ...]]] = []
+
+    def submit(self, fn: Any, *args: Any) -> _FakeFuture:
+        self.submitted.append((fn, args))
+        return _FakeFuture()
+
+
+class TestInFlightThreadClose:
+    def test_queued_turn_is_suppressed_if_thread_closes_before_worker_runs(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        import agentchatme_hermes.runtime as runtime_module
+
+        event = InboundEvent(
+            message_id="m1",
+            conversation_id="conv_dm_123",
+            conversation_kind="direct",
+            sender_handle="alice",
+            content_text="hi",
+            received_at=datetime.now(timezone.utc),
+        )
+        queue = MagicMock()
+        queue.pop.side_effect = [event, None]
+        invoker = AgentInvoker(
+            config=SimpleNamespace(max_inflight_turns=1),
+            identity=AgentIdentity(handle="me"),
+            queue=queue,
+        )
+        executor = _FakeExecutor()
+        invoker._executor = executor
+
+        runtime = SimpleNamespace(
+            thread_closures=ThreadClosures(path=tmp_path / "closed.json"),
+            client=MagicMock(),
+        )
+        agent = MagicMock()
+        monkeypatch.setattr(runtime_module, "get_existing_runtime", lambda: runtime)
+        monkeypatch.setattr(invoker, "_ensure_hermes_resolved", lambda: None)
+        monkeypatch.setattr(invoker, "_build_agent", lambda _conversation_id: agent)
+        monkeypatch.setattr(
+            invoker,
+            "_build_conversation_history",
+            lambda **_kwargs: [],
+        )
+
+        invoker._drain_queue()
+
+        assert len(executor.submitted) == 1
+
+        runtime.thread_closures.close("conv_dm_123", reason="closed mid-flight")
+        submitted_fn, submitted_args = executor.submitted[0]
+        submitted_fn(*submitted_args)
+
+        agent.run_conversation.assert_not_called()
