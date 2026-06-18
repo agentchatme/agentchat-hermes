@@ -145,6 +145,25 @@ GET_GROUP_CONTEXT_SCHEMA = {
     },
 }
 
+CHECK_GROUP_REPLY_READINESS_SCHEMA = {
+    "name": "agentchat_check_group_reply_readiness",
+    "description": (
+        "Preflight a group reply before you send it. Confirms your current membership context and, if you name a target "
+        "handle, whether that agent is actually in the room right now."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "string", "description": "Group id (conv_grp_...)."},
+            "target_handle": {
+                "type": "string",
+                "description": "Optional @handle you expect to address in the reply.",
+            },
+        },
+        "required": ["group_id"],
+    },
+}
+
 UPDATE_GROUP_SCHEMA = {
     "name": "agentchat_update_group",
     "description": (
@@ -629,6 +648,55 @@ def _build_get_group_context(runtime: Runtime) -> Callable[..., str]:
     return _handler
 
 
+def _build_check_group_reply_readiness(runtime: Runtime) -> Callable[..., str]:
+    def _handler(args: dict[str, Any], **_kwargs: Any) -> str:
+        from agentchatme import AgentChatError
+
+        try:
+            group_id = require_str(args, "group_id", max_len=64)
+            target_handle_raw = optional_str(args, "target_handle", max_len=64)
+            target_handle = (
+                normalize_handle(target_handle_raw, field="target_handle")
+                if target_handle_raw is not None
+                else None
+            )
+        except ToolArgError as exc:
+            return handle_arg_error(exc)
+
+        try:
+            detail = get_cached_group_detail(runtime, group_id)
+        except AgentChatError as exc:
+            return format_sdk_error(exc)
+
+        participants = get_group_member_rows(runtime, group_id)
+        member_handles = {
+            str(item["handle"]).lower()
+            for item in participants
+            if isinstance(item.get("handle"), str)
+        }
+        suggested_reply_targets = [
+            str(item["handle"])
+            for item in participants
+            if isinstance(item.get("handle"), str) and not bool(item.get("is_you"))
+        ][:3]
+        return ok(
+            {
+                "group_id": group_id,
+                "group_name": detail.get("name"),
+                "your_role": detail.get("your_role"),
+                "member_count": detail.get("member_count", len(participants)),
+                "can_reply": True,
+                "target_handle": target_handle,
+                "target_present": target_handle in member_handles if target_handle else None,
+                "target_is_self": target_handle == runtime.identity.handle if target_handle else None,
+                "suggested_reply_targets": suggested_reply_targets,
+                "participants": participants,
+            }
+        )
+
+    return _handler
+
+
 def _build_add_group_member(runtime: Runtime) -> Callable[..., str]:
     def _handler(args: dict[str, Any], **_kwargs: Any) -> str:
         from agentchatme import AgentChatError
@@ -792,6 +860,12 @@ def _build_reject_group_invite(runtime: Runtime) -> Callable[..., str]:
 # INFORMATION-SOURCE / HEAVY PLUS / HEAVY MINUS as confusable with
 # ASCII but the listing context is unambiguous.
 TOOLS = (
+    (
+        "agentchat_check_group_reply_readiness",
+        CHECK_GROUP_REPLY_READINESS_SCHEMA,
+        _build_check_group_reply_readiness,
+        "🛟",
+    ),
     (
         "agentchat_get_group_context",
         GET_GROUP_CONTEXT_SCHEMA,

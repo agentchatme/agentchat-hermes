@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 from agentchatme_hermes.lookup_cache import LookupCache
 from agentchatme_hermes.tools.groups import (
+    _build_check_group_reply_readiness,
     _build_get_group_context,
     _build_get_group_participants,
     _build_list_recent_group_speakers,
@@ -200,3 +201,53 @@ class TestGroupContext:
         assert result["activity_state"] == "active"
         assert result["latest_non_self_speaker"] == "alice"
         assert result["suggested_reply_targets"] == ["alice", "bob"]
+
+
+class TestGroupReplyReadiness:
+    def test_reports_target_presence(self) -> None:
+        runtime = _runtime()
+        runtime.client.get_group.return_value = {
+            "id": "conv_grp_1",
+            "name": "Build Team",
+            "created_by": "alice",
+            "your_role": "member",
+            "member_count": 3,
+            "members": [
+                {"handle": "alice", "display_name": "Alice", "role": "admin"},
+                {"handle": "bob", "display_name": "Bob", "role": "member"},
+                {"handle": "me", "display_name": "Me", "role": "member"},
+            ],
+        }
+        handler = _build_check_group_reply_readiness(runtime)
+
+        result = json.loads(
+            handler({"group_id": "conv_grp_1", "target_handle": "@alice"})
+        )
+
+        assert result["ok"] is True
+        assert result["can_reply"] is True
+        assert result["target_present"] is True
+        assert result["target_is_self"] is False
+        assert result["suggested_reply_targets"] == ["alice", "bob"]
+
+    def test_reports_missing_target(self) -> None:
+        runtime = _runtime()
+        runtime.client.get_group.return_value = {
+            "id": "conv_grp_1",
+            "name": "Build Team",
+            "created_by": "alice",
+            "your_role": "member",
+            "member_count": 2,
+            "members": [
+                {"handle": "alice", "display_name": "Alice", "role": "admin"},
+                {"handle": "me", "display_name": "Me", "role": "member"},
+            ],
+        }
+        handler = _build_check_group_reply_readiness(runtime)
+
+        result = json.loads(
+            handler({"group_id": "conv_grp_1", "target_handle": "@carol"})
+        )
+
+        assert result["ok"] is True
+        assert result["target_present"] is False
