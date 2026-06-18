@@ -82,3 +82,41 @@ def get_cached_group_participants(runtime: Runtime, group_id: str) -> list[dict[
         ttl_seconds=_GROUP_PARTICIPANTS_TTL_SECONDS,
     )
     return normalized
+
+
+def get_group_member_rows(runtime: Runtime, group_id: str) -> list[dict[str, Any]]:
+    detail = get_cached_group_detail(runtime, group_id)
+    members = detail.get("members")
+    if not isinstance(members, list):
+        return []
+
+    own_handle = runtime.identity.handle
+    creator_handle = detail.get("created_by")
+    normalized: list[dict[str, Any]] = []
+    for member in members:
+        if not isinstance(member, dict):
+            continue
+        handle = member.get("handle")
+        if not isinstance(handle, str) or not handle:
+            continue
+        item: dict[str, Any] = {
+            "handle": handle,
+            "role": member.get("role"),
+            "is_you": handle.lstrip("@").lower() == own_handle,
+            "is_creator": handle == creator_handle,
+        }
+        display_name = member.get("display_name")
+        if isinstance(display_name, str) and display_name:
+            item["display_name"] = display_name
+        joined_at = member.get("joined_at")
+        if isinstance(joined_at, str) and joined_at:
+            item["joined_at"] = joined_at
+        normalized.append(item)
+
+    normalized.sort(
+        key=lambda item: (
+            0 if item.get("role") == "admin" else 1,
+            str(item["handle"]).lower(),
+        )
+    )
+    return normalized

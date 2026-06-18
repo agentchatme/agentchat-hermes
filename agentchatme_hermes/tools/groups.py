@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from ..group_participants import (
     get_cached_group_detail,
+    get_group_member_rows,
     invalidate_group_lookup_cache,
 )
 from ._common import (
@@ -70,6 +71,21 @@ GET_GROUP_SCHEMA = {
         "Fetch a group's detail (name, description, member list, your "
         "role). Members-only — non-members get NOT_FOUND (existence is "
         "masked, never 403)."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "string", "description": "Group id (conv_grp_...)."},
+        },
+        "required": ["group_id"],
+    },
+}
+
+GET_GROUP_PARTICIPANTS_SCHEMA = {
+    "name": "agentchat_get_group_participants",
+    "description": (
+        "Inspect a group's membership with richer structure than the generic conversation participant list. "
+        "Returns the sorted member roster, admin count, creator, and your current role in the room."
     ),
     "parameters": {
         "type": "object",
@@ -331,6 +347,37 @@ def _build_update_group(runtime: Runtime) -> Callable[..., str]:
     return _handler
 
 
+def _build_get_group_participants(runtime: Runtime) -> Callable[..., str]:
+    def _handler(args: dict[str, Any], **_kwargs: Any) -> str:
+        from agentchatme import AgentChatError
+
+        try:
+            group_id = require_str(args, "group_id", max_len=64)
+        except ToolArgError as exc:
+            return handle_arg_error(exc)
+
+        try:
+            detail = get_cached_group_detail(runtime, group_id)
+        except AgentChatError as exc:
+            return format_sdk_error(exc)
+
+        participants = get_group_member_rows(runtime, group_id)
+        admin_count = sum(1 for item in participants if item.get("role") == "admin")
+        return ok(
+            {
+                "group_id": group_id,
+                "group_name": detail.get("name"),
+                "creator_handle": detail.get("created_by"),
+                "your_role": detail.get("your_role"),
+                "member_count": detail.get("member_count", len(participants)),
+                "admin_count": admin_count,
+                "participants": participants,
+            }
+        )
+
+    return _handler
+
+
 def _build_add_group_member(runtime: Runtime) -> Callable[..., str]:
     def _handler(args: dict[str, Any], **_kwargs: Any) -> str:
         from agentchatme import AgentChatError
@@ -494,6 +541,12 @@ def _build_reject_group_invite(runtime: Runtime) -> Callable[..., str]:
 # INFORMATION-SOURCE / HEAVY PLUS / HEAVY MINUS as confusable with
 # ASCII but the listing context is unambiguous.
 TOOLS = (
+    (
+        "agentchat_get_group_participants",
+        GET_GROUP_PARTICIPANTS_SCHEMA,
+        _build_get_group_participants,
+        "👥",
+    ),
     ("agentchat_create_group", CREATE_GROUP_SCHEMA, _build_create_group, "👥"),
     ("agentchat_get_group", GET_GROUP_SCHEMA, _build_get_group, "ℹ"),  # noqa: RUF001
     ("agentchat_update_group", UPDATE_GROUP_SCHEMA, _build_update_group, "✏"),
