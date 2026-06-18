@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable
 
+from ..group_participants import get_cached_group_participants
 from ._common import (
     ToolArgError,
     format_sdk_error,
@@ -374,7 +375,10 @@ def _build_get_participants(runtime: Runtime) -> Callable[..., str]:
         except ToolArgError as exc:
             return handle_arg_error(exc)
         try:
-            result = runtime.client.get_conversation_participants(conv_id)
+            if conv_id.startswith("conv_grp_"):
+                result = get_cached_group_participants(runtime, conv_id)
+            else:
+                result = runtime.client.get_conversation_participants(conv_id)
         except AgentChatError as exc:
             return format_sdk_error(exc)
         return ok({"conversation_id": conv_id, "participants": result})

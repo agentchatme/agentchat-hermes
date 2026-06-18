@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable
 
+from ..group_participants import (
+    get_cached_group_detail,
+    invalidate_group_lookup_cache,
+)
 from ._common import (
     ToolArgError,
     format_sdk_error,
@@ -292,7 +296,7 @@ def _build_get_group(runtime: Runtime) -> Callable[..., str]:
         except ToolArgError as exc:
             return handle_arg_error(exc)
         try:
-            result = runtime.client.get_group(group_id)
+            result = get_cached_group_detail(runtime, group_id)
         except AgentChatError as exc:
             return format_sdk_error(exc)
         return ok({"group": result})
@@ -321,6 +325,7 @@ def _build_update_group(runtime: Runtime) -> Callable[..., str]:
             result = runtime.client.update_group(group_id, req)
         except AgentChatError as exc:
             return format_sdk_error(exc)
+        invalidate_group_lookup_cache(runtime, group_id)
         return ok({"group": result})
 
     return _handler
@@ -339,6 +344,7 @@ def _build_add_group_member(runtime: Runtime) -> Callable[..., str]:
             result = runtime.client.add_group_member(group_id, handle)
         except AgentChatError as exc:
             return format_sdk_error(exc)
+        invalidate_group_lookup_cache(runtime, group_id)
         return ok({"membership": result})
 
     return _handler
@@ -357,6 +363,7 @@ def _build_remove_group_member(runtime: Runtime) -> Callable[..., str]:
             runtime.client.remove_group_member(group_id, handle)
         except AgentChatError as exc:
             return format_sdk_error(exc)
+        invalidate_group_lookup_cache(runtime, group_id)
         return ok({"group_id": group_id, "removed_handle": handle})
 
     return _handler
@@ -375,6 +382,7 @@ def _build_promote_group_member(runtime: Runtime) -> Callable[..., str]:
             result = runtime.client.promote_group_member(group_id, handle)
         except AgentChatError as exc:
             return format_sdk_error(exc)
+        invalidate_group_lookup_cache(runtime, group_id)
         return ok({"membership": result})
 
     return _handler
@@ -393,6 +401,7 @@ def _build_demote_group_member(runtime: Runtime) -> Callable[..., str]:
             result = runtime.client.demote_group_member(group_id, handle)
         except AgentChatError as exc:
             return format_sdk_error(exc)
+        invalidate_group_lookup_cache(runtime, group_id)
         return ok({"membership": result})
 
     return _handler
@@ -410,6 +419,7 @@ def _build_leave_group(runtime: Runtime) -> Callable[..., str]:
             runtime.client.leave_group(group_id)
         except AgentChatError as exc:
             return format_sdk_error(exc)
+        invalidate_group_lookup_cache(runtime, group_id)
         return ok({"left_group_id": group_id})
 
     return _handler
@@ -427,6 +437,7 @@ def _build_delete_group(runtime: Runtime) -> Callable[..., str]:
             result = runtime.client.delete_group(group_id)
         except AgentChatError as exc:
             return format_sdk_error(exc)
+        invalidate_group_lookup_cache(runtime, group_id)
         return ok({"deleted_group": result})
 
     return _handler
