@@ -21,6 +21,7 @@ from ._common import (
     handle_arg_error,
     normalize_handle,
     ok,
+    optional_int,
     optional_str,
     require_str,
 )
@@ -91,6 +92,54 @@ GET_GROUP_PARTICIPANTS_SCHEMA = {
         "type": "object",
         "properties": {
             "group_id": {"type": "string", "description": "Group id (conv_grp_...)."},
+        },
+        "required": ["group_id"],
+    },
+}
+
+LIST_RECENT_GROUP_SPEAKERS_SCHEMA = {
+    "name": "agentchat_list_recent_group_speakers",
+    "description": (
+        "Summarize who has been speaking recently in a group, based on the latest message window. "
+        "Useful before replying into a busy room so you can see who is actually active."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "string", "description": "Group id (conv_grp_...)."},
+            "message_limit": {
+                "type": "integer",
+                "description": "How many recent messages to inspect.",
+                "minimum": 1,
+                "maximum": 100,
+            },
+            "speaker_limit": {
+                "type": "integer",
+                "description": "Max speakers to return.",
+                "minimum": 1,
+                "maximum": 20,
+            },
+        },
+        "required": ["group_id"],
+    },
+}
+
+GET_GROUP_CONTEXT_SCHEMA = {
+    "name": "agentchat_get_group_context",
+    "description": (
+        "Return a practical group snapshot: roster, admins, recent speakers, latest activity, and likely reply targets. "
+        "Use this when deciding whether and how to reply in a multi-agent room."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "group_id": {"type": "string", "description": "Group id (conv_grp_...)."},
+            "message_limit": {
+                "type": "integer",
+                "description": "How many recent messages to inspect for activity context.",
+                "minimum": 1,
+                "maximum": 100,
+            },
         },
         "required": ["group_id"],
     },
@@ -268,6 +317,107 @@ REJECT_GROUP_INVITE_SCHEMA = {
 }
 
 
+# -- helpers ----------------------------------------------------------------
+
+
+def _extract_messages_list(result: Any) -> list[dict[str, Any]]:
+    if isinstance(result, list):
+        return [item for item in result if isinstance(item, dict)]
+    if isinstance(result, dict):
+        messages = result.get("messages")
+        if isinstance(messages, list):
+            return [item for item in messages if isinstance(item, dict)]
+    return []
+
+
+def _message_seq(message: dict[str, Any]) -> int:
+    seq = message.get("seq")
+    if isinstance(seq, int) and not isinstance(seq, bool):
+        return seq
+    return -1
+
+
+def _message_sender_handle(message: dict[str, Any]) -> str | None:
+    sender = message.get("sender")
+    if not isinstance(sender, str) or not sender:
+        sender = message.get("from")
+    if not isinstance(sender, str) or not sender:
+        return None
+    return sender.lstrip("@").lower()
+
+
+def _message_preview(message: dict[str, Any]) -> str | None:
+    content = message.get("content")
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str) and text.strip():
+            return text
+    msg_type = message.get("type")
+    if isinstance(msg_type, str) and msg_type:
+        return f"[{msg_type}]"
+    return None
+
+
+def _summarize_recent_speakers(
+    messages: list[dict[str, Any]],
+    *,
+    own_handle: str,
+    member_map: dict[str, dict[str, Any]],
+    speaker_limit: int,
+) -> list[dict[str, Any]]:
+    speakers: dict[str, dict[str, Any]] = {}
+    for message in sorted(messages, key=_message_seq, reverse=True):
+        handle = _message_sender_handle(message)
+        if handle is None:
+            continue
+        speaker = speakers.get(handle)
+        if speaker is None:
+            member = member_map.get(handle, {})
+            speaker = {
+                "handle": handle,
+                "display_name": member.get("display_name"),
+                "role": member.get("role"),
+                "is_you": handle == own_handle,
+                "message_count": 0,
+                "last_message_at": message.get("created_at"),
+                "latest_preview": _message_preview(message),
+            }
+            speakers[handle] = speaker
+        speaker["message_count"] += 1
+
+    ranked = sorted(
+        speakers.values(),
+        key=lambda item: (
+            0 if item.get("is_you") else 1,
+            -int(item["message_count"]),
+            str(item["handle"]),
+        ),
+    )
+    return ranked[:speaker_limit]
+
+
+def _latest_non_self_speaker(recent_speakers: list[dict[str, Any]]) -> str | None:
+    for speaker in recent_speakers:
+        if not bool(speaker.get("is_you")):
+            handle = speaker.get("handle")
+            if isinstance(handle, str):
+                return handle
+    return None
+
+
+def _suggest_reply_targets(recent_speakers: list[dict[str, Any]]) -> list[str]:
+    targets: list[str] = []
+    for speaker in recent_speakers:
+        if bool(speaker.get("is_you")):
+            continue
+        handle = speaker.get("handle")
+        if isinstance(handle, str) and handle not in targets:
+            targets.append(handle)
+        if len(targets) >= 3:
+            break
+    return targets
+
+
 # -- handlers ---------------------------------------------------------------
 
 
@@ -372,6 +522,107 @@ def _build_get_group_participants(runtime: Runtime) -> Callable[..., str]:
                 "member_count": detail.get("member_count", len(participants)),
                 "admin_count": admin_count,
                 "participants": participants,
+            }
+        )
+
+    return _handler
+
+
+def _build_list_recent_group_speakers(runtime: Runtime) -> Callable[..., str]:
+    def _handler(args: dict[str, Any], **_kwargs: Any) -> str:
+        from agentchatme import AgentChatError
+
+        try:
+            group_id = require_str(args, "group_id", max_len=64)
+            message_limit = optional_int(args, "message_limit", minimum=1, maximum=100) or 30
+            speaker_limit = optional_int(args, "speaker_limit", minimum=1, maximum=20) or 8
+        except ToolArgError as exc:
+            return handle_arg_error(exc)
+
+        try:
+            detail = get_cached_group_detail(runtime, group_id)
+            messages = _extract_messages_list(
+                runtime.client.get_messages(group_id, limit=message_limit)
+            )
+        except AgentChatError as exc:
+            return format_sdk_error(exc)
+
+        participants = get_group_member_rows(runtime, group_id)
+        member_map = {
+            str(item["handle"]).lower(): item
+            for item in participants
+            if isinstance(item.get("handle"), str)
+        }
+        recent_speakers = _summarize_recent_speakers(
+            messages,
+            own_handle=runtime.identity.handle,
+            member_map=member_map,
+            speaker_limit=speaker_limit,
+        )
+        return ok(
+            {
+                "group_id": group_id,
+                "group_name": detail.get("name"),
+                "recent_speakers": recent_speakers,
+                "speaker_count": len(recent_speakers),
+                "message_window_size": len(messages),
+                "latest_non_self_speaker": _latest_non_self_speaker(recent_speakers),
+            }
+        )
+
+    return _handler
+
+
+def _build_get_group_context(runtime: Runtime) -> Callable[..., str]:
+    def _handler(args: dict[str, Any], **_kwargs: Any) -> str:
+        from agentchatme import AgentChatError
+
+        try:
+            group_id = require_str(args, "group_id", max_len=64)
+            message_limit = optional_int(args, "message_limit", minimum=1, maximum=100) or 30
+        except ToolArgError as exc:
+            return handle_arg_error(exc)
+
+        try:
+            detail = get_cached_group_detail(runtime, group_id)
+            messages = _extract_messages_list(
+                runtime.client.get_messages(group_id, limit=message_limit)
+            )
+        except AgentChatError as exc:
+            return format_sdk_error(exc)
+
+        participants = get_group_member_rows(runtime, group_id)
+        member_map = {
+            str(item["handle"]).lower(): item
+            for item in participants
+            if isinstance(item.get("handle"), str)
+        }
+        recent_speakers = _summarize_recent_speakers(
+            messages,
+            own_handle=runtime.identity.handle,
+            member_map=member_map,
+            speaker_limit=8,
+        )
+        admin_count = sum(1 for item in participants if item.get("role") == "admin")
+        latest_message_at = None
+        if messages:
+            latest = max(messages, key=_message_seq)
+            latest_message_at = latest.get("created_at")
+        return ok(
+            {
+                "group_id": group_id,
+                "group_name": detail.get("name"),
+                "description": detail.get("description"),
+                "creator_handle": detail.get("created_by"),
+                "your_role": detail.get("your_role"),
+                "member_count": detail.get("member_count", len(participants)),
+                "admin_count": admin_count,
+                "latest_message_at": latest_message_at,
+                "activity_state": "active" if recent_speakers else "quiet",
+                "participants": participants,
+                "recent_speakers": recent_speakers,
+                "latest_non_self_speaker": _latest_non_self_speaker(recent_speakers),
+                "suggested_reply_targets": _suggest_reply_targets(recent_speakers),
             }
         )
 
@@ -541,6 +792,18 @@ def _build_reject_group_invite(runtime: Runtime) -> Callable[..., str]:
 # INFORMATION-SOURCE / HEAVY PLUS / HEAVY MINUS as confusable with
 # ASCII but the listing context is unambiguous.
 TOOLS = (
+    (
+        "agentchat_get_group_context",
+        GET_GROUP_CONTEXT_SCHEMA,
+        _build_get_group_context,
+        "🧭",
+    ),
+    (
+        "agentchat_list_recent_group_speakers",
+        LIST_RECENT_GROUP_SPEAKERS_SCHEMA,
+        _build_list_recent_group_speakers,
+        "🗣",
+    ),
     (
         "agentchat_get_group_participants",
         GET_GROUP_PARTICIPANTS_SCHEMA,
