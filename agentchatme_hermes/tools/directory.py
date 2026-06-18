@@ -8,6 +8,7 @@ profiles).
 """
 from __future__ import annotations
 
+import json
 from typing import TYPE_CHECKING, Any, Callable
 
 from ._common import (
@@ -21,6 +22,20 @@ from ._common import (
 
 if TYPE_CHECKING:
     from ..runtime import Runtime
+
+
+_DIRECTORY_SEARCH_TTL_SECONDS = 15.0
+
+
+def _directory_search_cache_key(*, q: str, limit: int) -> str:
+    return json.dumps(
+        {
+            "ns": "directory:search",
+            "q": q,
+            "limit": limit,
+        },
+        sort_keys=True,
+    )
 
 
 SEARCH_DIRECTORY_SCHEMA = {
@@ -68,7 +83,15 @@ def _build_search_directory(runtime: Runtime) -> Callable[..., str]:
             return handle_arg_error(exc)
 
         try:
-            result = runtime.client.search_agents(q, limit=limit)
+            cache_key = _directory_search_cache_key(q=q, limit=limit)
+            cached = runtime.lookup_cache.get(cache_key)
+            if cached is None:
+                cached = runtime.lookup_cache.set(
+                    cache_key,
+                    runtime.client.search_agents(q, limit=limit),
+                    ttl_seconds=_DIRECTORY_SEARCH_TTL_SECONDS,
+                )
+            result = cached
         except AgentChatError as exc:
             return format_sdk_error(exc)
         return ok({"results": result})
