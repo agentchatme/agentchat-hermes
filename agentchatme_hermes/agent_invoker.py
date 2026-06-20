@@ -6,14 +6,21 @@ A platform/channel adapter would force a mandatory reply via
 ``send()`` and create infinite loops between two agents. We bypass
 that machinery entirely. Per inbound:
 
-1. Construct an :class:`AIAgent` configured with our session_id
+1. **Reply gate** (:mod:`.reply_gate`). A forced reply/no-reply
+   decision on the agent's own model, with a deterministic
+   per-conversation circuit breaker (:mod:`.turn_guard`) underneath
+   it. ``no_reply`` ends the turn right here — this is what stops two
+   agents looping forever. Only a ``reply`` decision proceeds to the
+   steps below, so a no-reply turn never pays for AIAgent
+   construction.
+2. Construct an :class:`AIAgent` configured with our session_id
    namespace (``agentchat:<conversation_id>``). The agent loads
    prior turns of THIS conversation from the session DB
    automatically.
-2. Hand it a short notification prompt
+3. Hand it a short notification prompt
    (``prompts.build_notification_prompt``).
-3. Call :meth:`AIAgent.run_conversation`.
-4. **Discard the return value.** No auto-routing anywhere. The
+4. Call :meth:`AIAgent.run_conversation`.
+5. **Discard the return value.** No auto-routing anywhere. The
    agent's only way to actually send something on AgentChat is to
    call the ``agentchat_send_message`` tool during the turn.
 
@@ -44,6 +51,16 @@ import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any
+
+from . import reply_gate
+from .config import (
+    DEFAULT_GATE_MAX_REPLIES_PER_WINDOW,
+    DEFAULT_GATE_TIMEOUT_S,
+    DEFAULT_GATE_WINDOW_SECONDS,
+    DEFAULT_REPLY_GATE_ENABLED,
+    DEFAULT_REPLY_GATE_FAIL_OPEN,
+)
+from .turn_guard import TurnCircuitBreaker
 
 if TYPE_CHECKING:
     from .config import Config
@@ -85,6 +102,31 @@ class AgentInvoker:
         self._config = config
         self._identity = identity
         self._queue = queue
+
+        # Reply-gate settings resolved once. getattr-with-default so partial
+        # configs in tests construct cleanly; the production Config dataclass
+        # always carries these fields.
+        self._gate_enabled = getattr(
+            config, "reply_gate_enabled", DEFAULT_REPLY_GATE_ENABLED
+        )
+        self._gate_fail_open = getattr(
+            config, "reply_gate_fail_open", DEFAULT_REPLY_GATE_FAIL_OPEN
+        )
+        self._gate_timeout_s = getattr(
+            config, "gate_timeout_s", DEFAULT_GATE_TIMEOUT_S
+        )
+        # Deterministic seatbelt under the LLM gate, shared across all
+        # turn-worker threads (it is internally thread-safe).
+        self._breaker = TurnCircuitBreaker(
+            max_replies=getattr(
+                config,
+                "gate_max_replies_per_window",
+                DEFAULT_GATE_MAX_REPLIES_PER_WINDOW,
+            ),
+            window_seconds=getattr(
+                config, "gate_window_seconds", DEFAULT_GATE_WINDOW_SECONDS
+            ),
+        )
 
         self._executor: ThreadPoolExecutor | None = None
         self._dispatcher: threading.Thread | None = None
@@ -342,6 +384,39 @@ class AgentInvoker:
 
         self._ensure_hermes_resolved()
 
+        prompt = build_notification_prompt(event)
+        history = self._build_conversation_history(
+            conversation_id=event.conversation_id,
+            conversation_kind=event.conversation_kind,
+            trigger_message_id=event.message_id,
+        )
+
+        # --- reply gate ------------------------------------------------------
+        # Forced reply/no-reply decision BEFORE anything is composed. "No
+        # reply" is a first-class outcome that ends the turn here — this is
+        # what stops two agents ping-ponging acknowledgements forever. The
+        # agent is built only on the reply branch, so a no-reply turn never
+        # pays for AIAgent construction. Kill switch:
+        # AGENTCHATME_REPLY_GATE_ENABLED=0.
+        if self._gate_enabled:
+            decision = self._decide_reply(event, history)
+            logger.info(
+                "AgentInvoker: gate conv=%s msg=%s reply=%s source=%s "
+                "category=%s latency_ms=%d reason=%r",
+                event.conversation_id,
+                event.message_id,
+                decision.reply,
+                decision.source,
+                decision.category,
+                decision.latency_ms,
+                decision.reason,
+            )
+            if not decision.reply:
+                return  # no-reply ends the turn; nothing composed or sent
+            # Count the reply for the breaker before composing, so even a
+            # slow or stuck compose still advances the window toward the cap.
+            self._breaker.record_reply(event.conversation_id)
+
         agent = self._build_agent(event.conversation_id)
         if agent is None:
             logger.warning(
@@ -351,13 +426,6 @@ class AgentInvoker:
                 event.message_id,
             )
             return  # already logged inside _build_agent
-
-        prompt = build_notification_prompt(event)
-        history = self._build_conversation_history(
-            conversation_id=event.conversation_id,
-            conversation_kind=event.conversation_kind,
-            trigger_message_id=event.message_id,
-        )
 
         try:
             result = agent.run_conversation(
@@ -385,6 +453,48 @@ class AgentInvoker:
             event.message_id,
             len(history),
             len(final) if isinstance(final, str) else 0,
+        )
+
+    # -- reply gate ---------------------------------------------------------
+
+    def _decide_reply(
+        self, event: InboundEvent, history: list[dict[str, Any]]
+    ) -> reply_gate.GateDecision:
+        """Decide reply / no-reply for one inbound.
+
+        Order matters: the deterministic circuit breaker is checked first so
+        a runaway loop is stopped without even spending a decision call. When
+        it hasn't tripped, its current count is handed to the LLM as a loop
+        signal, and the decision runs on the agent's own model (so nothing
+        here touches the AgentChat server — the judgement lives at the edge).
+        """
+        if self._breaker.should_trip(event.conversation_id):
+            logger.warning(
+                "AgentInvoker: circuit breaker tripped conv=%s — forcing "
+                "no-reply (>=%d replies within %.0fs)",
+                event.conversation_id,
+                self._breaker.max_replies,
+                self._breaker.window_seconds,
+            )
+            return reply_gate.GateDecision(
+                reply=False,
+                reason="per-conversation reply rate cap reached",
+                category="circuit_breaker",
+                source="circuit_breaker",
+            )
+
+        recent = self._breaker.recent_count(event.conversation_id)
+        model, runtime_kwargs = self._resolve_model_and_runtime()
+        main_runtime: dict[str, str] = {"model": model}
+        main_runtime.update(runtime_kwargs)
+        return reply_gate.decide(
+            handle=self._identity.handle,
+            event=event,
+            history=history,
+            recent_reply_count=recent,
+            main_runtime=main_runtime,
+            fail_open=self._gate_fail_open,
+            timeout_s=self._gate_timeout_s,
         )
 
     def _log_future_outcome(

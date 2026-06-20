@@ -19,7 +19,9 @@ from agentchatme_hermes.agent_invoker import (
     _extract_messages_list,
     _translate_messages_to_history,
 )
+from agentchatme_hermes.reply_gate import GateDecision
 from agentchatme_hermes.thread_closures import ThreadClosures
+from agentchatme_hermes.turn_guard import TurnCircuitBreaker
 from agentchatme_hermes.types import AgentIdentity, InboundEvent
 
 if TYPE_CHECKING:
@@ -386,3 +388,179 @@ class TestInFlightThreadClose:
         submitted_fn(*submitted_args)
 
         agent.run_conversation.assert_not_called()
+
+
+def _wired_invoker(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config: Any
+) -> tuple[AgentInvoker, Any, dict[str, list[Any]]]:
+    """Build an invoker with a stubbed runtime + agent for turn-flow tests.
+
+    ``_build_agent`` and ``_build_conversation_history`` are stubbed so the
+    turn never touches Hermes or the SDK; ``calls["build_agent"]`` records
+    whether the agent was constructed (it should be, only on the reply path).
+    """
+    import agentchatme_hermes.runtime as runtime_module
+
+    invoker = AgentInvoker(
+        config=config,
+        identity=AgentIdentity(handle="me"),
+        queue=MagicMock(),
+    )
+    runtime = SimpleNamespace(
+        thread_closures=ThreadClosures(path=tmp_path / "closed.json"),
+        client=MagicMock(),
+    )
+    monkeypatch.setattr(runtime_module, "get_existing_runtime", lambda: runtime)
+    monkeypatch.setattr(invoker, "_ensure_hermes_resolved", lambda: None)
+
+    agent = MagicMock()
+    calls: dict[str, list[Any]] = {"build_agent": []}
+
+    def _fake_build_agent(conversation_id: str) -> Any:
+        calls["build_agent"].append(conversation_id)
+        return agent
+
+    monkeypatch.setattr(invoker, "_build_agent", _fake_build_agent)
+    monkeypatch.setattr(invoker, "_build_conversation_history", lambda **_kw: [])
+    return invoker, agent, calls
+
+
+def _inbound(conv: str = "conv_dm_a") -> InboundEvent:
+    return InboundEvent(
+        message_id="m1",
+        conversation_id=conv,
+        conversation_kind="direct",
+        sender_handle="alice",
+        content_text="hi",
+        received_at=datetime.now(timezone.utc),
+    )
+
+
+class TestReplyGateWiring:
+    """The gate's effect on the turn flow in ``_run_one_inner``."""
+
+    def test_reply_decision_runs_conversation_and_records_breaker(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes.prompts import build_notification_prompt
+
+        invoker, agent, calls = _wired_invoker(
+            monkeypatch, tmp_path, SimpleNamespace(max_inflight_turns=1)
+        )
+        monkeypatch.setattr(
+            invoker,
+            "_decide_reply",
+            lambda _ev, _hist: GateDecision(
+                reply=True, reason="open q", category="open_request", source="llm"
+            ),
+        )
+
+        invoker._run_one_inner(_inbound("conv_dm_a"), build_notification_prompt)
+
+        agent.run_conversation.assert_called_once()
+        assert calls["build_agent"] == ["conv_dm_a"]
+        # The reply was counted toward the circuit breaker.
+        assert invoker._breaker.recent_count("conv_dm_a") == 1
+
+    def test_no_reply_decision_skips_everything(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes.prompts import build_notification_prompt
+
+        invoker, agent, calls = _wired_invoker(
+            monkeypatch, tmp_path, SimpleNamespace(max_inflight_turns=1)
+        )
+        monkeypatch.setattr(
+            invoker,
+            "_decide_reply",
+            lambda _ev, _hist: GateDecision(
+                reply=False, reason="ack", category="closing", source="llm"
+            ),
+        )
+
+        invoker._run_one_inner(_inbound("conv_dm_a"), build_notification_prompt)
+
+        agent.run_conversation.assert_not_called()
+        # The agent was never even constructed on the no-reply path.
+        assert calls["build_agent"] == []
+        assert invoker._breaker.recent_count("conv_dm_a") == 0
+
+    def test_gate_disabled_bypasses_decision(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes.prompts import build_notification_prompt
+
+        invoker, agent, _calls = _wired_invoker(
+            monkeypatch,
+            tmp_path,
+            SimpleNamespace(max_inflight_turns=1, reply_gate_enabled=False),
+        )
+        decide_calls: list[Any] = []
+        monkeypatch.setattr(
+            invoker,
+            "_decide_reply",
+            lambda _ev, _hist: decide_calls.append(1)
+            or GateDecision(reply=True, reason="", category="other", source="llm"),
+        )
+
+        invoker._run_one_inner(_inbound("conv_dm_a"), build_notification_prompt)
+
+        agent.run_conversation.assert_called_once()
+        assert decide_calls == []  # gate disabled → no decision call at all
+
+    def test_decide_reply_circuit_breaker_short_circuits_llm(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        invoker, _agent, _calls = _wired_invoker(
+            monkeypatch, tmp_path, SimpleNamespace(max_inflight_turns=1)
+        )
+        invoker._breaker = TurnCircuitBreaker(max_replies=1, window_seconds=60)
+        invoker._breaker.record_reply("conv_dm_a")  # now at cap → tripped
+
+        decide_calls: list[Any] = []
+        monkeypatch.setattr(
+            "agentchatme_hermes.reply_gate.decide",
+            lambda **kw: decide_calls.append(kw)
+            or GateDecision(reply=True, reason="", category="other", source="llm"),
+        )
+
+        decision = invoker._decide_reply(_inbound("conv_dm_a"), [])
+
+        assert decision.reply is False
+        assert decision.source == "circuit_breaker"
+        # The expensive LLM decision was never consulted.
+        assert decide_calls == []
+
+    def test_decide_reply_feeds_signals_to_llm(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        invoker, _agent, _calls = _wired_invoker(
+            monkeypatch, tmp_path, SimpleNamespace(max_inflight_turns=1)
+        )
+        invoker._breaker = TurnCircuitBreaker(max_replies=5, window_seconds=60)
+        invoker._breaker.record_reply("conv_dm_a")
+        invoker._breaker.record_reply("conv_dm_a")  # recent=2, under cap
+
+        monkeypatch.setattr(
+            invoker,
+            "_resolve_model_and_runtime",
+            lambda: ("deepseek-x", {"provider": "deepseek"}),
+        )
+        captured: dict[str, Any] = {}
+        monkeypatch.setattr(
+            "agentchatme_hermes.reply_gate.decide",
+            lambda **kw: captured.update(kw)
+            or GateDecision(
+                reply=True, reason="x", category="open_request", source="llm"
+            ),
+        )
+
+        decision = invoker._decide_reply(_inbound("conv_dm_a"), [])
+
+        assert decision.reply is True
+        assert captured["handle"] == "me"
+        assert captured["recent_reply_count"] == 2
+        assert captured["main_runtime"] == {
+            "model": "deepseek-x",
+            "provider": "deepseek",
+        }

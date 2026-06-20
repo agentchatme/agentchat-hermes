@@ -29,6 +29,35 @@ DEFAULT_MAX_INFLIGHT_TURNS = 4
 # inactivity does. 0 disables the timeout entirely.
 DEFAULT_TURN_INACTIVITY_TIMEOUT_S = 600.0
 
+# --- reply gate ------------------------------------------------------------
+# Before the agent composes anything, a forced reply/no-reply decision runs
+# on the agent's own model. It exists to stop two agents ping-ponging
+# acknowledgements forever: once a conversation has wound down, staying
+# silent is the default and a reply has to earn its place. On by default;
+# the env var is a kill switch.
+DEFAULT_REPLY_GATE_ENABLED = True
+
+# When the decision call errors or returns something unparseable, do we
+# default to replying (responsive, but a loop could continue until the
+# circuit breaker trips) or to staying silent (loop-safe, but a genuine
+# message could be dropped)? We fail OPEN — a silently dropped message
+# reads as a dead agent, and the circuit breaker below bounds any loop a
+# fail-open lets through.
+DEFAULT_REPLY_GATE_FAIL_OPEN = True
+
+# Deterministic seatbelt under the LLM gate: if this agent has already sent
+# this many replies into ONE conversation within the rolling window, force
+# no-reply no matter what the gate decides. Catches a mis-firing gate AND a
+# gate that's entirely unavailable. Generous on purpose — the LLM gate is
+# the primary control; this only stops a runaway.
+DEFAULT_GATE_MAX_REPLIES_PER_WINDOW = 8
+DEFAULT_GATE_WINDOW_SECONDS = 180.0
+
+# Timeout (seconds) for the single decision call. Short — it's a one-shot
+# classification, not a full agent turn. On timeout we apply the fail-open
+# policy above.
+DEFAULT_GATE_TIMEOUT_S = 20.0
+
 
 class ConfigError(RuntimeError):
     """Raised when configuration is malformed."""
@@ -50,6 +79,11 @@ class Config:
     ws_url: str
     max_inflight_turns: int = DEFAULT_MAX_INFLIGHT_TURNS
     turn_inactivity_timeout_s: float = DEFAULT_TURN_INACTIVITY_TIMEOUT_S
+    reply_gate_enabled: bool = DEFAULT_REPLY_GATE_ENABLED
+    reply_gate_fail_open: bool = DEFAULT_REPLY_GATE_FAIL_OPEN
+    gate_max_replies_per_window: int = DEFAULT_GATE_MAX_REPLIES_PER_WINDOW
+    gate_window_seconds: float = DEFAULT_GATE_WINDOW_SECONDS
+    gate_timeout_s: float = DEFAULT_GATE_TIMEOUT_S
 
 
 def load_config() -> Config | None:
@@ -95,12 +129,35 @@ def load_config() -> Config | None:
         minimum=0.0,
     )
 
+    reply_gate_enabled = _parse_bool_env(
+        "AGENTCHATME_REPLY_GATE_ENABLED", DEFAULT_REPLY_GATE_ENABLED
+    )
+    reply_gate_fail_open = _parse_bool_env(
+        "AGENTCHATME_REPLY_GATE_FAIL_OPEN", DEFAULT_REPLY_GATE_FAIL_OPEN
+    )
+    gate_max_replies = _parse_int_env(
+        "AGENTCHATME_GATE_MAX_REPLIES_PER_WINDOW",
+        DEFAULT_GATE_MAX_REPLIES_PER_WINDOW,
+        minimum=1,
+    )
+    gate_window_seconds = _parse_float_env(
+        "AGENTCHATME_GATE_WINDOW_SECONDS", DEFAULT_GATE_WINDOW_SECONDS, minimum=1.0
+    )
+    gate_timeout_s = _parse_float_env(
+        "AGENTCHATME_GATE_TIMEOUT_S", DEFAULT_GATE_TIMEOUT_S, minimum=1.0
+    )
+
     return Config(
         api_key=api_key,
         api_base=api_base,
         ws_url=ws_url,
         max_inflight_turns=max_inflight,
         turn_inactivity_timeout_s=inactivity_timeout,
+        reply_gate_enabled=reply_gate_enabled,
+        reply_gate_fail_open=reply_gate_fail_open,
+        gate_max_replies_per_window=gate_max_replies,
+        gate_window_seconds=gate_window_seconds,
+        gate_timeout_s=gate_timeout_s,
     )
 
 
@@ -151,3 +208,21 @@ def _parse_float_env(name: str, default: float, *, minimum: float) -> float:
     if value < minimum:
         raise ConfigError(f"{name}={value} is below the minimum of {minimum}")
     return value
+
+
+_TRUE_TOKENS = frozenset({"1", "true", "yes", "on"})
+_FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUE_TOKENS:
+        return True
+    if raw in _FALSE_TOKENS:
+        return False
+    raise ConfigError(
+        f"{name}={raw!r} is not a boolean (use one of: "
+        f"{', '.join(sorted(_TRUE_TOKENS | _FALSE_TOKENS))})"
+    )

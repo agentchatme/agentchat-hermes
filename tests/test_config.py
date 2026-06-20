@@ -12,7 +12,12 @@ if TYPE_CHECKING:
 
 from agentchatme_hermes.config import (
     DEFAULT_API_BASE,
+    DEFAULT_GATE_MAX_REPLIES_PER_WINDOW,
+    DEFAULT_GATE_TIMEOUT_S,
+    DEFAULT_GATE_WINDOW_SECONDS,
     DEFAULT_MAX_INFLIGHT_TURNS,
+    DEFAULT_REPLY_GATE_ENABLED,
+    DEFAULT_REPLY_GATE_FAIL_OPEN,
     DEFAULT_TURN_INACTIVITY_TIMEOUT_S,
     ConfigError,
     load_config,
@@ -46,6 +51,11 @@ def _isolated(monkeypatch: pytest.MonkeyPatch, **values: str | None) -> None:
         "AGENTCHATME_WS_URL",
         "AGENTCHATME_MAX_INFLIGHT_TURNS",
         "AGENTCHATME_TURN_INACTIVITY_TIMEOUT_S",
+        "AGENTCHATME_REPLY_GATE_ENABLED",
+        "AGENTCHATME_REPLY_GATE_FAIL_OPEN",
+        "AGENTCHATME_GATE_MAX_REPLIES_PER_WINDOW",
+        "AGENTCHATME_GATE_WINDOW_SECONDS",
+        "AGENTCHATME_GATE_TIMEOUT_S",
     ):
         monkeypatch.delenv(k, raising=False)
     for k, v in values.items():
@@ -208,3 +218,124 @@ class TestLoadConfig:
         cfg = load_config()
         assert cfg is not None
         assert cfg.api_key == "ac_live_xyz"
+
+
+class TestGateConfig:
+    """Reply-gate knobs in :func:`load_config`."""
+
+    def test_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHATME_API_KEY="k")
+        cfg = load_config()
+        assert cfg is not None
+        assert cfg.reply_gate_enabled is DEFAULT_REPLY_GATE_ENABLED
+        assert cfg.reply_gate_fail_open is DEFAULT_REPLY_GATE_FAIL_OPEN
+        assert cfg.gate_max_replies_per_window == DEFAULT_GATE_MAX_REPLIES_PER_WINDOW
+        assert cfg.gate_window_seconds == DEFAULT_GATE_WINDOW_SECONDS
+        assert cfg.gate_timeout_s == DEFAULT_GATE_TIMEOUT_S
+
+    def test_enabled_kill_switch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(
+            monkeypatch,
+            AGENTCHATME_API_KEY="k",
+            AGENTCHATME_REPLY_GATE_ENABLED="0",
+        )
+        cfg = load_config()
+        assert cfg is not None
+        assert cfg.reply_gate_enabled is False
+
+    def test_fail_open_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(
+            monkeypatch,
+            AGENTCHATME_API_KEY="k",
+            AGENTCHATME_REPLY_GATE_FAIL_OPEN="false",
+        )
+        cfg = load_config()
+        assert cfg is not None
+        assert cfg.reply_gate_fail_open is False
+
+    @pytest.mark.parametrize("truthy", ["1", "true", "TRUE", "yes", "on", "On"])
+    def test_bool_truthy_tokens(
+        self, monkeypatch: pytest.MonkeyPatch, truthy: str
+    ) -> None:
+        _isolated(
+            monkeypatch,
+            AGENTCHATME_API_KEY="k",
+            AGENTCHATME_REPLY_GATE_ENABLED=truthy,
+        )
+        cfg = load_config()
+        assert cfg is not None
+        assert cfg.reply_gate_enabled is True
+
+    @pytest.mark.parametrize("falsy", ["0", "false", "FALSE", "no", "off", "Off"])
+    def test_bool_falsy_tokens(
+        self, monkeypatch: pytest.MonkeyPatch, falsy: str
+    ) -> None:
+        _isolated(
+            monkeypatch,
+            AGENTCHATME_API_KEY="k",
+            AGENTCHATME_REPLY_GATE_ENABLED=falsy,
+        )
+        cfg = load_config()
+        assert cfg is not None
+        assert cfg.reply_gate_enabled is False
+
+    def test_bool_invalid_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(
+            monkeypatch,
+            AGENTCHATME_API_KEY="k",
+            AGENTCHATME_REPLY_GATE_ENABLED="maybe",
+        )
+        with pytest.raises(ConfigError, match="not a boolean"):
+            load_config()
+
+    def test_max_replies_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(
+            monkeypatch,
+            AGENTCHATME_API_KEY="k",
+            AGENTCHATME_GATE_MAX_REPLIES_PER_WINDOW="3",
+        )
+        cfg = load_config()
+        assert cfg is not None
+        assert cfg.gate_max_replies_per_window == 3
+
+    def test_max_replies_below_minimum_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _isolated(
+            monkeypatch,
+            AGENTCHATME_API_KEY="k",
+            AGENTCHATME_GATE_MAX_REPLIES_PER_WINDOW="0",
+        )
+        with pytest.raises(ConfigError, match="below the minimum"):
+            load_config()
+
+    def test_window_seconds_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(
+            monkeypatch,
+            AGENTCHATME_API_KEY="k",
+            AGENTCHATME_GATE_WINDOW_SECONDS="45",
+        )
+        cfg = load_config()
+        assert cfg is not None
+        assert cfg.gate_window_seconds == 45.0
+
+    def test_timeout_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(
+            monkeypatch,
+            AGENTCHATME_API_KEY="k",
+            AGENTCHATME_GATE_TIMEOUT_S="8.5",
+        )
+        cfg = load_config()
+        assert cfg is not None
+        assert cfg.gate_timeout_s == 8.5
+
+    def test_timeout_below_minimum_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _isolated(
+            monkeypatch,
+            AGENTCHATME_API_KEY="k",
+            AGENTCHATME_GATE_TIMEOUT_S="0",
+        )
+        with pytest.raises(ConfigError, match="below the minimum"):
+            load_config()
