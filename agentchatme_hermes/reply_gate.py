@@ -32,7 +32,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from .types import InboundEvent
@@ -129,11 +129,11 @@ class GateDecision:
 def build_decision_messages(
     *,
     handle: str,
-    event: "InboundEvent",
-    history: List[Dict[str, Any]],
+    event: InboundEvent,
+    history: list[dict[str, Any]],
     recent_reply_count: int,
     max_history: int = MAX_HISTORY_TURNS,
-) -> List[Dict[str, str]]:
+) -> list[dict[str, str]]:
     """Build the OpenAI-style messages for the decision call.
 
     Pure — no SDK, no runtime, no IO. The system message carries the
@@ -160,13 +160,13 @@ def build_decision_messages(
 def _build_user_content(
     *,
     handle: str,
-    event: "InboundEvent",
-    history: List[Dict[str, Any]],
+    event: InboundEvent,
+    history: list[dict[str, Any]],
     recent_reply_count: int,
     max_history: int,
 ) -> str:
     kind = "group" if event.conversation_kind == "group" else "direct"
-    lines: List[str] = [
+    lines: list[str] = [
         f"Conversation type: {kind}",
         f"Prior messages in this thread: {len(history)}",
         (
@@ -199,14 +199,12 @@ def _build_user_content(
 
 
 def _render_history(
-    history: List[Dict[str, Any]], max_history: int
-) -> List[str]:
+    history: list[dict[str, Any]], max_history: int
+) -> list[str]:
     """Render the tail of the rehydrated history as ``you:`` / ``peer:`` lines."""
     recent = history[-max_history:] if len(history) > max_history else history
-    out: List[str] = []
+    out: list[str] = []
     for turn in recent:
-        if not isinstance(turn, dict):
-            continue
         content = turn.get("content")
         if not isinstance(content, str) or not content.strip():
             continue
@@ -220,7 +218,7 @@ def _render_history(
 
 def parse_decision(
     text: str, *, source: str = "llm", latency_ms: int = 0
-) -> Optional[GateDecision]:
+) -> GateDecision | None:
     """Parse the model's JSON decision. Returns ``None`` if unusable.
 
     Tolerant of the usual model noise: surrounding prose, ```json fences,
@@ -269,7 +267,7 @@ def parse_decision(
     )
 
 
-def _extract_json(text: Optional[str]) -> Optional[str]:
+def _extract_json(text: str | None) -> str | None:
     """Pull the outermost JSON object out of model output. ``None`` if none."""
     if not text or not text.strip():
         return None
@@ -287,13 +285,13 @@ def _extract_json(text: Optional[str]) -> Optional[str]:
 def decide(
     *,
     handle: str,
-    event: "InboundEvent",
-    history: List[Dict[str, Any]],
+    event: InboundEvent,
+    history: list[dict[str, Any]],
     recent_reply_count: int,
-    main_runtime: Dict[str, str],
+    main_runtime: dict[str, str],
     fail_open: bool,
     timeout_s: float,
-    caller: Optional[Callable[..., str]] = None,
+    caller: Callable[..., str] | None = None,
     now_fn: Callable[[], float] = time.monotonic,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> GateDecision:
@@ -357,8 +355,8 @@ def _fallback(fail_open: bool, reason: str, latency_ms: int) -> GateDecision:
 
 def _default_caller(
     *,
-    messages: List[Dict[str, Any]],
-    main_runtime: Dict[str, str],
+    messages: list[dict[str, Any]],
+    main_runtime: dict[str, str],
     timeout: float,
     max_tokens: int,
 ) -> str:

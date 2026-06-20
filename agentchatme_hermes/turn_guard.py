@@ -22,7 +22,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
-from typing import Callable, Deque, Dict, Optional
+from typing import Callable
 
 
 class TurnCircuitBreaker:
@@ -55,7 +55,7 @@ class TurnCircuitBreaker:
         self._window_seconds = window_seconds
         self._time_fn = time_fn
         self._lock = threading.Lock()
-        self._events: Dict[str, Deque[float]] = {}
+        self._events: dict[str, deque[float]] = {}
 
     @property
     def max_replies(self) -> int:
@@ -66,7 +66,7 @@ class TurnCircuitBreaker:
         return self._window_seconds
 
     def recent_count(
-        self, conversation_id: str, *, now: Optional[float] = None
+        self, conversation_id: str, *, now: float | None = None
     ) -> int:
         """Replies sent into ``conversation_id`` within the rolling window.
 
@@ -79,7 +79,7 @@ class TurnCircuitBreaker:
             return self._pruned_count(conversation_id, ts)
 
     def should_trip(
-        self, conversation_id: str, *, now: Optional[float] = None
+        self, conversation_id: str, *, now: float | None = None
     ) -> bool:
         """``True`` once the cap is reached — the caller must force no-reply.
 
@@ -92,7 +92,7 @@ class TurnCircuitBreaker:
             return self._pruned_count(conversation_id, ts) >= self._max_replies
 
     def record_reply(
-        self, conversation_id: str, *, now: Optional[float] = None
+        self, conversation_id: str, *, now: float | None = None
     ) -> None:
         """Record that the agent just replied into ``conversation_id``."""
         ts = self._time_fn() if now is None else now
@@ -113,7 +113,7 @@ class TurnCircuitBreaker:
         self._prune(conversation_id, dq, now)
         return len(dq)
 
-    def _prune(self, conversation_id: str, dq: Deque[float], now: float) -> None:
+    def _prune(self, conversation_id: str, dq: deque[float], now: float) -> None:
         cutoff = now - self._window_seconds
         while dq and dq[0] <= cutoff:
             dq.popleft()
