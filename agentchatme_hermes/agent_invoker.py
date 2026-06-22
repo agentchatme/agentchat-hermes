@@ -385,7 +385,7 @@ class AgentInvoker:
         self._ensure_hermes_resolved()
 
         prompt = build_notification_prompt(event)
-        history = self._build_conversation_history(
+        history, raw_messages = self._build_conversation_history(
             conversation_id=event.conversation_id,
             conversation_kind=event.conversation_kind,
             trigger_message_id=event.message_id,
@@ -399,7 +399,7 @@ class AgentInvoker:
         # pays for AIAgent construction. Kill switch:
         # AGENTCHATME_REPLY_GATE_ENABLED=0.
         if self._gate_enabled:
-            decision = self._decide_reply(event, history)
+            decision = self._decide_reply(event, history, raw_messages)
             logger.info(
                 "AgentInvoker: gate conv=%s msg=%s reply=%s source=%s "
                 "category=%s latency_ms=%d reason=%r",
@@ -458,15 +458,20 @@ class AgentInvoker:
     # -- reply gate ---------------------------------------------------------
 
     def _decide_reply(
-        self, event: InboundEvent, history: list[dict[str, Any]]
+        self,
+        event: InboundEvent,
+        history: list[dict[str, Any]],
+        raw_messages: list[dict[str, Any]],
     ) -> reply_gate.GateDecision:
         """Decide reply / no-reply for one inbound.
 
         Order matters: the deterministic circuit breaker is checked first so
         a runaway loop is stopped without even spending a decision call. When
-        it hasn't tripped, its current count is handed to the LLM as a loop
-        signal, and the decision runs on the agent's own model (so nothing
-        here touches the AgentChat server — the judgement lives at the edge).
+        it hasn't tripped, its current count is handed to the LLM alongside the
+        derived conversation signals (relationship + cadence, computed from
+        ``raw_messages`` with no extra fetch), and the decision runs on the
+        agent's own model (so nothing here touches the AgentChat server — the
+        judgement lives at the edge).
         """
         if self._breaker.should_trip(event.conversation_id):
             logger.warning(
@@ -484,6 +489,12 @@ class AgentInvoker:
             )
 
         recent = self._breaker.recent_count(event.conversation_id)
+        signals = reply_gate.compute_conversation_signals(
+            raw_messages,
+            own_handle=self._identity.handle,
+            trigger_message_id=event.message_id,
+            now=event.received_at,
+        )
         model, runtime_kwargs = self._resolve_model_and_runtime()
         main_runtime: dict[str, str] = {"model": model}
         main_runtime.update(runtime_kwargs)
@@ -492,6 +503,7 @@ class AgentInvoker:
             event=event,
             history=history,
             recent_reply_count=recent,
+            signals=signals,
             main_runtime=main_runtime,
             fail_open=self._gate_fail_open,
             timeout_s=self._gate_timeout_s,
@@ -541,8 +553,14 @@ class AgentInvoker:
         conversation_id: str,
         conversation_kind: str,
         trigger_message_id: str,
-    ) -> list[dict[str, Any]]:
-        """Fetch and translate recent messages into Hermes turn shape.
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Fetch recent messages; return ``(history, raw_messages)``.
+
+        ``history`` is the translated Hermes turn shape; ``raw_messages`` is the
+        untranslated ``get_messages`` result, kept so the caller can derive
+        timing/relationship signals (timestamps, senders) the translation drops
+        — from the SAME fetch, no second round-trip. Below: the translation
+        that produces ``history``.
 
         Mirrors ``gateway/run.py:15074-15113`` upstream — the agent
         wakes up with the full thread rehydrated as alternating
@@ -574,7 +592,7 @@ class AgentInvoker:
             # unreachable, but defensive in case a partial install
             # lands here before the runtime can fail-fast.
             logger.warning("AgentInvoker: agentchatme SDK not importable")
-            return []
+            return [], []
 
         try:
             result = self._runtime_client_get_messages(conversation_id)
@@ -585,18 +603,19 @@ class AgentInvoker:
                 conversation_id,
                 exc,
             )
-            return []
+            return [], []
 
         messages = _extract_messages_list(result)
         if not messages:
-            return []
+            return [], []
 
-        return _translate_messages_to_history(
+        history = _translate_messages_to_history(
             messages,
             own_handle=self._identity.handle,
             conversation_kind=conversation_kind,
             trigger_message_id=trigger_message_id,
         )
+        return history, messages
 
     def _runtime_client_get_messages(self, conversation_id: str) -> Any:
         """Indirection layer so tests can stub the SDK fetch cleanly."""
