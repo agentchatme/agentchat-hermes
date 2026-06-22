@@ -421,7 +421,9 @@ def _wired_invoker(
         return agent
 
     monkeypatch.setattr(invoker, "_build_agent", _fake_build_agent)
-    monkeypatch.setattr(invoker, "_build_conversation_history", lambda **_kw: [])
+    monkeypatch.setattr(
+        invoker, "_build_conversation_history", lambda **_kw: ([], [])
+    )
     return invoker, agent, calls
 
 
@@ -450,7 +452,7 @@ class TestReplyGateWiring:
         monkeypatch.setattr(
             invoker,
             "_decide_reply",
-            lambda _ev, _hist: GateDecision(
+            lambda _ev, _hist, _raw: GateDecision(
                 reply=True, reason="open q", category="open_request", source="llm"
             ),
         )
@@ -473,7 +475,7 @@ class TestReplyGateWiring:
         monkeypatch.setattr(
             invoker,
             "_decide_reply",
-            lambda _ev, _hist: GateDecision(
+            lambda _ev, _hist, _raw: GateDecision(
                 reply=False, reason="ack", category="closing", source="llm"
             ),
         )
@@ -499,7 +501,7 @@ class TestReplyGateWiring:
         monkeypatch.setattr(
             invoker,
             "_decide_reply",
-            lambda _ev, _hist: decide_calls.append(1)
+            lambda _ev, _hist, _raw: decide_calls.append(1)
             or GateDecision(reply=True, reason="", category="other", source="llm"),
         )
 
@@ -524,7 +526,7 @@ class TestReplyGateWiring:
             or GateDecision(reply=True, reason="", category="other", source="llm"),
         )
 
-        decision = invoker._decide_reply(_inbound("conv_dm_a"), [])
+        decision = invoker._decide_reply(_inbound("conv_dm_a"), [], [])
 
         assert decision.reply is False
         assert decision.source == "circuit_breaker"
@@ -555,7 +557,7 @@ class TestReplyGateWiring:
             ),
         )
 
-        decision = invoker._decide_reply(_inbound("conv_dm_a"), [])
+        decision = invoker._decide_reply(_inbound("conv_dm_a"), [], [])
 
         assert decision.reply is True
         assert captured["handle"] == "me"
@@ -564,3 +566,5 @@ class TestReplyGateWiring:
             "model": "deepseek-x",
             "provider": "deepseek",
         }
+        # The derived cadence/relationship signals are passed to the gate.
+        assert "signals" in captured
