@@ -21,9 +21,6 @@ winding down, silence is the default and a reply has to earn its place.
 The call runs on the agent's OWN model (via :func:`agent.auxiliary_client.call_llm`
 with the live main-runtime), so nothing about this depends on the AgentChat
 server — the platform stays a dumb carrier; the judgement lives at the edge.
-
-This is the smart layer. The dumb seatbelt underneath it lives in
-:mod:`agentchatme_hermes.turn_guard`.
 """
 from __future__ import annotations
 
@@ -56,8 +53,8 @@ MAX_HISTORY_TURNS = 12
 CADENCE_WINDOW_SECONDS = 60.0
 
 # Categories the model may return. Anything else is normalised to "other".
-# Internal sources ("fallback", "circuit_breaker") are set by code directly
-# and intentionally not in this set.
+# The internal "fallback" source is set by code directly and intentionally
+# not in this set.
 VALID_CATEGORIES = frozenset(
     {
         "open_request",
@@ -122,7 +119,6 @@ class GateDecision:
     audited and the gate calibrated:
 
     * ``"llm"`` — the model decided.
-    * ``"circuit_breaker"`` — the deterministic seatbelt forced no-reply.
     * ``"fail_open"`` / ``"fail_closed"`` — the LLM call failed or returned
       garbage and the configured fallback policy was applied.
     """
@@ -253,7 +249,6 @@ def build_decision_messages(
     handle: str,
     event: InboundEvent,
     history: list[dict[str, Any]],
-    recent_reply_count: int,
     signals: ConversationSignals | None = None,
     max_history: int = MAX_HISTORY_TURNS,
 ) -> list[dict[str, str]]:
@@ -261,8 +256,8 @@ def build_decision_messages(
 
     Pure — no SDK, no runtime, no IO. The system message carries the
     done-ness criterion; the user message carries the signals (relationship,
-    pace, turn depth, recent reply pressure, group-addressing) plus the recent
-    conversation and the new message.
+    pace, turn depth, group-addressing) plus the recent conversation and the
+    new message.
     """
     system = _SYSTEM_TEMPLATE.replace("{handle}", handle)
     return [
@@ -273,7 +268,6 @@ def build_decision_messages(
                 handle=handle,
                 event=event,
                 history=history,
-                recent_reply_count=recent_reply_count,
                 signals=signals,
                 max_history=max_history,
             ),
@@ -286,7 +280,6 @@ def _build_user_content(
     handle: str,
     event: InboundEvent,
     history: list[dict[str, Any]],
-    recent_reply_count: int,
     signals: ConversationSignals | None,
     max_history: int,
 ) -> str:
@@ -302,10 +295,6 @@ def _build_user_content(
                 f"previous message"
             )
     lines.append(f"Prior messages in this thread: {len(history)}")
-    lines.append(
-        f"Replies you (@{handle}) have already sent into this conversation "
-        f"recently: {recent_reply_count}"
-    )
     if kind == "group":
         mentioned = f"@{handle.lower()}" in (event.content_text or "").lower()
         lines.append(
@@ -419,7 +408,6 @@ def decide(
     handle: str,
     event: InboundEvent,
     history: list[dict[str, Any]],
-    recent_reply_count: int,
     main_runtime: dict[str, str],
     fail_open: bool,
     timeout_s: float,
@@ -433,15 +421,13 @@ def decide(
     ``caller`` is injectable so tests don't hit a real provider; the default
     routes through Hermes' host-owned :func:`call_llm`. On any failure —
     call error, timeout, unparseable output — the configured ``fail_open``
-    policy decides the fallback (and the circuit breaker, checked by the
-    caller before this runs, bounds any loop a fail-open lets through).
+    policy decides the fallback; the gate simply re-runs on the next inbound.
     """
     caller = caller or _default_caller
     messages = build_decision_messages(
         handle=handle,
         event=event,
         history=history,
-        recent_reply_count=recent_reply_count,
         signals=signals,
     )
 

@@ -7,12 +7,10 @@ A platform/channel adapter would force a mandatory reply via
 that machinery entirely. Per inbound:
 
 1. **Reply gate** (:mod:`.reply_gate`). A forced reply/no-reply
-   decision on the agent's own model, with a deterministic
-   per-conversation circuit breaker (:mod:`.turn_guard`) underneath
-   it. ``no_reply`` ends the turn right here — this is what stops two
-   agents looping forever. Only a ``reply`` decision proceeds to the
-   steps below, so a no-reply turn never pays for AIAgent
-   construction.
+   decision on the agent's own model. ``no_reply`` ends the turn
+   right here — this is what stops two agents looping forever. Only
+   a ``reply`` decision proceeds to the steps below, so a no-reply
+   turn never pays for AIAgent construction.
 2. Construct an :class:`AIAgent` configured with our session_id
    namespace (``agentchat:<conversation_id>``). The agent loads
    prior turns of THIS conversation from the session DB
@@ -54,13 +52,10 @@ from typing import TYPE_CHECKING, Any
 
 from . import reply_gate
 from .config import (
-    DEFAULT_GATE_MAX_REPLIES_PER_WINDOW,
     DEFAULT_GATE_TIMEOUT_S,
-    DEFAULT_GATE_WINDOW_SECONDS,
     DEFAULT_REPLY_GATE_ENABLED,
     DEFAULT_REPLY_GATE_FAIL_OPEN,
 )
-from .turn_guard import TurnCircuitBreaker
 
 if TYPE_CHECKING:
     from .config import Config
@@ -114,18 +109,6 @@ class AgentInvoker:
         )
         self._gate_timeout_s = getattr(
             config, "gate_timeout_s", DEFAULT_GATE_TIMEOUT_S
-        )
-        # Deterministic seatbelt under the LLM gate, shared across all
-        # turn-worker threads (it is internally thread-safe).
-        self._breaker = TurnCircuitBreaker(
-            max_replies=getattr(
-                config,
-                "gate_max_replies_per_window",
-                DEFAULT_GATE_MAX_REPLIES_PER_WINDOW,
-            ),
-            window_seconds=getattr(
-                config, "gate_window_seconds", DEFAULT_GATE_WINDOW_SECONDS
-            ),
         )
 
         self._executor: ThreadPoolExecutor | None = None
@@ -413,9 +396,6 @@ class AgentInvoker:
             )
             if not decision.reply:
                 return  # no-reply ends the turn; nothing composed or sent
-            # Count the reply for the breaker before composing, so even a
-            # slow or stuck compose still advances the window toward the cap.
-            self._breaker.record_reply(event.conversation_id)
 
         agent = self._build_agent(event.conversation_id)
         if agent is None:
@@ -465,30 +445,11 @@ class AgentInvoker:
     ) -> reply_gate.GateDecision:
         """Decide reply / no-reply for one inbound.
 
-        Order matters: the deterministic circuit breaker is checked first so
-        a runaway loop is stopped without even spending a decision call. When
-        it hasn't tripped, its current count is handed to the LLM alongside the
-        derived conversation signals (relationship + cadence, computed from
-        ``raw_messages`` with no extra fetch), and the decision runs on the
-        agent's own model (so nothing here touches the AgentChat server — the
-        judgement lives at the edge).
+        The decision is handed the derived conversation signals (relationship +
+        cadence, computed from ``raw_messages`` with no extra fetch) and runs on
+        the agent's own model — so nothing here touches the AgentChat server;
+        the judgement lives at the edge.
         """
-        if self._breaker.should_trip(event.conversation_id):
-            logger.warning(
-                "AgentInvoker: circuit breaker tripped conv=%s — forcing "
-                "no-reply (>=%d replies within %.0fs)",
-                event.conversation_id,
-                self._breaker.max_replies,
-                self._breaker.window_seconds,
-            )
-            return reply_gate.GateDecision(
-                reply=False,
-                reason="per-conversation reply rate cap reached",
-                category="circuit_breaker",
-                source="circuit_breaker",
-            )
-
-        recent = self._breaker.recent_count(event.conversation_id)
         signals = reply_gate.compute_conversation_signals(
             raw_messages,
             own_handle=self._identity.handle,
@@ -502,7 +463,6 @@ class AgentInvoker:
             handle=self._identity.handle,
             event=event,
             history=history,
-            recent_reply_count=recent,
             signals=signals,
             main_runtime=main_runtime,
             fail_open=self._gate_fail_open,

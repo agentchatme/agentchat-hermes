@@ -79,13 +79,13 @@ def _raw(
 class TestBuildDecisionMessages:
     def test_two_messages_system_then_user(self) -> None:
         msgs = build_decision_messages(
-            handle="me", event=_event(), history=[], recent_reply_count=0
+            handle="me", event=_event(), history=[]
         )
         assert [m["role"] for m in msgs] == ["system", "user"]
 
     def test_system_carries_handle_and_json_shape(self) -> None:
         msgs = build_decision_messages(
-            handle="me", event=_event(), history=[], recent_reply_count=0
+            handle="me", event=_event(), history=[]
         )
         system = msgs[0]["content"]
         assert "@me" in system
@@ -104,12 +104,10 @@ class TestBuildDecisionMessages:
             handle="me",
             event=_event(text="are you there?", sender="bob"),
             history=history,
-            recent_reply_count=4,
         )
         user = msgs[1]["content"]
         assert "Conversation type: direct" in user
         assert "Prior messages in this thread: 2" in user
-        assert "recently: 4" in user
         assert "are you there?" in user
         assert "@bob" in user
         # history rendered with speaker labels
@@ -121,7 +119,6 @@ class TestBuildDecisionMessages:
             handle="me",
             event=_event(kind="group", text="hey @me can you check this"),
             history=[],
-            recent_reply_count=0,
         )
         user = msgs[1]["content"]
         assert "Conversation type: group" in user
@@ -132,19 +129,18 @@ class TestBuildDecisionMessages:
             handle="me",
             event=_event(kind="group", text="anyone around?"),
             history=[],
-            recent_reply_count=0,
         )
         assert "not explicitly" in msgs[1]["content"].lower()
 
     def test_direct_has_no_addressing_hint(self) -> None:
         msgs = build_decision_messages(
-            handle="me", event=_event(kind="direct"), history=[], recent_reply_count=0
+            handle="me", event=_event(kind="direct"), history=[]
         )
         assert "directly addresses you" not in msgs[1]["content"].lower()
 
     def test_first_contact_renders_no_history(self) -> None:
         msgs = build_decision_messages(
-            handle="me", event=_event(), history=[], recent_reply_count=0
+            handle="me", event=_event(), history=[]
         )
         assert "first contact" in msgs[1]["content"].lower()
 
@@ -154,7 +150,6 @@ class TestBuildDecisionMessages:
             handle="me",
             event=_event(),
             history=history,
-            recent_reply_count=0,
             max_history=5,
         )
         user = msgs[1]["content"]
@@ -264,7 +259,6 @@ class TestDecide:
             handle="me",
             event=_event(),
             history=[],
-            recent_reply_count=0,
             main_runtime={"model": "test-model"},
             fail_open=fail_open,
             timeout_s=5.0,
@@ -428,7 +422,6 @@ class TestSignalsRendering:
             handle="me",
             event=_event(),
             history=[{"role": "user", "content": "hi"}],
-            recent_reply_count=1,
             signals=signals,
         )
         return msgs[1]["content"]
