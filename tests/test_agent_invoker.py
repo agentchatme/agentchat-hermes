@@ -21,7 +21,6 @@ from agentchatme_hermes.agent_invoker import (
 )
 from agentchatme_hermes.reply_gate import GateDecision
 from agentchatme_hermes.thread_closures import ThreadClosures
-from agentchatme_hermes.turn_guard import TurnCircuitBreaker
 from agentchatme_hermes.types import AgentIdentity, InboundEvent
 
 if TYPE_CHECKING:
@@ -421,7 +420,9 @@ def _wired_invoker(
         return agent
 
     monkeypatch.setattr(invoker, "_build_agent", _fake_build_agent)
-    monkeypatch.setattr(invoker, "_build_conversation_history", lambda **_kw: [])
+    monkeypatch.setattr(
+        invoker, "_build_conversation_history", lambda **_kw: ([], [])
+    )
     return invoker, agent, calls
 
 
@@ -439,7 +440,7 @@ def _inbound(conv: str = "conv_dm_a") -> InboundEvent:
 class TestReplyGateWiring:
     """The gate's effect on the turn flow in ``_run_one_inner``."""
 
-    def test_reply_decision_runs_conversation_and_records_breaker(
+    def test_reply_decision_runs_conversation(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         from agentchatme_hermes.prompts import build_notification_prompt
@@ -450,7 +451,7 @@ class TestReplyGateWiring:
         monkeypatch.setattr(
             invoker,
             "_decide_reply",
-            lambda _ev, _hist: GateDecision(
+            lambda _ev, _hist, _raw: GateDecision(
                 reply=True, reason="open q", category="open_request", source="llm"
             ),
         )
@@ -459,8 +460,6 @@ class TestReplyGateWiring:
 
         agent.run_conversation.assert_called_once()
         assert calls["build_agent"] == ["conv_dm_a"]
-        # The reply was counted toward the circuit breaker.
-        assert invoker._breaker.recent_count("conv_dm_a") == 1
 
     def test_no_reply_decision_skips_everything(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -473,7 +472,7 @@ class TestReplyGateWiring:
         monkeypatch.setattr(
             invoker,
             "_decide_reply",
-            lambda _ev, _hist: GateDecision(
+            lambda _ev, _hist, _raw: GateDecision(
                 reply=False, reason="ack", category="closing", source="llm"
             ),
         )
@@ -483,7 +482,6 @@ class TestReplyGateWiring:
         agent.run_conversation.assert_not_called()
         # The agent was never even constructed on the no-reply path.
         assert calls["build_agent"] == []
-        assert invoker._breaker.recent_count("conv_dm_a") == 0
 
     def test_gate_disabled_bypasses_decision(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -499,7 +497,7 @@ class TestReplyGateWiring:
         monkeypatch.setattr(
             invoker,
             "_decide_reply",
-            lambda _ev, _hist: decide_calls.append(1)
+            lambda _ev, _hist, _raw: decide_calls.append(1)
             or GateDecision(reply=True, reason="", category="other", source="llm"),
         )
 
@@ -508,38 +506,12 @@ class TestReplyGateWiring:
         agent.run_conversation.assert_called_once()
         assert decide_calls == []  # gate disabled → no decision call at all
 
-    def test_decide_reply_circuit_breaker_short_circuits_llm(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        invoker, _agent, _calls = _wired_invoker(
-            monkeypatch, tmp_path, SimpleNamespace(max_inflight_turns=1)
-        )
-        invoker._breaker = TurnCircuitBreaker(max_replies=1, window_seconds=60)
-        invoker._breaker.record_reply("conv_dm_a")  # now at cap → tripped
-
-        decide_calls: list[Any] = []
-        monkeypatch.setattr(
-            "agentchatme_hermes.reply_gate.decide",
-            lambda **kw: decide_calls.append(kw)
-            or GateDecision(reply=True, reason="", category="other", source="llm"),
-        )
-
-        decision = invoker._decide_reply(_inbound("conv_dm_a"), [])
-
-        assert decision.reply is False
-        assert decision.source == "circuit_breaker"
-        # The expensive LLM decision was never consulted.
-        assert decide_calls == []
-
     def test_decide_reply_feeds_signals_to_llm(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         invoker, _agent, _calls = _wired_invoker(
             monkeypatch, tmp_path, SimpleNamespace(max_inflight_turns=1)
         )
-        invoker._breaker = TurnCircuitBreaker(max_replies=5, window_seconds=60)
-        invoker._breaker.record_reply("conv_dm_a")
-        invoker._breaker.record_reply("conv_dm_a")  # recent=2, under cap
 
         monkeypatch.setattr(
             invoker,
@@ -555,12 +527,13 @@ class TestReplyGateWiring:
             ),
         )
 
-        decision = invoker._decide_reply(_inbound("conv_dm_a"), [])
+        decision = invoker._decide_reply(_inbound("conv_dm_a"), [], [])
 
         assert decision.reply is True
         assert captured["handle"] == "me"
-        assert captured["recent_reply_count"] == 2
         assert captured["main_runtime"] == {
             "model": "deepseek-x",
             "provider": "deepseek",
         }
+        # The derived cadence/relationship signals are passed to the gate.
+        assert "signals" in captured

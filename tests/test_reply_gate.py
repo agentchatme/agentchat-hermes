@@ -6,12 +6,14 @@ deterministic.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from agentchatme_hermes.reply_gate import (
+    ConversationSignals,
     GateDecision,
     build_decision_messages,
+    compute_conversation_signals,
     decide,
     parse_decision,
 )
@@ -42,19 +44,48 @@ def _times(*vals: float) -> Callable[[], float]:
     return lambda: next(it)
 
 
+_NOW = datetime(2026, 6, 21, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def _ago(seconds: float) -> str:
+    """ISO timestamp ``seconds`` before the fixed _NOW (negative = future)."""
+    return (_NOW - timedelta(seconds=seconds)).isoformat()
+
+
+def _raw(
+    msg_id: str,
+    *,
+    sender: str = "alice",
+    is_own: bool | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    """Build a raw get_messages-shaped row for signal tests."""
+    row: dict[str, Any] = {
+        "id": msg_id,
+        "type": "text",
+        "content": {"text": "x"},
+        "from": f"@{sender}",
+    }
+    if is_own is not None:
+        row["is_own"] = is_own
+    if created_at is not None:
+        row["created_at"] = created_at
+    return row
+
+
 # ──────────────────────── build_decision_messages ────────────────────────
 
 
 class TestBuildDecisionMessages:
     def test_two_messages_system_then_user(self) -> None:
         msgs = build_decision_messages(
-            handle="me", event=_event(), history=[], recent_reply_count=0
+            handle="me", event=_event(), history=[]
         )
         assert [m["role"] for m in msgs] == ["system", "user"]
 
     def test_system_carries_handle_and_json_shape(self) -> None:
         msgs = build_decision_messages(
-            handle="me", event=_event(), history=[], recent_reply_count=0
+            handle="me", event=_event(), history=[]
         )
         system = msgs[0]["content"]
         assert "@me" in system
@@ -73,12 +104,10 @@ class TestBuildDecisionMessages:
             handle="me",
             event=_event(text="are you there?", sender="bob"),
             history=history,
-            recent_reply_count=4,
         )
         user = msgs[1]["content"]
         assert "Conversation type: direct" in user
         assert "Prior messages in this thread: 2" in user
-        assert "recently: 4" in user
         assert "are you there?" in user
         assert "@bob" in user
         # history rendered with speaker labels
@@ -90,7 +119,6 @@ class TestBuildDecisionMessages:
             handle="me",
             event=_event(kind="group", text="hey @me can you check this"),
             history=[],
-            recent_reply_count=0,
         )
         user = msgs[1]["content"]
         assert "Conversation type: group" in user
@@ -101,19 +129,18 @@ class TestBuildDecisionMessages:
             handle="me",
             event=_event(kind="group", text="anyone around?"),
             history=[],
-            recent_reply_count=0,
         )
         assert "not explicitly" in msgs[1]["content"].lower()
 
     def test_direct_has_no_addressing_hint(self) -> None:
         msgs = build_decision_messages(
-            handle="me", event=_event(kind="direct"), history=[], recent_reply_count=0
+            handle="me", event=_event(kind="direct"), history=[]
         )
         assert "directly addresses you" not in msgs[1]["content"].lower()
 
     def test_first_contact_renders_no_history(self) -> None:
         msgs = build_decision_messages(
-            handle="me", event=_event(), history=[], recent_reply_count=0
+            handle="me", event=_event(), history=[]
         )
         assert "first contact" in msgs[1]["content"].lower()
 
@@ -123,7 +150,6 @@ class TestBuildDecisionMessages:
             handle="me",
             event=_event(),
             history=history,
-            recent_reply_count=0,
             max_history=5,
         )
         user = msgs[1]["content"]
@@ -233,7 +259,6 @@ class TestDecide:
             handle="me",
             event=_event(),
             history=[],
-            recent_reply_count=0,
             main_runtime={"model": "test-model"},
             fail_open=fail_open,
             timeout_s=5.0,
@@ -304,3 +329,127 @@ class TestDecide:
         assert captured["main_runtime"] == {"model": "test-model"}
         assert captured["timeout"] == 5.0
         assert isinstance(captured["messages"], list)
+
+
+# ──────────────────────── compute_conversation_signals ────────────────────────
+
+
+def _signals(
+    messages: list[Any], *, trigger: str = "trigger", own: str = "me"
+) -> ConversationSignals:
+    return compute_conversation_signals(
+        messages, own_handle=own, trigger_message_id=trigger, now=_NOW
+    )
+
+
+class TestConversationSignals:
+    def test_empty_is_first_contact(self) -> None:
+        s = _signals([])
+        assert s.first_contact is True
+        assert s.you_have_spoken is False
+        assert s.seconds_since_previous is None
+        assert s.messages_last_window == 1  # just the new message
+
+    def test_you_have_spoken_when_own_present(self) -> None:
+        msgs = [
+            _raw("m1", sender="me", is_own=True, created_at=_ago(30)),
+            _raw("m2", sender="alice", is_own=False, created_at=_ago(10)),
+        ]
+        s = _signals(msgs)
+        assert s.first_contact is False
+        assert s.you_have_spoken is True
+
+    def test_you_have_not_spoken_when_only_peer(self) -> None:
+        msgs = [_raw("m1", sender="alice", is_own=False, created_at=_ago(10))]
+        s = _signals(msgs)
+        assert s.first_contact is False
+        assert s.you_have_spoken is False
+
+    def test_handle_fallback_when_no_is_own(self) -> None:
+        # No is_own field → fall back to handle compare.
+        s = _signals([_raw("m1", sender="me", created_at=_ago(10))])
+        assert s.you_have_spoken is True
+
+    def test_cadence_window_counts_recent_plus_new(self) -> None:
+        msgs = [
+            _raw("m1", created_at=_ago(120)),  # outside the 60s window
+            _raw("m2", created_at=_ago(30)),  # inside
+            _raw("m3", created_at=_ago(5)),  # inside
+        ]
+        s = _signals(msgs)
+        assert s.messages_last_window == 3  # 2 inside + the new message
+
+    def test_seconds_since_previous_uses_latest(self) -> None:
+        msgs = [_raw("m1", created_at=_ago(40)), _raw("m2", created_at=_ago(8))]
+        s = _signals(msgs)
+        assert s.seconds_since_previous == 8.0
+
+    def test_trigger_message_excluded(self) -> None:
+        s = _signals([_raw("trigger", created_at=_ago(5))], trigger="trigger")
+        assert s.first_contact is True  # the only row was the trigger
+
+    def test_malformed_timestamps_skipped(self) -> None:
+        msgs = [
+            {"id": "m1", "from": "@alice", "created_at": "not-a-date"},
+            {"id": "m2", "from": "@alice"},  # no created_at
+        ]
+        s = _signals(msgs)
+        assert s.first_contact is False  # rows exist
+        assert s.seconds_since_previous is None  # but none parse
+        assert s.messages_last_window == 1
+
+    def test_naive_timestamp_assumed_utc(self) -> None:
+        # Naive (no tz) is assumed UTC — 10s before _NOW.
+        s = _signals([_raw("m1", created_at="2026-06-21T11:59:50")])
+        assert s.seconds_since_previous == 10.0
+
+    def test_future_timestamp_clamped_to_zero(self) -> None:
+        s = _signals([_raw("m1", created_at=_ago(-5))])  # 5s into the future
+        assert s.seconds_since_previous == 0.0
+
+    def test_non_dict_rows_ignored(self) -> None:
+        s = _signals(["garbage", None, _raw("m1", created_at=_ago(5))])
+        assert s.first_contact is False
+        assert s.messages_last_window == 2  # 1 valid in-window + new
+
+
+# ──────────────────────── signals rendering ────────────────────────
+
+
+class TestSignalsRendering:
+    def _user(self, signals: ConversationSignals | None) -> str:
+        msgs = build_decision_messages(
+            handle="me",
+            event=_event(),
+            history=[{"role": "user", "content": "hi"}],
+            signals=signals,
+        )
+        return msgs[1]["content"]
+
+    def test_established_and_pace_render(self) -> None:
+        sig = ConversationSignals(
+            first_contact=False,
+            you_have_spoken=True,
+            messages_last_window=5,
+            seconds_since_previous=8.0,
+        )
+        user = self._user(sig)
+        assert "Relationship: established" in user
+        assert "Pace: 5 message(s) in the last" in user
+        assert "8s since the" in user
+
+    def test_first_contact_renders_and_no_pace_without_gap(self) -> None:
+        sig = ConversationSignals(
+            first_contact=True,
+            you_have_spoken=False,
+            messages_last_window=1,
+            seconds_since_previous=None,
+        )
+        user = self._user(sig)
+        assert "first contact" in user.lower()
+        assert "Pace:" not in user  # no gap → no pace line
+
+    def test_none_signals_omits_both_lines(self) -> None:
+        user = self._user(None)
+        assert "Relationship:" not in user
+        assert "Pace:" not in user

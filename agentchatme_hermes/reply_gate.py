@@ -21,9 +21,6 @@ winding down, silence is the default and a reply has to earn its place.
 The call runs on the agent's OWN model (via :func:`agent.auxiliary_client.call_llm`
 with the live main-runtime), so nothing about this depends on the AgentChat
 server — the platform stays a dumb carrier; the judgement lives at the edge.
-
-This is the smart layer. The dumb seatbelt underneath it lives in
-:mod:`agentchatme_hermes.turn_guard`.
 """
 from __future__ import annotations
 
@@ -32,6 +29,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
@@ -49,9 +47,14 @@ DEFAULT_MAX_TOKENS = 256
 # needs the tail to tell "winding down" from "open question".
 MAX_HISTORY_TURNS = 12
 
+# Window (seconds) for the cadence signal — "how many messages in the last
+# minute". Tight on purpose: the loop is a rapid-fire phenomenon, so a short
+# window distinguishes a live volley from a normally paced exchange.
+CADENCE_WINDOW_SECONDS = 60.0
+
 # Categories the model may return. Anything else is normalised to "other".
-# Internal sources ("fallback", "circuit_breaker") are set by code directly
-# and intentionally not in this set.
+# The internal "fallback" source is set by code directly and intentionally
+# not in this set.
 VALID_CATEGORIES = frozenset(
     {
         "open_request",
@@ -97,7 +100,9 @@ _SYSTEM_TEMPLATE = (
     "Decisive bias: once a conversation is winding down, prefer \"no_reply\" — a "
     "reply must earn its place. Two agents trading acknowledgements forever is "
     "the exact failure you exist to prevent. If the only thing you could add is "
-    "another acknowledgement, choose \"no_reply\".\n"
+    "another acknowledgement, choose \"no_reply\". If the Pace line shows "
+    "messages flying back and forth rapidly with each only restating or "
+    "acknowledging the last, that IS the loop — choose \"no_reply\".\n"
     "\n"
     "Respond with ONLY a JSON object — no prose, no markdown fences:\n"
     '{"decision": "reply" or "no_reply", "reason": "<one short sentence>", '
@@ -114,7 +119,6 @@ class GateDecision:
     audited and the gate calibrated:
 
     * ``"llm"`` — the model decided.
-    * ``"circuit_breaker"`` — the deterministic seatbelt forced no-reply.
     * ``"fail_open"`` / ``"fail_closed"`` — the LLM call failed or returned
       garbage and the configured fallback policy was applied.
     """
@@ -126,20 +130,134 @@ class GateDecision:
     latency_ms: int = 0
 
 
+@dataclass(frozen=True)
+class ConversationSignals:
+    """Compact, deterministic context derived from the thread already in hand.
+
+    No network call and no server-side interpretation — every field comes from
+    the recent messages the gate already fetched plus the inbound message's own
+    timestamp. Rendered into short phrases for the prompt (never raw dumps), so
+    the per-message cost stays bounded.
+
+    * ``first_contact`` — no prior messages (a fresh opener).
+    * ``you_have_spoken`` — this agent already replied in the window (an
+      established two-way thread vs. being newly approached).
+    * ``messages_last_window`` — messages incl. the new one within
+      :data:`CADENCE_WINDOW_SECONDS`; a high count is the loop's tempo.
+    * ``seconds_since_previous`` — gap from the previous message to this one,
+      or ``None`` when there is no usable prior timestamp.
+    """
+
+    first_contact: bool
+    you_have_spoken: bool
+    messages_last_window: int
+    seconds_since_previous: float | None
+
+
+def compute_conversation_signals(
+    messages: list[dict[str, Any]],
+    *,
+    own_handle: str,
+    trigger_message_id: str,
+    now: datetime,
+    window_seconds: float = CADENCE_WINDOW_SECONDS,
+) -> ConversationSignals:
+    """Derive :class:`ConversationSignals` from the recent raw messages.
+
+    Pure and defensive: tolerates missing/malformed timestamps, non-dict rows,
+    and naive datetimes (assumed UTC). ``messages`` is the raw ``get_messages``
+    result; the triggering message is excluded so "now" isn't double-counted.
+    """
+    own = own_handle.lstrip("@").lower()
+    prior = [
+        m
+        for m in messages
+        if isinstance(m, dict) and m.get("id") != trigger_message_id
+    ]
+    first_contact = len(prior) == 0
+    you_have_spoken = any(_message_is_own(m, own) for m in prior)
+
+    timestamps = [
+        ts
+        for ts in (_parse_timestamp(m.get("created_at")) for m in prior)
+        if ts is not None
+    ]
+    cutoff = now - timedelta(seconds=window_seconds)
+    recent_in_window = sum(1 for ts in timestamps if ts >= cutoff)
+
+    seconds_since_previous: float | None = None
+    if timestamps:
+        delta = (now - max(timestamps)).total_seconds()
+        seconds_since_previous = delta if delta > 0 else 0.0  # clamp clock skew
+
+    return ConversationSignals(
+        first_contact=first_contact,
+        you_have_spoken=you_have_spoken,
+        messages_last_window=recent_in_window + 1,  # +1 for the new message
+        seconds_since_previous=seconds_since_previous,
+    )
+
+
+def _message_is_own(msg: dict[str, Any], own_handle_norm: str) -> bool:
+    """Trust server-precomputed ``is_own``; else compare sender handles.
+
+    Mirrors the role logic in the history translator.
+    """
+    is_own = msg.get("is_own")
+    if isinstance(is_own, bool):
+        return is_own
+    sender = msg.get("from") or msg.get("sender_handle") or ""
+    return str(sender).lstrip("@").lower() == own_handle_norm
+
+
+def _parse_timestamp(raw: Any) -> datetime | None:
+    """Parse an ISO-8601 ``created_at`` to a tz-aware datetime, or ``None``.
+
+    Naive timestamps are assumed UTC so comparisons against the (tz-aware)
+    inbound time never raise.
+    """
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _format_gap(seconds: float) -> str:
+    """Humanise a seconds gap into a compact token (``8s`` / ``3m`` / ``2h``)."""
+    if seconds < 90:
+        return f"{round(seconds)}s"
+    if seconds < 5400:
+        return f"{round(seconds / 60)}m"
+    return f"{round(seconds / 3600)}h"
+
+
+def _relationship_phrase(signals: ConversationSignals) -> str:
+    if signals.first_contact:
+        return "first contact — no prior messages in this thread"
+    if signals.you_have_spoken:
+        return "established — you have already replied in this thread"
+    return "this peer is messaging you, but you have not replied yet"
+
+
 def build_decision_messages(
     *,
     handle: str,
     event: InboundEvent,
     history: list[dict[str, Any]],
-    recent_reply_count: int,
+    signals: ConversationSignals | None = None,
     max_history: int = MAX_HISTORY_TURNS,
 ) -> list[dict[str, str]]:
     """Build the OpenAI-style messages for the decision call.
 
     Pure — no SDK, no runtime, no IO. The system message carries the
-    done-ness criterion; the user message carries the signals (turn depth,
-    recent reply pressure, group-addressing) plus the recent conversation and
-    the new message.
+    done-ness criterion; the user message carries the signals (relationship,
+    pace, turn depth, group-addressing) plus the recent conversation and the
+    new message.
     """
     system = _SYSTEM_TEMPLATE.replace("{handle}", handle)
     return [
@@ -150,7 +268,7 @@ def build_decision_messages(
                 handle=handle,
                 event=event,
                 history=history,
-                recent_reply_count=recent_reply_count,
+                signals=signals,
                 max_history=max_history,
             ),
         },
@@ -162,18 +280,21 @@ def _build_user_content(
     handle: str,
     event: InboundEvent,
     history: list[dict[str, Any]],
-    recent_reply_count: int,
+    signals: ConversationSignals | None,
     max_history: int,
 ) -> str:
     kind = "group" if event.conversation_kind == "group" else "direct"
-    lines: list[str] = [
-        f"Conversation type: {kind}",
-        f"Prior messages in this thread: {len(history)}",
-        (
-            f"Replies you (@{handle}) have already sent into this conversation "
-            f"recently: {recent_reply_count}"
-        ),
-    ]
+    lines: list[str] = [f"Conversation type: {kind}"]
+    if signals is not None:
+        lines.append(f"Relationship: {_relationship_phrase(signals)}")
+        if signals.seconds_since_previous is not None:
+            lines.append(
+                f"Pace: {signals.messages_last_window} message(s) in the last "
+                f"{int(CADENCE_WINDOW_SECONDS)}s; "
+                f"{_format_gap(signals.seconds_since_previous)} since the "
+                f"previous message"
+            )
+    lines.append(f"Prior messages in this thread: {len(history)}")
     if kind == "group":
         mentioned = f"@{handle.lower()}" in (event.content_text or "").lower()
         lines.append(
@@ -287,10 +408,10 @@ def decide(
     handle: str,
     event: InboundEvent,
     history: list[dict[str, Any]],
-    recent_reply_count: int,
     main_runtime: dict[str, str],
     fail_open: bool,
     timeout_s: float,
+    signals: ConversationSignals | None = None,
     caller: Callable[..., str] | None = None,
     now_fn: Callable[[], float] = time.monotonic,
     max_tokens: int = DEFAULT_MAX_TOKENS,
@@ -300,15 +421,14 @@ def decide(
     ``caller`` is injectable so tests don't hit a real provider; the default
     routes through Hermes' host-owned :func:`call_llm`. On any failure —
     call error, timeout, unparseable output — the configured ``fail_open``
-    policy decides the fallback (and the circuit breaker, checked by the
-    caller before this runs, bounds any loop a fail-open lets through).
+    policy decides the fallback; the gate simply re-runs on the next inbound.
     """
     caller = caller or _default_caller
     messages = build_decision_messages(
         handle=handle,
         event=event,
         history=history,
-        recent_reply_count=recent_reply_count,
+        signals=signals,
     )
 
     start = now_fn()

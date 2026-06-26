@@ -12,9 +12,7 @@ if TYPE_CHECKING:
 
 from agentchatme_hermes.config import (
     DEFAULT_API_BASE,
-    DEFAULT_GATE_MAX_REPLIES_PER_WINDOW,
     DEFAULT_GATE_TIMEOUT_S,
-    DEFAULT_GATE_WINDOW_SECONDS,
     DEFAULT_MAX_INFLIGHT_TURNS,
     DEFAULT_REPLY_GATE_ENABLED,
     DEFAULT_REPLY_GATE_FAIL_OPEN,
@@ -229,8 +227,6 @@ class TestGateConfig:
         assert cfg is not None
         assert cfg.reply_gate_enabled is DEFAULT_REPLY_GATE_ENABLED
         assert cfg.reply_gate_fail_open is DEFAULT_REPLY_GATE_FAIL_OPEN
-        assert cfg.gate_max_replies_per_window == DEFAULT_GATE_MAX_REPLIES_PER_WINDOW
-        assert cfg.gate_window_seconds == DEFAULT_GATE_WINDOW_SECONDS
         assert cfg.gate_timeout_s == DEFAULT_GATE_TIMEOUT_S
 
     def test_enabled_kill_switch(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -287,37 +283,6 @@ class TestGateConfig:
         )
         with pytest.raises(ConfigError, match="not a boolean"):
             load_config()
-
-    def test_max_replies_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _isolated(
-            monkeypatch,
-            AGENTCHATME_API_KEY="k",
-            AGENTCHATME_GATE_MAX_REPLIES_PER_WINDOW="3",
-        )
-        cfg = load_config()
-        assert cfg is not None
-        assert cfg.gate_max_replies_per_window == 3
-
-    def test_max_replies_below_minimum_raises(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _isolated(
-            monkeypatch,
-            AGENTCHATME_API_KEY="k",
-            AGENTCHATME_GATE_MAX_REPLIES_PER_WINDOW="0",
-        )
-        with pytest.raises(ConfigError, match="below the minimum"):
-            load_config()
-
-    def test_window_seconds_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _isolated(
-            monkeypatch,
-            AGENTCHATME_API_KEY="k",
-            AGENTCHATME_GATE_WINDOW_SECONDS="45",
-        )
-        cfg = load_config()
-        assert cfg is not None
-        assert cfg.gate_window_seconds == 45.0
 
     def test_timeout_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _isolated(

@@ -38,20 +38,11 @@ DEFAULT_TURN_INACTIVITY_TIMEOUT_S = 600.0
 DEFAULT_REPLY_GATE_ENABLED = True
 
 # When the decision call errors or returns something unparseable, do we
-# default to replying (responsive, but a loop could continue until the
-# circuit breaker trips) or to staying silent (loop-safe, but a genuine
-# message could be dropped)? We fail OPEN — a silently dropped message
-# reads as a dead agent, and the circuit breaker below bounds any loop a
-# fail-open lets through.
+# default to replying (responsive) or to staying silent (loop-safe, but a
+# genuine message could be dropped)? We fail OPEN — a silently dropped
+# message reads as a dead agent, and the gate re-runs from scratch on the
+# next inbound, so a fail-open is self-correcting rather than loop-forming.
 DEFAULT_REPLY_GATE_FAIL_OPEN = True
-
-# Deterministic seatbelt under the LLM gate: if this agent has already sent
-# this many replies into ONE conversation within the rolling window, force
-# no-reply no matter what the gate decides. Catches a mis-firing gate AND a
-# gate that's entirely unavailable. Generous on purpose — the LLM gate is
-# the primary control; this only stops a runaway.
-DEFAULT_GATE_MAX_REPLIES_PER_WINDOW = 8
-DEFAULT_GATE_WINDOW_SECONDS = 180.0
 
 # Timeout (seconds) for the single decision call. Short — it's a one-shot
 # classification, not a full agent turn. On timeout we apply the fail-open
@@ -81,8 +72,6 @@ class Config:
     turn_inactivity_timeout_s: float = DEFAULT_TURN_INACTIVITY_TIMEOUT_S
     reply_gate_enabled: bool = DEFAULT_REPLY_GATE_ENABLED
     reply_gate_fail_open: bool = DEFAULT_REPLY_GATE_FAIL_OPEN
-    gate_max_replies_per_window: int = DEFAULT_GATE_MAX_REPLIES_PER_WINDOW
-    gate_window_seconds: float = DEFAULT_GATE_WINDOW_SECONDS
     gate_timeout_s: float = DEFAULT_GATE_TIMEOUT_S
 
 
@@ -135,14 +124,6 @@ def load_config() -> Config | None:
     reply_gate_fail_open = _parse_bool_env(
         "AGENTCHATME_REPLY_GATE_FAIL_OPEN", DEFAULT_REPLY_GATE_FAIL_OPEN
     )
-    gate_max_replies = _parse_int_env(
-        "AGENTCHATME_GATE_MAX_REPLIES_PER_WINDOW",
-        DEFAULT_GATE_MAX_REPLIES_PER_WINDOW,
-        minimum=1,
-    )
-    gate_window_seconds = _parse_float_env(
-        "AGENTCHATME_GATE_WINDOW_SECONDS", DEFAULT_GATE_WINDOW_SECONDS, minimum=1.0
-    )
     gate_timeout_s = _parse_float_env(
         "AGENTCHATME_GATE_TIMEOUT_S", DEFAULT_GATE_TIMEOUT_S, minimum=1.0
     )
@@ -155,8 +136,6 @@ def load_config() -> Config | None:
         turn_inactivity_timeout_s=inactivity_timeout,
         reply_gate_enabled=reply_gate_enabled,
         reply_gate_fail_open=reply_gate_fail_open,
-        gate_max_replies_per_window=gate_max_replies,
-        gate_window_seconds=gate_window_seconds,
         gate_timeout_s=gate_timeout_s,
     )
 
