@@ -27,6 +27,18 @@ class InboundEvent:
     sender_handle: str
     content_text: str
     received_at: datetime
+    # ─ Platform-authored trusted context (server `message.context`) ─
+    # Identity the server resolved for us, so a stateless agent knows WHO it is
+    # talking to and WHERE without a lookup. All optional/defaulted so a message
+    # predating the server enrichment still parses (legacy path → bare handle).
+    sender_display_name: str | None = None
+    sender_kind: str = "agent"  # 'agent' | 'system'
+    group_name: str | None = None
+    member_count: int | None = None
+    # Handles @-mentioned in the message, parsed server-side (word-boundary
+    # correct). Tuple so the dataclass stays frozen/hashable. A recipient tests
+    # its OWN handle for membership — never substring-matches the raw text.
+    mentions: tuple[str, ...] = ()
 
     @classmethod
     def from_ws_message(cls, payload: dict[str, Any]) -> InboundEvent | None:
@@ -78,6 +90,32 @@ class InboundEvent:
         except ValueError:
             received_at = datetime.now(timezone.utc)
 
+        # Platform-authored trusted context block (may be absent on legacy
+        # messages). Read defensively — a malformed context never fails the
+        # frame; it just degrades to the bare-handle path.
+        context = payload.get("context")
+        ctx_sender = context.get("sender") if isinstance(context, dict) else None
+        ctx_conv = context.get("conversation") if isinstance(context, dict) else None
+        ctx_sender = ctx_sender if isinstance(ctx_sender, dict) else {}
+        ctx_conv = ctx_conv if isinstance(ctx_conv, dict) else {}
+
+        display_name_raw = ctx_sender.get("display_name")
+        sender_display_name = (
+            display_name_raw if isinstance(display_name_raw, str) else None
+        )
+        kind_raw = ctx_sender.get("kind")
+        sender_kind = kind_raw if kind_raw in ("agent", "system") else "agent"
+        group_name_raw = ctx_conv.get("group_name")
+        group_name = group_name_raw if isinstance(group_name_raw, str) else None
+        member_count_raw = ctx_conv.get("member_count")
+        member_count = member_count_raw if isinstance(member_count_raw, int) else None
+        mentions_raw = context.get("mentions") if isinstance(context, dict) else None
+        mentions = (
+            tuple(m.lower() for m in mentions_raw if isinstance(m, str))
+            if isinstance(mentions_raw, list)
+            else ()
+        )
+
         return cls(
             message_id=msg_id,
             conversation_id=conv_id,
@@ -85,6 +123,11 @@ class InboundEvent:
             sender_handle=sender_handle,
             content_text=text,
             received_at=received_at,
+            sender_display_name=sender_display_name,
+            sender_kind=sender_kind,
+            group_name=group_name,
+            member_count=member_count,
+            mentions=mentions,
         )
 
 

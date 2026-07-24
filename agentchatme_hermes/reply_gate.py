@@ -236,12 +236,77 @@ def _format_gap(seconds: float) -> str:
     return f"{round(seconds / 3600)}h"
 
 
+def format_received_at(dt: datetime) -> str:
+    """Render a message's arrival time as an unambiguous absolute UTC stamp,
+    e.g. ``2026-07-24 14:57 UTC``.
+
+    Agents have no clock of their own. The gate reasons in *relative* pace
+    (``_format_gap``), but the composing turn also needs the *absolute* time to
+    judge staleness and business-hours context, so this is surfaced alongside
+    the pace signal in the shared context header.
+    """
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
 def _relationship_phrase(signals: ConversationSignals) -> str:
     if signals.first_contact:
         return "first contact — no prior messages in this thread"
     if signals.you_have_spoken:
         return "established — you have already replied in this thread"
     return "this peer is messaging you, but you have not replied yet"
+
+
+def format_conversation_context(
+    *,
+    handle: str,
+    event: InboundEvent,
+    signals: ConversationSignals | None,
+    prior_count: int,
+) -> list[str]:
+    """The compact conversation-context header — type, relationship, pace, turn
+    depth, and group-addressing — derived purely from signals already in hand.
+
+    Shared VERBATIM by the reply-gate's decision prompt
+    (:func:`_build_user_content`) and the compose-turn wake
+    (:func:`prompts.build_notification_prompt`) so the model that WRITES the
+    reply sees the same signals the gate judged on, instead of a
+    decontextualised one-liner. Pure; no IO, no network. The absolute arrival
+    time is added by the compose wake on top of these lines (via
+    :func:`format_received_at`) — it is not part of the gate's tuned prompt.
+    """
+    if event.conversation_kind == "group":
+        # Name the room, not an opaque id. Falls back to bare "group" when the
+        # server didn't supply a name (legacy message).
+        where = f'group "{event.group_name}"' if event.group_name else "group"
+        if event.member_count is not None:
+            plural = "s" if event.member_count != 1 else ""
+            where += f" ({event.member_count} member{plural})"
+    else:
+        where = "direct"
+    lines: list[str] = [f"Conversation type: {where}"]
+    if signals is not None:
+        lines.append(f"Relationship: {_relationship_phrase(signals)}")
+        if signals.seconds_since_previous is not None:
+            lines.append(
+                f"Pace: {signals.messages_last_window} message(s) in the last "
+                f"{int(CADENCE_WINDOW_SECONDS)}s; "
+                f"{_format_gap(signals.seconds_since_previous)} since the "
+                f"previous message"
+            )
+    lines.append(f"Prior messages in this thread: {prior_count}")
+    # Mention: state the positive fact ONLY when true. A "not mentioned" line is
+    # deliberately omitted — negative framing biases some models toward silence
+    # and others toward noise, so we drop the confusion entirely (same reason a
+    # DM, where you are always the addressee, carries no such line). Membership
+    # is tested against the server's word-boundary-parsed list, never a raw
+    # substring of the text.
+    if (
+        event.conversation_kind == "group"
+        and handle
+        and handle.lower() in event.mentions
+    ):
+        lines.append("You were @-mentioned in this message.")
+    return lines
 
 
 def build_decision_messages(
@@ -283,23 +348,12 @@ def _build_user_content(
     signals: ConversationSignals | None,
     max_history: int,
 ) -> str:
-    kind = "group" if event.conversation_kind == "group" else "direct"
-    lines: list[str] = [f"Conversation type: {kind}"]
-    if signals is not None:
-        lines.append(f"Relationship: {_relationship_phrase(signals)}")
-        if signals.seconds_since_previous is not None:
-            lines.append(
-                f"Pace: {signals.messages_last_window} message(s) in the last "
-                f"{int(CADENCE_WINDOW_SECONDS)}s; "
-                f"{_format_gap(signals.seconds_since_previous)} since the "
-                f"previous message"
-            )
-    lines.append(f"Prior messages in this thread: {len(history)}")
-    if kind == "group":
-        mentioned = f"@{handle.lower()}" in (event.content_text or "").lower()
-        lines.append(
-            f"Message directly addresses you: {'yes' if mentioned else 'not explicitly'}"
-        )
+    lines: list[str] = format_conversation_context(
+        handle=handle,
+        event=event,
+        signals=signals,
+        prior_count=len(history),
+    )
 
     lines.append("")
     rendered = _render_history(history, max_history)

@@ -263,7 +263,17 @@ class TestTranslateMessagesToHistory:
 class TestNotificationPrompt:
     """Lock down the wake-prompt format — it's part of the LLM contract."""
 
-    def _event(self, *, conversation_kind: str = "direct", text: str = "hi") -> Any:
+    def _event(
+        self,
+        *,
+        conversation_kind: str = "direct",
+        text: str = "hi",
+        received_at: Any = None,
+        sender_display_name: Any = None,
+        sender_kind: str = "agent",
+        group_name: Any = None,
+        mentions: tuple[str, ...] = (),
+    ) -> Any:
         from datetime import datetime, timezone
 
         from agentchatme_hermes.types import InboundEvent
@@ -274,14 +284,62 @@ class TestNotificationPrompt:
             conversation_kind=conversation_kind,  # type: ignore[arg-type]
             sender_handle="alice",
             content_text=text,
-            received_at=datetime.now(timezone.utc),
+            received_at=received_at or datetime.now(timezone.utc),
+            sender_display_name=sender_display_name,
+            sender_kind=sender_kind,
+            group_name=group_name,
+            mentions=mentions,
         )
+
+    def test_surfaces_resolved_sender_identity(self) -> None:
+        from agentchatme_hermes.prompts import build_notification_prompt
+
+        prompt = build_notification_prompt(
+            self._event(sender_display_name="Alice Liddell"), handle="me"
+        )
+        assert "From: Alice Liddell (@alice)" in prompt
+
+    def test_flags_a_system_sender(self) -> None:
+        from agentchatme_hermes.prompts import build_notification_prompt
+
+        prompt = build_notification_prompt(
+            self._event(sender_display_name="Chatfather", sender_kind="system"),
+            handle="me",
+        )
+        assert "From: Chatfather (@alice), a system agent" in prompt
+
+    def test_group_header_names_the_room(self) -> None:
+        from agentchatme_hermes.prompts import build_notification_prompt
+
+        prompt = build_notification_prompt(
+            self._event(conversation_kind="group", group_name="Ops"), handle="me"
+        )
+        assert 'Conversation type: group "Ops"' in prompt
+
+    def test_mention_line_only_when_mentioned(self) -> None:
+        from agentchatme_hermes.prompts import build_notification_prompt
+
+        named = build_notification_prompt(
+            self._event(conversation_kind="group", mentions=("me",)), handle="me"
+        )
+        assert "You were @-mentioned in this message." in named
+        unnamed = build_notification_prompt(
+            self._event(conversation_kind="group", mentions=("someone-else",)),
+            handle="me",
+        )
+        assert "@-mentioned" not in unnamed
 
     def test_direct_format(self) -> None:
         from agentchatme_hermes.prompts import build_notification_prompt
 
-        prompt = build_notification_prompt(self._event(conversation_kind="direct"))
-        assert prompt.startswith("[agentchat] @alice: hi")
+        prompt = build_notification_prompt(
+            self._event(conversation_kind="direct"), handle="me"
+        )
+        # Body is preserved verbatim (history alternation still relies on it)…
+        assert "[agentchat] @alice: hi" in prompt
+        # …now under a context header stating type + arrival time.
+        assert "Conversation type: direct" in prompt
+        assert "Received:" in prompt
         # Skill hint is included so the agent can find the etiquette manual
         # (plugin skills don't appear in <available_skills>).
         assert "skill_view agentchat:agentchat" in prompt
@@ -292,10 +350,37 @@ class TestNotificationPrompt:
         from agentchatme_hermes.prompts import build_notification_prompt
 
         prompt = build_notification_prompt(
-            self._event(conversation_kind="group")
+            self._event(conversation_kind="group"), handle="me"
         )
-        assert prompt.startswith("[agentchat group conv_x] @alice: hi")
+        assert "[agentchat group conv_x] @alice: hi" in prompt
+        assert "Conversation type: group" in prompt
         assert "skill_view agentchat:agentchat" in prompt
+
+    def test_header_surfaces_timestamp_and_piped_signals(self) -> None:
+        """The whole point of the pipe: the composing model sees WHEN the
+        message arrived plus the same relationship/pace signals the gate has."""
+        from datetime import datetime, timezone
+
+        from agentchatme_hermes.prompts import build_notification_prompt
+        from agentchatme_hermes.reply_gate import ConversationSignals
+
+        received = datetime(2026, 7, 24, 14, 57, tzinfo=timezone.utc)
+        signals = ConversationSignals(
+            first_contact=False,
+            you_have_spoken=True,
+            messages_last_window=5,
+            seconds_since_previous=120.0,
+        )
+        prompt = build_notification_prompt(
+            self._event(received_at=received),
+            handle="me",
+            signals=signals,
+            prior_count=7,
+        )
+        assert "Received: 2026-07-24 14:57 UTC" in prompt
+        assert "Relationship: established" in prompt
+        assert "Pace: 5 message(s) in the last" in prompt
+        assert "Prior messages in this thread: 7" in prompt
 
     def test_prompt_does_not_bias_toward_silence(self) -> None:
         """The wake prompt is data only — no "silence is valid" tail.
@@ -303,11 +388,12 @@ class TestNotificationPrompt:
         Reply-vs-silence judgment lives in the skill, not the prompt.
         Anything in the prompt that biases the model toward one outcome
         compounds with the LLM's existing biases (cost-per-token,
-        safety training) and tilts the agent toward under-replying.
+        safety training) and tilts the agent toward under-replying. The
+        context header is pure fact, so this invariant still holds.
         """
         from agentchatme_hermes.prompts import build_notification_prompt
 
-        prompt = build_notification_prompt(self._event())
+        prompt = build_notification_prompt(self._event(), handle="me")
         lower = prompt.lower()
         assert "silence is" not in lower
         assert "decide" not in lower
@@ -506,9 +592,11 @@ class TestReplyGateWiring:
         agent.run_conversation.assert_called_once()
         assert decide_calls == []  # gate disabled → no decision call at all
 
-    def test_decide_reply_feeds_signals_to_llm(
+    def test_decide_reply_forwards_signals_to_llm(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        from agentchatme_hermes.reply_gate import ConversationSignals
+
         invoker, _agent, _calls = _wired_invoker(
             monkeypatch, tmp_path, SimpleNamespace(max_inflight_turns=1)
         )
@@ -527,7 +615,15 @@ class TestReplyGateWiring:
             ),
         )
 
-        decision = invoker._decide_reply(_inbound("conv_dm_a"), [], [])
+        # Signals are now derived once by the caller (_run_one_inner) and handed
+        # to _decide_reply, which forwards them verbatim to the gate.
+        signals = ConversationSignals(
+            first_contact=False,
+            you_have_spoken=True,
+            messages_last_window=3,
+            seconds_since_previous=42.0,
+        )
+        decision = invoker._decide_reply(_inbound("conv_dm_a"), [], signals)
 
         assert decision.reply is True
         assert captured["handle"] == "me"
@@ -535,5 +631,5 @@ class TestReplyGateWiring:
             "model": "deepseek-x",
             "provider": "deepseek",
         }
-        # The derived cadence/relationship signals are passed to the gate.
-        assert "signals" in captured
+        # The caller-derived cadence/relationship signals reach the gate as-is.
+        assert captured["signals"] is signals

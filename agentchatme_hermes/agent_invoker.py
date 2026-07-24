@@ -367,11 +367,28 @@ class AgentInvoker:
 
         self._ensure_hermes_resolved()
 
-        prompt = build_notification_prompt(event)
         history, raw_messages = self._build_conversation_history(
             conversation_id=event.conversation_id,
             conversation_kind=event.conversation_kind,
             trigger_message_id=event.message_id,
+        )
+        # Derive the conversation signals ONCE (pure, no fetch — over the
+        # messages already in hand) and feed them to BOTH the reply-gate
+        # decision AND the compose wake, so the model that WRITES the reply sees
+        # the same when/who/where/pace the gate judged on instead of a bare
+        # one-liner. Computed unconditionally (cheap) so the wake stays enriched
+        # even when the gate is disabled.
+        signals = reply_gate.compute_conversation_signals(
+            raw_messages,
+            own_handle=self._identity.handle,
+            trigger_message_id=event.message_id,
+            now=event.received_at,
+        )
+        prompt = build_notification_prompt(
+            event,
+            handle=self._identity.handle,
+            signals=signals,
+            prior_count=len(history),
         )
 
         # --- reply gate ------------------------------------------------------
@@ -382,7 +399,7 @@ class AgentInvoker:
         # pays for AIAgent construction. Kill switch:
         # AGENTCHATME_REPLY_GATE_ENABLED=0.
         if self._gate_enabled:
-            decision = self._decide_reply(event, history, raw_messages)
+            decision = self._decide_reply(event, history, signals)
             logger.info(
                 "AgentInvoker: gate conv=%s msg=%s reply=%s source=%s "
                 "category=%s latency_ms=%d reason=%r",
@@ -441,21 +458,15 @@ class AgentInvoker:
         self,
         event: InboundEvent,
         history: list[dict[str, Any]],
-        raw_messages: list[dict[str, Any]],
+        signals: reply_gate.ConversationSignals,
     ) -> reply_gate.GateDecision:
         """Decide reply / no-reply for one inbound.
 
-        The decision is handed the derived conversation signals (relationship +
-        cadence, computed from ``raw_messages`` with no extra fetch) and runs on
-        the agent's own model — so nothing here touches the AgentChat server;
-        the judgement lives at the edge.
+        The decision is handed the pre-derived conversation signals
+        (relationship + cadence, computed once by the caller and also fed to the
+        compose wake) and runs on the agent's own model — so nothing here
+        touches the AgentChat server; the judgement lives at the edge.
         """
-        signals = reply_gate.compute_conversation_signals(
-            raw_messages,
-            own_handle=self._identity.handle,
-            trigger_message_id=event.message_id,
-            now=event.received_at,
-        )
         model, runtime_kwargs = self._resolve_model_and_runtime()
         main_runtime: dict[str, str] = {"model": model}
         main_runtime.update(runtime_kwargs)
