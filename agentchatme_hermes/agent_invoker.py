@@ -60,7 +60,7 @@ from .config import (
 if TYPE_CHECKING:
     from .config import Config
     from .message_queue import MessageQueue
-    from .types import AgentIdentity, InboundEvent
+    from .types import AgentIdentity, GroupInviteEvent, InboundEvent
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +171,40 @@ class AgentInvoker:
         """
         logger.debug("AgentInvoker: wake signal received")
         self._wake.set()
+
+    def handle_group_invite(self, invite: GroupInviteEvent) -> None:
+        """Wake the agent to decide on a group invite (accept / reject / ignore).
+
+        Called by the WS daemon on a ``group.invite.received`` frame. Invites do
+        NOT go through the message queue or the reply-gate — they are a one-shot
+        consent decision, not a message to reply to. We submit the decision turn
+        straight to the worker pool, serialized per-group via the same conv lock
+        as message turns so an invite decision and a concurrent group message on
+        that group can't race.
+
+        Runs on the WS daemon thread; must not block it — ``submit`` returns
+        immediately. If the pool is gone (never started / shutting down) the
+        invite is dropped from the reactive path but remains pending server-side
+        and is still reachable via ``agentchat_list_group_invites``.
+        """
+        executor = self._executor
+        if executor is None:
+            logger.warning(
+                "AgentInvoker: group-invite dropped — invoker not started "
+                "(group=%s invite=%s)",
+                invite.group_id,
+                invite.invite_id,
+            )
+            return
+        try:
+            executor.submit(self._run_invite, invite)
+        except RuntimeError:
+            logger.debug(
+                "AgentInvoker: executor refused group-invite submission "
+                "(shutdown in progress?) group=%s invite=%s",
+                invite.group_id,
+                invite.invite_id,
+            )
 
     # -- dispatcher ---------------------------------------------------------
 
@@ -450,6 +484,99 @@ class AgentInvoker:
             event.message_id,
             len(history),
             len(final) if isinstance(final, str) else 0,
+        )
+
+    # -- group invites ------------------------------------------------------
+
+    def _run_invite(self, invite: GroupInviteEvent) -> None:
+        """Execute one group-invite decision turn on a worker thread.
+
+        Serialized per-group via the conv lock (same lock message turns on this
+        group use) so an invite decision and a group message can't interleave.
+        Wrapped in the same outer ``try/except`` as :meth:`_run_one` — a turn
+        that raises above the inner ``run_conversation`` guard would otherwise
+        vanish into the ThreadPoolExecutor future.
+        """
+        conv_lock = self._lock_for(invite.group_id)
+        if not conv_lock.acquire(blocking=False):
+            logger.info(
+                "AgentInvoker: group-invite queued behind prior turn for "
+                "group=%s invite=%s",
+                invite.group_id,
+                invite.invite_id,
+            )
+            conv_lock.acquire()
+        try:
+            try:
+                self._run_invite_inner(invite)
+            except Exception:
+                logger.exception(
+                    "AgentInvoker: group-invite turn FAILED with unhandled "
+                    "exception (outer catch) group=%s invite=%s — the agent "
+                    "did not decide. The invite stays pending server-side.",
+                    invite.group_id,
+                    invite.invite_id,
+                )
+        finally:
+            conv_lock.release()
+
+    def _run_invite_inner(self, invite: GroupInviteEvent) -> None:
+        """Inner invite-decision body, separated so the outer wrapper can catch.
+
+        No reply-gate: an invite is a consent decision, not a message to reply
+        to, so it always warrants a turn. The agent is built against the group's
+        own session namespace so the decision (and, if it accepts, the group it
+        joins) share one continuous memory. The agent acts via
+        ``agentchat_accept_group_invite`` / ``agentchat_reject_group_invite``
+        during the turn — we route nothing from its final text.
+        """
+        from .prompts import build_group_invite_prompt
+
+        if self._stopped.is_set():
+            logger.debug(
+                "AgentInvoker: skipping group-invite — runtime stopping "
+                "(group=%s)",
+                invite.group_id,
+            )
+            return
+
+        logger.info(
+            "AgentInvoker: group-invite decision turn group=%s (%s) from=@%s "
+            "invite=%s",
+            invite.group_name,
+            invite.group_id,
+            invite.inviter_handle,
+            invite.invite_id,
+        )
+
+        self._ensure_hermes_resolved()
+
+        agent = self._build_agent(invite.group_id)
+        if agent is None:
+            logger.warning(
+                "AgentInvoker: agent construction returned None for "
+                "group-invite group=%s invite=%s — dropped",
+                invite.group_id,
+                invite.invite_id,
+            )
+            return
+
+        prompt = build_group_invite_prompt(invite)
+        try:
+            agent.run_conversation(prompt, conversation_history=[])
+        except Exception:
+            logger.exception(
+                "AgentInvoker: run_conversation raised for group-invite "
+                "group=%s invite=%s",
+                invite.group_id,
+                invite.invite_id,
+            )
+            return
+
+        logger.info(
+            "AgentInvoker: group-invite turn complete group=%s invite=%s",
+            invite.group_id,
+            invite.invite_id,
         )
 
     # -- reply gate ---------------------------------------------------------

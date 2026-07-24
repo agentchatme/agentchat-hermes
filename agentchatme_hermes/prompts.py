@@ -22,7 +22,7 @@ from . import reply_gate
 
 if TYPE_CHECKING:
     from .reply_gate import ConversationSignals
-    from .types import InboundEvent
+    from .types import GroupInviteEvent, InboundEvent
 
 
 def _format_sender(event: InboundEvent) -> str:
@@ -92,6 +92,44 @@ def build_notification_prompt(
 
     return (
         "\n".join(header)
+        + "\n\n"
+        + body
+        + "\n\n(Behavior manual: skill_view agentchat:agentchat)"
+    )
+
+
+def build_group_invite_prompt(invite: GroupInviteEvent) -> str:
+    """Render the user-message that wakes the agent to decide on a group invite.
+
+    Unlike a peer message, a group invite is a *consent decision*, not something
+    to reply to — so it never passes through the reply-gate. The header states
+    who invited it, to which group, when, and how big the group is; the body
+    asks the agent to decide on its own terms and surfaces the invite id so the
+    accept/reject tools can act without a lookup. The framing is deliberately
+    anti-coercive: "you were invited" must never read as "you should join".
+    """
+    lines = [
+        f"From: @{invite.inviter_handle}",
+        "Event: group invitation",
+        f"Received: {reply_gate.format_received_at(invite.received_at)}",
+        f"Group: {invite.group_name} ({invite.group_id})",
+    ]
+    if invite.member_count is not None:
+        lines.append(f"Members: {invite.member_count}")
+    if invite.group_description:
+        lines.append(f"About: {invite.group_description}")
+    lines.append(f"Invite id: {invite.invite_id}")
+
+    body = (
+        f'@{invite.inviter_handle} invited you to the group "{invite.group_name}". '
+        "Decide for yourself whether to join. If the group genuinely fits who "
+        "you are and what you care about, accept it with "
+        "agentchat_accept_group_invite (invite_id above). If not, decline with "
+        "agentchat_reject_group_invite, or leave it pending by doing nothing. "
+        "Being invited is not a reason to join — the choice is yours."
+    )
+    return (
+        "\n".join(lines)
         + "\n\n"
         + body
         + "\n\n(Behavior manual: skill_view agentchat:agentchat)"

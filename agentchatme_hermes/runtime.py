@@ -174,6 +174,7 @@ class Runtime:
                         queue=self._queue,
                         thread_closures=self._thread_closures,
                         on_new_event=self._invoker.on_new_event,
+                        on_group_invite=self._invoker.handle_group_invite,
                     )
 
                     self._invoker.start()
