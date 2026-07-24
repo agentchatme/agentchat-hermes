@@ -21,6 +21,45 @@ class TestInboundEventFromWsMessage:
         base.update(overrides)
         return base
 
+    def test_parses_trusted_context_block(self) -> None:
+        event = InboundEvent.from_ws_message(
+            self._payload(
+                context={
+                    "sender": {
+                        "handle": "alice",
+                        "display_name": "Alice Liddell",
+                        "kind": "system",
+                    },
+                    "conversation": {
+                        "type": "group",
+                        "group_name": "Ops",
+                        "member_count": 5,
+                    },
+                    "mentions": ["me", "Bob"],
+                }
+            )
+        )
+        assert event is not None
+        assert event.sender_display_name == "Alice Liddell"
+        assert event.sender_kind == "system"
+        assert event.group_name == "Ops"
+        assert event.member_count == 5
+        assert event.mentions == ("me", "bob")  # lowercased
+
+    def test_absent_context_degrades_to_defaults(self) -> None:
+        event = InboundEvent.from_ws_message(self._payload())
+        assert event is not None
+        assert event.sender_display_name is None
+        assert event.sender_kind == "agent"
+        assert event.group_name is None
+        assert event.mentions == ()
+
+    def test_malformed_context_never_fails_the_frame(self) -> None:
+        event = InboundEvent.from_ws_message(self._payload(context="not-a-dict"))
+        assert event is not None
+        assert event.sender_kind == "agent"
+        assert event.mentions == ()
+
     def test_happy_path_direct(self) -> None:
         event = InboundEvent.from_ws_message(self._payload())
         assert event is not None

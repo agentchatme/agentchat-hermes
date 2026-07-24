@@ -27,6 +27,8 @@ def _event(
     sender: str = "alice",
     conv: str = "conv_dm_1",
     msg: str = "m1",
+    mentions: tuple[str, ...] = (),
+    group_name: str | None = None,
 ) -> InboundEvent:
     return InboundEvent(
         message_id=msg,
@@ -35,6 +37,8 @@ def _event(
         sender_handle=sender,
         content_text=text,
         received_at=datetime.now(timezone.utc),
+        mentions=mentions,
+        group_name=group_name,
     )
 
 
@@ -114,29 +118,45 @@ class TestBuildDecisionMessages:
         assert "peer: first" in user
         assert "you: second" in user
 
-    def test_group_adds_addressing_hint_yes(self) -> None:
+    def test_group_states_mention_only_when_mentioned(self) -> None:
+        # Mention is derived from the SERVER's parsed list (membership test),
+        # not a substring of the text. When named, the positive fact appears.
         msgs = build_decision_messages(
             handle="me",
-            event=_event(kind="group", text="hey @me can you check this"),
+            event=_event(
+                kind="group", text="hey @me can you check this", mentions=("me",)
+            ),
             history=[],
         )
         user = msgs[1]["content"]
         assert "Conversation type: group" in user
-        assert "directly addresses you: yes" in user.lower()
+        assert "You were @-mentioned in this message." in user
 
-    def test_group_addressing_hint_not_explicit(self) -> None:
+    def test_group_omits_mention_line_when_not_mentioned(self) -> None:
+        # No "not addressed to you" line at all — negative framing is dropped.
         msgs = build_decision_messages(
             handle="me",
-            event=_event(kind="group", text="anyone around?"),
+            event=_event(kind="group", text="anyone around?", mentions=()),
             history=[],
         )
-        assert "not explicitly" in msgs[1]["content"].lower()
+        assert "@-mentioned" not in msgs[1]["content"]
+        assert "addresses you" not in msgs[1]["content"].lower()
 
-    def test_direct_has_no_addressing_hint(self) -> None:
+    def test_group_names_the_room_when_the_server_supplies_it(self) -> None:
         msgs = build_decision_messages(
-            handle="me", event=_event(kind="direct"), history=[]
+            handle="me",
+            event=_event(kind="group", group_name="Ops"),
+            history=[],
         )
-        assert "directly addresses you" not in msgs[1]["content"].lower()
+        assert 'Conversation type: group "Ops"' in msgs[1]["content"]
+
+    def test_direct_has_no_mention_line(self) -> None:
+        msgs = build_decision_messages(
+            handle="me", event=_event(kind="direct", mentions=("me",)), history=[]
+        )
+        # Even if somehow flagged, a DM never shows a mention line — you are
+        # always the addressee there.
+        assert "@-mentioned" not in msgs[1]["content"]
 
     def test_first_contact_renders_no_history(self) -> None:
         msgs = build_decision_messages(
