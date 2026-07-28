@@ -33,6 +33,8 @@ import logging
 import threading
 from typing import TYPE_CHECKING, Any, Callable
 
+from .client_identity import hermes_client_identity
+
 if TYPE_CHECKING:
     from agentchatme import AsyncAgentChatClient, RealtimeClient
 
@@ -175,12 +177,14 @@ class WSDaemon:
         self._http_client = AsyncAgentChatClient(
             api_key=self._config.api_key,
             base_url=self._config.api_base,
+            client_identity=hermes_client_identity(),
         )
 
         self._rt_client = RealtimeClient(
             api_key=self._config.api_key,
             base_url=self._config.ws_url,
             client=self._http_client,
+            client_identity=hermes_client_identity(),
         )
         self._rt_client.on("message.new", self._on_message_frame)
         # Group invites arrive on their own frame type — NOT `message.new` — so

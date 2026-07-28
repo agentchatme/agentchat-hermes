@@ -28,6 +28,7 @@ import os
 import re
 from typing import Any
 
+from .client_identity import HERMES_CLIENT_HEADERS, hermes_client_identity
 from .soul_anchor import AnchorError, remove_soul_anchor, write_soul_anchor
 
 logger = logging.getLogger(__name__)
@@ -675,6 +676,7 @@ def _register_start(*, email: str, handle: str, display_name: str) -> str:
         resp = httpx.post(
             f"{_api_base()}/v1/register",
             json=body,
+            headers=HERMES_CLIENT_HEADERS,
             timeout=15.0,
         )
     except httpx.HTTPError as exc:
@@ -744,7 +746,10 @@ def _register_verify(*, pending_id: str, code: str) -> tuple[str, str]:
 
     try:
         agent, api_key, auth_client = AgentChatClient.verify(
-            pending_id, code, base_url=_api_base()
+            pending_id,
+            code,
+            base_url=_api_base(),
+            client_identity=hermes_client_identity(),
         )
     except Exception as exc:
         err_code = getattr(exc, "code", None)
@@ -774,7 +779,11 @@ def _validate_key_remote(api_key: str, print_warning: Any) -> str | None:
     """
     from agentchatme import AgentChatClient
 
-    client = AgentChatClient(api_key=api_key, base_url=_api_base())
+    client = AgentChatClient(
+        api_key=api_key,
+        base_url=_api_base(),
+        client_identity=hermes_client_identity(),
+    )
     try:
         try:
             me = client.get_me()

@@ -31,6 +31,7 @@ from getpass import getpass
 from typing import TYPE_CHECKING, Any, Callable
 
 from ._version import __version__
+from .client_identity import hermes_client_identity
 from .soul_anchor import AnchorError, remove_soul_anchor, write_soul_anchor
 
 if TYPE_CHECKING:
@@ -193,7 +194,10 @@ def _dispatch_register(args: argparse.Namespace) -> int:
 
     try:
         _agent, api_key, auth_client = AgentChatClient.verify(
-            pending_id, code, base_url=api_base
+            pending_id,
+            code,
+            base_url=api_base,
+            client_identity=hermes_client_identity(),
         )
     except AgentChatError as exc:
         return _exit_with(f"Verification failed: {exc}")
@@ -242,7 +246,11 @@ def _dispatch_login(args: argparse.Namespace) -> int:
             "`pip install agentchatme` and try again.",
         )
 
-    client = AgentChatClient(api_key=api_key, base_url=api_base)
+    client = AgentChatClient(
+        api_key=api_key,
+        base_url=api_base,
+        client_identity=hermes_client_identity(),
+    )
     try:
         try:
             me = client.get_me()
@@ -287,7 +295,11 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
             "The `agentchatme` SDK is not installed."
         )
 
-    client = AgentChatClient(api_key=saved_key, base_url=api_base)
+    client = AgentChatClient(
+        api_key=saved_key,
+        base_url=api_base,
+        client_identity=hermes_client_identity(),
+    )
     try:
         try:
             me = client.get_me()
@@ -386,7 +398,11 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
         # No key to test connectivity with — skip the rest.
         return _doctor_finalize(failures, warnings_count)
 
-    client = AgentChatClient(api_key=saved_key, base_url=api_base)
+    client = AgentChatClient(
+        api_key=saved_key,
+        base_url=api_base,
+        client_identity=hermes_client_identity(),
+    )
     try:
         try:
             me = client.get_me()

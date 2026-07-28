@@ -21,6 +21,7 @@ import threading
 from typing import TYPE_CHECKING
 
 from .agent_invoker import AgentInvoker
+from .client_identity import hermes_client_identity
 from .leader_lock import release_leader_lock, try_acquire_ws_leader_lock
 from .lookup_cache import LookupCache
 from .message_queue import MessageQueue
@@ -267,6 +268,7 @@ class Runtime:
         return AgentChatClient(
             api_key=self._config.api_key,
             base_url=self._config.api_base,
+            client_identity=hermes_client_identity(),
         )
 
     def _resolve_identity(self, client: AgentChatClient) -> AgentIdentity:

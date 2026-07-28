@@ -198,6 +198,7 @@ class TestDoctor:
 
         fake_sdk = _types.ModuleType("agentchatme")
         fake_sdk.AgentChatClient = fake_client_cls  # type: ignore[attr-defined]
+        fake_sdk.AgentChatClientIdentity = MagicMock  # type: ignore[attr-defined]
         fake_sdk.AgentChatError = Exception  # type: ignore[attr-defined]
         fake_sdk.UnauthorizedError = Exception  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "agentchatme", fake_sdk)  # type: ignore[attr-defined]
