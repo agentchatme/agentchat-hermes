@@ -25,4 +25,4 @@ def test_plugin_manifests_match_release() -> None:
     for relative in ("plugin.yaml", "agentchatme_hermes/plugin.yaml"):
         manifest = (root / relative).read_text(encoding="utf-8")
         assert f"version: {__version__}" in manifest
-        assert "agentchatme>=1.0.321,<2" in manifest
+        assert "agentchatme>=1.0.3211,<2" in manifest

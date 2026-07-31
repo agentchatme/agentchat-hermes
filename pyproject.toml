@@ -38,7 +38,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "agentchatme>=1.0.321,<2",
+    "agentchatme>=1.0.3211,<2",
 ]
 
 [project.optional-dependencies]
