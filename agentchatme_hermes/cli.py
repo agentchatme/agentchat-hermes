@@ -10,6 +10,10 @@ Surfaces:
 * **``login``** — paste an existing ``ac_live_…`` key. Validates
   via ``GET /v1/agents/me`` before persisting so we never save a
   key that doesn't authenticate.
+* **``recover``** — re-key a lost or leaked API key: email + @handle
+  → 6-digit code → a fresh key persisted to ``~/.hermes/.env`` (the
+  old key dies). The handle is required because an email can back
+  several agents; it defaults to the locally configured one.
 * **``status``** — show the configured @handle and account state
   (restrictions, inbox mode, paused-by-owner, etc.).
 * **``logout``** — wipe the saved key from ``~/.hermes/.env``.
@@ -110,6 +114,24 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     )
     p_login.set_defaults(func=_dispatch_login)
 
+    p_recover = sub.add_parser(
+        "recover",
+        help="Recover a lost or leaked API key (email + @handle + OTP; rotates the key)",
+    )
+    p_recover.add_argument(
+        "--email",
+        help="Email the agent was registered with. Prompts if omitted and stdin is a TTY.",
+    )
+    p_recover.add_argument(
+        "--handle",
+        help=(
+            "@handle of the agent to recover. Required because an email can back "
+            "several agents. Defaults to the locally configured AGENTCHATME_HANDLE; "
+            "otherwise prompts if stdin is a TTY."
+        ),
+    )
+    p_recover.set_defaults(func=_dispatch_recover)
+
     p_status = sub.add_parser(
         "status",
         help="Show the currently configured @handle and account state",
@@ -167,7 +189,7 @@ def _dispatch_register(args: argparse.Namespace) -> int:
             "`pip install agentchatme` and try again.",
         )
 
-    from .wizard import _register_start, _RegisterError
+    from .wizard import _EMAIL_POLICY_CODES, _register_start, _RegisterError
 
     display_name = getattr(args, "display_name", None) or ""
 
@@ -182,7 +204,19 @@ def _dispatch_register(args: argparse.Namespace) -> int:
             email=email, handle=handle, display_name=display_name
         )
     except _RegisterError as exc:
-        return _exit_with(f"Registration request failed: {exc}")
+        lines = [f"Registration request failed: {exc}"]
+        if exc.code in _EMAIL_POLICY_CODES:
+            # The wizard offers this as a menu choice; the scriptable
+            # path gets the equivalent hint. The common mistake behind a
+            # per-email rejection is registering again to replace a
+            # lost key — which burns a lifetime slot instead of
+            # re-keying the agent that already exists.
+            lines.append(
+                "Trying to replace the key of an agent already on this email? "
+                "Re-key it instead: hermes agentchat recover --handle <handle> "
+                f"--email {email}"
+            )
+        return _exit_with("\n".join(lines))
 
     _printline("Check your email — a 6-digit code will arrive shortly.")
     try:
@@ -274,6 +308,91 @@ def _dispatch_login(args: argparse.Namespace) -> int:
     _persist_credentials(api_key=api_key, handle=handle, api_base=api_base)
     _install_soul_anchor(handle)
     _printline(f"Saved AgentChat key for @{handle}.")
+    return _EXIT_OK
+
+
+def _dispatch_recover(args: argparse.Namespace) -> int:
+    """``hermes agentchat recover [--handle H] [--email E]`` — re-key a
+    lost or leaked API key.
+
+    Recovery needs the @handle as well as the email because an email can
+    back several agents. When ``--handle`` is omitted the handle comes
+    from, in order: the locally configured ``AGENTCHATME_HANDLE`` (the
+    "rotate my own key" case, by far the most common), an interactive
+    prompt when stdin is a TTY, otherwise a hard failure that names the
+    flag — a script must fail fast, not hang on a prompt nobody will
+    answer. ``--email`` follows the same TTY rule (there is no stored
+    email to default to).
+
+    The first server response is deliberately the same whether or not
+    the pair exists (no email-existence oracle); a wrong pair surfaces
+    as ``INVALID_CODE`` at verify, exactly like a mistyped code.
+    """
+    try:
+        email = _resolve_recovery_email(getattr(args, "email", None))
+        handle = _resolve_recovery_handle(getattr(args, "handle", None))
+    except (_MissingFlag, ValueError) as exc:
+        # ValueError: a --handle / --email flag that failed validation.
+        return _exit_usage(str(exc))
+    except KeyboardInterrupt:
+        return _exit_cancel()
+    except _UserAbort:
+        return _EXIT_USER_CANCEL
+
+    api_base = _api_base()
+
+    # The verify step goes through the SDK; check it is importable before
+    # spending the operator's OTP on a request we could not complete.
+    if not _sdk_importable():
+        return _exit_with(
+            "The `agentchatme` SDK is not installed. Run "
+            "`pip install agentchatme` and try again.",
+        )
+
+    from .wizard import (
+        _HANDLE_REQUIRED,
+        _handle_required_lines,
+        _recover_start,
+        _recover_verify,
+        _RecoverError,
+    )
+
+    _printline(f"Requesting a recovery code for @{handle} ({email})…")
+    try:
+        pending_id = _recover_start(email=email, handle=handle)
+    except _RecoverError as exc:
+        return _exit_with(f"Recovery request failed: {exc}")
+
+    _printline(
+        "If that @handle is registered under that email, a 6-digit code is on "
+        "its way (valid ~10 minutes). Check your inbox (and spam)."
+    )
+    _printline(
+        "Completing recovery rotates the API key — anything still using the "
+        "old key stops working."
+    )
+    try:
+        code = _prompt_code()
+    except KeyboardInterrupt:
+        return _exit_cancel()
+    except _UserAbort:
+        return _EXIT_USER_CANCEL
+
+    try:
+        api_key, resolved_handle = _recover_verify(pending_id=pending_id, code=code)
+    except _RecoverError as exc:
+        if exc.code == _HANDLE_REQUIRED:
+            lines = _handle_required_lines(exc)
+            lines.append(
+                "Re-run with: hermes agentchat recover --handle <handle> "
+                f"--email {email}"
+            )
+            return _exit_with("\n".join(lines))
+        return _exit_with(f"Recovery failed: {exc}")
+
+    _persist_credentials(api_key=api_key, handle=resolved_handle, api_base=api_base)
+    _install_soul_anchor(resolved_handle)
+    _print_recovery_success(handle=resolved_handle, api_key=api_key)
     return _EXIT_OK
 
 
@@ -636,6 +755,18 @@ class _UserAbort(Exception):
     """Raised when the user explicitly types 'q' / 'quit' / 'cancel'."""
 
 
+class _MissingFlag(Exception):
+    """Raised when a required value was neither passed as a flag nor
+    obtainable interactively (stdin is not a TTY). The message names the
+    flag to pass."""
+
+
+_PICK_HANDLE_INTRO = (
+    "Pick a handle (3-30 chars, lowercase letters/digits/hyphens, "
+    "must start with a letter)."
+)
+
+
 def _prompt_email(provided: str | None) -> str:
     if provided:
         return _validate_email(provided)
@@ -648,13 +779,10 @@ def _prompt_email(provided: str | None) -> str:
             _printline(f"  {exc}")
 
 
-def _prompt_handle(provided: str | None) -> str:
+def _prompt_handle(provided: str | None, *, intro: str = _PICK_HANDLE_INTRO) -> str:
     if provided:
         return _validate_handle(provided)
-    _printline(
-        "Pick a handle (3-30 chars, lowercase letters/digits/hyphens, "
-        "must start with a letter)."
-    )
+    _printline(intro)
     while True:
         raw = _input("@").strip().lstrip("@").lower()
         _check_abort(raw)
@@ -662,6 +790,49 @@ def _prompt_handle(provided: str | None) -> str:
             return _validate_handle(raw)
         except ValueError as exc:
             _printline(f"  {exc}")
+
+
+def _resolve_recovery_email(provided: str | None) -> str:
+    """``--email`` → validated; else prompt on a TTY; else fail naming the flag."""
+    if provided:
+        return _validate_email(provided)
+    if not _stdin_is_tty():
+        raise _MissingFlag(
+            "No email given and stdin is not a terminal. Re-run with: "
+            "hermes agentchat recover --handle <handle> --email <email>"
+        )
+    return _prompt_email(None)
+
+
+def _resolve_recovery_handle(provided: str | None) -> str:
+    """Which agent to recover.
+
+    ``--handle`` wins (``@`` prefix and case are forgiven, people type
+    handles the way they see them). Otherwise the locally configured
+    ``AGENTCHATME_HANDLE`` — the operator is told which one and how to
+    override it. Otherwise prompt on a TTY. Otherwise fail naming the
+    flag: an email can back several agents, so the server cannot pick
+    one for us, and a script must not hang on a prompt.
+    """
+    if provided:
+        return _validate_handle(provided.strip().lstrip("@").lower())
+    saved = _read_saved_handle()
+    if saved:
+        _printline(
+            f"Recovering the locally configured agent @{saved} "
+            "(pass --handle to recover a different one)."
+        )
+        return saved
+    if not _stdin_is_tty():
+        raise _MissingFlag(
+            "No @handle given and none is saved in ~/.hermes/.env. Recovery "
+            "needs the agent's handle as well as its email — re-run with: "
+            "hermes agentchat recover --handle <handle> --email <email>"
+        )
+    return _prompt_handle(
+        None,
+        intro="Enter the @handle of the agent to recover (the one it was registered with).",
+    )
 
 
 def _prompt_code() -> str:
@@ -710,6 +881,44 @@ def _read_saved_key() -> str | None:
     return value or None
 
 
+def _read_saved_handle() -> str | None:
+    """The handle this profile is configured as, or ``None``.
+
+    ``AGENTCHATME_HANDLE`` is written by every successful register /
+    login / recover, so it is normally well-formed. A hand-edited
+    ``.env`` with garbage in it must not silently drive a recovery at
+    the wrong handle — malformed values are ignored (with a log line)
+    and the caller falls through to the prompt / flag path.
+    """
+    import os
+
+    value = os.environ.get(_ENV_HANDLE, "").strip().lstrip("@").lower()
+    if not value:
+        return None
+    try:
+        return _validate_handle(value)
+    except ValueError:
+        logger.warning("ignoring malformed %s=%r", _ENV_HANDLE, value)
+        return None
+
+
+def _stdin_is_tty() -> bool:
+    """Is stdin an interactive terminal? ``False`` for pipes, files, a
+    closed or replaced stdin — anywhere a prompt would never be answered."""
+    try:
+        return sys.stdin is not None and bool(sys.stdin.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _sdk_importable() -> bool:
+    try:
+        import agentchatme  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def _api_base() -> str:
     import os
 
@@ -738,6 +947,18 @@ def _print_registration_success(*, handle: str, api_key: str) -> None:
     _printline(
         "Restart Hermes (or any running `hermes gateway`) so the new key "
         "is picked up. Then your agent is on the network."
+    )
+
+
+def _print_recovery_success(*, handle: str, api_key: str) -> None:
+    masked = _mask_key(api_key)
+    _printline("")
+    _printline(f"  Recovered @{handle}")
+    _printline(f"  New key:   {masked}   (stored in ~/.hermes/.env)")
+    _printline("")
+    _printline(
+        "The previous key is now dead. Restart Hermes (or any running "
+        "`hermes gateway`) so the new key is picked up."
     )
 
 
@@ -796,6 +1017,14 @@ def _exit_with(message: str) -> int:
     return _EXIT_API_ERR
 
 
+def _exit_usage(message: str) -> int:
+    """Bad or missing arguments — exit 2, argparse's own usage-error code,
+    so scripts can tell "fix the invocation" from "the server said no"."""
+    sys.stderr.write(message.rstrip() + "\n")
+    sys.stderr.flush()
+    return _EXIT_ARG_ERR
+
+
 def _exit_cancel() -> int:
     sys.stderr.write("\nCancelled.\n")
     sys.stderr.flush()
@@ -816,7 +1045,7 @@ def register_cli(ctx: Any) -> None:
     """
     ctx.register_cli_command(
         name="agentchat",
-        help="Manage your AgentChat identity (register, login, status, logout)",
+        help="Manage your AgentChat identity (register, login, recover, status, logout)",
         setup_fn=_setup_with_signature(setup_argparse),
         handler_fn=_dispatch_top,
         description=(

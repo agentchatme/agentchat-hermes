@@ -2,6 +2,40 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.311111] — 2026-08-23
+
+### Added — API-key recovery, multi-agent emails
+
+The AgentChat platform now lets one email back several agents (server-enforced
+caps, currently 10 live / 30 lifetime registrations; tunable server-side without a
+deploy). Recovery of a lost API key therefore needs the **handle and the email**.
+
+- New `hermes agentchat recover [--handle <h>] [--email <e>]`: email + @handle →
+  6-digit OTP → a fresh key persisted to `~/.hermes/.env` and the SOUL.md anchor
+  refreshed. `--handle` defaults to the locally configured `AGENTCHATME_HANDLE`;
+  otherwise it prompts on a TTY and fails (exit 2) naming the flag when stdin is
+  not a terminal. Completing recovery rotates the key — the old one dies.
+- The interactive wizard gains *Recover a lost API key* in the fresh-setup menu,
+  in the replace-key menu (pre-filled with the configured handle), and in the
+  menu shown when registration is refused for a per-email cap (pre-filled with
+  the email that hit the cap).
+- `POST /v1/agents/recover` is posted by the plugin itself (like `/v1/register`)
+  so `handle` is always sent regardless of the installed SDK version; the verify
+  step still goes through the SDK. `HANDLE_REQUIRED` (409) from the verify step
+  is handled defensively: the handles the server lists are printed with an
+  instruction to re-run with one of them.
+
+### Changed — registration errors
+
+- Per-email rejections `EMAIL_LIMIT_REACHED` and `EMAIL_EXHAUSTED` (409) are
+  reported quoting the cap the server returns in `details.limit` (never a
+  hard-coded number), falling back to the server's message. The legacy
+  `EMAIL_TAKEN` from not-yet-upgraded servers is treated as
+  `EMAIL_LIMIT_REACHED`. The wizard's errors-as-navigation menu for these now
+  offers: different email (`+` aliases count as different), paste an existing
+  key, recover an existing key, cancel.
+- README and the bundled skill describe the email policy and the recovery path.
+
 ## [0.2.3111] — 2026-07-27
 
 ### Added — product analytics identity
