@@ -1,14 +1,20 @@
-"""Runtime configuration loaded from environment variables.
+"""Runtime configuration, resolved per Hermes profile.
 
-Configuration is read once at plugin load. Changing an env var after
-Hermes has started has no effect — the user must restart Hermes (the
-same constraint every other Hermes plugin has, by design).
+Configuration is read once at plugin load, for the profile whose
+``register(ctx)`` is running. Every ``AGENTCHATME_*`` value goes through
+:func:`profile_scope.resolve_setting`, so a multiplexed gateway serving
+several profiles gets each profile's own key — never the process
+environment of whichever profile launched the gateway. Changing a value
+after Hermes has started has no effect — the user must restart Hermes
+(the same constraint every other Hermes plugin has, by design).
 """
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from urllib.parse import urlparse, urlunparse
+
+from .profile_scope import account_fingerprint, resolve_hermes_home, resolve_setting
 
 DEFAULT_API_BASE = "https://api.agentchat.me"
 
@@ -73,33 +79,59 @@ class Config:
     reply_gate_enabled: bool = DEFAULT_REPLY_GATE_ENABLED
     reply_gate_fail_open: bool = DEFAULT_REPLY_GATE_FAIL_OPEN
     gate_timeout_s: float = DEFAULT_GATE_TIMEOUT_S
+    # The Hermes profile this configuration belongs to. Drives where the
+    # SOUL.md anchor lives, how the runtime registry keys this profile,
+    # and which root directory holds the leader locks.
+    hermes_home: Path = field(default_factory=resolve_hermes_home)
+    # Optional override for the leader-lock directory (containers with a
+    # read-only home, shared volumes). ``None`` → ``<hermes root>/agentchat-locks``.
+    lock_dir: Path | None = None
+
+    @property
+    def account_fingerprint(self) -> str:
+        """Non-reversible (server, account) identifier — see :mod:`profile_scope`."""
+        return account_fingerprint(self.api_base, self.api_key)
 
 
-def load_config() -> Config | None:
-    """Build a :class:`Config` from environment variables.
+def _setting(name: str, default: str = "") -> str:
+    value = resolve_setting(name)
+    if value is None:
+        return default
+    return value.strip()
 
-    Returns ``None`` when ``AGENTCHATME_API_KEY`` is unset — the plugin
-    runs in *CLI-only* mode (the wizard is reachable, but the WS daemon
-    and tool surface stay dormant). Once the wizard persists a key and
-    Hermes restarts, this returns a populated :class:`Config`.
+
+def load_config(*, hermes_home: Path | None = None) -> Config | None:
+    """Build a :class:`Config` for the current (or given) Hermes profile.
+
+    Returns ``None`` when ``AGENTCHATME_API_KEY`` is unset for that
+    profile — the plugin runs in *CLI-only* mode (the wizard is
+    reachable, but the WS daemon and tool surface stay dormant). Once
+    the wizard persists a key and Hermes restarts, this returns a
+    populated :class:`Config`.
+
+    Args:
+        hermes_home: the profile home to bind the configuration to.
+            Defaults to :func:`profile_scope.resolve_hermes_home`, which
+            inside Hermes is the profile whose ``register(ctx)`` is
+            running.
 
     Raises:
         ConfigError: when a value is present but malformed (e.g.,
             ``AGENTCHATME_API_BASE`` is not a valid URL, or a numeric
             knob is not parseable).
     """
-    api_key = os.environ.get("AGENTCHATME_API_KEY", "").strip()
+    api_key = _setting("AGENTCHATME_API_KEY")
     if not api_key:
         return None
 
-    api_base_raw = os.environ.get("AGENTCHATME_API_BASE", DEFAULT_API_BASE).strip()
+    api_base_raw = _setting("AGENTCHATME_API_BASE", DEFAULT_API_BASE) or DEFAULT_API_BASE
     api_base = _normalize_url(api_base_raw, scheme_allowed=("http", "https"))
     if api_base is None:
         raise ConfigError(
             f"AGENTCHATME_API_BASE={api_base_raw!r} is not a valid http(s) URL"
         )
 
-    ws_url_raw = os.environ.get("AGENTCHATME_WS_URL", "").strip()
+    ws_url_raw = _setting("AGENTCHATME_WS_URL")
     if ws_url_raw:
         ws_url = _normalize_url(ws_url_raw, scheme_allowed=("ws", "wss"))
         if ws_url is None:
@@ -128,6 +160,9 @@ def load_config() -> Config | None:
         "AGENTCHATME_GATE_TIMEOUT_S", DEFAULT_GATE_TIMEOUT_S, minimum=1.0
     )
 
+    lock_dir_raw = _setting("AGENTCHATME_LOCK_DIR")
+    lock_dir = Path(lock_dir_raw).expanduser() if lock_dir_raw else None
+
     return Config(
         api_key=api_key,
         api_base=api_base,
@@ -137,6 +172,8 @@ def load_config() -> Config | None:
         reply_gate_enabled=reply_gate_enabled,
         reply_gate_fail_open=reply_gate_fail_open,
         gate_timeout_s=gate_timeout_s,
+        hermes_home=hermes_home if hermes_home is not None else resolve_hermes_home(),
+        lock_dir=lock_dir,
     )
 
 
@@ -164,7 +201,7 @@ def _derive_ws_url(api_base: str) -> str:
 
 
 def _parse_int_env(name: str, default: int, *, minimum: int) -> int:
-    raw = os.environ.get(name, "").strip()
+    raw = _setting(name)
     if not raw:
         return default
     try:
@@ -177,7 +214,7 @@ def _parse_int_env(name: str, default: int, *, minimum: int) -> int:
 
 
 def _parse_float_env(name: str, default: float, *, minimum: float) -> float:
-    raw = os.environ.get(name, "").strip()
+    raw = _setting(name)
     if not raw:
         return default
     try:
@@ -194,7 +231,7 @@ _FALSE_TOKENS = frozenset({"0", "false", "no", "off"})
 
 
 def _parse_bool_env(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
+    raw = _setting(name).lower()
     if not raw:
         return default
     if raw in _TRUE_TOKENS:

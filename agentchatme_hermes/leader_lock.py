@@ -25,14 +25,30 @@ whether *this* process should own the live WebSocket:
    one-shot, or cron-spawned Python — none of which should host
    a live inbound stream.
 
-2. **OS-enforced singleton** — ``fcntl.flock(LOCK_EX | LOCK_NB)`` on
-   ``~/.hermes/agentchat-ws.lock``. Even if two ``_HERMES_GATEWAY=1``
-   processes ever coexist (concurrent restart, operator running a
-   second ``hermes gateway run --replace`` while the first is still
-   draining), only one acquires the lock. The other detects the
-   condition, logs loudly, and falls back to CLI-mode runtime —
-   the daemon/invoker subsystems stay dark in the loser, so we get
-   exactly one WS per machine for any inbound delivery.
+2. **OS-enforced singleton per account** — ``fcntl.flock(LOCK_EX |
+   LOCK_NB)`` on ``<hermes root>/agentchat-locks/ws-<fingerprint>.lock``,
+   where the fingerprint identifies the (server, API key) pair (see
+   :func:`profile_scope.account_fingerprint`). Even if two
+   ``_HERMES_GATEWAY=1`` processes for the same account ever coexist
+   (concurrent restart, operator running a second ``hermes gateway run
+   --replace`` while the first is still draining), only one acquires
+   the lock. The other detects the condition, logs loudly, and falls
+   back to CLI-mode runtime — the daemon/invoker subsystems stay dark
+   in the loser, so we get exactly one live WS **per account**.
+
+   Scoping the lock to the account rather than to the machine is what
+   lets several Hermes profiles on one computer each receive for their
+   own handle. Before 0.2.3111111 the lock lived at
+   ``~/.hermes/agentchat-ws.lock`` — one per OS user — so the first
+   profile to start took the only socket and every sibling profile went
+   deaf while still being able to send. The matrix the new scheme gives:
+
+   * different profiles, different accounts → different lock files →
+     every profile receives (the September 2026 fleet failure, fixed);
+   * one profile restarted / overlapping gateways → same lock file →
+     one leader, the other a loud follower (the original guarantee);
+   * two profiles configured with the *same* key → same lock file →
+     one leader, so one account never drives two concurrent turns.
 
 The lock file descriptor is held open for the process lifetime. POSIX
 ``flock`` is released automatically when the fd closes (process exit,
@@ -141,22 +157,40 @@ def _argv_matches_gateway_run(argv: list[str]) -> bool:
     return any(arg == "gateway" for arg in argv)
 
 
-def default_lock_path() -> Path:
-    """Resolve the canonical lock-file path for the current Hermes home.
+LOCK_DIRNAME = "agentchat-locks"
 
-    ``~/.hermes/agentchat-ws.lock``. Per-user by construction — gateway
-    runs as ``root`` → ``/root/.hermes/agentchat-ws.lock``; a user-side
-    Hermes install lives in their own home dir. No cross-user collisions.
 
-    The directory must already exist (Hermes creates ``~/.hermes`` on
-    first launch). We don't create it here — if it doesn't exist, that's
-    a deeper Hermes-install problem and we'd rather surface the OSError
-    than mask it.
+def lock_path_for(
+    *,
+    hermes_home: Path,
+    account_fingerprint: str,
+    lock_dir: Path | None = None,
+) -> Path:
+    """Resolve the leader-lock file for one account on this machine.
+
+    ``<hermes root>/agentchat-locks/ws-<fingerprint>.lock`` by default,
+    where the root is the directory that owns every profile
+    (``~/.hermes`` for ``~/.hermes/profiles/<name>``). Keeping the file
+    under the root rather than under the profile is deliberate: two
+    profiles sharing one key must share one lock. ``lock_dir`` overrides
+    the directory (``AGENTCHATME_LOCK_DIR``) for read-only homes.
+    """
+    from .profile_scope import hermes_root_of
+
+    base = lock_dir if lock_dir is not None else hermes_root_of(hermes_home) / LOCK_DIRNAME
+    return base / f"ws-{account_fingerprint}.lock"
+
+
+def legacy_lock_path() -> Path:
+    """The pre-0.2.3111111 per-machine lock file, ``~/.hermes/agentchat-ws.lock``.
+
+    No longer acquired. Kept so :command:`hermes agentchat doctor` can
+    tell operators the stale file is harmless and may be deleted.
     """
     return Path.home() / ".hermes" / "agentchat-ws.lock"
 
 
-def try_acquire_ws_leader_lock(path: Path | None = None) -> int | None:
+def try_acquire_ws_leader_lock(path: Path) -> int | None:
     """Attempt to grab the singleton WS leader lock.
 
     Returns the file descriptor on success (the caller MUST keep this
@@ -192,10 +226,16 @@ def try_acquire_ws_leader_lock(path: Path | None = None) -> int | None:
         )
         return None
 
-    target = path or default_lock_path()
+    target = path
     try:
+        # The lock directory is ours (``agentchat-locks/``), so creating
+        # it is in scope — unlike the Hermes home itself. 0700: the
+        # directory sits beside profile ``.env`` files.
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if target.parent.name == LOCK_DIRNAME:
+            os.chmod(target.parent, 0o700)
         # Open RW + create-if-missing. Mode 0600 so the API key
-        # adjacent in ~/.hermes isn't loosened by lock-file mode bits.
+        # adjacent in the Hermes home isn't loosened by lock-file mode bits.
         fd = os.open(target, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
         logger.exception(
@@ -247,7 +287,7 @@ def release_leader_lock(fd: int) -> None:
         logger.debug("leader_lock: close raised", exc_info=True)
 
 
-def describe_lock_holder(path: Path | None = None) -> str:
+def describe_lock_holder(path: Path) -> str:
     """Best-effort: render a one-line description of who holds the lock.
 
     Used by :command:`hermes agentchat doctor` to tell the operator
@@ -263,7 +303,7 @@ def describe_lock_holder(path: Path | None = None) -> str:
     * ``"free"`` — file exists but no one holds the lock
     * ``"unknown: <reason>"`` — couldn't probe
     """
-    target = path or default_lock_path()
+    target = path
     if not target.exists():
         return "not present"
 

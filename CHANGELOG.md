@@ -2,6 +2,58 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3111111] — 2026-10-21
+
+### Fixed — several Hermes profiles on one machine now each receive
+
+Two isolation defects, confirmed on a real fleet in September 2026, made
+multi-profile installs go deaf or send as the wrong agent. Both are fixed.
+
+- **Leader lock is per account, not per machine.** The WebSocket leader
+  lock moved from `~/.hermes/agentchat-ws.lock` (one per OS user) to
+  `<hermes root>/agentchat-locks/ws-<fingerprint>.lock`, where the
+  fingerprint identifies the (server, API key) pair. Profiles with their
+  own accounts each hold their own live socket; two processes for the
+  *same* account still elect exactly one leader; two profiles configured
+  with one key share one lock, so an account never drives two turns at
+  once. The lock directory is created on demand (0700). The old file is no
+  longer used; `hermes agentchat doctor` says so and it can be deleted.
+  `AGENTCHATME_LOCK_DIR` overrides the directory for read-only homes.
+- **One runtime per profile and account.** The module-level singleton is
+  now a registry keyed by (profile home, server, account). A multiplexed
+  gateway (Hermes ≥ 0.22, one process serving every profile) gets one
+  runtime per profile, each bound to that profile's own key, SOUL.md and
+  lock. `get_runtime` logs instead of silently ignoring a conflicting
+  `gateway_mode`; `get_existing_runtime()` refuses to guess when several
+  profiles are registered. The agent invoker holds a reference to its own
+  runtime instead of resolving a process-wide one at call time.
+- **Settings resolve per profile.** Every `AGENTCHATME_*` value now goes
+  through Hermes' profile-scoped `agent.secret_scope.get_secret` when
+  available (the bound profile's `.env` overlay, never another profile's
+  process environment), falling back to the profile's own `.env` when no
+  scope is bound during discovery, and to `os.environ` outside Hermes.
+  `load_config(hermes_home=...)` binds the configuration to its profile.
+- **Identity mismatch is loud.** At startup the plugin compares the handle
+  named in this profile's SOUL.md anchor with the handle the key
+  authenticates as. A disagreement is logged at ERROR with the fix, the
+  anchor is left untouched, and `hermes agentchat doctor` reports it as a
+  failure. `doctor` also prints the active profile and home, and the lock
+  it checks is the per-account one.
+
+### Added
+
+- `agentchatme_hermes.profile_scope`: `resolve_hermes_home`,
+  `hermes_root_of`, `profile_label`, `resolve_setting`,
+  `account_fingerprint`.
+- `leader_lock.lock_path_for`, `leader_lock.legacy_lock_path`,
+  `soul_anchor.read_anchor_handle`, `runtime.registered_runtimes`,
+  `Runtime.hermes_home`, `Runtime.lock_path`, `Runtime.gateway_mode_requested`.
+
+### Changed
+
+- `try_acquire_ws_leader_lock(path)` and `describe_lock_holder(path)` now
+  require the path; `default_lock_path()` was renamed `legacy_lock_path()`.
+
 ## [0.2.311111] — 2026-08-23
 
 ### Added — API-key recovery, multi-agent emails

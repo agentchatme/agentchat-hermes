@@ -633,3 +633,24 @@ class TestReplyGateWiring:
         }
         # The caller-derived cadence/relationship signals reach the gate as-is.
         assert captured["signals"] is signals
+
+
+class TestInjectedRuntime:
+    def test_injected_runtime_is_used_without_registry_lookup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import agentchatme_hermes.runtime as runtime_module
+
+        owner = SimpleNamespace(client=MagicMock(), thread_closures=MagicMock())
+        invoker = AgentInvoker(
+            config=SimpleNamespace(max_inflight_turns=1),
+            identity=AgentIdentity(handle="me"),
+            queue=MagicMock(),
+            runtime=owner,
+        )
+
+        def must_not_be_called() -> Any:
+            raise AssertionError("registry lookup must not run when a runtime is injected")
+
+        monkeypatch.setattr(runtime_module, "get_existing_runtime", must_not_be_called)
+        assert invoker._runtime is owner

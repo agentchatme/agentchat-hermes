@@ -9,6 +9,7 @@ import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from pathlib import Path
 
 from agentchatme_hermes.config import (
     DEFAULT_API_BASE,
@@ -304,3 +305,52 @@ class TestGateConfig:
         )
         with pytest.raises(ConfigError, match="below the minimum"):
             load_config()
+
+
+# ───────────────────────── profile scoping ─────────────────────────
+
+
+class TestProfileScopedConfig:
+    def test_hermes_home_argument_is_bound(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _isolated(monkeypatch, AGENTCHATME_API_KEY="ac_live_x")
+        home = tmp_path / ".hermes" / "profiles" / "growth"
+        cfg = load_config(hermes_home=home)
+        assert cfg is not None
+        assert cfg.hermes_home == home
+        assert cfg.lock_dir is None
+
+    def test_lock_dir_setting(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        _isolated(monkeypatch, AGENTCHATME_API_KEY="ac_live_x")
+        monkeypatch.setenv("AGENTCHATME_LOCK_DIR", str(tmp_path / "run"))
+        cfg = load_config(hermes_home=tmp_path)
+        assert cfg is not None
+        assert cfg.lock_dir == tmp_path / "run"
+
+    def test_account_fingerprint_matches_helper(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes.profile_scope import account_fingerprint
+
+        _isolated(monkeypatch, AGENTCHATME_API_KEY="ac_live_x")
+        cfg = load_config(hermes_home=tmp_path)
+        assert cfg is not None
+        assert cfg.account_fingerprint == account_fingerprint(DEFAULT_API_BASE, "ac_live_x")
+
+    def test_values_come_from_the_profile_resolver(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Process env says one key, the profile scope another: profile wins."""
+        from agentchatme_hermes.profile_scope import set_setting_resolver_for_tests
+
+        _isolated(monkeypatch, AGENTCHATME_API_KEY="launch-profile-key")
+        set_setting_resolver_for_tests(
+            lambda name: {"AGENTCHATME_API_KEY": "growth-key"}.get(name)
+        )
+        try:
+            cfg = load_config(hermes_home=tmp_path)
+        finally:
+            set_setting_resolver_for_tests(None)
+        assert cfg is not None
+        assert cfg.api_key == "growth-key"

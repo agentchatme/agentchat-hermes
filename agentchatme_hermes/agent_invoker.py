@@ -93,10 +93,16 @@ class AgentInvoker:
         config: Config,
         identity: AgentIdentity,
         queue: MessageQueue,
+        runtime: Any | None = None,
     ) -> None:
         self._config = config
         self._identity = identity
         self._queue = queue
+        # The runtime this invoker belongs to. Injected by Runtime.start()
+        # so a process serving several profiles never resolves a sibling
+        # profile's runtime; ``None`` keeps the legacy singleton lookup
+        # for callers that construct an invoker standalone.
+        self._runtime_ref = runtime
 
         # Reply-gate settings resolved once. getattr-with-default so partial
         # configs in tests construct cleanly; the production Config dataclass
@@ -723,10 +729,15 @@ class AgentInvoker:
 
     @property
     def _runtime(self) -> Any:
-        """Lazy accessor — the runtime singleton may not exist at construct time
-        (we hold `_identity` separately, which is all the invoker truly needs).
-        Resolved via the get_existing_runtime singleton at call time.
+        """The owning runtime.
+
+        Prefers the reference injected at construction (one runtime per
+        profile — never a sibling's). Falls back to the registry lookup,
+        which is unambiguous only in a single-profile process.
         """
+        if self._runtime_ref is not None:
+            return self._runtime_ref
+
         from .runtime import get_existing_runtime
 
         rt = get_existing_runtime()

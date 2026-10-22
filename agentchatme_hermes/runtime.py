@@ -1,6 +1,9 @@
-"""Process-wide runtime coordinator.
+"""Per-profile runtime coordinator.
 
-One :class:`Runtime` per Hermes process. Owns:
+One :class:`Runtime` per (Hermes profile, AgentChat account) in a
+process. A classic single-profile gateway therefore has exactly one; a
+multiplexed gateway serving several profiles has one per profile, each
+bound to that profile's own key, home, SOUL.md and leader lock. Owns:
 
 * The resolved :class:`AgentIdentity` (handle only — internal id is
   server-side, we never extract it) loaded via ``GET /v1/agents/me``
@@ -12,19 +15,26 @@ One :class:`Runtime` per Hermes process. Owns:
   HTTP API calls (outbound + every other ``/v1/*`` op).
 
 Accessed via :func:`get_runtime` (constructs if needed) and
-:func:`get_existing_runtime` (returns the singleton or ``None``).
+:func:`get_existing_runtime` (returns the registered runtime or ``None``).
 """
 from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from .agent_invoker import AgentInvoker
 from .client_identity import hermes_client_identity
-from .leader_lock import release_leader_lock, try_acquire_ws_leader_lock
+from .leader_lock import lock_path_for, release_leader_lock, try_acquire_ws_leader_lock
 from .lookup_cache import LookupCache
 from .message_queue import MessageQueue
+from .profile_scope import (
+    account_fingerprint,
+    hermes_home_key,
+    profile_label,
+    resolve_hermes_home,
+)
 from .thread_closures import ThreadClosures
 from .types import AgentIdentity
 from .ws_daemon import WSDaemon
@@ -46,7 +56,7 @@ class Runtime:
       resolution + WSDaemon background thread + AgentInvoker thread
       pool. Reached only when the constructor was called with
       ``gateway_mode=True`` AND this process successfully acquired
-      the per-machine WS leader lock (see :mod:`.leader_lock`).
+      the per-account WS leader lock (see :mod:`.leader_lock`).
     * **Follower mode** — light runtime: sync HTTP client + identity
       resolution only. No WS connection opened, no invoker thread
       pool. Used by TUI/REPL, named CLI subcommands, one-shot agents,
@@ -56,13 +66,27 @@ class Runtime:
       leader-only.
 
     The two-gate design (env var + flock) eliminates every flavor
-    of multi-WS-per-machine: the gateway env var blocks TUI/CLI/
-    oneshot, and the flock blocks concurrent gateway invocations.
+    of multi-WS-per-account: the gateway env var blocks TUI/CLI/
+    oneshot, and the flock blocks concurrent gateways for one account
+    while letting sibling profiles with their own accounts receive.
     """
 
     def __init__(self, config: Config, *, gateway_mode: bool) -> None:
         self._config = config
         self._gateway_mode_requested = gateway_mode
+
+        # Profile binding. Read defensively: production passes a
+        # :class:`Config`, tests pass light doubles without these fields.
+        home = getattr(config, "hermes_home", None)
+        self._hermes_home: Path = Path(home) if home is not None else resolve_hermes_home()
+        fingerprint = getattr(config, "account_fingerprint", None)
+        if not isinstance(fingerprint, str):
+            fingerprint = account_fingerprint(config.api_base, config.api_key)
+        self._lock_path = lock_path_for(
+            hermes_home=self._hermes_home,
+            account_fingerprint=fingerprint,
+            lock_dir=getattr(config, "lock_dir", None),
+        )
 
         # Resolved at :meth:`start` time after the leader-lock attempt.
         # ``True`` only when both the env-var check AND the lock acquire
@@ -127,6 +151,21 @@ class Runtime:
         return self._thread_closures
 
     @property
+    def hermes_home(self) -> Path:
+        """Home of the Hermes profile this runtime serves."""
+        return self._hermes_home
+
+    @property
+    def lock_path(self) -> Path:
+        """Leader-lock file this runtime competes for (per account)."""
+        return self._lock_path
+
+    @property
+    def gateway_mode_requested(self) -> bool:
+        """What the constructor was asked for — not the resolved mode."""
+        return self._gateway_mode_requested
+
+    @property
     def is_leader(self) -> bool:
         """``True`` iff this process holds the WS leader lock.
 
@@ -168,6 +207,7 @@ class Runtime:
                         config=self._config,
                         identity=self._identity,
                         queue=self._queue,
+                        runtime=self,
                     )
                     self._ws_daemon = WSDaemon(
                         config=self._config,
@@ -182,29 +222,36 @@ class Runtime:
                     self._ws_daemon.start()
 
                     logger.info(
-                        "agentchat runtime started: handle=@%s ws=%s "
-                        "mode=leader (this process owns the live WS)",
+                        "agentchat runtime started: profile=%s handle=@%s "
+                        "ws=%s lock=%s mode=leader (this process owns the "
+                        "live WS for this account)",
+                        profile_label(self._hermes_home),
                         self._identity.handle,
                         self._config.ws_url,
+                        self._lock_path,
                     )
                 elif self._gateway_mode_requested:
-                    # Gateway-class process that lost the lock race.
-                    # Loud warning so the operator can see why their
-                    # second-gateway invocation isn't getting messages.
+                    # Gateway-class process that lost the lock race for
+                    # THIS account. Loud warning so the operator can see
+                    # why this invocation isn't getting messages.
                     logger.warning(
-                        "agentchat runtime started: handle=@%s "
-                        "mode=follower-gateway "
-                        "(another process holds the WS leader lock — "
-                        "this process will register tools and skill but "
-                        "will NOT receive live inbound. If this is a "
-                        "stale gateway, stop it first.)",
+                        "agentchat runtime started: profile=%s handle=@%s "
+                        "mode=follower-gateway (another process holds the "
+                        "leader lock for this account at %s — this process "
+                        "will register tools and skill but will NOT receive "
+                        "live inbound. If a stale gateway or a second "
+                        "profile uses the same API key, stop it or give "
+                        "each profile its own account.)",
+                        profile_label(self._hermes_home),
                         self._identity.handle,
+                        self._lock_path,
                     )
                 else:
                     logger.info(
-                        "agentchat runtime started: handle=@%s "
+                        "agentchat runtime started: profile=%s handle=@%s "
                         "mode=follower-cli (no WS, no invoker — live "
                         "inbound runs in the gateway process)",
+                        profile_label(self._hermes_home),
                         self._identity.handle,
                     )
             except Exception:
@@ -216,8 +263,8 @@ class Runtime:
                 raise
 
     def _try_acquire_leader(self) -> bool:
-        """Attempt the leader-lock acquire. Stores fd on success."""
-        fd = try_acquire_ws_leader_lock()
+        """Attempt the per-account leader-lock acquire. Stores fd on success."""
+        fd = try_acquire_ws_leader_lock(self._lock_path)
         if fd is None:
             return False
         self._leader_lock_fd = fd
@@ -335,54 +382,111 @@ class Runtime:
         self._is_leader = False
 
 
-# Module-level singleton. Hermes calls register(ctx) once per process,
-# and that's where get_runtime is first invoked.
-_singleton: Runtime | None = None
-_singleton_lock = threading.Lock()
+# ─── registry ──────────────────────────────────────────────────────────────
+#
+# One runtime per (profile home, server, account). Hermes calls
+# register(ctx) once per profile — once per process in the classic
+# single-profile gateway, once per served profile in a multiplexed one —
+# and each call must get its own runtime: its own key, its own socket,
+# its own SOUL.md. A single module-level object (the pre-0.2.3111111
+# design) silently handed every profile the first profile's identity.
+
+
+class _RuntimeKey(NamedTuple):
+    home_key: str
+    api_base: str
+    account_fingerprint: str
+
+
+def _key_for(config: Any) -> _RuntimeKey:
+    home = getattr(config, "hermes_home", None)
+    home_path = Path(home) if home is not None else resolve_hermes_home()
+    fingerprint = getattr(config, "account_fingerprint", None)
+    if not isinstance(fingerprint, str):
+        fingerprint = account_fingerprint(config.api_base, config.api_key)
+    return _RuntimeKey(
+        home_key=hermes_home_key(home_path),
+        api_base=str(config.api_base).rstrip("/"),
+        account_fingerprint=fingerprint,
+    )
+
+
+_runtimes: dict[_RuntimeKey, Runtime] = {}
+_registry_lock = threading.Lock()
 
 
 def get_runtime(config: Config, *, gateway_mode: bool) -> Runtime:
-    """Return the process-wide runtime, constructing if needed.
+    """Return the runtime for ``config``'s profile and account, constructing if needed.
 
-    Idempotent within a process — the same Config typically resolves
-    to the same Runtime. Construction is lock-guarded so concurrent
-    register() calls (which shouldn't happen, but defensive) don't
-    spawn two daemons.
+    Idempotent per key: the same profile + account resolves to the same
+    object for the life of the process. Construction is lock-guarded so
+    concurrent ``register()`` calls can't spawn two daemons for one
+    account.
 
-    ``gateway_mode`` is honored only on first construction; subsequent
-    calls within the same process return the existing singleton
-    regardless. That's the intended behavior — Hermes calls
-    ``register(ctx)`` once per process and the mode is fixed for the
-    process lifetime.
+    ``gateway_mode`` is honored on first construction for a key. A later
+    call with a different mode for the same key is logged — it means two
+    code paths disagree about what kind of process this is, which is
+    worth seeing in the log rather than silently resolving one way.
     """
-    global _singleton
-    with _singleton_lock:
-        if _singleton is None:
-            _singleton = Runtime(config, gateway_mode=gateway_mode)
-        return _singleton
+    key = _key_for(config)
+    with _registry_lock:
+        existing = _runtimes.get(key)
+        if existing is None:
+            existing = Runtime(config, gateway_mode=gateway_mode)
+            _runtimes[key] = existing
+        elif existing.gateway_mode_requested != gateway_mode:
+            logger.warning(
+                "agentchat runtime: get_runtime(gateway_mode=%s) for an "
+                "account already registered with gateway_mode=%s — keeping "
+                "the first construction (profile=%s)",
+                gateway_mode,
+                existing.gateway_mode_requested,
+                profile_label(existing.hermes_home),
+            )
+        return existing
 
 
-def get_existing_runtime() -> Runtime | None:
-    """Return the singleton if it exists, else None.
+def get_existing_runtime(config: Config | None = None) -> Runtime | None:
+    """Return an already-constructed runtime, or ``None``.
 
-    Used by lifecycle hooks (on_session_end) that need to stop the
-    runtime without re-constructing it.
+    With ``config`` the lookup is exact. Without it the call is only
+    unambiguous when a single runtime exists (the classic single-profile
+    process); with several profiles registered and no config to pick
+    one, this returns ``None`` rather than guessing another profile's
+    identity. Components that belong to a runtime should hold a
+    reference instead (see :class:`AgentInvoker`).
     """
-    with _singleton_lock:
-        return _singleton
+    with _registry_lock:
+        if config is not None:
+            return _runtimes.get(_key_for(config))
+        if len(_runtimes) == 1:
+            return next(iter(_runtimes.values()))
+        if _runtimes:
+            logger.debug(
+                "get_existing_runtime(): %d runtimes registered and no "
+                "config given — refusing to guess",
+                len(_runtimes),
+            )
+        return None
+
+
+def registered_runtimes() -> list[Runtime]:
+    """Snapshot of every runtime in this process (diagnostics)."""
+    with _registry_lock:
+        return list(_runtimes.values())
 
 
 def reset_for_tests() -> None:
-    """Drop the singleton — test-only.
+    """Stop and drop every runtime — test-only.
 
     Production code paths never call this. Tests use it to isolate
     runtime state between test functions.
     """
-    global _singleton
-    with _singleton_lock:
-        if _singleton is not None:
-            try:
-                _singleton.stop()
-            except Exception:
-                logger.debug("reset_for_tests: stop raised", exc_info=True)
-        _singleton = None
+    with _registry_lock:
+        runtimes = list(_runtimes.values())
+        _runtimes.clear()
+    for rt in runtimes:
+        try:
+            rt.stop()
+        except Exception:
+            logger.debug("reset_for_tests: stop raised", exc_info=True)

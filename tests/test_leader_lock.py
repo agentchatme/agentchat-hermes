@@ -26,12 +26,16 @@ if TYPE_CHECKING:
 
 from agentchatme_hermes.leader_lock import (
     GATEWAY_ENV_MARKER,
+    LOCK_DIRNAME,
     _argv_matches_gateway_run,
     describe_lock_holder,
     is_hermes_gateway_process,
+    legacy_lock_path,
+    lock_path_for,
     release_leader_lock,
     try_acquire_ws_leader_lock,
 )
+from agentchatme_hermes.profile_scope import account_fingerprint
 
 # The fcntl-using tests only run on POSIX. The is_hermes_gateway_process
 # and argv-detection tests are platform-independent and run everywhere.
@@ -202,11 +206,17 @@ class TestTryAcquireLeaderLock:
         finally:
             release_leader_lock(fd)
 
-    def test_directory_missing_returns_none(self, tmp_path: Path) -> None:
-        """Acquire on a path whose parent dir doesn't exist."""
-        lock = tmp_path / "does-not-exist" / "agentchat-ws.lock"
+    def test_missing_lock_directory_is_created(self, tmp_path: Path) -> None:
+        """The lock directory is ours — a fresh profile root must not block
+        leader election. Created 0700 when it is the agentchat-locks dir."""
+        lock = tmp_path / LOCK_DIRNAME / "ws-abc.lock"
         fd = try_acquire_ws_leader_lock(lock)
-        assert fd is None
+        assert fd is not None
+        try:
+            assert lock.parent.is_dir()
+            assert (lock.parent.stat().st_mode & 0o777) == 0o700
+        finally:
+            release_leader_lock(fd)
 
 
 @_posix_only
@@ -270,3 +280,106 @@ class TestReleaseLeaderLock:
 
 def _set_env(name: str, value: str, monkeypatch: Any) -> None:
     monkeypatch.setenv(name, value)
+
+
+# ───────────────────── lock_path_for: per-account scoping ─────────────────────
+
+
+class TestLockPathFor:
+    def test_lives_under_the_hermes_root_not_the_profile(self, tmp_path: Path) -> None:
+        root = tmp_path / ".hermes"
+        path = lock_path_for(
+            hermes_home=root / "profiles" / "growth", account_fingerprint="abcd"
+        )
+        assert path == root / LOCK_DIRNAME / "ws-abcd.lock"
+
+    def test_default_profile_uses_its_own_home_as_root(self, tmp_path: Path) -> None:
+        root = tmp_path / ".hermes"
+        assert lock_path_for(hermes_home=root, account_fingerprint="abcd") == (
+            root / LOCK_DIRNAME / "ws-abcd.lock"
+        )
+
+    def test_same_account_two_profiles_share_one_lock(self, tmp_path: Path) -> None:
+        """Cloned credentials must still yield exactly one live socket."""
+        root = tmp_path / ".hermes"
+        fp = account_fingerprint("https://api.agentchat.me", "ac_live_shared")
+        a = lock_path_for(hermes_home=root / "profiles" / "a", account_fingerprint=fp)
+        b = lock_path_for(hermes_home=root / "profiles" / "b", account_fingerprint=fp)
+        assert a == b
+
+    def test_different_accounts_never_share_a_lock(self, tmp_path: Path) -> None:
+        root = tmp_path / ".hermes"
+        a = lock_path_for(
+            hermes_home=root / "profiles" / "a",
+            account_fingerprint=account_fingerprint("https://api.agentchat.me", "k1"),
+        )
+        b = lock_path_for(
+            hermes_home=root / "profiles" / "b",
+            account_fingerprint=account_fingerprint("https://api.agentchat.me", "k2"),
+        )
+        assert a != b
+        assert a.parent == b.parent
+
+    def test_lock_dir_override(self, tmp_path: Path) -> None:
+        path = lock_path_for(
+            hermes_home=tmp_path / ".hermes",
+            account_fingerprint="abcd",
+            lock_dir=tmp_path / "run",
+        )
+        assert path == tmp_path / "run" / "ws-abcd.lock"
+
+    def test_legacy_path_is_the_old_per_machine_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setenv("HOME", str(tmp_path))
+        assert legacy_lock_path() == tmp_path / ".hermes" / "agentchat-ws.lock"
+
+
+@_posix_only
+class TestTwoProfilesOneMachine:
+    """Reproduction of the September 2026 fleet failure, now passing.
+
+    Chief, Growth and Operations ran as separate Hermes profiles under one
+    OS home. With a per-machine lock only the first to start received.
+    With per-account locks every profile holds its own socket, while two
+    profiles on one key still elect a single leader.
+    """
+
+    def test_distinct_accounts_both_acquire(self, tmp_path: Path) -> None:
+        root = tmp_path / ".hermes"
+        base = "https://api.agentchat.me"
+        growth = lock_path_for(
+            hermes_home=root / "profiles" / "growth",
+            account_fingerprint=account_fingerprint(base, "ac_live_growth"),
+        )
+        ops = lock_path_for(
+            hermes_home=root / "profiles" / "ops",
+            account_fingerprint=account_fingerprint(base, "ac_live_ops"),
+        )
+        fd_growth = try_acquire_ws_leader_lock(growth)
+        fd_ops = try_acquire_ws_leader_lock(ops)
+        try:
+            assert fd_growth is not None
+            assert fd_ops is not None, "second profile must receive too"
+        finally:
+            for fd in (fd_growth, fd_ops):
+                if fd is not None:
+                    release_leader_lock(fd)
+
+    def test_same_account_second_profile_follows_until_release(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / ".hermes"
+        fp = account_fingerprint("https://api.agentchat.me", "ac_live_shared")
+        a = lock_path_for(hermes_home=root / "profiles" / "a", account_fingerprint=fp)
+        b = lock_path_for(hermes_home=root / "profiles" / "b", account_fingerprint=fp)
+        fd_a = try_acquire_ws_leader_lock(a)
+        assert fd_a is not None
+        try:
+            assert try_acquire_ws_leader_lock(b) is None
+            assert describe_lock_holder(b) == "held"
+        finally:
+            release_leader_lock(fd_a)
+        fd_b = try_acquire_ws_leader_lock(b)
+        assert fd_b is not None
+        release_leader_lock(fd_b)

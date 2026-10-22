@@ -14,6 +14,7 @@ The load-bearing logic that needs coverage:
 """
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
@@ -21,6 +22,8 @@ from agentchatme_hermes._register import _is_gateway_context
 from agentchatme_hermes.leader_lock import GATEWAY_ENV_MARKER
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     import pytest
 
 
@@ -97,3 +100,73 @@ class TestRegisterNoSessionEndHook:
 def _unused_param_silencer(_: Any) -> None:
     """Silences linter complaints about unused-imports in adapted tests."""
     return None
+
+
+class TestProfileScopedRegistration:
+    def test_config_is_loaded_for_the_resolved_profile_home(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import _register
+
+        home = tmp_path / ".hermes" / "profiles" / "growth"
+        captured: dict[str, Any] = {}
+
+        def fake_load_config(*, hermes_home: Any = None) -> None:
+            captured["hermes_home"] = hermes_home
+            return None  # CLI-only: stops before any runtime is built
+
+        monkeypatch.setattr(_register, "resolve_hermes_home", lambda: home)
+        monkeypatch.setattr(_register, "load_config", fake_load_config)
+        _register.register(MagicMock())
+        assert captured["hermes_home"] == home
+
+
+class TestReconcileSoulAnchor:
+    def _runtime(self, handle: str, home: Path) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(identity=SimpleNamespace(handle=handle), hermes_home=home)
+
+    def test_backfills_when_absent(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import _register, soul_anchor
+
+        soul = tmp_path / "SOUL.md"
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
+        assert soul_anchor.read_anchor_handle(soul_path=soul) == "ops"
+
+    def test_mismatch_is_an_error_and_file_is_left_alone(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """SOUL.md says Growth, the key says Operations: shout, don't rewrite."""
+        from agentchatme_hermes import _register, soul_anchor
+
+        soul = tmp_path / "SOUL.md"
+        soul_anchor.write_soul_anchor("growth", soul_path=soul)
+        before = soul.read_text()
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        with caplog.at_level(logging.ERROR, logger="agentchatme_hermes._register"):
+            _register._reconcile_soul_anchor(self._runtime("operations", tmp_path))
+        assert soul.read_text() == before
+        messages = [rec.getMessage() for rec in caplog.records]
+        assert any("IDENTITY MISMATCH" in m and "@growth" in m and "@operations" in m for m in messages)
+
+    def test_matching_anchor_is_quiet(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from agentchatme_hermes import _register, soul_anchor
+
+        soul = tmp_path / "SOUL.md"
+        soul_anchor.write_soul_anchor("ops", soul_path=soul)
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
+            _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
+        assert not caplog.records

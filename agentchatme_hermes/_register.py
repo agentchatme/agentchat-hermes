@@ -1,10 +1,11 @@
 """Plugin registration entry — wires the plugin into a Hermes process.
 
-Called once per Hermes process by the plugin loader. Two registration
-modes, chosen based on which Hermes process is loading us:
+Called once per Hermes profile by the plugin loader (details at the end
+of this docstring). Two registration modes, chosen based on which Hermes
+process is loading us:
 
 * **Gateway mode** (the long-lived ``hermes gateway run`` process,
-  AND it successfully grabbed the per-machine WS leader lock):
+  AND it successfully grabbed the per-account WS leader lock):
   full runtime — sync HTTP client, background WS daemon for live
   inbound delivery, agent invoker thread pool for waking the agent
   on each ``message.new`` frame, tools, skill.
@@ -25,10 +26,10 @@ Mode selection has two layered signals (see :mod:`.leader_lock`):
    module load (before plugin discovery), and used by Hermes' own
    ``cli.py:538``. This is the authoritative "am I the gateway?"
    marker.
-2. ``fcntl.flock(LOCK_EX | LOCK_NB)`` on
-   ``~/.hermes/agentchat-ws.lock``. Even with the env var set, only
-   one process can hold this OS-level lock at a time. Losers fall
-   back to CLI mode.
+2. ``fcntl.flock(LOCK_EX | LOCK_NB)`` on the per-account lock file
+   under ``<hermes root>/agentchat-locks/``. Even with the env var set,
+   only one process can hold this OS-level lock for a given account at
+   a time. Losers fall back to CLI mode.
 
 The earlier 0.2.0 detector used ``ctx._manager._cli_ref is None``,
 which silently misfired: Hermes sets ``_cli_ref`` *after* plugin
@@ -42,8 +43,12 @@ not just process shutdown), which would spuriously stop the runtime
 mid-flight. Daemon threads (``daemon=True``) die with the process on
 real shutdown; no explicit cleanup hook is needed or wanted.
 
-Idempotent within a process — :func:`runtime.get_runtime` is a
-module-level singleton.
+Called once per Hermes **profile**: once per process in a classic
+gateway, once per served profile in a multiplexed gateway (Hermes keeps
+one plugin manager per profile home). Every call resolves its own
+profile home and its own ``AGENTCHATME_*`` settings and gets its own
+:class:`runtime.Runtime`, keyed by profile and account — see
+:mod:`.profile_scope`.
 """
 from __future__ import annotations
 
@@ -53,6 +58,7 @@ from typing import Any
 from ._version import __version__
 from .config import ConfigError, load_config
 from .leader_lock import is_hermes_gateway_process
+from .profile_scope import profile_label, resolve_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -71,18 +77,27 @@ def register(ctx: Any) -> None:
         # bring-up. Once cli.py lands this branch is unreachable.
         logger.debug("agentchatme_hermes.cli not yet present; skipping CLI registration")
 
+    hermes_home = resolve_hermes_home()
+    profile = profile_label(hermes_home)
+
     try:
-        config = load_config()
+        config = load_config(hermes_home=hermes_home)
     except ConfigError as exc:
         logger.warning(
-            "agentchat plugin: configuration error — running CLI-only. %s", exc
+            "agentchat plugin: configuration error (profile=%s) — running "
+            "CLI-only. %s",
+            profile,
+            exc,
         )
         return
 
     if config is None:
         logger.info(
-            "agentchat plugin: AGENTCHATME_API_KEY not set — running CLI-only. "
-            "Run `hermes agentchat register` to create an account."
+            "agentchat plugin: AGENTCHATME_API_KEY not set for profile=%s "
+            "(%s) — running CLI-only. Run `hermes agentchat register` to "
+            "create an account for this profile.",
+            profile,
+            hermes_home,
         )
         return
 
@@ -108,13 +123,12 @@ def register(ctx: Any) -> None:
         )
         return
 
-    # Non-interactive identity-activation hook. Wizard users
-    # (`hermes agentchat register/login`) already got the SOUL.md
-    # anchor written by cli._install_soul_anchor at that step. This
-    # backfill is the safety net for env-var-direct / scripted /
-    # container setups where the user set AGENTCHATME_API_KEY without
-    # running the wizard.
-    _ensure_soul_anchor(runtime)
+    # Identity reconciliation. Wizard users (`hermes agentchat
+    # register/login`) already got the SOUL.md anchor written at that
+    # step; this backfills it for env-var-direct / scripted / container
+    # setups — and refuses to stay quiet when the anchor and the key
+    # disagree about who this profile is.
+    _reconcile_soul_anchor(runtime)
 
     try:
         from .tools import register_tools
@@ -131,8 +145,12 @@ def register(ctx: Any) -> None:
         logger.debug("agentchatme_hermes.skills not yet present; skipping skill registration")
 
     logger.info(
-        "agentchat plugin registered (version=%s, api_base=%s, mode=%s)",
+        "agentchat plugin registered (version=%s, profile=%s, home=%s, "
+        "handle=@%s, api_base=%s, mode=%s)",
         __version__,
+        profile,
+        hermes_home,
+        runtime.identity.handle,
         config.api_base,
         "gateway" if gateway_mode else "cli",
     )
@@ -198,32 +216,59 @@ def _try_start_runtime(config: Any, *, gateway_mode: bool) -> Any:
     return runtime
 
 
-def _ensure_soul_anchor(runtime: Any) -> None:
-    """Backfill the SOUL.md identity anchor when absent.
+def _reconcile_soul_anchor(runtime: Any) -> None:
+    """Backfill the SOUL.md identity anchor, and flag an identity mismatch.
 
     The wizard writes the anchor on register/login (``cli.py``). This
     is the non-wizard path: a user who set ``AGENTCHATME_API_KEY``
-    directly (env var, hand-edited ``~/.hermes/.env``, container
-    secrets, scripted setup) reaches the plugin's startup with a
-    valid runtime + resolved handle but no anchor in SOUL.md. We
-    write it on their behalf.
+    directly (env var, hand-edited profile ``.env``, container secrets,
+    scripted setup) reaches the plugin's startup with a valid runtime +
+    resolved handle but no anchor in SOUL.md. We write it on their
+    behalf.
 
-    Respectful — checks for the marker pair first and skips when
-    present. If a user explicitly removed the block while keeping
-    their key, we do not silently re-add it on every restart.
+    When an anchor IS present we leave the file alone — a user who
+    hand-edited the block made an explicit choice. But if the anchor
+    names a *different* handle than the key authenticates as, this
+    profile believes it is one agent while the server sees another.
+    That is never intentional, and it is exactly how one fleet ended up
+    with a profile labelled *Growth* sending as *Operations*. We log at
+    ERROR and leave the anchor untouched: rewriting it would hide the
+    credential mix-up; ``hermes agentchat doctor`` reports it too.
 
-    Non-fatal — anchor failures are logged as warnings, not raised.
-    The plugin's primary mechanics (WS, tools, skill) work
-    independent of SOUL.md content.
+    Non-fatal — anchor failures are logged, not raised. The plugin's
+    primary mechanics (WS, tools, skill) work independent of SOUL.md.
     """
     try:
-        from .soul_anchor import AnchorError, has_anchor, write_soul_anchor
+        from .soul_anchor import (
+            AnchorError,
+            has_anchor,
+            read_anchor_handle,
+            resolve_soul_path,
+            write_soul_anchor,
+        )
     except ImportError:
         logger.debug("agentchatme_hermes.soul_anchor not importable; skipping backfill")
         return
 
     try:
         if has_anchor():
+            anchored = read_anchor_handle()
+            actual = runtime.identity.handle
+            if anchored is not None and anchored != actual:
+                logger.error(
+                    "agentchat plugin: IDENTITY MISMATCH for profile=%s — "
+                    "%s says this agent is @%s but AGENTCHATME_API_KEY "
+                    "authenticates as @%s. This profile is configured with "
+                    "another agent's key (or another agent's SOUL.md). Fix "
+                    "the key with `hermes agentchat login` in this profile, "
+                    "or re-run `hermes agentchat register`. Messages this "
+                    "profile sends will be attributed to @%s.",
+                    profile_label(runtime.hermes_home),
+                    resolve_soul_path(),
+                    anchored,
+                    actual,
+                    actual,
+                )
             return
         path = write_soul_anchor(runtime.identity.handle)
         logger.info(

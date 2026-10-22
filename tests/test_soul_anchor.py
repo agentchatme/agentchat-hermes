@@ -18,6 +18,7 @@ from agentchatme_hermes.soul_anchor import (
     _strip_anchor_block,
     _upsert_anchor_block,
     has_anchor,
+    read_anchor_handle,
     remove_soul_anchor,
     render_anchor_block,
     write_soul_anchor,
@@ -381,3 +382,26 @@ class TestVerifyDefense:
         soul = tmp_path / "SOUL.md"
         with pytest.raises(AnchorError, match="did not land"):
             soul_anchor.write_soul_anchor("alice", soul_path=soul)
+
+
+# ───────────────────────── read_anchor_handle ─────────────────────────
+
+
+class TestReadAnchorHandle:
+    def test_reads_back_the_written_handle(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        write_soul_anchor("growth-bot", soul_path=soul)
+        assert read_anchor_handle(soul_path=soul) == "growth-bot"
+
+    def test_none_when_file_missing(self, tmp_path: Path) -> None:
+        assert read_anchor_handle(soul_path=tmp_path / "SOUL.md") is None
+
+    def test_none_when_markers_absent(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text("You are **@someone** on AgentChat but outside our block\n")
+        assert read_anchor_handle(soul_path=soul) is None
+
+    def test_none_when_block_hand_edited_beyond_recognition(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(f"{ANCHOR_START}\nI am an agent.\n{ANCHOR_END}\n")
+        assert read_anchor_handle(soul_path=soul) is None
