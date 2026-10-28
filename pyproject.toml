@@ -133,6 +133,10 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# pytest-asyncio >= 1.x warns when this is unset, and `filterwarnings = error`
+# turns that warning into an INTERNALERROR before any test runs (CI on
+# Python 3.10+ since Oct 2026). "function" is the documented default.
+asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 # importlib mode prevents pytest's classic package-rootdir auto-detection
 # from treating the top-level git-clone shim (__init__.py) as the
