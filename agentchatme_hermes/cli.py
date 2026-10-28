@@ -32,6 +32,7 @@ import logging
 import re
 import sys
 from getpass import getpass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from ._version import __version__
@@ -476,6 +477,11 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
     _printline(f"AgentChat plugin doctor — agentchatme-hermes {__version__}")
     _printline("")
 
+    from .profile_scope import profile_label, resolve_hermes_home, resolve_setting
+
+    hermes_home = resolve_hermes_home()
+    ok(f"Profile: {profile_label(hermes_home)} ({hermes_home})")
+
     saved_key = _read_saved_key()
     if saved_key:
         ok(f"AGENTCHATME_API_KEY set ({_mask_key(saved_key)})")
@@ -491,9 +497,7 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
     else:
         ok(f"API base: {api_base} (overridden via AGENTCHATME_API_BASE)")
 
-    import os
-
-    saved_handle = os.environ.get(_ENV_HANDLE, "").strip()
+    saved_handle = (resolve_setting(_ENV_HANDLE) or "").strip()
     if saved_handle:
         ok(f"Local handle hint: @{saved_handle}")
     else:
@@ -522,6 +526,7 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
         base_url=api_base,
         client_identity=hermes_client_identity(),
     )
+    authenticated_handle: str | None = None
     try:
         try:
             me = client.get_me()
@@ -537,7 +542,8 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
 
         handle = me.get("handle") if isinstance(me, dict) else None
         if isinstance(handle, str) and handle:
-            ok(f"Authenticated as @{handle}")
+            authenticated_handle = handle.lstrip("@").lower()
+            ok(f"Authenticated as @{authenticated_handle}")
         else:
             fail("Server response missing handle — refusing to trust")
             return _doctor_finalize(failures, warnings_count)
@@ -581,10 +587,25 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
         client.close()
 
     try:
-        from .soul_anchor import has_anchor
+        from .soul_anchor import has_anchor, read_anchor_handle, resolve_soul_path
 
         if has_anchor():
-            ok("SOUL.md identity anchor present")
+            anchored = read_anchor_handle()
+            if (
+                anchored is not None
+                and authenticated_handle is not None
+                and anchored != authenticated_handle
+            ):
+                fail(
+                    f"IDENTITY MISMATCH: {resolve_soul_path()} says @{anchored} "
+                    f"but the configured key authenticates as "
+                    f"@{authenticated_handle}. This profile holds another "
+                    "agent's key or another agent's SOUL.md — run "
+                    "`hermes agentchat login` here with the right key, or "
+                    "re-register."
+                )
+            else:
+                ok("SOUL.md identity anchor present")
         else:
             warn(
                 "SOUL.md identity anchor missing — run "
@@ -601,18 +622,70 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
             "(`hermes gateway`) for live inbound delivery"
         )
 
-    # Report the WS leader-lock state. The doctor itself never holds
-    # the lock (it's a one-shot CLI invocation), so the meaningful
-    # states are "held" (gateway running — good), "free" (no leader —
-    # bad if a gateway should be running), or "not present" (file
-    # never created — gateway hasn't run since last cleanup).
+    # Report the WS leader-lock state for THIS account. The doctor
+    # itself never holds the lock (it's a one-shot CLI invocation), so
+    # the meaningful states are "held" (gateway running — good), "free"
+    # (no leader — bad if a gateway should be running), or "not present"
+    # (file never created — gateway hasn't run since last cleanup).
     try:
-        from .leader_lock import default_lock_path, describe_lock_holder
+        from .leader_lock import describe_lock_holder, legacy_lock_path, lock_path_for
+        from .profile_scope import account_fingerprint
 
-        state = describe_lock_holder()
-        lock_path = default_lock_path()
+        lock_dir_raw = (resolve_setting("AGENTCHATME_LOCK_DIR") or "").strip()
+        lock_path = lock_path_for(
+            hermes_home=hermes_home,
+            account_fingerprint=account_fingerprint(api_base, saved_key),
+            lock_dir=Path(lock_dir_raw).expanduser() if lock_dir_raw else None,
+        )
+        state = describe_lock_holder(lock_path)
+        if legacy_lock_path().exists():
+            warn(
+                f"Legacy lock file {legacy_lock_path()} is from a version "
+                "before 0.2.3111111 and is no longer used — safe to delete"
+            )
         if state == "held":
-            ok(f"WS leader lock held ({lock_path})")
+            ok(f"WS leader lock held for this account ({lock_path})")
+            # The lock proves a process owns the receive role for this
+            # account; the heartbeat record beside it proves the daemon
+            # thread is alive and connected. Both are needed to say
+            # "receiving".
+            from .ws_health import (
+                HEALTH_STALE_AFTER_SECONDS,
+                health_age_seconds,
+                health_path_for,
+                read_ws_health,
+            )
+
+            health = read_ws_health(health_path_for(lock_path))
+            if health is None:
+                fail(
+                    "WS leader lock is held but the daemon health record is "
+                    "missing or invalid — restart `hermes gateway`"
+                )
+            else:
+                age = health_age_seconds(health)
+                health_state = health["state"]
+                if age > HEALTH_STALE_AFTER_SECONDS:
+                    fail(
+                        "WS leader lock is held but daemon health is stale "
+                        f"({age:.0f}s old, pid={health['pid']}) — restart `hermes gateway`"
+                    )
+                elif health_state == "connected":
+                    ok(
+                        "WS daemon connected "
+                        f"(@{health['handle']}, pid={health['pid']}, heartbeat {age:.0f}s ago)"
+                    )
+                elif health_state in {"starting", "reconnecting", "restart_wait"}:
+                    warn(
+                        "WS daemon is recovering "
+                        f"(state={health_state}, attempt={health['restart_attempt']}, "
+                        f"heartbeat {age:.0f}s ago)"
+                    )
+                else:
+                    fail(
+                        "WS leader lock is held but the daemon reports stopped — "
+                        "restart `hermes gateway`"
+                    )
         elif state == "free":
             warn(
                 f"WS leader lock file present but no holder ({lock_path}) — "
@@ -875,9 +948,9 @@ def _validate_handle(value: str) -> str:
 
 
 def _read_saved_key() -> str | None:
-    import os
+    from .profile_scope import resolve_setting
 
-    value = os.environ.get(_ENV_API_KEY, "").strip()
+    value = (resolve_setting(_ENV_API_KEY) or "").strip()
     return value or None
 
 
@@ -890,9 +963,9 @@ def _read_saved_handle() -> str | None:
     the wrong handle — malformed values are ignored (with a log line)
     and the caller falls through to the prompt / flag path.
     """
-    import os
+    from .profile_scope import resolve_setting
 
-    value = os.environ.get(_ENV_HANDLE, "").strip().lstrip("@").lower()
+    value = (resolve_setting(_ENV_HANDLE) or "").strip().lstrip("@").lower()
     if not value:
         return None
     try:
@@ -920,9 +993,9 @@ def _sdk_importable() -> bool:
 
 
 def _api_base() -> str:
-    import os
+    from .profile_scope import resolve_setting
 
-    raw = os.environ.get(_ENV_API_BASE, "").strip()
+    raw = (resolve_setting(_ENV_API_BASE) or "").strip()
     return raw.rstrip("/") if raw else _DEFAULT_API_BASE
 
 

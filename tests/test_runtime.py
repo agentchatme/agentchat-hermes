@@ -18,11 +18,15 @@ leader-lock acquire path is patched per-test so we can drive both
 from __future__ import annotations
 
 import contextlib
+import logging
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture(autouse=True)
@@ -35,12 +39,19 @@ def _reset_runtime_singleton() -> Any:
     runtime.reset_for_tests()
 
 
-def _config() -> Any:
+def _config(
+    *,
+    api_key: str = "ac_live_test",
+    hermes_home: Path | None = None,
+    lock_dir: Path | None = None,
+) -> Any:
     return SimpleNamespace(
-        api_key="ac_live_test",
+        api_key=api_key,
         api_base="https://api.example.test",
         ws_url="wss://api.example.test/v1/ws",
         max_inflight_turns=2,
+        hermes_home=hermes_home,
+        lock_dir=lock_dir,
     )
 
 
@@ -209,3 +220,169 @@ class TestGetRuntimeIdempotency:
             r2 = get_runtime(_config(), gateway_mode=True)
             assert r2 is r1
             assert not ws_cls.called
+
+
+class TestPerAccountLockWiring:
+    def test_acquire_uses_the_per_account_lock_path(self, tmp_path: Path) -> None:
+        from agentchatme_hermes.leader_lock import LOCK_DIRNAME
+        from agentchatme_hermes.runtime import Runtime
+
+        root = tmp_path / ".hermes"
+        with _patched_runtime(lock_winner=True) as (_ws, _inv, _client, acquire, _rel):
+            rt = Runtime(_config(hermes_home=root / "profiles" / "growth"), gateway_mode=True)
+            rt.start()
+            acquire.assert_called_once_with(rt.lock_path)
+            assert rt.lock_path.parent == root / LOCK_DIRNAME
+            assert rt.hermes_home == root / "profiles" / "growth"
+
+    def test_invoker_receives_its_runtime(self) -> None:
+        """No singleton lookup inside a turn — the invoker is told who owns it."""
+        from agentchatme_hermes.runtime import Runtime
+
+        with _patched_runtime(lock_winner=True) as (_ws, invoker_cls, _client, _acq, _rel):
+            rt = Runtime(_config(), gateway_mode=True)
+            rt.start()
+            assert invoker_cls.call_args.kwargs["runtime"] is rt
+
+
+class TestRuntimeRegistry:
+    """One runtime per (profile, account) — the multiplexed-gateway contract."""
+
+    def test_two_accounts_get_two_runtimes(self, tmp_path: Path) -> None:
+        from agentchatme_hermes.runtime import get_runtime
+
+        home = tmp_path / ".hermes"
+        with _patched_runtime():
+            growth = get_runtime(
+                _config(api_key="ac_live_growth", hermes_home=home / "profiles" / "growth"),
+                gateway_mode=True,
+            )
+            ops = get_runtime(
+                _config(api_key="ac_live_ops", hermes_home=home / "profiles" / "ops"),
+                gateway_mode=True,
+            )
+            assert growth is not ops
+            assert growth.lock_path != ops.lock_path
+
+    def test_same_account_two_profiles_two_runtimes_one_lock(self, tmp_path: Path) -> None:
+        from agentchatme_hermes.runtime import get_runtime
+
+        home = tmp_path / ".hermes"
+        with _patched_runtime():
+            a = get_runtime(_config(hermes_home=home / "profiles" / "a"), gateway_mode=True)
+            b = get_runtime(_config(hermes_home=home / "profiles" / "b"), gateway_mode=True)
+            assert a is not b, "each profile has its own SOUL.md and tools"
+            assert a.lock_path == b.lock_path, "but one account elects one leader"
+
+    def test_mode_mismatch_is_logged_not_silent(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agentchatme_hermes.runtime import get_runtime
+
+        with _patched_runtime(), caplog.at_level(logging.WARNING, logger="agentchatme_hermes.runtime"):
+            r1 = get_runtime(_config(), gateway_mode=False)
+            r2 = get_runtime(_config(), gateway_mode=True)
+            assert r1 is r2
+            assert any("gateway_mode" in rec.getMessage() for rec in caplog.records)
+
+    def test_get_existing_runtime_exact_and_ambiguous(self, tmp_path: Path) -> None:
+        from agentchatme_hermes.runtime import get_existing_runtime, get_runtime
+
+        home = tmp_path / ".hermes"
+        with _patched_runtime():
+            assert get_existing_runtime() is None
+            cfg_a = _config(api_key="k-a", hermes_home=home / "profiles" / "a")
+            a = get_runtime(cfg_a, gateway_mode=False)
+            assert get_existing_runtime() is a, "single runtime is unambiguous"
+            cfg_b = _config(api_key="k-b", hermes_home=home / "profiles" / "b")
+            b = get_runtime(cfg_b, gateway_mode=False)
+            assert get_existing_runtime(cfg_a) is a
+            assert get_existing_runtime(cfg_b) is b
+            assert get_existing_runtime() is None, "never guess between profiles"
+
+    def test_reset_stops_every_runtime(self, tmp_path: Path) -> None:
+        from agentchatme_hermes import runtime as runtime_module
+
+        home = tmp_path / ".hermes"
+        with _patched_runtime(lock_winner=True) as (_ws, _inv, _client, _acq, release):
+            a = runtime_module.get_runtime(
+                _config(api_key="k-a", hermes_home=home / "profiles" / "a"), gateway_mode=True
+            )
+            b = runtime_module.get_runtime(
+                _config(api_key="k-b", hermes_home=home / "profiles" / "b"), gateway_mode=True
+            )
+            a.start()
+            b.start()
+            runtime_module.reset_for_tests()
+            assert release.call_count == 2
+            assert runtime_module.registered_runtimes() == []
+
+
+class TestRuntimeHandle:
+    def test_unbound_access_raises_not_ready(self) -> None:
+        from agentchatme_hermes.runtime import RuntimeHandle, RuntimeNotReady
+
+        handle = RuntimeHandle()
+        assert handle.is_bound is False
+        with pytest.raises(RuntimeNotReady) as excinfo:
+            _ = handle.client
+        assert "hermes agentchat register" in str(excinfo.value)
+
+    def test_bound_handle_delegates(self) -> None:
+        from agentchatme_hermes.runtime import RuntimeHandle
+
+        target = SimpleNamespace(client="the-client", identity=SimpleNamespace(handle="ops"))
+        handle = RuntimeHandle()
+        handle.bind(target)  # type: ignore[arg-type]
+        assert handle.is_bound is True
+        assert handle.client == "the-client"
+        assert handle.identity.handle == "ops"
+
+
+class TestFollowerTakeover:
+    def test_follower_gateway_takes_over_when_lock_frees(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The leader exits; the waiting gateway wins the next election and
+        starts the socket without a restart."""
+        import time
+
+        from agentchatme_hermes import runtime as runtime_module
+        from agentchatme_hermes.runtime import Runtime
+
+        monkeypatch.setattr(runtime_module, "LEADER_RETRY_INTERVAL_S", 0.01)
+        with _patched_runtime(lock_winner=False) as (ws_cls, invoker_cls, _client, acquire, _rel):
+            acquire.side_effect = [None, None, 99]
+            rt = Runtime(_config(), gateway_mode=True)
+            rt.start()
+            assert rt.is_leader is False
+            assert not ws_cls.called
+
+            deadline = time.monotonic() + 2.0
+            while not rt.is_leader and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            assert rt.is_leader is True
+            ws_cls.return_value.start.assert_called_once()
+            invoker_cls.return_value.start.assert_called_once()
+            assert acquire.call_count == 3
+            rt.stop()
+
+    def test_cli_follower_never_retries(self) -> None:
+        from agentchatme_hermes.runtime import Runtime
+
+        with _patched_runtime(lock_winner=False) as (_ws, _inv, _client, acquire, _rel):
+            rt = Runtime(_config(), gateway_mode=False)
+            rt.start()
+            assert rt._leader_retry_thread is None
+            assert not acquire.called
+
+    def test_health_record_lives_beside_the_lock(self, tmp_path: Path) -> None:
+        from agentchatme_hermes.runtime import Runtime
+
+        with _patched_runtime(lock_winner=True) as (ws_cls, _inv, _client, _acq, _rel):
+            rt = Runtime(_config(hermes_home=tmp_path / ".hermes"), gateway_mode=True)
+            rt.start()
+            health_path = ws_cls.call_args.kwargs["health_path"]
+            assert health_path.parent == rt.lock_path.parent
+            assert health_path.name == rt.lock_path.stem + ".health.json"

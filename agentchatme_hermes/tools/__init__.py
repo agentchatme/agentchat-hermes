@@ -13,9 +13,11 @@ client so handlers don't have to re-resolve it on every call.
 """
 from __future__ import annotations
 
+import functools
 import logging
 from typing import TYPE_CHECKING, Any
 
+from ..runtime import RuntimeHandle, RuntimeNotReady
 from . import (
     attachments,
     contacts,
@@ -27,8 +29,11 @@ from . import (
     presence,
     profile,
 )
+from ._common import err
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..runtime import Runtime
 
 logger = logging.getLogger(__name__)
@@ -51,8 +56,13 @@ _MODULES = (
 )
 
 
-def register_tools(ctx: Any, runtime: Runtime) -> None:
+def register_tools(ctx: Any, runtime: Runtime | RuntimeHandle) -> None:
     """Register every ``agentchat_*`` tool with Hermes.
+
+    ``runtime`` is normally a :class:`RuntimeHandle` bound later by the
+    activation watcher, so tools exist from the first turn even on a
+    profile that has no key yet. A call before activation returns the
+    stable ``NOT_CONFIGURED`` error with the fix, instead of a traceback.
 
     Idempotent within a process — Hermes' tool registry rejects a
     second registration for the same name, so a re-register (e.g.,
@@ -65,8 +75,21 @@ def register_tools(ctx: Any, runtime: Runtime) -> None:
                 name=name,
                 toolset=TOOLSET,
                 schema=schema,
-                handler=builder(runtime),
+                handler=_guard_not_ready(builder(runtime)),
                 emoji=emoji,
             )
             registered += 1
     logger.info("agentchat: registered %d tools under toolset '%s'", registered, TOOLSET)
+
+
+def _guard_not_ready(handler: Callable[..., str]) -> Callable[..., str]:
+    """Translate :class:`RuntimeNotReady` into the tool error envelope."""
+
+    @functools.wraps(handler)
+    def wrapped(args: dict[str, Any], **kwargs: Any) -> str:
+        try:
+            return handler(args, **kwargs)
+        except RuntimeNotReady as exc:
+            return err("NOT_CONFIGURED", str(exc))
+
+    return wrapped

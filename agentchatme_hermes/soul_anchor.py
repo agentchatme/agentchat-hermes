@@ -42,6 +42,7 @@ orphan  — if the user uninstalls the package without running ``logout``,
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -202,6 +203,32 @@ def has_anchor(*, soul_path: Path | None = None) -> bool:
     except OSError:
         return False
     return ANCHOR_START in content and ANCHOR_END in content
+
+
+_ANCHOR_HANDLE_RE = re.compile(r"You are \*\*@([a-z0-9][a-z0-9-]*)\*\* on AgentChat")
+
+
+def read_anchor_handle(*, soul_path: Path | None = None) -> str | None:
+    """Return the handle named inside the fenced block, or ``None``.
+
+    ``None`` when the file or the markers are absent, or when the block
+    was hand-edited into a shape we no longer recognise. Used at plugin
+    start to detect a profile whose SOUL.md says one identity while its
+    API key authenticates as another — the mix-up behind the September
+    2026 fleet incident, where a profile labelled *Growth* was sending
+    as *Operations*.
+    """
+    target = soul_path if soul_path is not None else resolve_soul_path()
+    try:
+        content = target.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    start_idx = content.find(ANCHOR_START)
+    end_idx = content.find(ANCHOR_END)
+    if start_idx < 0 or end_idx < 0 or end_idx < start_idx:
+        return None
+    match = _ANCHOR_HANDLE_RE.search(content[start_idx:end_idx])
+    return match.group(1) if match else None
 
 
 def remove_soul_anchor(*, soul_path: Path | None = None) -> bool:
