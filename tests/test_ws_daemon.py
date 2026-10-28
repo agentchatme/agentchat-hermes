@@ -12,15 +12,14 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
 
 from agentchatme_hermes.thread_closures import ThreadClosures
 from agentchatme_hermes.types import AgentIdentity
 from agentchatme_hermes.ws_daemon import WSDaemon
-
-if TYPE_CHECKING:
-    import pytest
 
 
 def _make_daemon(*, own_handle: str = "alice") -> tuple[WSDaemon, Any, Any, Any]:
@@ -187,6 +186,67 @@ class TestCounters:
         assert daemon._frames_self_filtered == 1
         assert daemon._frames_queued == 1
         assert daemon._frames_thread_closed == 0
+
+
+class TestSupervisor:
+    def test_event_loop_failure_restarts_inside_the_lock_holding_process(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        daemon, _queue, _on_new_event, _closures = _make_daemon()
+        calls = 0
+
+        async def failing_then_stop() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("simulated loop death")
+            daemon._stopped.set()
+
+        monkeypatch.setattr(daemon, "_main", failing_then_stop)
+        monkeypatch.setattr(daemon, "_write_health", MagicMock())
+        monkeypatch.setattr(
+            "agentchatme_hermes.ws_daemon.random.uniform",
+            lambda _low, _high: 0.0,
+        )
+
+        daemon._run_loop()
+
+        assert calls == 2
+        assert daemon._loop is None
+        daemon._write_health.assert_any_call(  # type: ignore[attr-defined]
+            "restart_wait", last_error="simulated loop death"
+        )
+        daemon._write_health.assert_called_with("stopped")  # type: ignore[attr-defined]
+
+    async def test_disconnected_watchdog_escalates_to_supervisor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        daemon, _queue, _on_new_event, _closures = _make_daemon()
+        daemon._rt_client = SimpleNamespace(is_connected=False)
+        daemon._disconnected_since = 0.0
+        monkeypatch.setattr("agentchatme_hermes.ws_daemon._HEARTBEAT_INTERVAL_S", 0.0)
+        monkeypatch.setattr(
+            "agentchatme_hermes.ws_daemon.time.monotonic",
+            lambda: 151.0,
+        )
+        monkeypatch.setattr(daemon, "_write_health", MagicMock())
+
+        with pytest.raises(RuntimeError, match="remained disconnected"):
+            await daemon._heartbeat_loop()
+
+        daemon._write_health.assert_called_with("reconnecting")  # type: ignore[attr-defined]
+
+    def test_disconnect_publishes_recovering_health(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        daemon, _queue, _on_new_event, _closures = _make_daemon()
+        health = MagicMock()
+        monkeypatch.setattr(daemon, "_write_health", health)
+
+        daemon._on_disconnect(
+            {"code": 1006, "reason": "network lost", "was_clean": False}
+        )
+
+        assert daemon._disconnected_since is not None
+        health.assert_called_with("reconnecting", last_error="network lost")
 
 
 def _invite_frame(

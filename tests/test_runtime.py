@@ -316,3 +316,73 @@ class TestRuntimeRegistry:
             runtime_module.reset_for_tests()
             assert release.call_count == 2
             assert runtime_module.registered_runtimes() == []
+
+
+class TestRuntimeHandle:
+    def test_unbound_access_raises_not_ready(self) -> None:
+        from agentchatme_hermes.runtime import RuntimeHandle, RuntimeNotReady
+
+        handle = RuntimeHandle()
+        assert handle.is_bound is False
+        with pytest.raises(RuntimeNotReady) as excinfo:
+            _ = handle.client
+        assert "hermes agentchat register" in str(excinfo.value)
+
+    def test_bound_handle_delegates(self) -> None:
+        from agentchatme_hermes.runtime import RuntimeHandle
+
+        target = SimpleNamespace(client="the-client", identity=SimpleNamespace(handle="ops"))
+        handle = RuntimeHandle()
+        handle.bind(target)  # type: ignore[arg-type]
+        assert handle.is_bound is True
+        assert handle.client == "the-client"
+        assert handle.identity.handle == "ops"
+
+
+class TestFollowerTakeover:
+    def test_follower_gateway_takes_over_when_lock_frees(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The leader exits; the waiting gateway wins the next election and
+        starts the socket without a restart."""
+        import time
+
+        from agentchatme_hermes import runtime as runtime_module
+        from agentchatme_hermes.runtime import Runtime
+
+        monkeypatch.setattr(runtime_module, "LEADER_RETRY_INTERVAL_S", 0.01)
+        with _patched_runtime(lock_winner=False) as (ws_cls, invoker_cls, _client, acquire, _rel):
+            acquire.side_effect = [None, None, 99]
+            rt = Runtime(_config(), gateway_mode=True)
+            rt.start()
+            assert rt.is_leader is False
+            assert not ws_cls.called
+
+            deadline = time.monotonic() + 2.0
+            while not rt.is_leader and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+            assert rt.is_leader is True
+            ws_cls.return_value.start.assert_called_once()
+            invoker_cls.return_value.start.assert_called_once()
+            assert acquire.call_count == 3
+            rt.stop()
+
+    def test_cli_follower_never_retries(self) -> None:
+        from agentchatme_hermes.runtime import Runtime
+
+        with _patched_runtime(lock_winner=False) as (_ws, _inv, _client, acquire, _rel):
+            rt = Runtime(_config(), gateway_mode=False)
+            rt.start()
+            assert rt._leader_retry_thread is None
+            assert not acquire.called
+
+    def test_health_record_lives_beside_the_lock(self, tmp_path: Path) -> None:
+        from agentchatme_hermes.runtime import Runtime
+
+        with _patched_runtime(lock_winner=True) as (ws_cls, _inv, _client, _acq, _rel):
+            rt = Runtime(_config(hermes_home=tmp_path / ".hermes"), gateway_mode=True)
+            rt.start()
+            health_path = ws_cls.call_args.kwargs["health_path"]
+            assert health_path.parent == rt.lock_path.parent
+            assert health_path.name == rt.lock_path.stem + ".health.json"

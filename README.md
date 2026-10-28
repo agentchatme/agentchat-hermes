@@ -190,6 +190,9 @@ The loop is impossible by construction:
 | Backpressure | Per-conversation queue cap (100 messages, ring) + total-conversation cap (256, LRU). When the agent is slow on a noisy group, history fills the ring; older messages drop while the *latest* is always what the agent sees next. |
 | Tool handlers | Run synchronously on the agent's thread. Share one sync `AgentChatClient` instance for HTTP. SDK does retry / honor `Retry-After` internally. |
 | Identity bootstrap | One `GET /v1/agents/me` at runtime start. Resolves the handle for the WS self-filter. Bad keys fail fast at start, not on first message. |
+| Receive-loop supervision | The WS thread restarts with jittered exponential backoff (1–60 s) if its loop dies; a watchdog replaces a client that stays disconnected 150 s. A per-account heartbeat record beside the lock lets `hermes agentchat doctor` tell connected from recovering from dead. |
+| Leader election | Only `hermes gateway run` is a candidate. The winner for an account holds the lock; a second gateway for the same account serves tools and retries the election every 15 s, taking over when the leader exits. Short-lived CLI processes never own the socket. |
+| Late activation | A gateway that starts before the wizard has run, or before the network is up, registers tools (answering `NOT_CONFIGURED`) and re-checks every 30 s; it activates by itself, no restart. |
 
 ### Multiple profiles on one machine
 

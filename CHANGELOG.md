@@ -39,6 +39,35 @@ multi-profile installs go deaf or send as the wrong agent. Both are fixed.
   anchor is left untouched, and `hermes agentchat doctor` reports it as a
   failure. `doctor` also prints the active profile and home, and the lock
   it checks is the per-account one.
+- **Only `hermes gateway run` can own the socket.** Leader candidacy now
+  requires that argv; the inherited `_HERMES_GATEWAY=1` marker alone no
+  longer qualifies, and `hermes gateway status|stop|restart|…` never does.
+  Previously a short-lived process could win a free lock, connect, drain and
+  acknowledge the backlog into its own memory, then exit — losing messages
+  (observed as bursts of connects from one host with deliveries never seen).
+- **A gateway that boots before its key, or before the network, activates
+  by itself.** Tools and the skill are registered from the first turn and
+  answer a stable `NOT_CONFIGURED` error until the runtime is up. In a
+  gateway an activation watcher re-checks configuration every 30 s (backing
+  off to 5 min while a present key cannot reach the server) and starts the
+  runtime with no restart. Before, such a gateway stayed CLI-only forever.
+- **A follower gateway takes over.** A gateway-class process that lost the
+  election retries it every 15 s and brings up the socket the moment the
+  previous holder exits.
+- **The receive loop is supervised.** The WebSocket thread restarts with
+  jittered exponential backoff (1–60 s) when its loop dies, a liveness
+  watchdog replaces a client that has stayed disconnected for 150 s, and an
+  initial connect failure no longer kills the receive thread while the lock
+  is held. The daemon writes a per-account heartbeat record,
+  `ws-<fingerprint>.health.json` beside the lock, which `doctor` reads to
+  tell a connected daemon from a recovering or dead one.
+
+### Known limitation (deferred)
+
+- Inbound frames are acknowledged when enqueued in memory, before the
+  agent turn runs. A crash in that window loses the message locally (the
+  server keeps it only until acked). A durable local inbox is the next
+  release's work.
 
 ### Added
 

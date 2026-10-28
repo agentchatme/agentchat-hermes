@@ -645,6 +645,47 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
             )
         if state == "held":
             ok(f"WS leader lock held for this account ({lock_path})")
+            # The lock proves a process owns the receive role for this
+            # account; the heartbeat record beside it proves the daemon
+            # thread is alive and connected. Both are needed to say
+            # "receiving".
+            from .ws_health import (
+                HEALTH_STALE_AFTER_SECONDS,
+                health_age_seconds,
+                health_path_for,
+                read_ws_health,
+            )
+
+            health = read_ws_health(health_path_for(lock_path))
+            if health is None:
+                fail(
+                    "WS leader lock is held but the daemon health record is "
+                    "missing or invalid — restart `hermes gateway`"
+                )
+            else:
+                age = health_age_seconds(health)
+                health_state = health["state"]
+                if age > HEALTH_STALE_AFTER_SECONDS:
+                    fail(
+                        "WS leader lock is held but daemon health is stale "
+                        f"({age:.0f}s old, pid={health['pid']}) — restart `hermes gateway`"
+                    )
+                elif health_state == "connected":
+                    ok(
+                        "WS daemon connected "
+                        f"(@{health['handle']}, pid={health['pid']}, heartbeat {age:.0f}s ago)"
+                    )
+                elif health_state in {"starting", "reconnecting", "restart_wait"}:
+                    warn(
+                        "WS daemon is recovering "
+                        f"(state={health_state}, attempt={health['restart_attempt']}, "
+                        f"heartbeat {age:.0f}s ago)"
+                    )
+                else:
+                    fail(
+                        "WS leader lock is held but the daemon reports stopped — "
+                        "restart `hermes gateway`"
+                    )
         elif state == "free":
             warn(
                 f"WS leader lock file present but no holder ({lock_path}) — "

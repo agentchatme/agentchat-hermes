@@ -30,12 +30,17 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import random
 import threading
+import time
 from typing import TYPE_CHECKING, Any, Callable
 
 from .client_identity import hermes_client_identity
+from .ws_health import WSHealthState, write_ws_health
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from agentchatme import AsyncAgentChatClient, RealtimeClient
 
     from .config import Config
@@ -51,6 +56,10 @@ _STOP_GRACE_SECONDS = 5.0
 # Heartbeat interval. Long enough to not spam the log, short enough
 # that "is the daemon alive?" is a question with an answer ≤60s old.
 _HEARTBEAT_INTERVAL_S = 60.0
+_DISCONNECTED_RESTART_AFTER_S = 150.0
+_SUPERVISOR_BACKOFF_BASE_S = 1.0
+_SUPERVISOR_BACKOFF_MAX_S = 60.0
+_STABLE_CONNECTION_S = 30.0
 
 
 class WSDaemon:
@@ -70,6 +79,7 @@ class WSDaemon:
         thread_closures: ThreadClosures,
         on_new_event: Callable[[], None],
         on_group_invite: Callable[[GroupInviteEvent], None],
+        health_path: Path | None = None,
     ) -> None:
         self._config = config
         self._identity = identity
@@ -77,6 +87,10 @@ class WSDaemon:
         self._thread_closures = thread_closures
         self._on_new_event = on_new_event
         self._on_group_invite = on_group_invite
+        # Where the liveness record for THIS account is written. ``None``
+        # falls back to the legacy per-machine file (test doubles only;
+        # the runtime always passes the per-account path).
+        self._health_path = health_path
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -86,11 +100,14 @@ class WSDaemon:
         self._stopped = threading.Event()
         self._lock = threading.Lock()
 
-        # Set by ``_main`` once the loop is running. ``_shutdown``
-        # signals this to cleanly unblock ``_main``'s park-forever
+        # Set by ``_main`` once the loop is running. ``_shutdown`` closes
+        # the clients and then signals this to cleanly unblock ``_main``'s
         # await, replacing the older ``await asyncio.Future()`` pattern
         # that needed task cancellation to unwind.
         self._stop_event: asyncio.Event | None = None
+        self._disconnected_since: float | None = None
+        self._last_connected_at: float | None = None
+        self._restart_attempt = 0
 
         # Operational counters for the periodic heartbeat log. Bumped
         # atomically inside :meth:`_on_message_frame` so the heartbeat
@@ -134,7 +151,14 @@ class WSDaemon:
 
         loop = self._loop
         if loop is not None and not loop.is_closed():
-            asyncio.run_coroutine_threadsafe(self._shutdown(), loop)
+            shutdown = self._shutdown()
+            try:
+                asyncio.run_coroutine_threadsafe(shutdown, loop)
+            except RuntimeError:
+                # The supervisor may have closed this cycle between the
+                # is_closed check and scheduling. It will observe _stopped and
+                # exit; explicitly close the unscheduled coroutine.
+                shutdown.close()
 
         thread = self._thread
         if thread is not None and thread.is_alive():
@@ -148,20 +172,70 @@ class WSDaemon:
     # -- internals ----------------------------------------------------------
 
     def _run_loop(self) -> None:
-        loop = asyncio.new_event_loop()
-        self._loop = loop
-        asyncio.set_event_loop(loop)
-        self._started.set()
+        first_cycle = True
+        while not self._stopped.is_set():
+            loop = asyncio.new_event_loop()
+            self._loop = loop
+            asyncio.set_event_loop(loop)
+            if first_cycle:
+                self._started.set()
+                first_cycle = False
 
-        try:
-            loop.run_until_complete(self._main())
-        except Exception:
-            logger.exception("WSDaemon: event loop crashed")
-        finally:
+            cycle_started = time.monotonic()
+            cycle_error: Exception | None = None
             try:
-                loop.close()
-            except Exception:
-                logger.debug("WSDaemon: loop close raised", exc_info=True)
+                self._write_health("starting")
+                loop.run_until_complete(self._main())
+                if not self._stopped.is_set():
+                    cycle_error = RuntimeError("WebSocket main coroutine exited unexpectedly")
+            except Exception as exc:
+                cycle_error = exc
+                if not self._stopped.is_set():
+                    logger.exception("WSDaemon: event loop cycle crashed")
+            finally:
+                with contextlib.suppress(Exception):
+                    loop.run_until_complete(self._cleanup_clients())
+                pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
+                for task in pending:
+                    task.cancel()
+                if pending:
+                    with contextlib.suppress(Exception):
+                        loop.run_until_complete(
+                            asyncio.gather(*pending, return_exceptions=True)
+                        )
+                self._stop_event = None
+                self._loop = None
+                asyncio.set_event_loop(None)
+                try:
+                    loop.close()
+                except Exception:
+                    logger.debug("WSDaemon: loop close raised", exc_info=True)
+
+            if self._stopped.is_set():
+                break
+
+            lived_for = time.monotonic() - cycle_started
+            if lived_for >= _STABLE_CONNECTION_S:
+                self._restart_attempt = 0
+            self._restart_attempt += 1
+            ceiling = min(
+                _SUPERVISOR_BACKOFF_MAX_S,
+                _SUPERVISOR_BACKOFF_BASE_S * (2 ** (self._restart_attempt - 1)),
+            )
+            delay = random.uniform(ceiling * 0.8, ceiling * 1.2)
+            error_text = str(cycle_error) if cycle_error is not None else None
+            self._write_health("restart_wait", last_error=error_text)
+            logger.warning(
+                "WSDaemon: restarting receive loop in %.1fs (attempt=%d, error=%s)",
+                delay,
+                self._restart_attempt,
+                error_text or "unknown",
+            )
+            # threading.Event.wait is interruptible, unlike sleep: stop() can
+            # end a long backoff immediately even though there is no live loop.
+            self._stopped.wait(delay)
+
+        self._write_health("stopped")
 
     async def _main(self) -> None:
         from agentchatme import AsyncAgentChatClient, RealtimeClient
@@ -200,30 +274,35 @@ class WSDaemon:
         self._rt_client.on_error(self._on_error)
 
         # Stop-event lives on this loop. ``_shutdown`` (scheduled
-        # cross-thread) sets it, which unblocks the park-forever wait
+        # cross-thread) sets it after transport cleanup, which unblocks the wait
         # below — cleaner than the old "await never-resolved Future
         # + cancel" pattern, which left a "thread did not exit within
         # 5.0s grace" warning on most shutdowns.
         self._stop_event = asyncio.Event()
 
-        try:
-            await self._rt_client.connect()
-        except Exception:
-            logger.exception("WSDaemon: initial connect failed")
-            return
+        self._disconnected_since = time.monotonic()
+        await self._rt_client.connect()
 
         # Start the heartbeat alongside the park-forever wait so the
         # daemon emits a "still alive" signal every minute even when
         # no traffic is flowing. Both run concurrently; either ending
         # unblocks the main coroutine.
         heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        stop_task = asyncio.create_task(self._stop_event.wait())
         try:
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._stop_event.wait()
+            done, _pending = await asyncio.wait(
+                {heartbeat_task, stop_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if heartbeat_task in done:
+                # Propagate the liveness watchdog's exception into the outer
+                # supervisor. A normal heartbeat loop never returns itself.
+                await heartbeat_task
         finally:
             heartbeat_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await heartbeat_task
+            stop_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(heartbeat_task, stop_task)
 
     async def _heartbeat_loop(self) -> None:
         """Periodic 'WSDaemon alive' signal with counters.
@@ -242,8 +321,31 @@ class WSDaemon:
                 await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
             except asyncio.CancelledError:
                 return
+
             try:
                 connected = bool(rt_client.is_connected) if rt_client else False
+            except Exception:
+                connected = False
+                logger.exception("WSDaemon: reading SDK connection state raised")
+
+            if connected:
+                self._disconnected_since = None
+                self._write_health("connected")
+            else:
+                if self._disconnected_since is None:
+                    self._disconnected_since = time.monotonic()
+                disconnected_for = time.monotonic() - self._disconnected_since
+                self._write_health("reconnecting")
+                if disconnected_for >= _DISCONNECTED_RESTART_AFTER_S:
+                    # Deliberately outside the heartbeat-log guard below: this
+                    # exception is the liveness signal the outer supervisor
+                    # must see in order to replace a wedged SDK client.
+                    raise RuntimeError(
+                        "WebSocket remained disconnected for "
+                        f"{disconnected_for:.0f}s"
+                    )
+
+            try:
                 logger.info(
                     "WSDaemon heartbeat: connected=%s handle=@%s "
                     "frames=%d self_filtered=%d thread_closed=%d queued=%d pending_convs=%d",
@@ -262,20 +364,26 @@ class WSDaemon:
                 logger.exception("WSDaemon: heartbeat-log raised")
 
     async def _shutdown(self) -> None:
-        # Signal the park-forever wait in ``_main`` to unblock cleanly.
-        # The Event-based approach (vs the old task-cancellation dance)
-        # lets the loop drain pending tasks and exit on its own without
-        # the 5.0s grace timeout firing.
+        # Close transport first, then unblock `_main`. If the event were set
+        # first, run_until_complete(_main) could return and cancel this task
+        # halfway through disconnect/aclose, leaking SDK background work.
         stop_event = self._stop_event
-        if stop_event is not None:
-            stop_event.set()
+        try:
+            await self._cleanup_clients()
+        finally:
+            if stop_event is not None:
+                stop_event.set()
 
+    async def _cleanup_clients(self) -> None:
         rt = self._rt_client
         if rt is not None:
             try:
                 await rt.disconnect()
             except Exception:
                 logger.debug("WSDaemon: rt disconnect raised", exc_info=True)
+            finally:
+                if self._rt_client is rt:
+                    self._rt_client = None
 
         http = self._http_client
         if http is not None:
@@ -283,20 +391,32 @@ class WSDaemon:
                 await http.aclose()
             except Exception:
                 logger.debug("WSDaemon: http aclose raised", exc_info=True)
+            finally:
+                if self._http_client is http:
+                    self._http_client = None
 
-        loop = self._loop
-        if loop is not None:
-            # Cancel any background tasks the SDK might still have
-            # (reconnect timers, hello-ack watchdogs) so the loop can
-            # exit. Don't cancel the current task — that's us.
-            for task in asyncio.all_tasks(loop):
-                if task is not asyncio.current_task():
-                    task.cancel()
-            loop.call_soon_threadsafe(loop.stop)
+    def _write_health(
+        self, state: WSHealthState, *, last_error: str | None = None
+    ) -> None:
+        try:
+            write_ws_health(
+                handle=self._identity.handle,
+                state=state,
+                restart_attempt=self._restart_attempt,
+                last_error=last_error,
+                last_connected_at=self._last_connected_at,
+                path=self._health_path,
+            )
+        except Exception:
+            # Health diagnostics can never become a receive-path dependency.
+            logger.debug("WSDaemon: health record write failed", exc_info=True)
 
     # -- SDK callbacks ------------------------------------------------------
 
     def _on_connect(self) -> None:
+        self._disconnected_since = None
+        self._last_connected_at = time.time()
+        self._write_health("connected")
         logger.info("WSDaemon: connected as @%s", self._identity.handle)
         # Catch up on invites that landed while we were offline or before the
         # live subscription existed. Group-invite frames are live-only (unlike
@@ -364,6 +484,13 @@ class WSDaemon:
             )
 
     def _on_disconnect(self, info: dict[str, Any]) -> None:
+        if self._disconnected_since is None:
+            self._disconnected_since = time.monotonic()
+        reason = info.get("reason")
+        self._write_health(
+            "reconnecting",
+            last_error=str(reason) if reason else None,
+        )
         logger.info(
             "WSDaemon: disconnected (code=%s reason=%s clean=%s)",
             info.get("code"),
@@ -376,6 +503,11 @@ class WSDaemon:
         # state (transient socket errors fire here while the SDK's
         # internal reconnect handles recovery). We log at warning
         # level and let the SDK's machinery decide what to do.
+        if self._disconnected_since is None and not bool(
+            self._rt_client and self._rt_client.is_connected
+        ):
+            self._disconnected_since = time.monotonic()
+        self._write_health("reconnecting", last_error=str(exc))
         logger.warning("WSDaemon: error from SDK: %s", exc)
 
     def _on_message_frame(self, frame: dict[str, Any]) -> None:

@@ -53,14 +53,26 @@ profile home and its own ``AGENTCHATME_*`` settings and gets its own
 from __future__ import annotations
 
 import logging
-from typing import Any
+import threading
+from typing import TYPE_CHECKING, Any
 
 from ._version import __version__
 from .config import ConfigError, load_config
 from .leader_lock import is_hermes_gateway_process
 from .profile_scope import profile_label, resolve_hermes_home
+from .runtime import RuntimeHandle
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+# How often a gateway process without a working configuration re-checks
+# for one. Cheap when no key exists (a settings read); when a key exists
+# but the server is unreachable the watcher backs off exponentially up to
+# ACTIVATION_RETRY_MAX_S so a flapping network does not spam the log.
+ACTIVATION_RETRY_S = 30.0
+ACTIVATION_RETRY_MAX_S = 300.0
 
 
 def register(ctx: Any) -> None:
@@ -79,61 +91,58 @@ def register(ctx: Any) -> None:
 
     hermes_home = resolve_hermes_home()
     profile = profile_label(hermes_home)
+    gateway_mode = _is_gateway_context(ctx)
 
-    try:
-        config = load_config(hermes_home=hermes_home)
-    except ConfigError as exc:
-        logger.warning(
-            "agentchat plugin: configuration error (profile=%s) — running "
-            "CLI-only. %s",
-            profile,
-            exc,
-        )
+    # Tools and skill are registered unconditionally, bound to a handle
+    # that the runtime fills in when it comes up. The agent therefore
+    # always sees its AgentChat tools; before activation they answer
+    # NOT_CONFIGURED with the fix instead of not existing at all.
+    handle = RuntimeHandle()
+    _register_surface(ctx, handle)
+
+    watcher = ActivationWatcher(
+        handle=handle,
+        hermes_home=hermes_home,
+        profile=profile,
+        gateway_mode=gateway_mode,
+    )
+    outcome = watcher.try_activate()
+
+    if outcome == "active":
         return
 
-    if config is None:
+    if gateway_mode:
+        # Long-lived process: keep trying. A gateway that boots before the
+        # wizard has run, or before the network is up, activates by
+        # itself the moment configuration and connectivity exist. Before
+        # 0.2.3111111 that gateway stayed CLI-only until a restart — the
+        # most common reason a freshly installed profile never received.
+        watcher.start()
         logger.info(
-            "agentchat plugin: AGENTCHATME_API_KEY not set for profile=%s "
-            "(%s) — running CLI-only. Run `hermes agentchat register` to "
-            "create an account for this profile.",
+            "agentchat plugin: %s for profile=%s (%s) — gateway will "
+            "re-check every %.0fs and activate without a restart.",
+            "no API key configured" if outcome == "unconfigured" else "runtime did not start",
+            profile,
+            hermes_home,
+            ACTIVATION_RETRY_S,
+        )
+    else:
+        logger.info(
+            "agentchat plugin: %s for profile=%s (%s) — CLI-only in this "
+            "process. Run `hermes agentchat register` (new account) or "
+            "`hermes agentchat login` (existing key) in this profile.",
+            "no API key configured" if outcome == "unconfigured" else "runtime did not start",
             profile,
             hermes_home,
         )
-        return
 
-    gateway_mode = _is_gateway_context(ctx)
 
-    runtime = _try_start_runtime(config, gateway_mode=gateway_mode)
-    if runtime is None:
-        # Runtime failed to start. We deliberately do NOT raise the
-        # error up to the plugin loader — that would mark the whole
-        # plugin as failed-to-load and hide it from `hermes plugins
-        # list`, which then makes the issue invisible. Instead we log
-        # at ERROR level (so it shows up in ~/.hermes/logs/errors.log
-        # AND in journalctl), surface a status hint, and register the
-        # plugin in degraded mode. The user can then run `hermes
-        # agentchat doctor` to see a clear diagnostic and either
-        # rotate keys, re-login, or check connectivity.
-        logger.info(
-            "agentchat plugin registered in degraded mode (version=%s). "
-            "Tools, skill, and live inbound are disabled until the "
-            "runtime can start — run `hermes agentchat doctor` to "
-            "diagnose.",
-            __version__,
-        )
-        return
-
-    # Identity reconciliation. Wizard users (`hermes agentchat
-    # register/login`) already got the SOUL.md anchor written at that
-    # step; this backfills it for env-var-direct / scripted / container
-    # setups — and refuses to stay quiet when the anchor and the key
-    # disagree about who this profile is.
-    _reconcile_soul_anchor(runtime)
-
+def _register_surface(ctx: Any, handle: RuntimeHandle) -> None:
+    """Register tools and skill against a late-bound runtime handle."""
     try:
         from .tools import register_tools
 
-        register_tools(ctx, runtime)
+        register_tools(ctx, handle)
     except ImportError:
         logger.debug("agentchatme_hermes.tools not yet present; skipping tool registration")
 
@@ -144,16 +153,102 @@ def register(ctx: Any) -> None:
     except ImportError:
         logger.debug("agentchatme_hermes.skills not yet present; skipping skill registration")
 
-    logger.info(
-        "agentchat plugin registered (version=%s, profile=%s, home=%s, "
-        "handle=@%s, api_base=%s, mode=%s)",
-        __version__,
-        profile,
-        hermes_home,
-        runtime.identity.handle,
-        config.api_base,
-        "gateway" if gateway_mode else "cli",
-    )
+
+class ActivationWatcher:
+    """Brings a profile's runtime up as soon as it can, and keeps trying.
+
+    One instance per ``register(ctx)`` call, i.e. per profile.
+    :meth:`try_activate` performs a single attempt and is what the tests
+    drive; :meth:`start` runs it on a daemon thread with backoff until it
+    succeeds or the process exits.
+    """
+
+    def __init__(
+        self,
+        *,
+        handle: RuntimeHandle,
+        hermes_home: Path,
+        profile: str,
+        gateway_mode: bool,
+    ) -> None:
+        self._handle = handle
+        self._hermes_home = hermes_home
+        self._profile = profile
+        self._gateway_mode = gateway_mode
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._failures = 0
+
+    def try_activate(self) -> str:
+        """One attempt. Returns ``"active"``, ``"unconfigured"`` or ``"failed"``."""
+        if self._handle.is_bound:
+            return "active"
+        try:
+            config = load_config(hermes_home=self._hermes_home)
+        except ConfigError as exc:
+            logger.warning(
+                "agentchat plugin: configuration error (profile=%s) — %s",
+                self._profile,
+                exc,
+            )
+            self._failures += 1
+            return "failed"
+        if config is None:
+            return "unconfigured"
+
+        runtime = _try_start_runtime(config, gateway_mode=self._gateway_mode)
+        if runtime is None:
+            self._failures += 1
+            return "failed"
+
+        self._handle.bind(runtime)
+        self._failures = 0
+
+        # Identity reconciliation. Wizard users (`hermes agentchat
+        # register/login`) already got the SOUL.md anchor written at that
+        # step; this backfills it for env-var-direct / scripted /
+        # container setups — and refuses to stay quiet when the anchor
+        # and the key disagree about who this profile is.
+        _reconcile_soul_anchor(runtime)
+
+        logger.info(
+            "agentchat plugin registered (version=%s, profile=%s, home=%s, "
+            "handle=@%s, api_base=%s, mode=%s)",
+            __version__,
+            self._profile,
+            self._hermes_home,
+            runtime.identity.handle,
+            config.api_base,
+            "gateway" if self._gateway_mode else "cli",
+        )
+        return "active"
+
+    def next_delay(self) -> float:
+        """Backoff for the watcher thread: flat while unconfigured, exponential after failures."""
+        if self._failures == 0:
+            return ACTIVATION_RETRY_S
+        return min(ACTIVATION_RETRY_MAX_S, ACTIVATION_RETRY_S * (2.0 ** (self._failures - 1)))
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="agentchat-activation", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.next_delay()):
+            try:
+                if self.try_activate() == "active":
+                    return
+            except Exception:
+                # The watcher must outlive any surprise; log and keep going.
+                logger.exception("agentchat plugin: activation attempt raised")
+                self._failures += 1
 
 
 def _is_gateway_context(ctx: Any) -> bool:
@@ -192,10 +287,10 @@ def _try_start_runtime(config: Any, *, gateway_mode: bool) -> Any:
     * Server schema regression (RuntimeError from _resolve_identity)
     * Hermes runtime helpers unimportable from inside this process
 
-    All of these are recoverable — the user fixes the underlying issue
-    and restarts the gateway. None of them should kill the whole plugin
-    load; we want the CLI subcommand to remain reachable so the user
-    can diagnose.
+    All of these are recoverable — in a gateway the activation watcher
+    retries with backoff; elsewhere the user fixes the underlying issue
+    and restarts. None of them should kill the whole plugin load; we want
+    the CLI subcommand to remain reachable so the user can diagnose.
     """
     from .runtime import get_runtime
 
@@ -204,9 +299,9 @@ def _try_start_runtime(config: Any, *, gateway_mode: bool) -> Any:
         runtime.start()
     except Exception as exc:
         logger.error(
-            "agentchat plugin: runtime startup failed — the plugin will "
-            "be inactive (no live inbound, no tools, no skill). Reason: %s. "
-            "See ~/.hermes/logs/errors.log for the full traceback. "
+            "agentchat plugin: runtime startup failed — tools answer "
+            "NOT_CONFIGURED and there is no live inbound until it starts. "
+            "Reason: %s. See the Hermes errors log for the full traceback. "
             "Try `hermes agentchat doctor` to diagnose, or `hermes "
             "agentchat login` to rotate to a known-good key.",
             exc,

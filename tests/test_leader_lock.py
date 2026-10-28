@@ -53,12 +53,16 @@ class TestIsHermesGatewayProcess:
         monkeypatch.setattr(sys, "argv", ["hermes"])
         assert is_hermes_gateway_process() is False
 
-    def test_env_set_to_one_returns_true(
+    def test_env_marker_alone_is_not_enough(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """The inherited marker alone no longer makes a leader candidate:
+        every child the gateway spawns inherits it, and a child that won
+        the lock would drain and ack the backlog into its own memory and
+        then exit."""
         monkeypatch.setenv(GATEWAY_ENV_MARKER, "1")
         monkeypatch.setattr(sys, "argv", ["hermes"])
-        assert is_hermes_gateway_process() is True
+        assert is_hermes_gateway_process() is False
 
     def test_argv_gateway_run_returns_true_even_without_env(
         self, monkeypatch: pytest.MonkeyPatch
@@ -383,3 +387,41 @@ class TestTwoProfilesOneMachine:
         fd_b = try_acquire_ws_leader_lock(b)
         assert fd_b is not None
         release_leader_lock(fd_b)
+
+
+class TestArgvGatewayRunOnly:
+    """Only the long-lived `hermes gateway run` process may own a socket."""
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["hermes", "gateway", "run"],
+            ["hermes", "gateway", "run", "--replace"],
+            ["hermes", "gateway", "-p", "growth", "run"],
+            ["hermes", "gateway", "--profile", "growth", "run"],
+            ["hermes", "gateway", "--replace", "run"],
+            ["python", "-m", "hermes_cli.main", "gateway", "run"],
+            ["hermes", "gateway"],  # legacy spelling of "start the gateway"
+        ],
+    )
+    def test_gateway_run_forms_are_candidates(self, argv: list[str]) -> None:
+        assert _argv_matches_gateway_run(argv) is True
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["hermes", "gateway", "status"],
+            ["hermes", "gateway", "stop"],
+            ["hermes", "gateway", "restart"],
+            ["hermes", "gateway", "list"],
+            ["hermes", "gateway", "install"],
+            ["hermes", "gateway", "migrate", "--multiplex"],
+            ["hermes", "gateway", "-p", "growth", "status"],
+            ["hermes", "agentchat", "doctor"],
+            ["hermes", "agentchat", "status"],
+            ["hermes", "chat"],
+            ["hermes"],
+        ],
+    )
+    def test_short_lived_commands_are_never_candidates(self, argv: list[str]) -> None:
+        assert _argv_matches_gateway_run(argv) is False

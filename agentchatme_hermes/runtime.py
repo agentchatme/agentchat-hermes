@@ -38,6 +38,7 @@ from .profile_scope import (
 from .thread_closures import ThreadClosures
 from .types import AgentIdentity
 from .ws_daemon import WSDaemon
+from .ws_health import health_path_for
 
 if TYPE_CHECKING:
     from agentchatme import AgentChatClient
@@ -45,6 +46,55 @@ if TYPE_CHECKING:
     from .config import Config
 
 logger = logging.getLogger(__name__)
+
+# A gateway-class process that lost the leader election keeps trying.
+# When the leader for this account exits (crash, restart, profile
+# migration) the next attempt wins and this process takes over the live
+# socket without anyone restarting it. Module constant so tests can
+# shrink it.
+LEADER_RETRY_INTERVAL_S = 15.0
+
+
+class RuntimeNotReady(RuntimeError):
+    """Raised when a tool runs before this profile's runtime is active."""
+
+
+class RuntimeHandle:
+    """Late-binding reference to one profile's :class:`Runtime`.
+
+    Tool handlers are registered with Hermes at plugin load, which may
+    happen before the profile has an API key (fresh install, wizard not
+    yet run) or before the server could be reached. Handlers hold this
+    handle instead of a runtime; every attribute access forwards to the
+    bound runtime, or raises :class:`RuntimeNotReady` with the fix. The
+    activation watcher binds the runtime the moment configuration
+    appears, with no gateway restart.
+    """
+
+    def __init__(self, runtime: Runtime | None = None) -> None:
+        self._runtime = runtime
+
+    def bind(self, runtime: Runtime) -> None:
+        self._runtime = runtime
+
+    @property
+    def runtime(self) -> Runtime | None:
+        return self._runtime
+
+    @property
+    def is_bound(self) -> bool:
+        return self._runtime is not None
+
+    def __getattr__(self, name: str) -> Any:
+        runtime = self.__dict__.get("_runtime")
+        if runtime is None:
+            raise RuntimeNotReady(
+                "AgentChat is not set up in this Hermes profile yet. Ask your "
+                "human to run `hermes agentchat register` (new account) or "
+                "`hermes agentchat login` (existing key) in this profile. The "
+                "plugin activates by itself once the key exists."
+            )
+        return getattr(runtime, name)
 
 
 class Runtime:
@@ -111,6 +161,11 @@ class Runtime:
         # process lifetime — POSIX flock auto-releases on close, so we
         # explicitly close in :meth:`stop`/:meth:`_teardown_partial`.
         self._leader_lock_fd: int | None = None
+
+        # Follower-gateway takeover: retries the leader election until
+        # it wins or the runtime stops.
+        self._retry_stop = threading.Event()
+        self._leader_retry_thread: threading.Thread | None = None
 
     # -- accessors ----------------------------------------------------------
 
@@ -202,25 +257,7 @@ class Runtime:
                 )
 
                 if self._is_leader:
-                    self._queue = MessageQueue()
-                    self._invoker = AgentInvoker(
-                        config=self._config,
-                        identity=self._identity,
-                        queue=self._queue,
-                        runtime=self,
-                    )
-                    self._ws_daemon = WSDaemon(
-                        config=self._config,
-                        identity=self._identity,
-                        queue=self._queue,
-                        thread_closures=self._thread_closures,
-                        on_new_event=self._invoker.on_new_event,
-                        on_group_invite=self._invoker.handle_group_invite,
-                    )
-
-                    self._invoker.start()
-                    self._ws_daemon.start()
-
+                    self._start_leader_components()
                     logger.info(
                         "agentchat runtime started: profile=%s handle=@%s "
                         "ws=%s lock=%s mode=leader (this process owns the "
@@ -233,19 +270,22 @@ class Runtime:
                 elif self._gateway_mode_requested:
                     # Gateway-class process that lost the lock race for
                     # THIS account. Loud warning so the operator can see
-                    # why this invocation isn't getting messages.
+                    # why this invocation isn't getting messages — and a
+                    # retry loop so it takes over when the leader goes.
                     logger.warning(
                         "agentchat runtime started: profile=%s handle=@%s "
                         "mode=follower-gateway (another process holds the "
                         "leader lock for this account at %s — this process "
-                        "will register tools and skill but will NOT receive "
-                        "live inbound. If a stale gateway or a second "
-                        "profile uses the same API key, stop it or give "
-                        "each profile its own account.)",
+                        "serves tools and skill but will NOT receive live "
+                        "inbound until that process exits; it retries the "
+                        "election every %.0fs. If a second profile uses the "
+                        "same API key, give each profile its own account.)",
                         profile_label(self._hermes_home),
                         self._identity.handle,
                         self._lock_path,
+                        LEADER_RETRY_INTERVAL_S,
                     )
+                    self._start_leader_retry()
                 else:
                     logger.info(
                         "agentchat runtime started: profile=%s handle=@%s "
@@ -270,11 +310,99 @@ class Runtime:
         self._leader_lock_fd = fd
         return True
 
+    def _start_leader_components(self) -> None:
+        """Bring up queue, invoker and WS daemon. Caller holds ``_lock``.
+
+        Requires :attr:`_identity` and the leader lock. Shared by the
+        start-time election and the follower takeover path so both
+        produce exactly the same leader.
+        """
+        assert self._identity is not None
+        self._queue = MessageQueue()
+        self._invoker = AgentInvoker(
+            config=self._config,
+            identity=self._identity,
+            queue=self._queue,
+            runtime=self,
+        )
+        self._ws_daemon = WSDaemon(
+            config=self._config,
+            identity=self._identity,
+            queue=self._queue,
+            thread_closures=self._thread_closures,
+            on_new_event=self._invoker.on_new_event,
+            on_group_invite=self._invoker.handle_group_invite,
+            health_path=health_path_for(self._lock_path),
+        )
+        self._invoker.start()
+        self._ws_daemon.start()
+
+    def _start_leader_retry(self) -> None:
+        """Keep contesting the election from a follower-gateway runtime."""
+        if self._leader_retry_thread is not None:
+            return
+        self._retry_stop.clear()
+        thread = threading.Thread(
+            target=self._leader_retry_loop,
+            name="agentchat-leader-retry",
+            daemon=True,
+        )
+        self._leader_retry_thread = thread
+        thread.start()
+
+    def _leader_retry_loop(self) -> None:
+        while not self._retry_stop.wait(LEADER_RETRY_INTERVAL_S):
+            with self._lock:
+                if self._stopped or self._is_leader:
+                    return
+                if not self._try_acquire_leader():
+                    continue
+                try:
+                    self._start_leader_components()
+                except Exception:
+                    # Give the lock back so another process can take it;
+                    # the next tick retries from scratch.
+                    logger.exception(
+                        "agentchat runtime: takeover failed after winning the lock"
+                    )
+                    self._teardown_leader_components()
+                    continue
+                self._is_leader = True
+                logger.warning(
+                    "agentchat runtime: took over as WS leader for @%s "
+                    "(profile=%s, lock=%s) — the previous holder exited",
+                    self._identity.handle if self._identity else "?",
+                    profile_label(self._hermes_home),
+                    self._lock_path,
+                )
+                return
+
+    def _teardown_leader_components(self) -> None:
+        """Undo :meth:`_start_leader_components` and release the lock."""
+        if self._ws_daemon is not None:
+            try:
+                self._ws_daemon.stop()
+            except Exception:
+                logger.debug("agentchat runtime: ws_daemon stop raised", exc_info=True)
+            self._ws_daemon = None
+        if self._invoker is not None:
+            try:
+                self._invoker.stop()
+            except Exception:
+                logger.debug("agentchat runtime: invoker stop raised", exc_info=True)
+            self._invoker = None
+        self._queue = None
+        if self._leader_lock_fd is not None:
+            release_leader_lock(self._leader_lock_fd)
+            self._leader_lock_fd = None
+        self._is_leader = False
+
     def stop(self) -> None:
         with self._lock:
             if not self._started or self._stopped:
                 return
             self._stopped = True
+            self._retry_stop.set()
 
         # Order matters: stop inbound first (WS daemon) so no new
         # events land in the queue, then drain the invoker, then close
@@ -374,6 +502,7 @@ class Runtime:
             release_leader_lock(self._leader_lock_fd)
             self._leader_lock_fd = None
 
+        self._retry_stop.set()
         self._identity = None
         self._client = None
         self._queue = None
