@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import stat
+import sys
 from typing import TYPE_CHECKING
 
 from agentchatme_hermes.ws_health import (
@@ -27,7 +28,8 @@ def test_health_round_trip_is_atomic_shape_and_private(tmp_path: Path) -> None:
     )
 
     assert read_ws_health(target) == written
-    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    if sys.platform != "win32":  # chmod bits are advisory on Windows
+        assert stat.S_IMODE(target.stat().st_mode) == 0o600
     assert list(target.parent.glob("*.tmp")) == []
 
 

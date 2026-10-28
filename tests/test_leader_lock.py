@@ -335,7 +335,11 @@ class TestLockPathFor:
     def test_legacy_path_is_the_old_per_machine_file(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        monkeypatch.setenv("HOME", str(tmp_path))
+        import pathlib
+
+        # Path.home() reads USERPROFILE on Windows and HOME elsewhere; patch
+        # the method rather than an env var so the test is platform-neutral.
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: tmp_path))
         assert legacy_lock_path() == tmp_path / ".hermes" / "agentchat-ws.lock"
 
 

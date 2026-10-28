@@ -44,8 +44,10 @@ class TestResolveHermesHome:
     def test_default_is_dot_hermes_under_home(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        import pathlib
+
         monkeypatch.delenv("HERMES_HOME", raising=False)
-        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: tmp_path))
         assert resolve_hermes_home() == tmp_path / ".hermes"
 
 
