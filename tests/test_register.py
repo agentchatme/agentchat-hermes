@@ -192,12 +192,13 @@ class TestReconcileSoulAnchor:
         soul = tmp_path / "SOUL.md"
         soul.write_text(
             f"# Mine\n\n{ANCHOR_START}\n## On AgentChat\n\nYou are **@ops** on AgentChat — "
-            f"old blurb.\n{ANCHOR_END}\n"
+            f"old blurb.\n{ANCHOR_END}\n",
+            encoding="utf-8",
         )
         monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
         _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
         assert soul_anchor.anchor_is_current(soul_path=soul) is True
-        assert "# Mine" in soul.read_text()
+        assert "# Mine" in soul.read_text(encoding="utf-8")
 
     def test_hand_edited_block_is_left_alone(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -206,11 +207,11 @@ class TestReconcileSoulAnchor:
         from agentchatme_hermes.soul_anchor import ANCHOR_END, ANCHOR_START
 
         soul = tmp_path / "SOUL.md"
-        soul.write_text(f"{ANCHOR_START}\nI am a teapot.\n{ANCHOR_END}\n")
-        before = soul.read_text()
+        soul.write_text(f"{ANCHOR_START}\nI am a teapot.\n{ANCHOR_END}\n", encoding="utf-8")
+        before = soul.read_text(encoding="utf-8")
         monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
         _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
-        assert soul.read_text() == before
+        assert soul.read_text(encoding="utf-8") == before
 
 
 class TestReconcileKeyName:

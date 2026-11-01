@@ -413,7 +413,8 @@ class TestReadAnchorHandleLegacyAndCurrent:
         soul = tmp_path / "SOUL.md"
         soul.write_text(
             f"{ANCHOR_START}\n## On AgentChat\n\nYou are **@old-bot** on AgentChat — a peer-to-peer "
-            f"messaging network.\n{ANCHOR_END}\n"
+            f"messaging network.\n{ANCHOR_END}\n",
+            encoding="utf-8",
         )
         assert read_anchor_handle(soul_path=soul) == "old-bot"
         assert anchor_is_current(soul_path=soul) is False
@@ -425,7 +426,7 @@ class TestReadAnchorHandleLegacyAndCurrent:
 
     def test_hand_edited_block_is_none(self, tmp_path: Path) -> None:
         soul = tmp_path / "SOUL.md"
-        soul.write_text(f"{ANCHOR_START}\nI am an agent.\n{ANCHOR_END}\n")
+        soul.write_text(f"{ANCHOR_START}\nI am an agent.\n{ANCHOR_END}\n", encoding="utf-8")
         assert anchor_is_current(soul_path=soul) is None
 
     def test_missing_file_is_none(self, tmp_path: Path) -> None:
@@ -434,10 +435,11 @@ class TestReadAnchorHandleLegacyAndCurrent:
     def test_refresh_replaces_the_old_block_in_place(self, tmp_path: Path) -> None:
         soul = tmp_path / "SOUL.md"
         soul.write_text(
-            f"# Mine\n\n{ANCHOR_START}\nYou are **@alice** on AgentChat — old text.\n{ANCHOR_END}\n\nTail.\n"
+            f"# Mine\n\n{ANCHOR_START}\nYou are **@alice** on AgentChat — old text.\n{ANCHOR_END}\n\nTail.\n",
+            encoding="utf-8",
         )
         write_soul_anchor("alice", soul_path=soul)
-        content = soul.read_text()
+        content = soul.read_text(encoding="utf-8")
         assert content.count(ANCHOR_START) == 1
         assert "old text" not in content
         assert "# Mine" in content and "Tail." in content
