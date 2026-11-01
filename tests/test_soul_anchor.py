@@ -13,14 +13,17 @@ import pytest
 
 from agentchatme_hermes.soul_anchor import (
     ANCHOR_END,
+    ANCHOR_LINE_TEMPLATE,
     ANCHOR_START,
     AnchorError,
     _strip_anchor_block,
     _upsert_anchor_block,
+    anchor_is_current,
     has_anchor,
     read_anchor_handle,
     remove_soul_anchor,
     render_anchor_block,
+    render_anchor_line,
     write_soul_anchor,
 )
 
@@ -32,35 +35,33 @@ if TYPE_CHECKING:
 
 
 class TestRenderAnchorBlock:
-    def test_handle_substituted_twice(self) -> None:
+    def test_block_is_markers_around_the_published_identity_line(self) -> None:
         block = render_anchor_block("alice")
-        # The OpenClaw template substitutes the handle into TWO slots —
-        # the bold heading reference AND the backtick share-instruction.
-        assert "**@alice**" in block
-        assert "`@alice`" in block
+        assert block == "\n".join([ANCHOR_START, render_anchor_line("alice"), ANCHOR_END])
 
-    def test_starts_with_anchor_start(self) -> None:
-        block = render_anchor_block("alice")
-        assert block.startswith(ANCHOR_START)
+    def test_identity_line_is_the_published_template_with_the_handle(self) -> None:
+        line = render_anchor_line("alice")
+        assert line == ANCHOR_LINE_TEMPLATE.replace("<handle>", "alice")
+        assert line.startswith("I am @alice on AgentChat (api.agentchat.me).")
+        assert "agentchat_inbox first and decide per card" in line
+        assert line.endswith("Full guide: https://agentchat.me/skill.md")
+        assert "<handle>" not in line
 
-    def test_ends_with_anchor_end(self) -> None:
+    def test_no_text_of_our_own(self) -> None:
+        # The pre-v3 block carried a six-line blurb and a Hermes skill_view
+        # idiom written by this plugin. The identity line is the manual's.
         block = render_anchor_block("alice")
-        assert block.endswith(ANCHOR_END)
-
-    def test_hermes_skill_idiom_present(self) -> None:
-        """Hermes-specific adaptation: the skill-load command is
-        included as a verbatim shell command the agent can copy."""
-        block = render_anchor_block("alice")
-        assert "skill_view agentchat:agentchat" in block
+        assert "skill_view" not in block
+        assert "phone number" not in block
+        assert "**@" not in block
 
     def test_strips_at_prefix(self) -> None:
         block = render_anchor_block("@alice")
-        assert "**@alice**" in block
-        assert "**@@alice**" not in block
+        assert "I am @alice on" in block
+        assert "@@alice" not in block
 
     def test_strips_whitespace(self) -> None:
-        block = render_anchor_block("  alice  ")
-        assert "**@alice**" in block
+        assert "I am @alice on" in render_anchor_block("  alice  ")
 
     def test_empty_handle_raises(self) -> None:
         with pytest.raises(AnchorError, match="empty"):
@@ -88,7 +89,7 @@ class TestWriteSoulAnchor:
         assert result_path == soul
         assert soul.exists()
         content = soul.read_text(encoding="utf-8")
-        assert "**@alice**" in content
+        assert "I am @alice on AgentChat" in content
         assert ANCHOR_START in content
         assert ANCHOR_END in content
 
@@ -109,7 +110,7 @@ class TestWriteSoulAnchor:
         content = soul.read_text(encoding="utf-8")
         assert "# My agent" in content
         assert "You are a friendly research assistant." in content
-        assert "**@alice**" in content
+        assert "I am @alice on AgentChat" in content
 
     def test_idempotent_same_handle(self, tmp_path: Path) -> None:
         soul = tmp_path / "SOUL.md"
@@ -134,8 +135,8 @@ class TestWriteSoulAnchor:
         write_soul_anchor("bob", soul_path=soul)
 
         content = soul.read_text(encoding="utf-8")
-        assert "**@bob**" in content
-        assert "**@alice**" not in content
+        assert "I am @bob on AgentChat" in content
+        assert "I am @alice on AgentChat" not in content
         # Still exactly one block, not two competing ones
         assert content.count(ANCHOR_START) == 1
         assert content.count(ANCHOR_END) == 1
@@ -175,13 +176,13 @@ class TestRemoveSoulAnchor:
             encoding="utf-8",
         )
         write_soul_anchor("alice", soul_path=soul)
-        assert "**@alice**" in soul.read_text(encoding="utf-8")
+        assert "I am @alice on AgentChat" in soul.read_text(encoding="utf-8")
 
         removed = remove_soul_anchor(soul_path=soul)
 
         assert removed is True
         content = soul.read_text(encoding="utf-8")
-        assert "**@alice**" not in content
+        assert "I am @alice on AgentChat" not in content
         assert ANCHOR_START not in content
         assert ANCHOR_END not in content
         assert "# My agent" in content
@@ -247,8 +248,8 @@ class TestUpsertAnchorBlock:
         second = self._block("bob")
         intermediate = _upsert_anchor_block("Header.\n", first)
         result = _upsert_anchor_block(intermediate, second)
-        assert "**@bob**" in result
-        assert "**@alice**" not in result
+        assert "I am @bob on AgentChat" in result
+        assert "I am @alice on AgentChat" not in result
         assert "Header." in result
 
     def test_separates_with_blank_line(self) -> None:
@@ -405,3 +406,39 @@ class TestReadAnchorHandle:
         soul = tmp_path / "SOUL.md"
         soul.write_text(f"{ANCHOR_START}\nI am an agent.\n{ANCHOR_END}\n")
         assert read_anchor_handle(soul_path=soul) is None
+
+
+class TestReadAnchorHandleLegacyAndCurrent:
+    def test_pre_v3_block_is_still_recognised(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(
+            f"{ANCHOR_START}\n## On AgentChat\n\nYou are **@old-bot** on AgentChat — a peer-to-peer "
+            f"messaging network.\n{ANCHOR_END}\n"
+        )
+        assert read_anchor_handle(soul_path=soul) == "old-bot"
+        assert anchor_is_current(soul_path=soul) is False
+
+    def test_current_block_is_current(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        write_soul_anchor("alice", soul_path=soul)
+        assert anchor_is_current(soul_path=soul) is True
+
+    def test_hand_edited_block_is_none(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(f"{ANCHOR_START}\nI am an agent.\n{ANCHOR_END}\n")
+        assert anchor_is_current(soul_path=soul) is None
+
+    def test_missing_file_is_none(self, tmp_path: Path) -> None:
+        assert anchor_is_current(soul_path=tmp_path / "SOUL.md") is None
+
+    def test_refresh_replaces_the_old_block_in_place(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(
+            f"# Mine\n\n{ANCHOR_START}\nYou are **@alice** on AgentChat — old text.\n{ANCHOR_END}\n\nTail.\n"
+        )
+        write_soul_anchor("alice", soul_path=soul)
+        content = soul.read_text()
+        assert content.count(ANCHOR_START) == 1
+        assert "old text" not in content
+        assert "# Mine" in content and "Tail." in content
+        assert anchor_is_current(soul_path=soul) is True

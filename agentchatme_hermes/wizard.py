@@ -13,12 +13,12 @@ Internal mechanics are 0.2.0:
   except the two unauthenticated "start" requests (``/v1/register`` and
   ``/v1/agents/recover``) which the plugin posts itself — see
   :func:`_register_start` / :func:`_recover_start` for why.
-* The success paths (register / paste / replace / recover) call
-  :func:`agentchatme_hermes.soul_anchor.write_soul_anchor` to install
-  the identity anchor in ``~/.hermes/SOUL.md`` — the always-on identity
-  surface 0.1.x did not have.
-* The logout path calls
-  :func:`agentchatme_hermes.soul_anchor.remove_soul_anchor`.
+* The success paths (register / paste / replace / recover) *place the
+  doorbell* (:mod:`agentchatme_hermes.placement`): the key in the profile
+  ``.env`` as ``AGENTCHAT_API_KEY``, the published identity line in
+  ``SOUL.md``, and the hosted MCP server in ``config.yaml``.
+* The logout path clears the key, strips the identity line and removes
+  our ``mcp_servers.agentchat`` entry.
 * The recover path (lost / leaked API key) re-keys an existing agent
   from its email **and** @handle — an email can back several agents, so
   the email alone no longer identifies one.
@@ -36,7 +36,9 @@ from collections.abc import Mapping
 from typing import Any
 
 from .client_identity import HERMES_CLIENT_HEADERS, hermes_client_identity
-from .soul_anchor import AnchorError, remove_soul_anchor, write_soul_anchor
+from .config import ENV_API_BASE, ENV_API_KEY, ENV_API_KEY_LEGACY, ENV_HANDLE
+from .placement import clear_api_key, persist_api_key, place_identity_and_tools
+from .soul_anchor import remove_soul_anchor
 
 logger = logging.getLogger(__name__)
 
@@ -107,8 +109,11 @@ def _interactive_setup_body() -> None:
     print_header("AgentChat")
     print()
 
-    existing_key = (get_env_value("AGENTCHATME_API_KEY") or "").strip()
-    existing_handle = (get_env_value("AGENTCHATME_HANDLE") or "").strip().lstrip("@")
+    existing_key = (
+        (get_env_value(ENV_API_KEY) or "").strip()
+        or (get_env_value(ENV_API_KEY_LEGACY) or "").strip()
+    )
+    existing_handle = (get_env_value(ENV_HANDLE) or "").strip().lstrip("@")
 
     if existing_key:
         _edit_menu(
@@ -343,7 +348,7 @@ def _logout_flow(
     """
     print()
     if not prompt_yes_no(
-        "Clear AGENTCHATME_API_KEY and AGENTCHATME_HANDLE from ~/.hermes/.env? "
+        f"Clear {ENV_API_KEY} and {ENV_HANDLE} from the profile .env? "
         "Your AgentChat agent will remain on the server — this only removes "
         "credentials from THIS Hermes profile.",
         False,
@@ -351,20 +356,28 @@ def _logout_flow(
         print_info("Cancelled. Existing credentials retained.")
         return
 
-    save_env_value("AGENTCHATME_API_KEY", "")
-    save_env_value("AGENTCHATME_HANDLE", "")
+    clear_api_key(save_env_value)
+    save_env_value(ENV_HANDLE, "")
 
-    # 0.2.0 addition: strip the SOUL.md identity anchor so the agent
-    # loses its AgentChat awareness across all contexts. Idempotent —
-    # no-op when the block is already absent.
+    # Strip the SOUL.md identity line so the agent loses its AgentChat
+    # awareness across all contexts. Idempotent — no-op when absent.
     try:
         removed = remove_soul_anchor()
         if removed:
-            _step("Identity anchor removed from ~/.hermes/SOUL.md")
+            _step("Identity line removed from SOUL.md")
     except OSError as exc:
         # Non-fatal — credentials are cleared, the anchor's just stuck.
         # User can delete the block manually if it matters.
         logger.warning("logout: SOUL.md anchor strip failed: %s", exc)
+
+    # Remove our hosted-tools entry (a hand-managed one is left alone).
+    try:
+        from .mcp_registration import uninstall_entry
+
+        if uninstall_entry(api_base=_api_base()):
+            _step("Hosted-tools entry mcp_servers.agentchat removed from config.yaml")
+    except Exception as exc:
+        logger.warning("logout: mcp_servers.agentchat removal failed: %s", exc)
 
     print_success("Logged out. Run `hermes agentchat` to reconfigure.")
 
@@ -399,10 +412,10 @@ def _paste_existing_key_flow(
         print_warning("Key validation failed — not persisted. Try again with a fresh key.")
         return False
 
-    save_env_value("AGENTCHATME_API_KEY", api_key)
-    save_env_value("AGENTCHATME_HANDLE", handle)
+    _save_key(save_env_value, api_key)
+    save_env_value(ENV_HANDLE, handle)
     _step(f"Key validated — you are @{handle}")
-    _install_anchor_or_warn(handle, print_warning)
+    _place_or_warn(handle, print_warning)
     return True
 
 
@@ -516,11 +529,11 @@ def _register_new_agent_flow(
         print_warning(f"Verification request failed: {e}")
         return False
 
-    save_env_value("AGENTCHATME_API_KEY", api_key)
-    save_env_value("AGENTCHATME_HANDLE", resolved_handle)
+    _save_key(save_env_value, api_key)
+    save_env_value(ENV_HANDLE, resolved_handle)
     masked = _mask_key(api_key)
     _step(f"Registered as @{resolved_handle} (key {masked})")
-    _install_anchor_or_warn(resolved_handle, print_warning)
+    _place_or_warn(resolved_handle, print_warning)
     return True
 
 
@@ -640,11 +653,11 @@ def _recover_lost_key_flow(
         print_warning(f"Recovery request failed: {e}")
         return False
 
-    save_env_value("AGENTCHATME_API_KEY", api_key)
-    save_env_value("AGENTCHATME_HANDLE", resolved_handle)
+    _save_key(save_env_value, api_key)
+    save_env_value(ENV_HANDLE, resolved_handle)
     masked = _mask_key(api_key)
     _step(f"Recovered @{resolved_handle} (new key {masked}) — the previous key is now dead")
-    _install_anchor_or_warn(resolved_handle, print_warning)
+    _place_or_warn(resolved_handle, print_warning)
     return True
 
 
@@ -790,27 +803,30 @@ def _mask_key(key: str) -> str:
     return f"{prefix}…{suffix}"
 
 
-# ─── anchor integration (0.2.0 only) ───────────────────────────────────────
+# ─── placement ─────────────────────────────────────────────────────────────
 
 
-def _install_anchor_or_warn(handle: str, print_warning: Any) -> None:
-    """Upsert the SOUL.md anchor after a successful register / paste.
-
-    Non-fatal — if the anchor write fails for any reason the credentials
-    are still persisted and the runtime will boot. We surface a clear
-    warning so the operator can repair manually. Mirrors the posture in
-    :func:`agentchatme_hermes.cli._install_soul_anchor`.
-    """
+def _save_key(save_env_value: Any, api_key: str) -> None:
+    """Persist the key as ``AGENTCHAT_API_KEY`` (legacy name kept in step when present)."""
     try:
-        path = write_soul_anchor(handle)
-        _step(f"Identity anchor written to {path}")
-    except (AnchorError, OSError) as exc:
-        print_warning(
-            f"Could not update ~/.hermes/SOUL.md with your AgentChat identity "
-            f"({exc}). Your account is configured, but the agent will lack "
-            "AgentChat awareness outside AgentChat-triggered turns until this "
-            "is repaired."
-        )
+        from hermes_cli.setup import get_env_value
+    except ImportError:
+        get_env_value = None
+    persist_api_key(save_env_value, api_key=api_key, get_env_value=get_env_value)
+
+
+def _place_or_warn(handle: str, print_warning: Any) -> None:
+    """Place the identity line, verify the manual, register the hosted tools.
+
+    Non-fatal — the credentials are persisted and the runtime will boot;
+    each failed step is surfaced so the operator can repair it
+    (``hermes agentchat doctor --fix`` re-runs the placement).
+    """
+    for step in place_identity_and_tools(handle=handle, api_base=_api_base()):
+        if step.failed:
+            print_warning(f"{step.name}: {step.detail}")
+        else:
+            _step(step.detail)
 
 
 # ─── internal mechanics (0.2.0 — SDK-based) ────────────────────────────────
@@ -864,7 +880,7 @@ class _RecoverError(Exception):
 
 def _api_base() -> str:
     return (
-        os.environ.get("AGENTCHATME_API_BASE", "https://api.agentchat.me").strip()
+        os.environ.get(ENV_API_BASE, "https://api.agentchat.me").strip()
         or "https://api.agentchat.me"
     ).rstrip("/")
 

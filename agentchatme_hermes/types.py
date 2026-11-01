@@ -1,134 +1,16 @@
 """Cross-module value types.
 
-Kept in their own module so the WS daemon, message queue, agent
-invoker, and prompt builder don't form a circular import graph.
+Kept in their own module so the WS daemon, invoker and runtime don't form a
+circular import graph. Message bodies never appear here: a ``message.new``
+frame is a knock, and the daemon reads only the sender (to skip its own
+echo) and the ids (for the log line). What the message says is read by the
+agent, through the hosted tools, inside its turn.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Literal
-
-ConversationKind = Literal["direct", "group"]
-
-
-@dataclass(frozen=True)
-class InboundEvent:
-    """A single peer-message poke delivered from the WS daemon to the agent.
-
-    Frozen so it can pass between threads (WS thread → invoker thread)
-    safely without defensive copies. Sender filtering happens upstream
-    in the daemon — events handed to the queue are never self-authored.
-    """
-
-    message_id: str
-    conversation_id: str
-    conversation_kind: ConversationKind
-    sender_handle: str
-    content_text: str
-    received_at: datetime
-    # ─ Platform-authored trusted context (server `message.context`) ─
-    # Identity the server resolved for us, so a stateless agent knows WHO it is
-    # talking to and WHERE without a lookup. All optional/defaulted so a message
-    # predating the server enrichment still parses (legacy path → bare handle).
-    sender_display_name: str | None = None
-    sender_kind: str = "agent"  # 'agent' | 'system'
-    group_name: str | None = None
-    member_count: int | None = None
-    # Handles @-mentioned in the message, parsed server-side (word-boundary
-    # correct). Tuple so the dataclass stays frozen/hashable. A recipient tests
-    # its OWN handle for membership — never substring-matches the raw text.
-    mentions: tuple[str, ...] = ()
-
-    @classmethod
-    def from_ws_message(cls, payload: dict[str, Any]) -> InboundEvent | None:
-        """Build an event from a raw ``message.new`` WS frame payload.
-
-        Returns ``None`` when the payload is malformed (missing required
-        fields, unknown conversation kind). Tolerant by design — we'd
-        rather skip a single frame we don't understand than crash the
-        WS loop.
-        """
-        msg_id = payload.get("id")
-        conv_id = payload.get("conversation_id")
-        sender = payload.get("from") or payload.get("sender")
-        content = payload.get("content") or {}
-
-        if not isinstance(msg_id, str) or not isinstance(conv_id, str):
-            return None
-        if not isinstance(sender, str) or not sender:
-            return None
-        if not isinstance(content, dict):
-            return None
-
-        # Server returns "@handle" — normalize to bare handle for
-        # consistency with our tool surface (which strips the @ too).
-        sender_handle = sender.lstrip("@").lower()
-
-        # The server uses message.content.text for type="text" and
-        # message.content.data for everything else. We only surface
-        # text in the notification — non-text types still produce an
-        # event, but with a placeholder string so the agent at least
-        # knows something landed.
-        msg_type = payload.get("type", "text")
-        if msg_type == "text":
-            text = str(content.get("text", "")).strip()
-        else:
-            text = f"[non-text message: type={msg_type}]"
-
-        conv_kind: ConversationKind = (
-            "group" if str(conv_id).startswith("conv_grp_") else "direct"
-        )
-
-        created_at_raw = payload.get("created_at")
-        try:
-            received_at = (
-                datetime.fromisoformat(created_at_raw.replace("Z", "+00:00"))
-                if isinstance(created_at_raw, str)
-                else datetime.now(timezone.utc)
-            )
-        except ValueError:
-            received_at = datetime.now(timezone.utc)
-
-        # Platform-authored trusted context block (may be absent on legacy
-        # messages). Read defensively — a malformed context never fails the
-        # frame; it just degrades to the bare-handle path.
-        context = payload.get("context")
-        ctx_sender = context.get("sender") if isinstance(context, dict) else None
-        ctx_conv = context.get("conversation") if isinstance(context, dict) else None
-        ctx_sender = ctx_sender if isinstance(ctx_sender, dict) else {}
-        ctx_conv = ctx_conv if isinstance(ctx_conv, dict) else {}
-
-        display_name_raw = ctx_sender.get("display_name")
-        sender_display_name = (
-            display_name_raw if isinstance(display_name_raw, str) else None
-        )
-        kind_raw = ctx_sender.get("kind")
-        sender_kind = kind_raw if kind_raw in ("agent", "system") else "agent"
-        group_name_raw = ctx_conv.get("group_name")
-        group_name = group_name_raw if isinstance(group_name_raw, str) else None
-        member_count_raw = ctx_conv.get("member_count")
-        member_count = member_count_raw if isinstance(member_count_raw, int) else None
-        mentions_raw = context.get("mentions") if isinstance(context, dict) else None
-        mentions = (
-            tuple(m.lower() for m in mentions_raw if isinstance(m, str))
-            if isinstance(mentions_raw, list)
-            else ()
-        )
-
-        return cls(
-            message_id=msg_id,
-            conversation_id=conv_id,
-            conversation_kind=conv_kind,
-            sender_handle=sender_handle,
-            content_text=text,
-            received_at=received_at,
-            sender_display_name=sender_display_name,
-            sender_kind=sender_kind,
-            group_name=group_name,
-            member_count=member_count,
-            mentions=mentions,
-        )
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -159,8 +41,8 @@ class GroupInviteEvent:
         """Build an event from a raw ``group.invite.received`` frame payload.
 
         Returns ``None`` only when the load-bearing ids are missing/malformed —
-        tolerant by design, mirroring :meth:`InboundEvent.from_ws_message`: skip
-        a frame we can't act on rather than crash the WS loop.
+        tolerant by design: skip a frame we can't act on rather than crash the
+        WS loop.
         """
         invite_id = payload.get("id")
         group_id = payload.get("group_id")
@@ -213,8 +95,8 @@ class AgentIdentity:
     WS daemon to filter our own outbound from the inbound stream
     (sender_handle == handle).
 
-    **Handle only — no internal ``agt_…`` id.** Internal database ids
-    are server-side only. Agents identify themselves and each other by
+    **Handle only — no internal ``agt_…`` id.** Internal database ids are
+    server-side only. Agents identify themselves and each other by
     handle on the wire. Surfacing the internal id in the plugin would
     be a needless attack-surface expansion (leak through logs, error
     messages, agent-visible context) for zero functional benefit — the

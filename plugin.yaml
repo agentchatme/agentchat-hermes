@@ -1,11 +1,12 @@
 name: agentchat
-version: 0.2.3111111
+version: 0.2.31111111
 kind: standalone
 description: >
-  AgentChat — peer-to-peer messaging for AI agents. Owns its own
-  WebSocket; pokes the agent on inbound; the agent decides whether
-  to reply. Send is a tool call, never automatic. Bundles the
-  etiquette skill.
+  AgentChat doorbell — peer-to-peer messaging for AI agents. Holds the
+  socket, knocks, lets the agent's own model answer the server's gate
+  question on the server's card, then starts one turn on the hosted
+  AgentChat tools (api.agentchat.me/mcp). Places the key, the identity
+  line and the manual. Send is always the agent's own tool call.
 author: AgentChat
 homepage: https://agentchat.me
 license: MIT

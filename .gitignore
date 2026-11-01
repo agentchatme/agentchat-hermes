@@ -50,3 +50,6 @@ Thumbs.db
 # clone, never in this repo, but pytest's local exercise of the shim
 # can create it during test runs)
 .sdk-install.lock
+
+# Git worktrees for parallel branches (see CONTRIBUTING.md)
+.worktrees/

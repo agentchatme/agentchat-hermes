@@ -16,7 +16,15 @@ Surfaces:
   several agents; it defaults to the locally configured one.
 * **``status``** — show the configured @handle and account state
   (restrictions, inbox mode, paused-by-owner, etc.).
-* **``logout``** — wipe the saved key from ``~/.hermes/.env``.
+* **``logout``** — wipe the saved key from ``~/.hermes/.env``, strip the
+  identity line from SOUL.md, remove our ``mcp_servers.agentchat`` entry.
+* **``doctor``** — check every placement (key, identity line, manual,
+  hosted tools) plus the lock and the daemon's health; ``--fix`` re-places.
+
+Every successful register / login / recover *places* the doorbell: the key
+in the profile ``.env`` as ``AGENTCHAT_API_KEY``, the published identity
+line in SOUL.md, and the hosted MCP server in ``config.yaml`` — see
+:mod:`.placement`.
 
 The wizard is the only path users need. The named subcommands
 exist so CI / power users can script the same operations.
@@ -37,7 +45,9 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from ._version import __version__
 from .client_identity import hermes_client_identity
-from .soul_anchor import AnchorError, remove_soul_anchor, write_soul_anchor
+from .config import ENV_API_BASE, ENV_API_KEY, ENV_API_KEY_LEGACY, ENV_HANDLE
+from .placement import PlacementStep, clear_api_key, persist_api_key, place_identity_and_tools
+from .soul_anchor import remove_soul_anchor
 
 if TYPE_CHECKING:
     import argparse
@@ -50,11 +60,14 @@ logger = logging.getLogger(__name__)
 _HANDLE_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-# Env var keys we persist. Keep in lockstep with the SDK / runtime —
-# any rename here is a breaking change for users with a configured key.
-_ENV_API_KEY = "AGENTCHATME_API_KEY"
-_ENV_HANDLE = "AGENTCHATME_HANDLE"
-_ENV_API_BASE = "AGENTCHATME_API_BASE"
+# Env var keys we persist (canonical names live in config.py). The key is
+# ``AGENTCHAT_API_KEY`` — the name the manual and the hosted-MCP header
+# use; ``AGENTCHATME_API_KEY`` is read as a fallback and kept in step while
+# it exists.
+_ENV_API_KEY = ENV_API_KEY
+_ENV_API_KEY_LEGACY = ENV_API_KEY_LEGACY
+_ENV_HANDLE = ENV_HANDLE
+_ENV_API_BASE = ENV_API_BASE
 
 _DEFAULT_API_BASE = "https://api.agentchat.me"
 
@@ -147,7 +160,15 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
 
     p_doctor = sub.add_parser(
         "doctor",
-        help="Diagnose AgentChat configuration & connectivity",
+        help="Diagnose AgentChat configuration, placement & connectivity",
+    )
+    p_doctor.add_argument(
+        "--fix",
+        action="store_true",
+        help=(
+            "Re-place what is missing or outdated: the identity line in SOUL.md and the "
+            "hosted-tools entry in config.yaml (never touches a hand-managed entry)."
+        ),
     )
     p_doctor.set_defaults(func=_dispatch_doctor)
 
@@ -252,7 +273,7 @@ def _dispatch_register(args: argparse.Namespace) -> int:
         logger.debug("auth_client close raised", exc_info=True)
 
     _persist_credentials(api_key=api_key, handle=handle, api_base=api_base)
-    _install_soul_anchor(handle)
+    _install_placement(handle, api_base=api_base)
     _print_registration_success(handle=handle, api_key=api_key)
     return _EXIT_OK
 
@@ -307,7 +328,7 @@ def _dispatch_login(args: argparse.Namespace) -> int:
         )
 
     _persist_credentials(api_key=api_key, handle=handle, api_base=api_base)
-    _install_soul_anchor(handle)
+    _install_placement(handle, api_base=api_base)
     _printline(f"Saved AgentChat key for @{handle}.")
     return _EXIT_OK
 
@@ -392,7 +413,7 @@ def _dispatch_recover(args: argparse.Namespace) -> int:
         return _exit_with(f"Recovery failed: {exc}")
 
     _persist_credentials(api_key=api_key, handle=resolved_handle, api_base=api_base)
-    _install_soul_anchor(resolved_handle)
+    _install_placement(resolved_handle, api_base=api_base)
     _print_recovery_success(handle=resolved_handle, api_key=api_key)
     return _EXIT_OK
 
@@ -437,21 +458,27 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
-def _dispatch_doctor(_args: argparse.Namespace) -> int:
-    """Health-check the plugin's configuration end-to-end.
+def _dispatch_doctor(args: argparse.Namespace) -> int:
+    """Health-check the doorbell end-to-end.
 
     Surfaces in a single checklist:
 
-    * env vars (api key, handle, api base)
+    * the key (which variable name holds it), handle hint, api base
     * SDK importability
     * API reachability + auth (``GET /v1/agents/me``)
     * Account-side flags that would silently suppress live delivery
       (paused-by-owner, inbox mode = strict, etc.)
-    * Undelivered backlog (``GET /v1/messages/undelivered/count``)
-    * SOUL.md anchor presence
+    * the four placements: identity line in SOUL.md (present, current,
+      matching the key), the bundled manual, the hosted-tools entry in
+      ``config.yaml``, the key under the name that entry references
     * Gateway process detection (informational only — the doctor
       itself is a CLI process, so we can only check whether *another*
       process matching ``hermes gateway`` is running)
+    * WS leader ownership plus the daemon's heartbeat record (the lock
+      alone cannot distinguish a healthy receiver from a dead thread)
+
+    ``--fix`` re-places the identity line and the hosted-tools entry
+    before the checks run (a hand-managed entry is never touched).
 
     Exit code is the number of failed checks; ``0`` means clean.
     Each line is prefixed with ``[ok]`` / ``[warn]`` / ``[fail]``
@@ -474,7 +501,7 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
         _printline(f"  [fail] {line}")
 
     _printline("")
-    _printline(f"AgentChat plugin doctor — agentchatme-hermes {__version__}")
+    _printline(f"AgentChat doorbell doctor — agentchatme-hermes {__version__}")
     _printline("")
 
     from .profile_scope import profile_label, resolve_hermes_home, resolve_setting
@@ -482,12 +509,37 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
     hermes_home = resolve_hermes_home()
     ok(f"Profile: {profile_label(hermes_home)} ({hermes_home})")
 
-    saved_key = _read_saved_key()
-    if saved_key:
-        ok(f"AGENTCHATME_API_KEY set ({_mask_key(saved_key)})")
+    from .config import DOORBELL_OFF, ENV_DOORBELL
+
+    doorbell = (resolve_setting(ENV_DOORBELL) or "").strip().lower()
+    if doorbell == DOORBELL_OFF:
+        warn(
+            f"{ENV_DOORBELL}=off — this profile holds no socket and is never woken; "
+            "the hosted tools and the manual still work when the agent is run"
+        )
+
+    saved = _read_saved_key_source()
+    saved_key = saved[0] if saved else None
+    if saved is not None:
+        key, source = saved
+        if source == _ENV_API_KEY:
+            ok(f"{_ENV_API_KEY} set ({_mask_key(key)})")
+        else:
+            warn(
+                f"key found only under the pre-v3 name {source} ({_mask_key(key)}) — the "
+                f"hosted tools authenticate with ${{{_ENV_API_KEY}}}; the gateway mirrors "
+                f"it at activation, or run `hermes agentchat login` to write {_ENV_API_KEY}"
+            )
+        legacy = (resolve_setting(_ENV_API_KEY_LEGACY) or "").strip()
+        canonical = (resolve_setting(_ENV_API_KEY) or "").strip()
+        if legacy and canonical and legacy != canonical:
+            fail(
+                f"{_ENV_API_KEY} and {_ENV_API_KEY_LEGACY} hold different keys — the plugin "
+                f"uses {_ENV_API_KEY}; remove or fix the other"
+            )
     else:
         fail(
-            "AGENTCHATME_API_KEY not set — run "
+            f"{_ENV_API_KEY} not set — run "
             "`hermes agentchat register` or `hermes agentchat login`"
         )
 
@@ -586,8 +638,17 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
     finally:
         client.close()
 
+    if getattr(args, "fix", False) and authenticated_handle is not None:
+        for step in place_identity_and_tools(handle=authenticated_handle, api_base=api_base):
+            (fail if step.failed else ok)(f"fix: {step.name} {step.status} — {step.detail}")
+
     try:
-        from .soul_anchor import has_anchor, read_anchor_handle, resolve_soul_path
+        from .soul_anchor import (
+            anchor_is_current,
+            has_anchor,
+            read_anchor_handle,
+            resolve_soul_path,
+        )
 
         if has_anchor():
             anchored = read_anchor_handle()
@@ -604,15 +665,67 @@ def _dispatch_doctor(_args: argparse.Namespace) -> int:
                     "`hermes agentchat login` here with the right key, or "
                     "re-register."
                 )
+            elif anchored is not None and anchor_is_current() is False:
+                warn(
+                    "SOUL.md identity line is from an older release — run "
+                    "`hermes agentchat doctor --fix` to place the published text"
+                )
+            elif anchored is None:
+                warn(
+                    "SOUL.md agentchat block was hand-edited and names no handle this plugin "
+                    "recognises — it is yours, left alone; the published identity line is at "
+                    "https://agentchat.me/skill.md (Be reachable)"
+                )
             else:
-                ok("SOUL.md identity anchor present")
+                ok(f"SOUL.md identity line present (@{anchored}, published text)")
         else:
             warn(
-                "SOUL.md identity anchor missing — run "
-                "`hermes agentchat login` (or re-register) to install it"
+                "SOUL.md identity line missing — run "
+                "`hermes agentchat doctor --fix` (or `hermes agentchat login`) to place it"
             )
     except ImportError:
         warn("soul_anchor module not importable — skipping anchor check")
+
+    from .placement import BUNDLED_SKILL_PATH
+
+    if BUNDLED_SKILL_PATH.exists():
+        ok("manual bundled as the agentchat:agentchat skill (https://agentchat.me/skill.md)")
+    else:
+        fail(f"bundled manual missing at {BUNDLED_SKILL_PATH} — reinstall agentchatme-hermes")
+
+    try:
+        from .mcp_registration import (
+            McpRegistrationError,
+            hosted_mcp_url,
+            inspect_entry,
+            manual_snippet,
+        )
+
+        try:
+            entry_state = inspect_entry(api_base=api_base)
+        except McpRegistrationError as exc:
+            warn(f"hosted-tools entry not checked — {exc}")
+        else:
+            if entry_state == "ours":
+                ok(
+                    f"hosted tools registered: mcp_servers.agentchat → {hosted_mcp_url(api_base)} "
+                    "(tools appear as mcp__agentchat__<tool>; `hermes mcp test agentchat` probes it)"
+                )
+            elif entry_state == "user_managed":
+                ok("mcp_servers.agentchat is managed by hand in config.yaml — left alone")
+            elif entry_state == "disabled":
+                warn(
+                    "mcp_servers.agentchat is disabled in config.yaml — the agent has no "
+                    "AgentChat tools"
+                )
+            else:
+                fail(
+                    "hosted tools NOT registered — mcp_servers.agentchat missing from "
+                    "config.yaml. Run `hermes agentchat doctor --fix`, or add:\n"
+                    + manual_snippet(api_base)
+                )
+    except ImportError:
+        warn("mcp_registration module not importable — skipping tool-source check")
 
     if _other_gateway_running():
         ok("Hermes gateway process detected (live inbound active)")
@@ -770,38 +883,52 @@ def _dispatch_logout(_args: argparse.Namespace) -> int:
             "inside a Hermes install?"
         )
 
-    save_env_value(_ENV_API_KEY, "")
+    clear_api_key(save_env_value)
     save_env_value(_ENV_HANDLE, "")
     _uninstall_soul_anchor()
+    _uninstall_mcp_registration()
     _printline(
-        "AgentChat key cleared from ~/.hermes/.env. Your account on the "
+        "AgentChat key cleared from the profile .env. Your account on the "
         "server is unchanged."
     )
     return _EXIT_OK
 
 
-def _install_soul_anchor(handle: str) -> None:
-    """Upsert the AgentChat identity block into SOUL.md.
+def _install_placement(handle: str, *, api_base: str) -> list[PlacementStep]:
+    """Place the identity line, verify the manual, register the hosted tools.
 
-    Failure is non-fatal: credentials are already persisted, the account
-    is fully operational, and the anchor is the "subconscious identity
-    everywhere" enhancement. Surface a clear warning so the operator can
-    repair it later — mirrors the OpenClaw plugin's posture at
-    ``channel.wizard.ts:749``.
+    Failure is non-fatal: credentials are already persisted and the account
+    is fully operational. Each failed step is printed with its reason so the
+    operator can repair it (``hermes agentchat doctor --fix`` re-runs this).
     """
+    steps = place_identity_and_tools(handle=handle, api_base=api_base)
+    for step in steps:
+        if step.failed:
+            sys.stderr.write(f"Warning: {step.name}: {step.detail}\n")
+            sys.stderr.flush()
+        else:
+            _printline(f"{step.name}: {step.detail}")
+    return steps
+
+
+def _uninstall_mcp_registration() -> None:
+    """Remove our ``mcp_servers.agentchat`` entry (a hand-managed one is left alone)."""
     try:
-        path = write_soul_anchor(handle)
-    except (AnchorError, OSError) as exc:
+        from .mcp_registration import McpRegistrationError, uninstall_entry
+
+        removed = uninstall_entry(api_base=_api_base())
+    except McpRegistrationError as exc:
         sys.stderr.write(
-            "Warning: failed to update ~/.hermes/SOUL.md with your "
-            f"AgentChat identity. Your account is configured, but the "
-            "agent will not be told about its handle outside of "
-            "AgentChat-triggered turns until this is repaired. "
-            f"(Reason: {exc})\n"
+            f"Warning: could not remove mcp_servers.agentchat from config.yaml ({exc}).\n"
         )
         sys.stderr.flush()
         return
-    _printline(f"Identity anchor written to {path}")
+    except Exception as exc:
+        sys.stderr.write(f"Warning: Hermes refused the config.yaml write ({exc}).\n")
+        sys.stderr.flush()
+        return
+    if removed:
+        _printline("Hosted-tools entry mcp_servers.agentchat removed from config.yaml")
 
 
 def _uninstall_soul_anchor() -> None:
@@ -947,11 +1074,16 @@ def _validate_handle(value: str) -> str:
 # ───────────────────────── helpers ─────────────────────────
 
 
-def _read_saved_key() -> str | None:
-    from .profile_scope import resolve_setting
+def _read_saved_key_source() -> tuple[str, str] | None:
+    """``(key, variable name)`` — canonical name first, legacy name as fallback."""
+    from .config import resolve_api_key
 
-    value = (resolve_setting(_ENV_API_KEY) or "").strip()
-    return value or None
+    return resolve_api_key()
+
+
+def _read_saved_key() -> str | None:
+    resolved = _read_saved_key_source()
+    return resolved[0] if resolved else None
 
 
 def _read_saved_handle() -> str | None:
@@ -1000,10 +1132,15 @@ def _api_base() -> str:
 
 
 def _persist_credentials(*, api_key: str, handle: str, api_base: str) -> None:
-    """Write through Hermes's env-config so subsequent processes see it."""
-    from hermes_cli.config import save_env_value
+    """Write through Hermes's env-config so subsequent processes see it.
 
-    save_env_value(_ENV_API_KEY, api_key)
+    The key lands under ``AGENTCHAT_API_KEY`` (the name the hosted-MCP header
+    references); a pre-v3 ``AGENTCHATME_API_KEY`` line is kept in step so a
+    downgrade still finds the key.
+    """
+    from hermes_cli.config import get_env_value, save_env_value
+
+    persist_api_key(save_env_value, api_key=api_key, get_env_value=get_env_value)
     save_env_value(_ENV_HANDLE, handle)
     # Only persist the API base when the user overrode the default —
     # leaves the default unchanged for everyone else.
@@ -1015,11 +1152,12 @@ def _print_registration_success(*, handle: str, api_key: str) -> None:
     masked = _mask_key(api_key)
     _printline("")
     _printline(f"  Registered @{handle}")
-    _printline(f"  Key:   {masked}   (stored in ~/.hermes/.env)")
+    _printline(f"  Key:   {masked}   (stored in the profile .env as {_ENV_API_KEY})")
     _printline("")
     _printline(
         "Restart Hermes (or any running `hermes gateway`) so the new key "
-        "is picked up. Then your agent is on the network."
+        "is picked up; in an open session run /reload-mcp so the AgentChat "
+        "tools connect. Then your agent is on the network."
     )
 
 
@@ -1027,7 +1165,7 @@ def _print_recovery_success(*, handle: str, api_key: str) -> None:
     masked = _mask_key(api_key)
     _printline("")
     _printline(f"  Recovered @{handle}")
-    _printline(f"  New key:   {masked}   (stored in ~/.hermes/.env)")
+    _printline(f"  New key:   {masked}   (stored in the profile .env as {_ENV_API_KEY})")
     _printline("")
     _printline(
         "The previous key is now dead. Restart Hermes (or any running "
@@ -1051,7 +1189,7 @@ def _print_status(me: dict[str, Any]) -> None:
     _printline(f"  Inbox mode:    {inbox_mode}")
     if paused_by_owner != "none":
         _printline(f"  Paused:        {paused_by_owner}  (owner-paused)")
-    _printline(f"  Plugin:        agentchatme-hermes {__version__}")
+    _printline(f"  Plugin:        agentchatme-hermes {__version__} (doorbell v3)")
     _printline("")
 
 
@@ -1118,7 +1256,7 @@ def register_cli(ctx: Any) -> None:
     """
     ctx.register_cli_command(
         name="agentchat",
-        help="Manage your AgentChat identity (register, login, recover, status, logout)",
+        help="Manage your AgentChat identity (register, login, recover, status, logout, doctor)",
         setup_fn=_setup_with_signature(setup_argparse),
         handler_fn=_dispatch_top,
         description=(

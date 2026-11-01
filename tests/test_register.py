@@ -175,20 +175,122 @@ class TestReconcileSoulAnchor:
 
         soul = tmp_path / "SOUL.md"
         soul_anchor.write_soul_anchor("ops", soul_path=soul)
+        before = soul.read_text()
         monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
             _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
         assert not caplog.records
+        assert soul.read_text() == before
 
-
-class TestSurfaceAlwaysRegistered:
-    def test_tools_and_skill_exist_before_configuration(
+    def test_pre_v3_block_with_matching_handle_is_refreshed(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A fresh profile with no key still gets the tool surface; the tools
-        answer NOT_CONFIGURED instead of being absent."""
-        import json
+        """Same handle, older text → the published identity line replaces it."""
+        from agentchatme_hermes import _register, soul_anchor
+        from agentchatme_hermes.soul_anchor import ANCHOR_END, ANCHOR_START
 
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(
+            f"# Mine\n\n{ANCHOR_START}\n## On AgentChat\n\nYou are **@ops** on AgentChat — "
+            f"old blurb.\n{ANCHOR_END}\n"
+        )
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
+        assert soul_anchor.anchor_is_current(soul_path=soul) is True
+        assert "# Mine" in soul.read_text()
+
+    def test_hand_edited_block_is_left_alone(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import _register, soul_anchor
+        from agentchatme_hermes.soul_anchor import ANCHOR_END, ANCHOR_START
+
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(f"{ANCHOR_START}\nI am a teapot.\n{ANCHOR_END}\n")
+        before = soul.read_text()
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
+        assert soul.read_text() == before
+
+
+class TestReconcileKeyName:
+    def test_legacy_only_profile_gets_the_canonical_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import types
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register
+        from agentchatme_hermes.config import ENV_API_KEY, ENV_API_KEY_LEGACY
+
+        env = {ENV_API_KEY_LEGACY: "ac_live_old"}
+        module = types.ModuleType("hermes_cli.config")
+        module.get_env_value = env.get  # type: ignore[attr-defined]
+        module.save_env_value = env.__setitem__  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+        monkeypatch.setitem(sys.modules, "hermes_cli.config", module)
+
+        _register._reconcile_key_name(SimpleNamespace(api_key_source=ENV_API_KEY_LEGACY))
+        assert env[ENV_API_KEY] == "ac_live_old"
+
+    def test_canonical_profile_is_untouched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register
+        from agentchatme_hermes.config import ENV_API_KEY
+
+        monkeypatch.setitem(sys.modules, "hermes_cli", None)  # would raise if imported
+        _register._reconcile_key_name(SimpleNamespace(api_key_source=ENV_API_KEY))
+
+
+class TestReconcileMcpRegistration:
+    def test_backfills_through_placement(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register, placement
+        from agentchatme_hermes.placement import PlacementStep
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            placement,
+            "place_mcp",
+            lambda api_base: calls.append(api_base) or PlacementStep("mcp", "changed", "added"),
+        )
+        runtime = SimpleNamespace(
+            identity=SimpleNamespace(handle="ops"),
+            hermes_home=tmp_path,
+            config=SimpleNamespace(api_base="https://api.example.test"),
+        )
+        _register._reconcile_mcp_registration(runtime)
+        assert calls == ["https://api.example.test"]
+
+    def test_failure_is_logged_not_raised(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register, placement
+        from agentchatme_hermes.placement import PlacementStep
+
+        monkeypatch.setattr(
+            placement, "place_mcp", lambda api_base: PlacementStep("mcp", "failed", "no hermes")
+        )
+        runtime = SimpleNamespace(
+            identity=SimpleNamespace(handle="ops"),
+            hermes_home=tmp_path,
+            config=SimpleNamespace(api_base="https://api.example.test"),
+        )
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
+            _register._reconcile_mcp_registration(runtime)
+        assert any("hosted tools not registered" in r.getMessage() for r in caplog.records)
+
+
+class TestSurface:
+    def test_skill_registered_and_no_native_tools(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The manual is a skill from the first turn; tools are the hosted MCP
+        server declared in config.yaml, never ``register_tool`` calls."""
         from agentchatme_hermes import _register
 
         monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
@@ -197,27 +299,19 @@ class TestSurfaceAlwaysRegistered:
         ctx = MagicMock()
         _register.register(ctx)
 
-        names = [c.kwargs["name"] for c in ctx.register_tool.call_args_list]
-        assert "agentchat_send_message" in names
         assert ctx.register_skill.called
-
-        send = next(
-            c.kwargs["handler"] for c in ctx.register_tool.call_args_list
-            if c.kwargs["name"] == "agentchat_send_message"
-        )
-        result = json.loads(send({"to": "@peer", "text": "hi"}))
-        assert result["ok"] is False
-        assert result["error"]["code"] == "NOT_CONFIGURED"
-        assert "hermes agentchat register" in result["error"]["message"]
+        skill_kwargs = ctx.register_skill.call_args.kwargs
+        assert skill_kwargs["name"] == "agentchat"
+        assert skill_kwargs["path"].name == "SKILL.md"
+        assert skill_kwargs["path"].parent.name == "agentchat"
+        assert not ctx.register_tool.called, "no native tools — the hosted MCP server is the tool source"
 
 
 class TestActivationWatcher:
     def _watcher(self, tmp_path: Path, *, gateway_mode: bool = True) -> Any:
         from agentchatme_hermes._register import ActivationWatcher
-        from agentchatme_hermes.runtime import RuntimeHandle
 
         return ActivationWatcher(
-            handle=RuntimeHandle(),
             hermes_home=tmp_path / ".hermes",
             profile="default",
             gateway_mode=gateway_mode,
@@ -236,12 +330,14 @@ class TestActivationWatcher:
         runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path)
         monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode: runtime)
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
+        monkeypatch.setattr(_register, "_reconcile_key_name", lambda cfg: None)
+        monkeypatch.setattr(_register, "_reconcile_mcp_registration", lambda rt: None)
 
         watcher = self._watcher(tmp_path)
         assert watcher.try_activate() == "unconfigured"
         assert watcher.next_delay() == _register.ACTIVATION_RETRY_S
         assert watcher.try_activate() == "active"
-        assert watcher._handle.runtime is runtime
+        assert watcher.runtime is runtime
         assert watcher.try_activate() == "active", "idempotent once bound"
 
     def test_start_failure_backs_off_then_recovers(
@@ -262,6 +358,8 @@ class TestActivationWatcher:
             _register, "_try_start_runtime", lambda cfg, *, gateway_mode: outcomes.pop(0)
         )
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
+        monkeypatch.setattr(_register, "_reconcile_key_name", lambda cfg: None)
+        monkeypatch.setattr(_register, "_reconcile_mcp_registration", lambda rt: None)
 
         watcher = self._watcher(tmp_path)
         assert watcher.try_activate() == "failed"

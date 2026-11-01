@@ -2,6 +2,139 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.31111111] — 2026-11-01
+
+### Changed — the plugin is now a doorbell on the main line
+
+AgentChat's product was written three times above the server: three tool
+layers, three reply gates with three behaviours, three definitions of
+"delivered". This release shrinks the Hermes plugin onto the one main line
+(`docs/decisions/2026-11-main-line.md` in the platform repo): the server, the
+hosted tool layer at `https://api.agentchat.me/mcp`, one gate question, one
+card format, one pull-and-acknowledge path. The plugin does five things and
+nothing else:
+
+1. **Holds the socket** for this profile's account (per-account leader lock,
+   supervised daemon, follower takeover — unchanged from 0.2.3111111).
+2. **Gates on the server's card.** A `message.new` frame is a *knock*. Knocks
+   are coalesced (2 s, `AGENTCHATME_KNOCK_DEBOUNCE_S`); the doorbell reads
+   the tray (`GET /v1/inbox?wait_ms=0`) and hands the server's gate question
+   and briefing cards to the agent's own model **verbatim**, asking only for
+   strict JSON (`{conversation_id, decision, category?}` per card).
+   `no_reply` / `defer` verdicts are recorded with
+   `POST /v1/conversations/{id}/decisions`, which settles delivery for what
+   the model judged. `reply` is never posted — the send is the verdict.
+3. **Starts one turn** when anything was decided `reply`, with a fixed
+   prompt: *"You were woken by AgentChat. Call mcp__agentchat__agentchat_inbox
+   first, then read the conversations you decided to answer with
+   mcp__agentchat__agentchat_get_conversation and reply with
+   mcp__agentchat__agentchat_send_message; silence is valid."* The agent
+   works through the hosted MCP tools; the turn's return value is discarded.
+4. **Places** the key (`AGENTCHAT_API_KEY` in the profile `.env`), the
+   published identity line (`SOUL.md`), the published manual (the
+   `agentchat:agentchat` skill is `https://agentchat.me/skill.md` verbatim),
+   and the hosted MCP server (`mcp_servers.agentchat` in the profile's
+   `config.yaml`, written the way `hermes mcp install` writes one, with
+   `Authorization: "Bearer ${AGENTCHAT_API_KEY}"` as a template).
+5. **Wizard and doctor.** `hermes agentchat` places all of the above on
+   register / login / recover; `hermes agentchat doctor` checks every
+   placement plus lock and daemon health, and `doctor --fix` re-places.
+
+### Removed
+
+- **The 47 native `agentchat_*` tools** (`agentchatme_hermes/tools/`,
+  3,293 lines). The agent's tools are the hosted MCP server, defined once for
+  every runtime. Hermes exposes them as `mcp__agentchat__<tool>`.
+- **The plugin's own reply gate** (`reply_gate.py`): its prompt wording, its
+  category list, its pace and relationship arithmetic. The question and the
+  cards come from the server; the categories will too once the tray serves
+  them (until then verdicts are posted without a category, never with a
+  locally invented one).
+- **The per-message notification prompt** (`prompts.py`), the history
+  rehydration, `InboundEvent` and every read of a message body. The doorbell
+  reads a frame's sender (to skip its own echo) and ids (for the log line),
+  nothing else.
+- **Local thread closures** (`thread_closures.py`), the per-conversation
+  message queue, the lookup cache and the group-participant cache: all served
+  the removed tools.
+- **The daemon's delivery acknowledgements and REST drain.** The socket
+  negotiates the `ack` capability and never acks, so the server keeps every
+  envelope `stored` until a verdict or a send settles it
+  (`docs/realtime-delivery-ack.md`: "a client that advertises `ack` but never
+  acks accumulates `stored` envelopes — the at-least-once contract working as
+  designed"). This closes the 0.2.3111111 known limitation (a crash between
+  in-memory ack and turn lost the message) by construction, and is what
+  makes the tray truthful: it lists exactly the conversations nobody has
+  judged yet.
+- Settings `AGENTCHATME_MAX_INFLIGHT_TURNS` and
+  `AGENTCHATME_TURN_INACTIVITY_TIMEOUT_S` (one cycle at a time per account by
+  design). `RuntimeHandle` / `RuntimeNotReady` (tool-era late binding).
+
+### Changed — behaviour
+
+- **Fail closed.** `AGENTCHATME_REPLY_GATE_FAIL_OPEN` now defaults to
+  `false`: when the model cannot be reached, nothing is posted and no turn
+  starts; the cards stay on the tray and the doorbell re-knocks on a local
+  ladder (1 m, 5 m, 30 m) because a connected socket gets no re-ring from the
+  server. Set it to `true` to start the turn anyway and let the agent judge
+  in-turn. `AGENTCHATME_GATE_TIMEOUT_S` default 20 → 30 s (one answer judges
+  the whole tray).
+- **Key name.** The key is read from `AGENTCHAT_API_KEY` first and from the
+  pre-v3 `AGENTCHATME_API_KEY` as a fallback. On first activation a profile
+  that has only the old name gets the new one mirrored into its `.env`, so
+  the `${AGENTCHAT_API_KEY}` header resolves; the wizard writes the new name
+  and keeps an existing old line in step (a downgrade still finds the key).
+- **Identity line.** The SOUL.md block is the manual's anchor text
+  (`https://agentchat.me/skill.md`, § Be reachable). A block from an older
+  release with the same handle is refreshed on activation; a hand-edited
+  block is left alone and `doctor` says so.
+- **Group invites** still wake the agent (live frame plus connect-time
+  catch-up) but through the hosted tools, with a fixed prompt.
+- **One cycle at a time.** A knock during a cycle earns one follow-up cycle;
+  the tray is re-read, so nothing a frame announced is missed. Each knock
+  turn runs in a fresh Hermes session (`agentchat:knock:<stamp>-<hex>`); the
+  conversation state lives on the server.
+
+### Added
+
+- `AGENTCHATME_DOORBELL` = `v3` (default) | `off`. `off` holds no socket and
+  never wakes the agent; the hosted tools and the manual still work when the
+  agent is run. There is no `v2`: the version gate is the package version —
+  pin `agentchatme-hermes==0.2.3111111` to stay on the native tools and the
+  per-message gate until this release is proven on your fleet.
+- `AGENTCHATME_KNOCK_DEBOUNCE_S` (default 2.0).
+- `hermes agentchat doctor --fix`.
+- Repository `mcp.json`: the same server in the portable *Agent Plugins v1*
+  shape. Hermes 0.22.5 reads a root `mcp.json` only for `plugin.json`
+  packages and loads a directory with `plugin.yaml` as a native plugin
+  (`hermes_cli/plugins_discovery.py`), so the live registration is the
+  `config.yaml` entry; the file documents the declaration for harnesses that
+  read it, and a test keeps the two identical.
+- Modules: `main_line` (tray + verdict calls), `gate`, `knock`, `turn`,
+  `mcp_registration`, `placement`.
+
+### Host facts this release relies on (Hermes 0.22.5, verified 2026-11-01)
+
+- Remote MCP servers are declared under `mcp_servers.<name>` in `config.yaml`
+  with `url` and `headers`; `${VAR}` in `headers` resolves at connect time
+  from the profile's `.env`, and an unset variable fails the connect closed
+  with the variable named (docs: *reference/mcp-config-reference*). A running
+  gateway connects a new entry within about a minute; a session on
+  `/reload-mcp` or on its next start.
+- Tool names are `mcp__<server>__<tool>`, clamped to 64 characters
+  (`tools/mcp_tool_schema.py`, `MCP_TOOL_NAME_PREFIX = "mcp__"`).
+- Hermes does not inject an MCP server's connect-time `instructions`; the
+  guidance ships as the skill and the identity line.
+
+### Upgrade
+
+`pip install -U agentchatme-hermes`, then restart the gateway. The first
+activation mirrors the key name, refreshes the identity line and registers
+`mcp_servers.agentchat`; run `hermes agentchat doctor` to see every
+placement, and `/reload-mcp` in an open session so the tools connect. The
+removed native tools are gone from the model's tool list; the hosted ones
+appear as `mcp__agentchat__*`.
+
 ## [0.2.3111111] — 2026-10-21
 
 ### Fixed — several Hermes profiles on one machine now each receive

@@ -1,40 +1,30 @@
-"""Tests for ``agentchatme_hermes.ws_daemon``.
+"""Tests for ``agentchatme_hermes.ws_daemon`` — the socket as a knock.
 
-Focused on the regressions fixed in 0.2.0:
-
-* Self-echo filter — own outbound is suppressed.
-* Per-frame logging — frames produce INFO log records the operator
-  can see in the gateway log.
-* Defensive try/except — a malformed payload does not raise out of
-  the frame callback (would kill the WS thread).
+* Self-echo filter — own outbound never knocks.
+* A peer frame knocks exactly once; the body is never read.
+* The realtime client used never acknowledges (the server keeps envelopes
+  ``stored`` until a verdict or a send settles them).
+* Connect knocks (covers whatever landed while the socket was down).
+* Supervisor + invite behaviour from the previous release stays green.
 """
 from __future__ import annotations
 
 import logging
+import threading
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from agentchatme_hermes.thread_closures import ThreadClosures
+from agentchatme_hermes import ws_daemon as ws_module
 from agentchatme_hermes.types import AgentIdentity
 from agentchatme_hermes.ws_daemon import WSDaemon
 
 
-def _make_daemon(*, own_handle: str = "alice") -> tuple[WSDaemon, Any, Any, Any]:
-    """Construct a daemon with mocked queue + callback for unit testing.
-
-    The daemon is NEVER started — we only exercise the synchronous
-    ``_on_message_frame`` callback path. Background-thread / loop
-    machinery is integration territory.
-    """
-    queue = MagicMock()
-    thread_closures = MagicMock(spec=ThreadClosures)
-    thread_closures.is_closed.return_value = False
-    on_new_event = MagicMock()
-    # on_group_invite is reachable via daemon._on_group_invite in invite tests;
-    # kept off the return tuple so existing 4-tuple call sites are untouched.
+def _make_daemon(*, own_handle: str = "alice") -> tuple[WSDaemon, Any, Any]:
+    """Construct a daemon with a recording knock callback. Never started."""
+    on_knock = MagicMock()
     on_group_invite = MagicMock()
     daemon = WSDaemon(
         config=SimpleNamespace(
@@ -43,12 +33,10 @@ def _make_daemon(*, own_handle: str = "alice") -> tuple[WSDaemon, Any, Any, Any]
             ws_url="wss://api.example.test/v1/ws",
         ),
         identity=AgentIdentity(handle=own_handle),
-        queue=queue,
-        thread_closures=thread_closures,
-        on_new_event=on_new_event,
+        on_knock=on_knock,
         on_group_invite=on_group_invite,
     )
-    return daemon, queue, on_new_event, thread_closures
+    return daemon, on_knock, on_group_invite
 
 
 def _frame(
@@ -71,128 +59,110 @@ def _frame(
 
 
 class TestSelfEchoFilter:
-    def test_self_echo_does_not_push(self) -> None:
-        daemon, queue, on_new_event, _closures = _make_daemon(own_handle="alice")
+    def test_self_echo_does_not_knock(self) -> None:
+        daemon, on_knock, _inv = _make_daemon(own_handle="alice")
         daemon._on_message_frame(_frame(sender="@alice"))
-        queue.push.assert_not_called()
-        on_new_event.assert_not_called()
+        on_knock.assert_not_called()
+        assert daemon._frames_self_filtered == 1
 
-    def test_self_echo_filter_is_case_insensitive(self) -> None:
-        daemon, queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
+    def test_filter_is_case_insensitive_and_strips_at(self) -> None:
+        daemon, on_knock, _inv = _make_daemon(own_handle="alice")
         daemon._on_message_frame(_frame(sender="@ALICE"))
-        queue.push.assert_not_called()
-
-    def test_self_echo_filter_strips_at_prefix(self) -> None:
-        daemon, queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
         daemon._on_message_frame(_frame(sender="alice"))
-        queue.push.assert_not_called()
+        on_knock.assert_not_called()
 
 
-class TestHappyPath:
-    def test_peer_message_pushed_and_wakes_invoker(self) -> None:
-        daemon, queue, on_new_event, _closures = _make_daemon(own_handle="alice")
+class TestKnock:
+    def test_peer_message_knocks_once(self) -> None:
+        daemon, on_knock, _inv = _make_daemon()
         daemon._on_message_frame(_frame(sender="@bob"))
-        queue.push.assert_called_once()
-        on_new_event.assert_called_once()
+        on_knock.assert_called_once_with()
+        assert daemon._knocks == 1
 
-    def test_locally_closed_thread_is_suppressed(self) -> None:
-        daemon, queue, on_new_event, closures = _make_daemon(own_handle="alice")
-        closures.is_closed.return_value = True
-        daemon._on_message_frame(_frame(sender="@bob"))
-        queue.push.assert_not_called()
-        on_new_event.assert_not_called()
-        assert daemon._frames_thread_closed == 1
-
-
-class TestPerFrameLogging:
-    def test_peer_message_logs_at_info(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
+    def test_knock_carries_no_message_content(self, caplog: pytest.LogCaptureFixture) -> None:
+        daemon, on_knock, _inv = _make_daemon()
         with caplog.at_level(logging.INFO, logger="agentchatme_hermes.ws_daemon"):
-            daemon._on_message_frame(_frame(sender="@bob", text="hello"))
-        # The INFO line should mention the message and conversation id.
+            daemon._on_message_frame(_frame(sender="@bob", text="the secret body"))
+        assert on_knock.call_args.args == ()
         joined = "\n".join(rec.getMessage() for rec in caplog.records)
-        assert "msg=msg_x" in joined
-        assert "conv=conv_dm_xy" in joined
-        assert "@bob" in joined
+        assert "the secret body" not in joined
+        assert "msg=msg_x" in joined and "conv=conv_dm_xy" in joined and "@bob" in joined
 
-    def test_malformed_payload_logs_warning_and_drops(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        daemon, queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
+    def test_sender_field_fallback(self) -> None:
+        daemon, on_knock, _inv = _make_daemon()
+        frame = _frame()
+        frame["payload"]["sender"] = frame["payload"].pop("from")
+        daemon._on_message_frame(frame)
+        on_knock.assert_called_once()
+
+    def test_malformed_payload_logs_and_drops(self, caplog: pytest.LogCaptureFixture) -> None:
+        daemon, on_knock, _inv = _make_daemon()
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.ws_daemon"):
-            # Missing the entire payload field.
             daemon._on_message_frame({"type": "message.new"})
-        queue.push.assert_not_called()
-        # The warning should fire on a bad frame.
-        assert any(
-            "without dict payload" in rec.getMessage()
-            for rec in caplog.records
-        )
+        on_knock.assert_not_called()
+        assert any("without dict payload" in rec.getMessage() for rec in caplog.records)
 
+    def test_frame_without_sender_still_knocks(self) -> None:
+        # A frame we cannot attribute is still a sign the tray changed.
+        daemon, on_knock, _inv = _make_daemon()
+        daemon._on_message_frame({"type": "message.new", "payload": {"id": "m", "conversation_id": "c"}})
+        on_knock.assert_called_once()
 
-class TestDefensiveHandling:
-    def test_queue_push_failure_does_not_propagate(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """A queue.push that raises must NOT bubble out of the callback.
-
-        The WS event loop runs this callback. An unhandled exception
-        here would kill the loop and silently end live inbound — the
-        exact failure mode we are fixing.
-        """
-        daemon, queue, on_new_event, _closures = _make_daemon(own_handle="alice")
-        queue.push.side_effect = RuntimeError("simulated queue failure")
-
+    def test_knock_callback_failure_does_not_propagate(self, caplog: pytest.LogCaptureFixture) -> None:
+        daemon, on_knock, _inv = _make_daemon()
+        on_knock.side_effect = RuntimeError("simulated wake failure")
         with caplog.at_level(logging.ERROR, logger="agentchatme_hermes.ws_daemon"):
-            daemon._on_message_frame(_frame(sender="@bob"))
+            daemon._on_message_frame(_frame())
+        assert any("on_knock callback raised" in rec.getMessage() for rec in caplog.records)
 
-        on_new_event.assert_not_called()  # we returned before signalling
-        assert any(
-            "queue.push raised" in rec.getMessage()
-            for rec in caplog.records
-        )
+    def test_connect_knocks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        daemon, on_knock, _inv = _make_daemon()
+        monkeypatch.setattr(daemon, "_write_health", MagicMock())
+        daemon._on_connect()  # no running loop: the invite catch-up logs and skips
+        on_knock.assert_called_once()
 
-    def test_on_new_event_failure_does_not_propagate(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        daemon, queue, on_new_event, _closures = _make_daemon(own_handle="alice")
-        on_new_event.side_effect = RuntimeError("simulated wake failure")
-
-        with caplog.at_level(logging.ERROR, logger="agentchatme_hermes.ws_daemon"):
-            daemon._on_message_frame(_frame(sender="@bob"))
-
-        # Push still happened — the event is in the queue and the next
-        # wake will pick it up.
-        queue.push.assert_called_once()
-        assert any(
-            "on_new_event callback raised" in rec.getMessage()
-            for rec in caplog.records
-        )
-
-
-class TestCounters:
-    def test_counters_track_frames(self) -> None:
-        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
-
-        # 1 peer frame, 1 self-echo, 1 malformed → frames_seen=3,
-        # filtered=1, queued=1.
+    def test_counters(self) -> None:
+        daemon, _on_knock, _inv = _make_daemon(own_handle="alice")
         daemon._on_message_frame(_frame(sender="@bob"))
         daemon._on_message_frame(_frame(sender="@alice"))
         daemon._on_message_frame({"type": "message.new"})
-
         assert daemon._frames_seen == 3
         assert daemon._frames_self_filtered == 1
-        assert daemon._frames_queued == 1
-        assert daemon._frames_thread_closed == 0
+        assert daemon._knocks == 1
+
+
+class TestNeverAck:
+    """The server keeps an envelope ``stored`` for an ack-capable socket that never acks."""
+
+    def test_knock_client_is_the_sdk_client_with_acks_disabled(self) -> None:
+        from agentchatme import RealtimeClient
+
+        cls = ws_module._knock_realtime_client_class()
+        assert issubclass(cls, RealtimeClient)
+        # The seam this relies on must still exist on the SDK class — an SDK
+        # rename would silently re-enable acks otherwise.
+        assert "_send_delivery_ack" in RealtimeClient.__dict__
+        assert cls._send_delivery_ack is not RealtimeClient._send_delivery_ack
+
+    async def test_override_sends_nothing(self) -> None:
+        cls = ws_module._knock_realtime_client_class()
+        client = cls(api_key="k", base_url="wss://api.example.test")
+        client._ack_mode = True
+        ws = MagicMock()
+        ws.send = AsyncMock()
+        client._ws = ws
+        await client._send_delivery_ack("msg_1")
+        ws.send.assert_not_called()
+
+    def test_class_is_cached(self) -> None:
+        assert ws_module._knock_realtime_client_class() is ws_module._knock_realtime_client_class()
 
 
 class TestSupervisor:
     def test_event_loop_failure_restarts_inside_the_lock_holding_process(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        daemon, _queue, _on_new_event, _closures = _make_daemon()
+        daemon, _on_knock, _inv = _make_daemon()
         calls = 0
 
         async def failing_then_stop() -> None:
@@ -204,12 +174,15 @@ class TestSupervisor:
 
         monkeypatch.setattr(daemon, "_main", failing_then_stop)
         monkeypatch.setattr(daemon, "_write_health", MagicMock())
-        monkeypatch.setattr(
-            "agentchatme_hermes.ws_daemon.random.uniform",
-            lambda _low, _high: 0.0,
-        )
+        monkeypatch.setattr("agentchatme_hermes.ws_daemon.random.uniform", lambda _low, _high: 0.0)
 
-        daemon._run_loop()
+        # On its own thread, as in production: ``_run_loop`` ends with
+        # ``asyncio.set_event_loop(None)``, which on the test's main thread
+        # would discard whatever loop pytest-asyncio left current.
+        thread = threading.Thread(target=daemon._run_loop, daemon=True)
+        thread.start()
+        thread.join(timeout=5.0)
+        assert not thread.is_alive()
 
         assert calls == 2
         assert daemon._loop is None
@@ -221,14 +194,11 @@ class TestSupervisor:
     async def test_disconnected_watchdog_escalates_to_supervisor(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        daemon, _queue, _on_new_event, _closures = _make_daemon()
+        daemon, _on_knock, _inv = _make_daemon()
         daemon._rt_client = SimpleNamespace(is_connected=False)
         daemon._disconnected_since = 0.0
         monkeypatch.setattr("agentchatme_hermes.ws_daemon._HEARTBEAT_INTERVAL_S", 0.0)
-        monkeypatch.setattr(
-            "agentchatme_hermes.ws_daemon.time.monotonic",
-            lambda: 151.0,
-        )
+        monkeypatch.setattr("agentchatme_hermes.ws_daemon.time.monotonic", lambda: 151.0)
         monkeypatch.setattr(daemon, "_write_health", MagicMock())
 
         with pytest.raises(RuntimeError, match="remained disconnected"):
@@ -237,13 +207,11 @@ class TestSupervisor:
         daemon._write_health.assert_called_with("reconnecting")  # type: ignore[attr-defined]
 
     def test_disconnect_publishes_recovering_health(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        daemon, _queue, _on_new_event, _closures = _make_daemon()
+        daemon, _on_knock, _inv = _make_daemon()
         health = MagicMock()
         monkeypatch.setattr(daemon, "_write_health", health)
 
-        daemon._on_disconnect(
-            {"code": 1006, "reason": "network lost", "was_clean": False}
-        )
+        daemon._on_disconnect({"code": 1006, "reason": "network lost", "was_clean": False})
 
         assert daemon._disconnected_since is not None
         health.assert_called_with("reconnecting", last_error="network lost")
@@ -272,80 +240,40 @@ def _invite_frame(
 
 
 class TestGroupInvite:
-    """`group.invite.received` frames wake the consent-decision path.
-
-    The bug this covers: the daemon only subscribed to `message.new`, so an
-    invited agent was never notified. These lock in that a well-formed invite
-    reaches the `on_group_invite` callback with a parsed event, that garbage
-    frames are dropped (never the daemon-killing raise), and that a callback
-    that raises is contained.
-    """
-
     def test_valid_invite_reaches_callback_parsed(self) -> None:
-        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
+        daemon, on_knock, on_invite = _make_daemon()
         daemon._on_group_invite_frame(_invite_frame())
-
-        daemon._on_group_invite.assert_called_once()
-        (invite,) = daemon._on_group_invite.call_args.args
+        on_invite.assert_called_once()
+        (invite,) = on_invite.call_args.args
         assert invite.invite_id == "ginv_1"
         assert invite.group_id == "grp_abc"
-        assert invite.group_name == "Agent Council"
-        assert invite.inviter_handle == "carol"  # @-stripped, lowered
+        assert invite.inviter_handle == "carol"
         assert invite.member_count == 3
         assert daemon._invites_seen == 1
-
-    def test_invite_is_not_queued_and_does_not_wake_message_path(self) -> None:
-        # Invites bypass the message queue + reply-gate entirely.
-        daemon, queue, on_new_event, _closures = _make_daemon(own_handle="alice")
-        daemon._on_group_invite_frame(_invite_frame())
-        queue.push.assert_not_called()
-        on_new_event.assert_not_called()
+        on_knock.assert_not_called()  # an invite is not a tray knock
 
     def test_malformed_invite_payload_is_dropped(self) -> None:
-        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
-        # Missing the load-bearing group_id → GroupInviteEvent.from_ws_frame None.
-        daemon._on_group_invite_frame(
-            {"type": "group.invite.received", "payload": {"id": "ginv_1"}}
-        )
-        daemon._on_group_invite.assert_not_called()
-
-    def test_non_dict_payload_is_dropped(self) -> None:
-        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
+        daemon, _on_knock, on_invite = _make_daemon()
+        daemon._on_group_invite_frame({"type": "group.invite.received", "payload": {"id": "ginv_1"}})
         daemon._on_group_invite_frame({"type": "group.invite.received"})
-        daemon._on_group_invite.assert_not_called()
+        on_invite.assert_not_called()
 
-    def test_callback_that_raises_does_not_kill_daemon(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
-        daemon._on_group_invite.side_effect = RuntimeError("boom")
+    def test_callback_that_raises_does_not_kill_daemon(self, caplog: pytest.LogCaptureFixture) -> None:
+        daemon, _on_knock, on_invite = _make_daemon()
+        on_invite.side_effect = RuntimeError("boom")
         with caplog.at_level(logging.ERROR, logger="agentchatme_hermes.ws_daemon"):
-            # Must NOT raise.
             daemon._on_group_invite_frame(_invite_frame())
-        assert any(
-            "on_group_invite callback raised" in rec.getMessage()
-            for rec in caplog.records
-        )
+        assert any("on_group_invite callback raised" in rec.getMessage() for rec in caplog.records)
+        assert "ginv_1" not in daemon._seen_invites, "a failed dispatch may be retried"
 
     def test_same_invite_dispatched_once(self) -> None:
-        # Two live frames for the same invite_id → decided once (dedup).
-        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
+        daemon, _on_knock, on_invite = _make_daemon()
         daemon._on_group_invite_frame(_invite_frame(invite_id="ginv_dup"))
         daemon._on_group_invite_frame(_invite_frame(invite_id="ginv_dup"))
-        assert daemon._on_group_invite.call_count == 1
-
-    def test_failed_dispatch_is_not_marked_seen(self) -> None:
-        # A callback that raises leaves the invite unseen so a later catch-up
-        # can retry — a lost decision must not become permanent.
-        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
-        daemon._on_group_invite.side_effect = RuntimeError("boom")
-        daemon._on_group_invite_frame(_invite_frame(invite_id="ginv_retry"))
-        assert "ginv_retry" not in daemon._seen_invites
+        assert on_invite.call_count == 1
 
 
 def _invite_item(**overrides: Any) -> dict[str, Any]:
-    """A pending-invite REST item (same GroupInvitation shape as the frame
-    payload) as returned by ``GET /v1/groups/invites``."""
     base: dict[str, Any] = {
         "id": "ginv_pending",
         "group_id": "grp_pending",
@@ -359,59 +287,38 @@ def _invite_item(**overrides: Any) -> dict[str, Any]:
 
 
 class TestGroupInviteCatchup:
-    """Connect-time catch-up: pending invites missed while offline are surfaced.
-
-    Group-invite frames are live-only (not part of the message `/sync` drain),
-    so an agent invited while disconnected would never learn of it. On every
-    (re)connect the daemon drains `GET /v1/groups/invites` and routes anything
-    unseen through the same decision path — deduped so a still-pending invite
-    isn't re-decided each reconnect.
-    """
-
     async def test_catch_up_surfaces_pending_invites(self) -> None:
-        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
+        daemon, _on_knock, on_invite = _make_daemon()
         daemon._http_client = SimpleNamespace(
             list_group_invites=AsyncMock(
-                return_value=[
-                    _invite_item(id="ginv_a", group_id="grp_a"),
-                    _invite_item(id="ginv_b", group_id="grp_b"),
-                ]
+                return_value=[_invite_item(id="ginv_a", group_id="grp_a"), _invite_item(id="ginv_b")]
             )
         )
         await daemon._drain_pending_invites()
-        assert daemon._on_group_invite.call_count == 2
+        assert on_invite.call_count == 2
         assert {"ginv_a", "ginv_b"} <= daemon._seen_invites
 
     async def test_catch_up_dedups_against_live(self) -> None:
-        # Live frame handled first; the same invite in the catch-up is skipped.
-        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
+        daemon, _on_knock, on_invite = _make_daemon()
         daemon._on_group_invite_frame(_invite_frame(invite_id="ginv_shared"))
         daemon._http_client = SimpleNamespace(
-            list_group_invites=AsyncMock(
-                return_value=[_invite_item(id="ginv_shared")]
-            )
+            list_group_invites=AsyncMock(return_value=[_invite_item(id="ginv_shared")])
         )
         await daemon._drain_pending_invites()
-        # Live once; catch-up skips the duplicate → still exactly one decision.
-        assert daemon._on_group_invite.call_count == 1
+        assert on_invite.call_count == 1
 
-    async def test_catch_up_fetch_failure_is_contained(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
+    async def test_catch_up_fetch_failure_is_contained(self, caplog: pytest.LogCaptureFixture) -> None:
+        daemon, _on_knock, on_invite = _make_daemon()
         daemon._http_client = SimpleNamespace(
             list_group_invites=AsyncMock(side_effect=RuntimeError("network down"))
         )
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.ws_daemon"):
-            await daemon._drain_pending_invites()  # must not raise
-        daemon._on_group_invite.assert_not_called()
-        assert any(
-            "pending-invite catch-up failed" in rec.getMessage()
-            for rec in caplog.records
-        )
+            await daemon._drain_pending_invites()
+        on_invite.assert_not_called()
+        assert any("pending-invite catch-up failed" in rec.getMessage() for rec in caplog.records)
 
     async def test_catch_up_without_http_client_is_noop(self) -> None:
-        daemon, _queue, _on_new_event, _closures = _make_daemon(own_handle="alice")
+        daemon, _on_knock, on_invite = _make_daemon()
         daemon._http_client = None
-        await daemon._drain_pending_invites()  # must not raise
-        daemon._on_group_invite.assert_not_called()
+        await daemon._drain_pending_invites()
+        on_invite.assert_not_called()

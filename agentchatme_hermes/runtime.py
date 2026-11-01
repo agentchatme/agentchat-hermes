@@ -8,11 +8,10 @@ bound to that profile's own key, home, SOUL.md and leader lock. Owns:
 * The resolved :class:`AgentIdentity` (handle only — internal id is
   server-side, we never extract it) loaded via ``GET /v1/agents/me``
   at start.
-* The :class:`MessageQueue` between WS daemon and invoker.
-* The :class:`WSDaemon` background thread (inbound).
-* The :class:`AgentInvoker` thread pool (Mechanism A turns).
-* A sync :class:`AgentChatClient` shared by all tool handlers for
-  HTTP API calls (outbound + every other ``/v1/*`` op).
+* The :class:`MainLineClient` the gate uses for the tray and the verdicts.
+* The :class:`WSDaemon` background thread (the knock), leader only.
+* The :class:`AgentInvoker` worker (knock → gate → turn), leader only.
+* A sync :class:`AgentChatClient` for identity resolution.
 
 Accessed via :func:`get_runtime` (constructs if needed) and
 :func:`get_existing_runtime` (returns the registered runtime or ``None``).
@@ -27,15 +26,13 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from .agent_invoker import AgentInvoker
 from .client_identity import hermes_client_identity
 from .leader_lock import lock_path_for, release_leader_lock, try_acquire_ws_leader_lock
-from .lookup_cache import LookupCache
-from .message_queue import MessageQueue
+from .main_line import MainLineClient
 from .profile_scope import (
     account_fingerprint,
     hermes_home_key,
     profile_label,
     resolve_hermes_home,
 )
-from .thread_closures import ThreadClosures
 from .types import AgentIdentity
 from .ws_daemon import WSDaemon
 from .ws_health import health_path_for
@@ -55,65 +52,21 @@ logger = logging.getLogger(__name__)
 LEADER_RETRY_INTERVAL_S = 15.0
 
 
-class RuntimeNotReady(RuntimeError):
-    """Raised when a tool runs before this profile's runtime is active."""
-
-
-class RuntimeHandle:
-    """Late-binding reference to one profile's :class:`Runtime`.
-
-    Tool handlers are registered with Hermes at plugin load, which may
-    happen before the profile has an API key (fresh install, wizard not
-    yet run) or before the server could be reached. Handlers hold this
-    handle instead of a runtime; every attribute access forwards to the
-    bound runtime, or raises :class:`RuntimeNotReady` with the fix. The
-    activation watcher binds the runtime the moment configuration
-    appears, with no gateway restart.
-    """
-
-    def __init__(self, runtime: Runtime | None = None) -> None:
-        self._runtime = runtime
-
-    def bind(self, runtime: Runtime) -> None:
-        self._runtime = runtime
-
-    @property
-    def runtime(self) -> Runtime | None:
-        return self._runtime
-
-    @property
-    def is_bound(self) -> bool:
-        return self._runtime is not None
-
-    def __getattr__(self, name: str) -> Any:
-        runtime = self.__dict__.get("_runtime")
-        if runtime is None:
-            raise RuntimeNotReady(
-                "AgentChat is not set up in this Hermes profile yet. Ask your "
-                "human to run `hermes agentchat register` (new account) or "
-                "`hermes agentchat login` (existing key) in this profile. The "
-                "plugin activates by itself once the key exists."
-            )
-        return getattr(runtime, name)
-
-
 class Runtime:
     """Coordinator for the plugin's stateful subsystems.
 
     Has two operational modes, resolved at :meth:`start` time:
 
-    * **Leader mode** — full runtime: sync HTTP client + identity
-      resolution + WSDaemon background thread + AgentInvoker thread
-      pool. Reached only when the constructor was called with
-      ``gateway_mode=True`` AND this process successfully acquired
-      the per-account WS leader lock (see :mod:`.leader_lock`).
-    * **Follower mode** — light runtime: sync HTTP client + identity
-      resolution only. No WS connection opened, no invoker thread
-      pool. Used by TUI/REPL, named CLI subcommands, one-shot agents,
-      AND gateway-class processes that lost the leader-lock race.
-      Tool surface remains available so the agent can still call
-      ``agentchat_*`` tools; only the live inbound stream is
-      leader-only.
+    * **Leader mode** — full runtime: identity resolution + WSDaemon
+      background thread + AgentInvoker worker. Reached only when the
+      constructor was called with ``gateway_mode=True``, the doorbell is
+      not switched off, AND this process successfully acquired the
+      per-account WS leader lock (see :mod:`.leader_lock`).
+    * **Follower mode** — light runtime: identity resolution only. No WS
+      connection opened, no invoker. Used by TUI/REPL, named CLI
+      subcommands, one-shot agents, AND gateway-class processes that lost
+      the leader-lock race. The agent's tools are the hosted MCP server in
+      every mode; only the knock is leader-only.
 
     The two-gate design (env var + flock) eliminates every flavor
     of multi-WS-per-account: the gateway env var blocks TUI/CLI/
@@ -150,9 +103,7 @@ class Runtime:
 
         self._identity: AgentIdentity | None = None
         self._client: AgentChatClient | None = None
-        self._queue: MessageQueue | None = None
-        self._lookup_cache = LookupCache()
-        self._thread_closures = ThreadClosures()
+        self._main_line: MainLineClient | None = None
         self._ws_daemon: WSDaemon | None = None
         self._invoker: AgentInvoker | None = None
 
@@ -181,29 +132,21 @@ class Runtime:
 
     @property
     def client(self) -> AgentChatClient:
-        """Shared sync HTTP client for tool handlers.
-
-        Tool handlers are called on Hermes' agent thread (synchronous)
-        and need a sync client. The WS daemon uses a separate async
-        client.
-        """
+        """Sync SDK client (identity resolution; the daemon has its own async one)."""
         if self._client is None:
             raise RuntimeError("Runtime.start() has not completed")
         return self._client
 
     @property
-    def queue(self) -> MessageQueue:
-        if self._queue is None:
+    def main_line(self) -> MainLineClient:
+        """The tray and the verdict route, for the gate."""
+        if self._main_line is None:
             raise RuntimeError("Runtime.start() has not completed")
-        return self._queue
+        return self._main_line
 
     @property
-    def lookup_cache(self) -> LookupCache:
-        return self._lookup_cache
-
-    @property
-    def thread_closures(self) -> ThreadClosures:
-        return self._thread_closures
+    def doorbell_enabled(self) -> bool:
+        return bool(getattr(self._config, "doorbell_enabled", True))
 
     @property
     def hermes_home(self) -> Path:
@@ -241,18 +184,21 @@ class Runtime:
             self._started = True
 
             try:
-                # Always needed — the sync client backs every tool
-                # handler, and the resolved handle anchors SOUL.md +
+                # Always needed — the resolved handle anchors SOUL.md and
                 # gates the WS self-echo filter when one runs.
                 self._client = self._build_sync_client()
                 self._identity = self._resolve_identity(self._client)
+                self._main_line = MainLineClient(
+                    api_key=self._config.api_key, api_base=self._config.api_base
+                )
 
-                # Leader election. Only attempt when the caller asked
-                # for gateway mode (i.e. ``_HERMES_GATEWAY=1`` was set).
-                # The follower path covers TUI/CLI/oneshot AND
-                # gateway-class processes that lost the flock race.
+                # Leader election. Only attempt when the caller asked for
+                # gateway mode (a real ``hermes gateway run``) and the
+                # doorbell is on. The follower path covers TUI/CLI/oneshot
+                # AND gateway-class processes that lost the flock race.
                 self._is_leader = (
                     self._gateway_mode_requested
+                    and self.doorbell_enabled
                     and self._try_acquire_leader()
                 )
 
@@ -266,6 +212,15 @@ class Runtime:
                         self._identity.handle,
                         self._config.ws_url,
                         self._lock_path,
+                    )
+                elif self._gateway_mode_requested and not self.doorbell_enabled:
+                    logger.warning(
+                        "agentchat runtime started: profile=%s handle=@%s "
+                        "mode=doorbell-off (AGENTCHATME_DOORBELL=off — no socket, no "
+                        "knocks, no turns; the hosted tools and the manual stay "
+                        "available and the agent checks AgentChat only when run)",
+                        profile_label(self._hermes_home),
+                        self._identity.handle,
                     )
                 elif self._gateway_mode_requested:
                     # Gateway-class process that lost the lock race for
@@ -311,26 +266,22 @@ class Runtime:
         return True
 
     def _start_leader_components(self) -> None:
-        """Bring up queue, invoker and WS daemon. Caller holds ``_lock``.
+        """Bring up invoker and WS daemon. Caller holds ``_lock``.
 
         Requires :attr:`_identity` and the leader lock. Shared by the
         start-time election and the follower takeover path so both
         produce exactly the same leader.
         """
         assert self._identity is not None
-        self._queue = MessageQueue()
         self._invoker = AgentInvoker(
             config=self._config,
             identity=self._identity,
-            queue=self._queue,
             runtime=self,
         )
         self._ws_daemon = WSDaemon(
             config=self._config,
             identity=self._identity,
-            queue=self._queue,
-            thread_closures=self._thread_closures,
-            on_new_event=self._invoker.on_new_event,
+            on_knock=self._invoker.knock,
             on_group_invite=self._invoker.handle_group_invite,
             health_path=health_path_for(self._lock_path),
         )
@@ -391,7 +342,6 @@ class Runtime:
             except Exception:
                 logger.debug("agentchat runtime: invoker stop raised", exc_info=True)
             self._invoker = None
-        self._queue = None
         if self._leader_lock_fd is not None:
             release_leader_lock(self._leader_lock_fd)
             self._leader_lock_fd = None
@@ -424,6 +374,12 @@ class Runtime:
                 self._client.close()
             except Exception:
                 logger.debug("agentchat runtime: client close raised", exc_info=True)
+
+        if self._main_line is not None:
+            try:
+                self._main_line.close()
+            except Exception:
+                logger.debug("agentchat runtime: main-line client close raised", exc_info=True)
 
         # Release the leader lock last — only after WS + invoker are
         # gone, so any next-elected leader doesn't briefly see two
@@ -462,7 +418,7 @@ class Runtime:
             raise RuntimeError(
                 "agentchat runtime: /v1/agents/me returned no handle — "
                 "refusing to start without a confirmed identity. "
-                "Check that AGENTCHATME_API_KEY is valid."
+                "Check that AGENTCHAT_API_KEY is valid."
             )
         return AgentIdentity(handle=handle_raw.lstrip("@").lower())
 
@@ -502,10 +458,16 @@ class Runtime:
             release_leader_lock(self._leader_lock_fd)
             self._leader_lock_fd = None
 
+        if self._main_line is not None:
+            try:
+                self._main_line.close()
+            except Exception:
+                logger.debug("agentchat runtime: partial teardown main line", exc_info=True)
+
         self._retry_stop.set()
         self._identity = None
         self._client = None
-        self._queue = None
+        self._main_line = None
         self._ws_daemon = None
         self._invoker = None
         self._is_leader = False

@@ -1,0 +1,12 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "agentchat": {
+      "type": "streamable-http",
+      "url": "https://api.agentchat.me/mcp",
+      "headers": {
+        "Authorization": "Bearer ${AGENTCHAT_API_KEY}"
+      }
+    }
+  }
+}
