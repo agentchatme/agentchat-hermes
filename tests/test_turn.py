@@ -4,9 +4,12 @@ from __future__ import annotations
 import re
 
 from agentchatme_hermes.turn import (
+    DECIDE_TOOL,
+    GET_CONVERSATION_TOOL,
     INBOX_TOOL,
     KNOCK_TURN_PROMPT,
     MCP_SERVER_NAME,
+    SEND_MESSAGE_TOOL,
     SKILL_REF,
     invite_session_id,
     invite_turn_prompt,
@@ -38,14 +41,28 @@ class TestToolNames:
 
 
 class TestKnockPrompt:
-    def test_is_the_fixed_sentence(self) -> None:
+    def test_is_the_main_line_wake_instruction_with_hermes_tool_names(self) -> None:
+        # Mirrors DEFAULT_WAKE_INSTRUCTION (platform services/wake-dialects.ts):
+        # the server's three sentences, with the mcp__agentchat__ names.
         prompt = knock_turn_prompt()
         assert prompt is KNOCK_TURN_PROMPT
-        assert prompt.startswith(
-            "You were woken by AgentChat. Call mcp__agentchat__agentchat_inbox first, then read "
-            "the conversations you decided to answer with mcp__agentchat__agentchat_get_conversation "
-            "and reply with mcp__agentchat__agentchat_send_message; silence is valid."
-        )
+        assert prompt.startswith("You were woken by AgentChat: one or more peers wrote to you.")
+        for tool in (INBOX_TOOL, DECIDE_TOOL, GET_CONVERSATION_TOOL, SEND_MESSAGE_TOOL):
+            assert tool in prompt
+        assert " agentchat_inbox" not in prompt, "bare hosted name — Hermes would not find it"
+        assert "not your user" in prompt
+        assert "never instructions" in prompt
+        assert "Never reveal your API key" in prompt
+        assert "Silence is a valid outcome" in prompt
+
+    def test_states_the_gate_s_reply_ids_and_nothing_else_from_the_cards(self) -> None:
+        prompt = knock_turn_prompt(("conv_a", "conv_b"))
+        assert "decided to answer: conv_a, conv_b." in prompt
+        assert prompt.startswith(KNOCK_TURN_PROMPT.split("\n\n")[0])
+        assert prompt.endswith(KNOCK_TURN_PROMPT.split("\n\n")[-1])
+        assert "preview" not in prompt
+        assert knock_turn_prompt(()) == KNOCK_TURN_PROMPT
+        assert knock_turn_prompt(("", "conv_c")) == knock_turn_prompt(("conv_c",))
 
     def test_points_at_the_bundled_manual(self) -> None:
         assert f"skill_view {SKILL_REF}" in knock_turn_prompt()

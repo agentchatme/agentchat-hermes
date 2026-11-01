@@ -327,7 +327,9 @@ class AgentInvoker:
             len(result.reply_conversations),
             result.source,
         )
-        if self._run_turn(prompt=knock_turn_prompt(), session_id=session_id):
+        if self._run_turn(
+            prompt=knock_turn_prompt(result.reply_conversations), session_id=session_id
+        ):
             self.turns += 1
 
     def _run_invite_turn(self, invite: GroupInviteEvent) -> None:

@@ -136,7 +136,7 @@ class TestRunCycle:
         assert tray["conversations"] == [_card("a"), _card("b")]
         assert kwargs["main_runtime"] == {"model": "m", "provider": "p"}
         assert kwargs["fail_open"] is False
-        agent.run_conversation.assert_called_once_with(knock_turn_prompt(), conversation_history=[])
+        agent.run_conversation.assert_called_once_with(knock_turn_prompt(("a",)), conversation_history=[])
         assert inv.turns == 1
 
     def test_no_reply_cards_means_no_turn(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -214,7 +214,7 @@ class TestRunCycle:
         result = inv.run_cycle()
         assert result is not None and result.source == "disabled"
         assert gate_calls == [], "gate off → the model is not asked by the doorbell"
-        agent.run_conversation.assert_called_once_with(knock_turn_prompt(), conversation_history=[])
+        agent.run_conversation.assert_called_once_with(knock_turn_prompt(("a",)), conversation_history=[])
 
     def test_tray_read_failure_reknocks(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, _ml, agent, _calls = _invoker(
