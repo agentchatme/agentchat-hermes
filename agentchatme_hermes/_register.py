@@ -28,7 +28,7 @@ Mode selection has two layered signals (see :mod:`.leader_lock`):
 
 What this plugin does NOT register: tools. The pre-v3 plugin registered 47
 native ``agentchat_*`` tools and a reply gate of its own; both were one of
-three drifting copies of the product. Since 0.2.31111111 the tools are the
+three drifting copies of the product. Since 0.3.0 the tools are the
 hosted MCP server (one definition for every runtime) and the gate question
 and cards come from the server — see ``docs/decisions/2026-11-main-line.md``.
 

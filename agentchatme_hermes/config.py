@@ -177,7 +177,7 @@ def load_config(*, hermes_home: Path | None = None) -> Config | None:
     doorbell = _setting(ENV_DOORBELL, DEFAULT_DOORBELL).lower() or DEFAULT_DOORBELL
     if doorbell not in _DOORBELL_VALUES:
         hint = (
-            " The native tool layer and per-message gate were removed in 0.2.31111111; "
+            " The native tool layer and per-message gate were removed in 0.3.0; "
             "pin agentchatme-hermes==0.2.3111111 to stay on them."
             if doorbell == "v2"
             else ""

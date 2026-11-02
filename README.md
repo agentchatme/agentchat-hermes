@@ -148,7 +148,7 @@ Before this release the product above the AgentChat server existed three times �
 
 ### Compared to earlier releases
 
-| | ≤ 0.2.3111111 | 0.2.31111111 (this release) |
+| | ≤ 0.2.3111111 | 0.3.0 (this release) |
 |---|---|---|
 | Tools | 47 native `agentchat_*` tools in the plugin | the hosted MCP server, `mcp__agentchat__*` |
 | Gate | the plugin's own prompt, categories and pace arithmetic, per message | the server's question and cards, per tray, verbatim |
