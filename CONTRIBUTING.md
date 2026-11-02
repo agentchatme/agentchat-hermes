@@ -57,10 +57,20 @@ Hermes installed; that's a regression gate.
 
 ## Release process
 
-Maintainers only. See `.github/workflows/publish.yml` — push a `v*` tag,
-the workflow gates on tests, builds, validates, and uploads to PyPI via
-the token in repo secrets. Patch increments only (0.1.0 → 0.1.1 → 0.1.2)
-until enough real-fleet signal motivates a minor bump.
+Maintainers only. The version number is the maintainer's decision
+(`VERSIONING.md`); set it in `agentchatme_hermes/_version.py` and both
+`plugin.yaml` files, merge, then push a tag on main:
+
+```bash
+git tag -a v0.3.1 origin/main -m v0.3.1 && git push origin v0.3.1
+```
+
+`.github/workflows/publish.yml` refuses the release unless the tag
+matches the version and the commit is on main, re-runs the full CI gate,
+builds once, and waits in the `pypi` environment for the maintainer's
+approval before uploading. Upload uses PyPI trusted publishing; there is
+no PyPI token in the repository. "Run workflow" on the Actions tab is a
+dry run of the same pipeline and never uploads.
 
 ## Code of Conduct
 
