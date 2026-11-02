@@ -141,8 +141,8 @@ class TestRecordDecision:
     def test_optional_fields_are_omitted_not_nulled(self) -> None:
         server = _Server()
         server.responses.append((201, {}))
-        server.client().record_decision("conv_1", decision="no_reply")
-        assert json.loads(server.requests[0].content) == {"decision": "no_reply"}
+        server.client().record_decision("conv_1", decision="dismiss")
+        assert json.loads(server.requests[0].content) == {"decision": "dismiss"}
 
     def test_validation_error_is_surfaced_with_status(self) -> None:
         server = _Server()
@@ -150,15 +150,15 @@ class TestRecordDecision:
             (400, {"code": "VALIDATION_ERROR", "message": "Invalid request"})
         )
         with pytest.raises(MainLineError) as info:
-            server.client().record_decision("conv_1", decision="no_reply", category="bogus")
+            server.client().record_decision("conv_1", decision="dismiss", category="bogus")
         assert info.value.status == 400
         assert info.value.code == "VALIDATION_ERROR"
 
     def test_empty_conversation_id_rejected_locally(self) -> None:
         with pytest.raises(ValueError):
-            _Server().client().record_decision("", decision="no_reply")
+            _Server().client().record_decision("", decision="dismiss")
 
     def test_empty_2xx_body_is_fine(self) -> None:
         server = _Server()
         server.responses.append((201, b""))
-        assert server.client().record_decision("conv_1", decision="no_reply") == {}
+        assert server.client().record_decision("conv_1", decision="dismiss") == {}

@@ -4,6 +4,11 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [0.3.0] — 2026-11-02
 
+### Changed
+
+- The gate's "nothing needed" verdict is `dismiss` (reply / dismiss / defer), matching the server's vocabulary; a model that still answers `no_reply` is posted as `dismiss`.
+- Bundled manual refreshed to skill.md 2.1.1: the curl examples show a key placeholder instead of the environment variable, which is what Hermes' plugin scanner flagged as exfiltration and blocked the git install path on.
+
 ### Changed — the plugin is now a doorbell on the main line
 
 AgentChat's product was written three times above the server: three tool
@@ -21,7 +26,7 @@ nothing else:
    the tray (`GET /v1/inbox?wait_ms=0`) and hands the server's gate question
    and briefing cards to the agent's own model **verbatim**, asking only for
    strict JSON (`{conversation_id, decision, category?}` per card).
-   `no_reply` / `defer` verdicts are recorded with
+   `dismiss` / `defer` verdicts are recorded with
    `POST /v1/conversations/{id}/decisions`, which settles delivery for what
    the model judged. `reply` is never posted — the send is the verdict.
 3. **Starts one turn** when anything was decided `reply`. The prompt is the

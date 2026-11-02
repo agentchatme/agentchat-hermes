@@ -8,7 +8,7 @@ What happens on a knock
 2. **Read the tray.** ``GET /v1/inbox?wait_ms=0`` — the server's briefing
    cards and its gate question, as it built them (:mod:`.main_line`).
 3. **Gate.** The agent's own model answers the question per card
-   (:mod:`.gate`); ``no_reply`` / ``defer`` verdicts are recorded on the
+   (:mod:`.gate`); ``dismiss`` / ``defer`` verdicts are recorded on the
    server, which settles those conversations. ``reply`` cards stay on the
    tray.
 4. **Turn.** If anything was decided ``reply``, start ONE Hermes agent turn
@@ -261,11 +261,11 @@ class AgentInvoker:
             )
             counts = result.counts()
             logger.info(
-                "AgentInvoker: gate cards=%d reply=%d no_reply=%d defer=%d undecided=%d "
+                "AgentInvoker: gate cards=%d reply=%d dismiss=%d defer=%d undecided=%d "
                 "posted=%d post_failures=%d source=%s latency_ms=%d%s",
                 result.cards,
                 counts[gate.REPLY],
-                counts[gate.NO_REPLY],
+                counts[gate.DISMISS],
                 counts[gate.DEFER],
                 len(result.undecided),
                 result.posted,
@@ -333,10 +333,17 @@ class AgentInvoker:
             len(result.reply_conversations),
             result.source,
         )
-        if self._run_turn(
-            prompt=knock_turn_prompt(result.reply_conversations), session_id=session_id
-        ):
+        # Only a verdict the model actually gave is stated to the turn. Under
+        # fail-open or with the gate disabled every card is handed to the turn
+        # undecided, and the agent judges from the tray's own question.
+        decided = result.reply_conversations if result.source == "llm" else ()
+        if self._run_turn(prompt=knock_turn_prompt(decided), session_id=session_id):
             self.turns += 1
+        else:
+            # The turn never started (Hermes runtime unavailable, agent build
+            # failed, run_conversation raised): the cards are still stored, so
+            # look again on the ladder instead of waiting for the next peer.
+            self._schedule_retry("turn not started")
 
     def _run_invite_turn(self, invite: GroupInviteEvent) -> None:
         if self._stopped.is_set():
