@@ -90,7 +90,7 @@ class TestRetryKnock:
         assert time.monotonic() - started >= 0.04
         coalescer.stop()
 
-    def test_second_knock_after_replaces_the_first(self) -> None:
+    def test_sooner_knock_after_replaces_a_later_one(self) -> None:
         fires: list[int] = []
         coalescer = KnockCoalescer(on_fire=lambda: fires.append(1), debounce_s=0.0)
         coalescer.knock_after(5.0)
@@ -98,6 +98,18 @@ class TestRetryKnock:
         assert _wait_for(lambda: len(fires) == 1)
         time.sleep(0.1)
         assert len(fires) == 1, "the replaced delayed knock must not fire too"
+        coalescer.stop()
+
+    def test_later_knock_after_never_pushes_a_sooner_one_back(self) -> None:
+        # Two fail-closed cycles inside one outage: the 60 s retry must not be
+        # replaced by the 300 s one, or recovery waits five minutes for nothing.
+        fires: list[int] = []
+        coalescer = KnockCoalescer(on_fire=lambda: fires.append(1), debounce_s=0.0)
+        coalescer.knock_after(0.03)
+        assert coalescer.delayed_pending
+        coalescer.knock_after(5.0)
+        assert _wait_for(lambda: len(fires) == 1, timeout=1.0)
+        assert not coalescer.delayed_pending
         coalescer.stop()
 
 

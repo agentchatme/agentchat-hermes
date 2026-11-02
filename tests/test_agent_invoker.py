@@ -181,6 +181,19 @@ class TestRunCycle:
             inv.run_cycle()
         assert scheduled == list(invoker_module.RETRY_LADDER_S)
 
+    def test_failure_while_a_retry_is_pending_does_not_climb(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        failing = gate.GateResult(source="fail_closed", cards=1, undecided=("a",))
+        inv, _ml, _agent, _calls = _invoker(monkeypatch, trays=[_tray(_card("a"))] * 3, gate_result=failing)
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "knock_after", scheduled.append)
+        inv.run_cycle()
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        # A knock lands mid-outage and its cycle fails too, with the 60 s retry still pending.
+        monkeypatch.setattr(type(inv._coalescer), "delayed_pending", property(lambda self: True))
+        inv.run_cycle()
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]], "one outage, one rung"
+        assert inv._retry_rung == 1
+
     def test_success_resets_the_ladder(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, _ml, _agent, _calls = _invoker(
             monkeypatch,

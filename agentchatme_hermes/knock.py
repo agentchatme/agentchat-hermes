@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -32,9 +33,10 @@ class KnockCoalescer:
     """Debounce knocks into single fires.
 
     * :meth:`knock` — arm the timer if none is armed; otherwise absorb.
-    * :meth:`knock_after` — a delayed knock (retry ladder). Replaces any
-      earlier delayed knock still pending; an immediate knock in between
-      still fires on its own schedule.
+    * :meth:`knock_after` — a delayed knock (retry ladder). When one is
+      already pending the SOONER deadline wins (a later retry never pushes
+      an earlier one back); an immediate knock in between still fires on
+      its own schedule.
     * :meth:`stop` — cancel everything; later knocks are ignored.
     """
 
@@ -51,6 +53,7 @@ class KnockCoalescer:
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
         self._delayed: threading.Timer | None = None
+        self._delayed_deadline: float | None = None
         self._stopped = False
         self.knocks = 0
         self.absorbed = 0
@@ -60,6 +63,12 @@ class KnockCoalescer:
     def armed(self) -> bool:
         with self._lock:
             return self._timer is not None
+
+    @property
+    def delayed_pending(self) -> bool:
+        """True while a retry knock is scheduled and has not fired."""
+        with self._lock:
+            return self._delayed is not None
 
     def knock(self) -> None:
         with self._lock:
@@ -76,15 +85,19 @@ class KnockCoalescer:
         timer.start()
 
     def knock_after(self, delay_s: float) -> None:
+        deadline = time.monotonic() + max(0.0, delay_s)
         with self._lock:
             if self._stopped:
                 return
             if self._delayed is not None:
+                if self._delayed_deadline is not None and self._delayed_deadline <= deadline:
+                    return  # an earlier retry is already on its way; keep it
                 self._delayed.cancel()
             timer = threading.Timer(max(0.0, delay_s), self._delayed_knock)
             timer.name = "agentchat-knock-retry"
             timer.daemon = True
             self._delayed = timer
+            self._delayed_deadline = deadline
         timer.start()
 
     def stop(self) -> None:
@@ -93,6 +106,7 @@ class KnockCoalescer:
             timers = [t for t in (self._timer, self._delayed) if t is not None]
             self._timer = None
             self._delayed = None
+            self._delayed_deadline = None
         for timer in timers:
             timer.cancel()
 
@@ -101,6 +115,7 @@ class KnockCoalescer:
     def _delayed_knock(self) -> None:
         with self._lock:
             self._delayed = None
+            self._delayed_deadline = None
         self.knock()
 
     def _fire(self) -> None:

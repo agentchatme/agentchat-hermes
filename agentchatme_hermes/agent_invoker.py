@@ -299,6 +299,12 @@ class AgentInvoker:
         return result
 
     def _schedule_retry(self, reason: str) -> None:
+        if self._coalescer.delayed_pending:
+            # A retry is already on its way (a knock landed mid-outage and
+            # failed again). One outage climbs the ladder once; climbing per
+            # failed cycle would replace the sooner retry with a later one.
+            logger.info("AgentInvoker: %s — a re-knock is already scheduled; not climbing the ladder", reason)
+            return
         if self._retry_rung >= len(RETRY_LADDER_S):
             logger.warning(
                 "AgentInvoker: %s — retry ladder exhausted; waiting for the next knock "
