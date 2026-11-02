@@ -3,7 +3,7 @@
 Three modes need to behave correctly:
 
 * **Leader** (gateway_mode=True, lock acquired) — full runtime: WS
-  daemon + invoker + sync client + identity.
+  daemon (the knock) + invoker (gate → turn) + main-line client + identity.
 * **Follower-gateway** (gateway_mode=True, lock NOT acquired) — light
   runtime, loud warning, no WS, no invoker. This is the path a
   second concurrent gateway hits.
@@ -153,17 +153,6 @@ class TestRuntimeStartFollowerCli:
             assert not invoker_cls.called
             assert rt.is_leader is False
 
-    def test_cli_queue_is_unavailable(self) -> None:
-        """In CLI mode, accessing the queue raises (it doesn't exist)."""
-        from agentchatme_hermes.runtime import Runtime
-
-        with _patched_runtime():
-            rt = Runtime(_config(), gateway_mode=False)
-            rt.start()
-
-            with pytest.raises(RuntimeError):
-                _ = rt.queue
-
 
 class TestRuntimeStopReleasesLock:
     def test_leader_stop_releases_lock(self) -> None:
@@ -235,14 +224,20 @@ class TestPerAccountLockWiring:
             assert rt.lock_path.parent == root / LOCK_DIRNAME
             assert rt.hermes_home == root / "profiles" / "growth"
 
-    def test_invoker_receives_its_runtime(self) -> None:
-        """No singleton lookup inside a turn — the invoker is told who owns it."""
+    def test_invoker_receives_its_runtime_and_daemon_knocks_it(self) -> None:
+        """No singleton lookup inside a turn — the invoker is told who owns it,
+        and the daemon's knock callback is the invoker's."""
         from agentchatme_hermes.runtime import Runtime
 
-        with _patched_runtime(lock_winner=True) as (_ws, invoker_cls, _client, _acq, _rel):
+        with _patched_runtime(lock_winner=True) as (ws_cls, invoker_cls, _client, _acq, _rel):
             rt = Runtime(_config(), gateway_mode=True)
             rt.start()
             assert invoker_cls.call_args.kwargs["runtime"] is rt
+            assert ws_cls.call_args.kwargs["on_knock"] is invoker_cls.return_value.knock
+            assert (
+                ws_cls.call_args.kwargs["on_group_invite"]
+                is invoker_cls.return_value.handle_group_invite
+            )
 
 
 class TestRuntimeRegistry:
@@ -318,25 +313,34 @@ class TestRuntimeRegistry:
             assert runtime_module.registered_runtimes() == []
 
 
-class TestRuntimeHandle:
-    def test_unbound_access_raises_not_ready(self) -> None:
-        from agentchatme_hermes.runtime import RuntimeHandle, RuntimeNotReady
+class TestDoorbellOff:
+    def test_gateway_with_doorbell_off_never_contests_the_lock(self) -> None:
+        """AGENTCHATME_DOORBELL=off: identity resolves, no socket, no invoker, no lock."""
+        from agentchatme_hermes.runtime import Runtime
 
-        handle = RuntimeHandle()
-        assert handle.is_bound is False
-        with pytest.raises(RuntimeNotReady) as excinfo:
-            _ = handle.client
-        assert "hermes agentchat register" in str(excinfo.value)
+        with _patched_runtime(lock_winner=True) as (ws_cls, invoker_cls, _client, acquire, _rel):
+            cfg = _config()
+            cfg.doorbell_enabled = False
+            rt = Runtime(cfg, gateway_mode=True)
+            rt.start()
+            assert rt.identity.handle == "alice"
+            assert rt.is_leader is False
+            assert not acquire.called
+            assert not ws_cls.called
+            assert not invoker_cls.called
+            assert rt._leader_retry_thread is None
 
-    def test_bound_handle_delegates(self) -> None:
-        from agentchatme_hermes.runtime import RuntimeHandle
 
-        target = SimpleNamespace(client="the-client", identity=SimpleNamespace(handle="ops"))
-        handle = RuntimeHandle()
-        handle.bind(target)  # type: ignore[arg-type]
-        assert handle.is_bound is True
-        assert handle.client == "the-client"
-        assert handle.identity.handle == "ops"
+class TestMainLineClient:
+    def test_runtime_builds_the_main_line_client_for_the_gate(self) -> None:
+        from agentchatme_hermes.main_line import MainLineClient
+        from agentchatme_hermes.runtime import Runtime
+
+        with _patched_runtime(lock_winner=False):
+            rt = Runtime(_config(), gateway_mode=False)
+            rt.start()
+            assert isinstance(rt.main_line, MainLineClient)
+            rt.stop()
 
 
 class TestFollowerTakeover:

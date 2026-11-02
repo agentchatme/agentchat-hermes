@@ -150,6 +150,8 @@ class TestArgparseWiring:
         args = parser.parse_args(["doctor"])
         assert args.action == "doctor"
         assert args.func is _dispatch_doctor
+        assert args.fix is False
+        assert parser.parse_args(["doctor", "--fix"]).fix is True
 
 
 class TestDoctor:
@@ -166,13 +168,13 @@ class TestDoctor:
 
         from agentchatme_hermes import cli
 
-        monkeypatch.setattr(cli, "_read_saved_key", lambda: None)  # type: ignore[attr-defined]
+        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: None)  # type: ignore[attr-defined]
         # Doctor short-circuits after the env-var check when no key,
         # so SDK import doesn't need to be stubbed.
-        rc = cli._dispatch_doctor(argparse.Namespace())
+        rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         captured = capsys.readouterr()  # type: ignore[attr-defined]
         assert rc >= 1
-        assert "AGENTCHATME_API_KEY not set" in captured.out
+        assert "AGENTCHAT_API_KEY not set" in captured.out
 
     def test_doctor_returns_zero_on_clean_config(
         self, monkeypatch: object, capsys: object
@@ -182,7 +184,9 @@ class TestDoctor:
 
         from agentchatme_hermes import cli
 
-        monkeypatch.setattr(cli, "_read_saved_key", lambda: "ac_live_xyz")  # type: ignore[attr-defined]
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            cli, "_read_saved_key_source", lambda: ("ac_live_xyz", cli._ENV_API_KEY)
+        )
 
         fake_client = MagicMock()
         fake_client.get_me.return_value = {
@@ -208,13 +212,31 @@ class TestDoctor:
         # off so the test doesn't depend on host process state.
         monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)  # type: ignore[attr-defined]
 
-        rc = cli._dispatch_doctor(argparse.Namespace())
+        rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         captured = capsys.readouterr()  # type: ignore[attr-defined]
         assert "Authenticated as @alice" in captured.out
-        # Exit code reflects failures only (warnings allowed). Two
-        # plausible warns from a fresh checkout: no gateway process,
-        # no SOUL.md anchor. Both warnings, neither a failure.
+        assert "manual bundled" in captured.out
+        # Exit code reflects failures only (warnings allowed). Plausible
+        # warns from a fresh checkout: no gateway process, no SOUL.md
+        # anchor, hosted-tools entry not checkable without Hermes. All
+        # warnings, none a failure.
         assert rc == 0, (
             f"doctor returned non-zero exit code {rc} on a clean "
             f"config; output:\n{captured.out}"
         )
+
+    def test_doctor_warns_on_legacy_key_name(self, monkeypatch: object, capsys: object) -> None:
+        import argparse
+
+        from agentchatme_hermes import cli
+
+        monkeypatch.setattr(  # type: ignore[attr-defined]
+            cli, "_read_saved_key_source", lambda: ("ac_live_xyz", cli._ENV_API_KEY_LEGACY)
+        )
+        monkeypatch.setattr(cli, "_sdk_importable", lambda: False)  # type: ignore[attr-defined]
+        import sys
+
+        monkeypatch.setitem(sys.modules, "agentchatme", None)  # type: ignore[attr-defined]
+        cli._dispatch_doctor(argparse.Namespace(fix=False))
+        captured = capsys.readouterr()  # type: ignore[attr-defined]
+        assert "pre-v3 name AGENTCHATME_API_KEY" in captured.out

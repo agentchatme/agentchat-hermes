@@ -199,7 +199,9 @@ class _Harness:
         monkeypatch.setattr(wizard, "_recover_start", start)
         monkeypatch.setattr(wizard, "_recover_verify", verify)
         monkeypatch.setattr(cli, "_persist_credentials", persist)
-        monkeypatch.setattr(cli, "_install_soul_anchor", self.anchored.append)
+        monkeypatch.setattr(
+            cli, "_install_placement", lambda handle, *, api_base: self.anchored.append(handle) or []
+        )
         monkeypatch.setattr(cli, "_prompt_code", lambda: self.code)
         monkeypatch.setattr(cli, "_sdk_importable", lambda: True)
         monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)

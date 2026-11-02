@@ -1,656 +1,361 @@
-"""Tests for the pure helpers in ``agentchatme_hermes.agent_invoker``.
+"""Tests for ``agentchatme_hermes.agent_invoker`` — knock → gate → turn.
 
-We unit-test the conversation-history translation in isolation — no
-Hermes, no SDK, no runtime. The end-to-end ``AgentInvoker._run_one``
-path requires a real Hermes ``AIAgent`` and is exercised through the
-integration suite (planned for a later commit).
+The Hermes side (AIAgent, SessionDB, provider resolution) is stubbed; the
+main line is a recorder. What must hold:
+
+* a knock becomes exactly one cycle: one tray read, one gate call;
+* ``reply`` cards start ONE turn with the fixed prompt; none → no turn;
+* fail-closed posts nothing, starts nothing, and re-knocks on the ladder;
+* gate disabled → the turn starts straight from the tray;
+* a knock during a cycle earns one more cycle afterwards;
+* group invites run their own fixed-prompt turn.
 """
 from __future__ import annotations
 
+import threading
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 from unittest.mock import MagicMock
 
-from agentchatme_hermes.agent_invoker import (
-    _FALLBACK_MODEL,
-    AgentInvoker,
-    _coerce_model_string,
-    _extract_messages_list,
-    _translate_messages_to_history,
-)
-from agentchatme_hermes.reply_gate import GateDecision
-from agentchatme_hermes.thread_closures import ThreadClosures
-from agentchatme_hermes.types import AgentIdentity, InboundEvent
+import pytest
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    import pytest
+from agentchatme_hermes import agent_invoker as invoker_module
+from agentchatme_hermes import gate
+from agentchatme_hermes.agent_invoker import _FALLBACK_MODEL, AgentInvoker, _coerce_model_string
+from agentchatme_hermes.main_line import MainLineError
+from agentchatme_hermes.turn import invite_turn_prompt, knock_turn_prompt
+from agentchatme_hermes.types import AgentIdentity, GroupInviteEvent
 
 
-def _msg(
-    *,
-    msg_id: str,
-    text: str,
-    is_own: bool | None = None,
-    sender: str = "alice",
-    msg_type: str = "text",
-) -> dict[str, Any]:
-    """Build a synthetic AgentChat-shaped message payload."""
-    payload: dict[str, Any] = {
-        "id": msg_id,
-        "type": msg_type,
-        "content": {"text": text},
-        "from": f"@{sender}",
+def _card(cid: str) -> dict[str, Any]:
+    return {"conversation_id": cid, "preview": {"message_id": f"msg_{cid}"}}
+
+
+def _tray(*cards: dict[str, Any], truncated: bool = False) -> dict[str, Any]:
+    return {
+        "you": "@me",
+        "question": "Decide.",
+        "conversations": list(cards),
+        "deferred": 0,
+        "truncated": truncated,
     }
-    if is_own is not None:
-        payload["is_own"] = is_own
-    return payload
+
+
+class _MainLine:
+    def __init__(self, trays: list[Any]) -> None:
+        self.trays = list(trays)
+        self.inbox_calls = 0
+        self.decisions: list[tuple[str, dict[str, Any]]] = []
+
+    def inbox(self, *, wait_ms: int = 0, limit: int = 50) -> dict[str, Any]:
+        self.inbox_calls += 1
+        nxt = self.trays.pop(0) if self.trays else _tray()
+        if isinstance(nxt, Exception):
+            raise nxt
+        return nxt  # type: ignore[no-any-return]
+
+    def record_decision(self, conversation_id: str, **body: Any) -> dict[str, Any]:
+        self.decisions.append((conversation_id, body))
+        return {}
+
+
+def _invoker(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    trays: list[Any],
+    gate_result: gate.GateResult | Exception | None = None,
+    config: Any = None,
+) -> tuple[AgentInvoker, _MainLine, MagicMock, list[Any]]:
+    """An invoker with a stubbed runtime, agent and (optionally) gate."""
+    main_line = _MainLine(trays)
+    runtime = SimpleNamespace(main_line=main_line)
+    cfg = config or SimpleNamespace(knock_debounce_s=0.0)
+    inv = AgentInvoker(config=cfg, identity=AgentIdentity(handle="me"), runtime=runtime)
+
+    agent = MagicMock()
+    agent.run_conversation.return_value = {"final_response": "ok"}
+    monkeypatch.setattr(inv, "_ensure_hermes_resolved", lambda: None)
+    monkeypatch.setattr(inv, "_build_agent", lambda _session_id: agent)
+    monkeypatch.setattr(inv, "_resolve_model_and_runtime", lambda: ("m", {"provider": "p"}))
+
+    gate_calls: list[Any] = []
+    if gate_result is not None:
+
+        def fake_run_gate(tray: Any, **kwargs: Any) -> gate.GateResult:
+            gate_calls.append((tray, kwargs))
+            if isinstance(gate_result, Exception):
+                raise gate_result
+            return gate_result
+
+        monkeypatch.setattr(invoker_module.gate, "run_gate", fake_run_gate)
+    return inv, main_line, agent, gate_calls
+
+
+def _llm_result(reply: tuple[str, ...] = (), *, cards: int = 1, **kw: Any) -> gate.GateResult:
+    return gate.GateResult(source="llm", cards=cards, reply_conversations=reply, **kw)
 
 
 # ──────────────────────── _coerce_model_string ────────────────────────
 
 
 class TestCoerceModelString:
-    """Pin down the model-config shape handling.
-
-    The 0.2.1 production hang came from this helper not existing:
-    ``cfg.get("model")`` returned the nested dict
-    ``{"default": "deepseek-v4-flash", "provider": "deepseek", ...}``,
-    which was passed straight into ``AIAgent(model=...)`` and crashed
-    deep inside Hermes' ``_anthropic_prompt_cache_policy`` with
-    ``'dict' object has no attribute 'lower'``.
-    """
-
     def test_nested_dict_with_default(self) -> None:
-        cfg_value = {
-            "default": "deepseek-v4-flash",
-            "provider": "deepseek",
-            "model": "deepseek-v4-flash",
-        }
-        assert _coerce_model_string(cfg_value) == "deepseek-v4-flash"
+        assert _coerce_model_string({"default": "d", "provider": "x", "model": "d"}) == "d"
 
-    def test_nested_dict_default_takes_precedence_over_model(self) -> None:
-        cfg_value = {"default": "primary-model", "model": "fallback-model"}
-        assert _coerce_model_string(cfg_value) == "primary-model"
+    def test_default_beats_model(self) -> None:
+        assert _coerce_model_string({"default": "primary", "model": "fallback"}) == "primary"
 
-    def test_nested_dict_falls_back_to_model_when_no_default(self) -> None:
-        cfg_value = {"model": "the-model", "provider": "deepseek"}
-        assert _coerce_model_string(cfg_value) == "the-model"
+    def test_model_when_no_default(self) -> None:
+        assert _coerce_model_string({"model": "the-model"}) == "the-model"
 
     def test_flat_string(self) -> None:
-        assert _coerce_model_string("deepseek-v4-flash") == "deepseek-v4-flash"
+        assert _coerce_model_string("flat") == "flat"
 
-    def test_empty_string_falls_back(self) -> None:
-        assert _coerce_model_string("") == _FALLBACK_MODEL
+    @pytest.mark.parametrize("value", ["", None, {}, {"provider": "x"}, {"default": 42}, 42, ["a"]])
+    def test_unusable_shapes_fall_back(self, value: Any) -> None:
+        assert _coerce_model_string(value) == _FALLBACK_MODEL
 
-    def test_none_falls_back(self) -> None:
-        assert _coerce_model_string(None) == _FALLBACK_MODEL
 
-    def test_empty_dict_falls_back(self) -> None:
-        assert _coerce_model_string({}) == _FALLBACK_MODEL
+# ──────────────────────── one cycle ────────────────────────
 
-    def test_dict_without_recognizable_keys_falls_back(self) -> None:
-        # Dict shape but neither ``default`` nor ``model`` is set —
-        # we cannot guess what string the operator intended.
-        assert _coerce_model_string({"provider": "deepseek"}) == _FALLBACK_MODEL
 
-    def test_dict_with_non_string_default_falls_back(self) -> None:
-        # Defensive: a numeric or None value where a string was
-        # expected must not silently get passed through.
-        assert _coerce_model_string({"default": 42}) == _FALLBACK_MODEL
-        assert _coerce_model_string({"default": None, "model": "real"}) == "real"
-
-    def test_completely_unknown_shape_falls_back(self) -> None:
-        assert _coerce_model_string(42) == _FALLBACK_MODEL
-        assert _coerce_model_string(["a", "b"]) == _FALLBACK_MODEL
-
-
-# ──────────────────────── _extract_messages_list ────────────────────────
-
-
-class TestExtractMessagesList:
-    def test_dict_with_messages_key(self) -> None:
-        result = {"messages": [_msg(msg_id="m1", text="hi")]}
-        assert len(_extract_messages_list(result)) == 1
-
-    def test_bare_list(self) -> None:
-        assert len(_extract_messages_list([_msg(msg_id="m1", text="hi")])) == 1
-
-    def test_none_returns_empty(self) -> None:
-        assert _extract_messages_list(None) == []
-
-    def test_unexpected_shape_returns_empty(self) -> None:
-        assert _extract_messages_list("garbage") == []
-        assert _extract_messages_list(42) == []
-        assert _extract_messages_list({"unexpected": "shape"}) == []
-
-    def test_filters_non_dict_entries(self) -> None:
-        result = {"messages": [_msg(msg_id="m1", text="hi"), "garbage", None]}
-        assert len(_extract_messages_list(result)) == 1
-
-
-# ──────────────────────── _translate_messages_to_history ────────────────────────
-
-
-class TestTranslateMessagesToHistory:
-    def _call(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        own_handle: str = "me",
-        conversation_kind: str = "direct",
-        trigger_message_id: str = "trigger",
-    ) -> list[dict[str, Any]]:
-        return _translate_messages_to_history(
-            messages,
-            own_handle=own_handle,
-            conversation_kind=conversation_kind,
-            trigger_message_id=trigger_message_id,
-        )
-
-    # -- is_own → role mapping --
-
-    def test_self_message_becomes_assistant(self) -> None:
-        msgs = [_msg(msg_id="m1", text="hello", is_own=True, sender="me")]
-        history = self._call(msgs)
-        assert history == [{"role": "assistant", "content": "hello"}]
-
-    def test_peer_message_becomes_user(self) -> None:
-        msgs = [_msg(msg_id="m1", text="hi", is_own=False, sender="alice")]
-        history = self._call(msgs)
-        assert history == [{"role": "user", "content": "hi"}]
-
-    # -- is_own fallback to handle compare --
-
-    def test_is_own_fallback_via_handle_match(self) -> None:
-        # No is_own field; rely on sender handle comparison
-        msgs = [_msg(msg_id="m1", text="hello", sender="me")]
-        history = self._call(msgs, own_handle="me")
-        assert history == [{"role": "assistant", "content": "hello"}]
-
-    def test_is_own_fallback_via_handle_mismatch(self) -> None:
-        msgs = [_msg(msg_id="m1", text="hi", sender="alice")]
-        history = self._call(msgs, own_handle="me")
-        assert history == [{"role": "user", "content": "hi"}]
-
-    def test_handle_compare_is_case_insensitive(self) -> None:
-        msgs = [_msg(msg_id="m1", text="hi", sender="ME")]
-        history = self._call(msgs, own_handle="me")
-        assert history[0]["role"] == "assistant"
-
-    def test_handle_compare_strips_at_prefix(self) -> None:
-        # Server may or may not include @; we accept either.
-        msgs = [{"id": "m1", "type": "text", "content": {"text": "hi"}, "from": "me"}]
-        history = self._call(msgs, own_handle="me")
-        assert history[0]["role"] == "assistant"
-
-    # -- group prefix --
-
-    def test_group_prefixes_peer_messages(self) -> None:
-        msgs = [_msg(msg_id="m1", text="hello team", sender="alice", is_own=False)]
-        history = self._call(msgs, conversation_kind="group")
-        assert history == [{"role": "user", "content": "[@alice] hello team"}]
-
-    def test_group_does_not_prefix_self(self) -> None:
-        msgs = [_msg(msg_id="m1", text="hi everyone", sender="me", is_own=True)]
-        history = self._call(msgs, conversation_kind="group")
-        assert history == [{"role": "assistant", "content": "hi everyone"}]
-
-    def test_direct_does_not_prefix(self) -> None:
-        msgs = [_msg(msg_id="m1", text="hi", sender="alice", is_own=False)]
-        history = self._call(msgs, conversation_kind="direct")
-        assert history == [{"role": "user", "content": "hi"}]
-
-    def test_group_with_unknown_sender_uses_placeholder(self) -> None:
-        msgs = [{"id": "m1", "type": "text", "content": {"text": "hi"}}]
-        history = self._call(msgs, conversation_kind="group")
-        assert history == [{"role": "user", "content": "[@?] hi"}]
-
-    # -- trigger exclusion --
-
-    def test_trigger_message_is_excluded(self) -> None:
-        msgs = [
-            _msg(msg_id="m1", text="old", is_own=False, sender="alice"),
-            _msg(msg_id="trigger", text="latest", is_own=False, sender="alice"),
-        ]
-        history = self._call(msgs, trigger_message_id="trigger")
-        assert len(history) == 1
-        assert history[0]["content"] == "old"
-
-    # -- non-text and edge cases --
-
-    def test_non_text_messages_skipped(self) -> None:
-        msgs = [
-            _msg(msg_id="m1", text="x", msg_type="file"),
-            _msg(msg_id="m2", text="y", is_own=False, sender="alice"),
-        ]
-        history = self._call(msgs)
-        assert len(history) == 1
-        assert history[0]["content"] == "y"
-
-    def test_missing_content_dict_skipped(self) -> None:
-        msgs = [{"id": "m1", "type": "text", "from": "alice"}]
-        history = self._call(msgs)
-        assert history == []
-
-    def test_empty_text_skipped(self) -> None:
-        msgs = [{"id": "m1", "type": "text", "content": {"text": ""}, "from": "alice"}]
-        history = self._call(msgs)
-        assert history == []
-
-    def test_non_string_text_skipped(self) -> None:
-        msgs = [{"id": "m1", "type": "text", "content": {"text": 42}, "from": "alice"}]
-        history = self._call(msgs)
-        assert history == []
-
-    def test_oldest_first_preserved(self) -> None:
-        # The caller is expected to receive messages oldest-first; we
-        # don't reorder. Confirm the order survives translation.
-        msgs = [
-            _msg(msg_id="m1", text="first", sender="alice", is_own=False),
-            _msg(msg_id="m2", text="second", sender="me", is_own=True),
-            _msg(msg_id="m3", text="third", sender="alice", is_own=False),
-        ]
-        history = self._call(msgs)
-        assert [h["content"] for h in history] == ["first", "second", "third"]
-
-
-# ──────────────────────── prompts.py ────────────────────────
-
-
-class TestNotificationPrompt:
-    """Lock down the wake-prompt format — it's part of the LLM contract."""
-
-    def _event(
-        self,
-        *,
-        conversation_kind: str = "direct",
-        text: str = "hi",
-        received_at: Any = None,
-        sender_display_name: Any = None,
-        sender_kind: str = "agent",
-        group_name: Any = None,
-        mentions: tuple[str, ...] = (),
-    ) -> Any:
-        from datetime import datetime, timezone
-
-        from agentchatme_hermes.types import InboundEvent
-
-        return InboundEvent(
-            message_id="m1",
-            conversation_id="conv_x",
-            conversation_kind=conversation_kind,  # type: ignore[arg-type]
-            sender_handle="alice",
-            content_text=text,
-            received_at=received_at or datetime.now(timezone.utc),
-            sender_display_name=sender_display_name,
-            sender_kind=sender_kind,
-            group_name=group_name,
-            mentions=mentions,
-        )
-
-    def test_surfaces_resolved_sender_identity(self) -> None:
-        from agentchatme_hermes.prompts import build_notification_prompt
-
-        prompt = build_notification_prompt(
-            self._event(sender_display_name="Alice Liddell"), handle="me"
-        )
-        assert "From: Alice Liddell (@alice)" in prompt
-
-    def test_flags_a_system_sender(self) -> None:
-        from agentchatme_hermes.prompts import build_notification_prompt
-
-        prompt = build_notification_prompt(
-            self._event(sender_display_name="Chatfather", sender_kind="system"),
-            handle="me",
-        )
-        assert "From: Chatfather (@alice), a system agent" in prompt
-
-    def test_group_header_names_the_room(self) -> None:
-        from agentchatme_hermes.prompts import build_notification_prompt
-
-        prompt = build_notification_prompt(
-            self._event(conversation_kind="group", group_name="Ops"), handle="me"
-        )
-        assert 'Conversation type: group "Ops"' in prompt
-
-    def test_mention_line_only_when_mentioned(self) -> None:
-        from agentchatme_hermes.prompts import build_notification_prompt
-
-        named = build_notification_prompt(
-            self._event(conversation_kind="group", mentions=("me",)), handle="me"
-        )
-        assert "You were @-mentioned in this message." in named
-        unnamed = build_notification_prompt(
-            self._event(conversation_kind="group", mentions=("someone-else",)),
-            handle="me",
-        )
-        assert "@-mentioned" not in unnamed
-
-    def test_direct_format(self) -> None:
-        from agentchatme_hermes.prompts import build_notification_prompt
-
-        prompt = build_notification_prompt(
-            self._event(conversation_kind="direct"), handle="me"
-        )
-        # Body is preserved verbatim (history alternation still relies on it)…
-        assert "[agentchat] @alice: hi" in prompt
-        # …now under a context header stating type + arrival time.
-        assert "Conversation type: direct" in prompt
-        assert "Received:" in prompt
-        # Skill hint is included so the agent can find the etiquette manual
-        # (plugin skills don't appear in <available_skills>).
-        assert "skill_view agentchat:agentchat" in prompt
-        # Direct prompt should NOT have the group-id annotation
-        assert "[agentchat group" not in prompt
-
-    def test_group_format_includes_conv_id(self) -> None:
-        from agentchatme_hermes.prompts import build_notification_prompt
-
-        prompt = build_notification_prompt(
-            self._event(conversation_kind="group"), handle="me"
-        )
-        assert "[agentchat group conv_x] @alice: hi" in prompt
-        assert "Conversation type: group" in prompt
-        assert "skill_view agentchat:agentchat" in prompt
-
-    def test_header_surfaces_timestamp_and_piped_signals(self) -> None:
-        """The whole point of the pipe: the composing model sees WHEN the
-        message arrived plus the same relationship/pace signals the gate has."""
-        from datetime import datetime, timezone
-
-        from agentchatme_hermes.prompts import build_notification_prompt
-        from agentchatme_hermes.reply_gate import ConversationSignals
-
-        received = datetime(2026, 7, 24, 14, 57, tzinfo=timezone.utc)
-        signals = ConversationSignals(
-            first_contact=False,
-            you_have_spoken=True,
-            messages_last_window=5,
-            seconds_since_previous=120.0,
-        )
-        prompt = build_notification_prompt(
-            self._event(received_at=received),
-            handle="me",
-            signals=signals,
-            prior_count=7,
-        )
-        assert "Received: 2026-07-24 14:57 UTC" in prompt
-        assert "Relationship: established" in prompt
-        assert "Pace: 5 message(s) in the last" in prompt
-        assert "Prior messages in this thread: 7" in prompt
-
-    def test_prompt_does_not_bias_toward_silence(self) -> None:
-        """The wake prompt is data only — no "silence is valid" tail.
-
-        Reply-vs-silence judgment lives in the skill, not the prompt.
-        Anything in the prompt that biases the model toward one outcome
-        compounds with the LLM's existing biases (cost-per-token,
-        safety training) and tilts the agent toward under-replying. The
-        context header is pure fact, so this invariant still holds.
-        """
-        from agentchatme_hermes.prompts import build_notification_prompt
-
-        prompt = build_notification_prompt(self._event(), handle="me")
-        lower = prompt.lower()
-        assert "silence is" not in lower
-        assert "decide" not in lower
-        assert "you may" not in lower
-
-    def test_content_text_is_full_not_truncated(self) -> None:
-        from agentchatme_hermes.prompts import build_notification_prompt
-
-        long_text = "x" * 5000
-        prompt = build_notification_prompt(self._event(text=long_text))
-        assert long_text in prompt
-
-
-class _FakeFuture:
-    def add_done_callback(self, _callback: Any) -> None:
-        return None
-
-    def exception(self) -> None:
-        return None
-
-
-class _FakeExecutor:
-    def __init__(self) -> None:
-        self.submitted: list[tuple[Any, tuple[Any, ...]]] = []
-
-    def submit(self, fn: Any, *args: Any) -> _FakeFuture:
-        self.submitted.append((fn, args))
-        return _FakeFuture()
-
-
-class TestInFlightThreadClose:
-    def test_queued_turn_is_suppressed_if_thread_closes_before_worker_runs(
-        self,
-        monkeypatch: pytest.MonkeyPatch,
-        tmp_path: Path,
-    ) -> None:
-        import agentchatme_hermes.runtime as runtime_module
-
-        event = InboundEvent(
-            message_id="m1",
-            conversation_id="conv_dm_123",
-            conversation_kind="direct",
-            sender_handle="alice",
-            content_text="hi",
-            received_at=datetime.now(timezone.utc),
-        )
-        queue = MagicMock()
-        queue.pop.side_effect = [event, None]
-        invoker = AgentInvoker(
-            config=SimpleNamespace(max_inflight_turns=1),
-            identity=AgentIdentity(handle="me"),
-            queue=queue,
-        )
-        executor = _FakeExecutor()
-        invoker._executor = executor
-
-        runtime = SimpleNamespace(
-            thread_closures=ThreadClosures(path=tmp_path / "closed.json"),
-            client=MagicMock(),
-        )
-        agent = MagicMock()
-        monkeypatch.setattr(runtime_module, "get_existing_runtime", lambda: runtime)
-        monkeypatch.setattr(invoker, "_ensure_hermes_resolved", lambda: None)
-        monkeypatch.setattr(invoker, "_build_agent", lambda _conversation_id: agent)
-        monkeypatch.setattr(
-            invoker,
-            "_build_conversation_history",
-            lambda **_kwargs: [],
-        )
-
-        invoker._drain_queue()
-
-        assert len(executor.submitted) == 1
-
-        runtime.thread_closures.close("conv_dm_123", reason="closed mid-flight")
-        submitted_fn, submitted_args = executor.submitted[0]
-        submitted_fn(*submitted_args)
-
-        agent.run_conversation.assert_not_called()
-
-
-def _wired_invoker(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, config: Any
-) -> tuple[AgentInvoker, Any, dict[str, list[Any]]]:
-    """Build an invoker with a stubbed runtime + agent for turn-flow tests.
-
-    ``_build_agent`` and ``_build_conversation_history`` are stubbed so the
-    turn never touches Hermes or the SDK; ``calls["build_agent"]`` records
-    whether the agent was constructed (it should be, only on the reply path).
-    """
-    import agentchatme_hermes.runtime as runtime_module
-
-    invoker = AgentInvoker(
-        config=config,
-        identity=AgentIdentity(handle="me"),
-        queue=MagicMock(),
-    )
-    runtime = SimpleNamespace(
-        thread_closures=ThreadClosures(path=tmp_path / "closed.json"),
-        client=MagicMock(),
-    )
-    monkeypatch.setattr(runtime_module, "get_existing_runtime", lambda: runtime)
-    monkeypatch.setattr(invoker, "_ensure_hermes_resolved", lambda: None)
-
-    agent = MagicMock()
-    calls: dict[str, list[Any]] = {"build_agent": []}
-
-    def _fake_build_agent(conversation_id: str) -> Any:
-        calls["build_agent"].append(conversation_id)
-        return agent
-
-    monkeypatch.setattr(invoker, "_build_agent", _fake_build_agent)
-    monkeypatch.setattr(
-        invoker, "_build_conversation_history", lambda **_kw: ([], [])
-    )
-    return invoker, agent, calls
-
-
-def _inbound(conv: str = "conv_dm_a") -> InboundEvent:
-    return InboundEvent(
-        message_id="m1",
-        conversation_id=conv,
-        conversation_kind="direct",
-        sender_handle="alice",
-        content_text="hi",
-        received_at=datetime.now(timezone.utc),
-    )
-
-
-class TestReplyGateWiring:
-    """The gate's effect on the turn flow in ``_run_one_inner``."""
-
-    def test_reply_decision_runs_conversation(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        from agentchatme_hermes.prompts import build_notification_prompt
-
-        invoker, agent, calls = _wired_invoker(
-            monkeypatch, tmp_path, SimpleNamespace(max_inflight_turns=1)
-        )
-        monkeypatch.setattr(
-            invoker,
-            "_decide_reply",
-            lambda _ev, _hist, _raw: GateDecision(
-                reply=True, reason="open q", category="open_request", source="llm"
-            ),
-        )
-
-        invoker._run_one_inner(_inbound("conv_dm_a"), build_notification_prompt)
-
-        agent.run_conversation.assert_called_once()
-        assert calls["build_agent"] == ["conv_dm_a"]
-
-    def test_no_reply_decision_skips_everything(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        from agentchatme_hermes.prompts import build_notification_prompt
-
-        invoker, agent, calls = _wired_invoker(
-            monkeypatch, tmp_path, SimpleNamespace(max_inflight_turns=1)
-        )
-        monkeypatch.setattr(
-            invoker,
-            "_decide_reply",
-            lambda _ev, _hist, _raw: GateDecision(
-                reply=False, reason="ack", category="closing", source="llm"
-            ),
-        )
-
-        invoker._run_one_inner(_inbound("conv_dm_a"), build_notification_prompt)
-
-        agent.run_conversation.assert_not_called()
-        # The agent was never even constructed on the no-reply path.
-        assert calls["build_agent"] == []
-
-    def test_gate_disabled_bypasses_decision(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        from agentchatme_hermes.prompts import build_notification_prompt
-
-        invoker, agent, _calls = _wired_invoker(
+class TestRunCycle:
+    def test_reply_starts_one_turn_with_the_fixed_prompt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, main_line, agent, gate_calls = _invoker(
             monkeypatch,
-            tmp_path,
-            SimpleNamespace(max_inflight_turns=1, reply_gate_enabled=False),
+            trays=[_tray(_card("a"), _card("b"))],
+            gate_result=_llm_result(("a",), cards=2, posted=1),
         )
-        decide_calls: list[Any] = []
-        monkeypatch.setattr(
-            invoker,
-            "_decide_reply",
-            lambda _ev, _hist, _raw: decide_calls.append(1)
-            or GateDecision(reply=True, reason="", category="other", source="llm"),
+        result = inv.run_cycle()
+        assert result is not None and result.source == "llm"
+        assert main_line.inbox_calls == 1
+        assert len(gate_calls) == 1
+        tray, kwargs = gate_calls[0]
+        assert tray["conversations"] == [_card("a"), _card("b")]
+        assert kwargs["main_runtime"] == {"model": "m", "provider": "p"}
+        assert kwargs["fail_open"] is False
+        agent.run_conversation.assert_called_once_with(knock_turn_prompt(("a",)), conversation_history=[])
+        assert inv.turns == 1
+
+    def test_no_reply_cards_means_no_turn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, agent, _calls = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], gate_result=_llm_result((), posted=1)
         )
+        inv.run_cycle()
+        agent.run_conversation.assert_not_called()
+        assert inv.turns == 0
 
-        invoker._run_one_inner(_inbound("conv_dm_a"), build_notification_prompt)
-
-        agent.run_conversation.assert_called_once()
-        assert decide_calls == []  # gate disabled → no decision call at all
-
-    def test_decide_reply_forwards_signals_to_llm(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        from agentchatme_hermes.reply_gate import ConversationSignals
-
-        invoker, _agent, _calls = _wired_invoker(
-            monkeypatch, tmp_path, SimpleNamespace(max_inflight_turns=1)
+    def test_empty_tray_asks_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, agent, gate_calls = _invoker(
+            monkeypatch, trays=[_tray()], gate_result=_llm_result(("a",))
         )
+        result = inv.run_cycle()
+        assert result is not None and result.source == "empty"
+        assert gate_calls == []
+        agent.run_conversation.assert_not_called()
 
-        monkeypatch.setattr(
-            invoker,
-            "_resolve_model_and_runtime",
-            lambda: ("deepseek-x", {"provider": "deepseek"}),
-        )
-        captured: dict[str, Any] = {}
-        monkeypatch.setattr(
-            "agentchatme_hermes.reply_gate.decide",
-            lambda **kw: captured.update(kw)
-            or GateDecision(
-                reply=True, reason="x", category="open_request", source="llm"
-            ),
-        )
-
-        # Signals are now derived once by the caller (_run_one_inner) and handed
-        # to _decide_reply, which forwards them verbatim to the gate.
-        signals = ConversationSignals(
-            first_contact=False,
-            you_have_spoken=True,
-            messages_last_window=3,
-            seconds_since_previous=42.0,
-        )
-        decision = invoker._decide_reply(_inbound("conv_dm_a"), [], signals)
-
-        assert decision.reply is True
-        assert captured["handle"] == "me"
-        assert captured["main_runtime"] == {
-            "model": "deepseek-x",
-            "provider": "deepseek",
-        }
-        # The caller-derived cadence/relationship signals reach the gate as-is.
-        assert captured["signals"] is signals
-
-
-class TestInjectedRuntime:
-    def test_injected_runtime_is_used_without_registry_lookup(
+    def test_fail_closed_posts_nothing_starts_nothing_and_reknocks(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import agentchatme_hermes.runtime as runtime_module
-
-        owner = SimpleNamespace(client=MagicMock(), thread_closures=MagicMock())
-        invoker = AgentInvoker(
-            config=SimpleNamespace(max_inflight_turns=1),
-            identity=AgentIdentity(handle="me"),
-            queue=MagicMock(),
-            runtime=owner,
+        inv, _ml, agent, _calls = _invoker(
+            monkeypatch,
+            trays=[_tray(_card("a"))],
+            gate_result=gate.GateResult(source="fail_closed", cards=1, undecided=("a",), failure="down"),
         )
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "knock_after", scheduled.append)
+        inv.run_cycle()
+        agent.run_conversation.assert_not_called()
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
 
-        def must_not_be_called() -> Any:
-            raise AssertionError("registry lookup must not run when a runtime is injected")
+    def test_retry_ladder_climbs_then_stops(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        failing = gate.GateResult(source="fail_closed", cards=1, undecided=("a",))
+        inv, _ml, _agent, _calls = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))] * 10, gate_result=failing
+        )
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "knock_after", scheduled.append)
+        for _ in range(5):
+            inv.run_cycle()
+        assert scheduled == list(invoker_module.RETRY_LADDER_S)
 
-        monkeypatch.setattr(runtime_module, "get_existing_runtime", must_not_be_called)
-        assert invoker._runtime is owner
+    def test_failure_while_a_retry_is_pending_does_not_climb(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        failing = gate.GateResult(source="fail_closed", cards=1, undecided=("a",))
+        inv, _ml, _agent, _calls = _invoker(monkeypatch, trays=[_tray(_card("a"))] * 3, gate_result=failing)
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "knock_after", scheduled.append)
+        inv.run_cycle()
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        # A knock lands mid-outage and its cycle fails too, with the 60 s retry still pending.
+        monkeypatch.setattr(type(inv._coalescer), "delayed_pending", property(lambda self: True))
+        inv.run_cycle()
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]], "one outage, one rung"
+        assert inv._retry_rung == 1
+
+    def test_success_resets_the_ladder(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, _agent, _calls = _invoker(
+            monkeypatch,
+            trays=[_tray(_card("a"))] * 3,
+            gate_result=gate.GateResult(source="fail_closed", cards=1, undecided=("a",)),
+        )
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "knock_after", scheduled.append)
+        inv.run_cycle()
+        monkeypatch.setattr(invoker_module.gate, "run_gate", lambda tray, **kw: _llm_result((), posted=1))
+        inv.run_cycle()
+        assert inv._retry_rung == 0
+
+    def test_fail_open_starts_the_turn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, agent, _calls = _invoker(
+            monkeypatch,
+            trays=[_tray(_card("a"))],
+            gate_result=gate.GateResult(source="fail_open", cards=1, reply_conversations=("a",)),
+            config=SimpleNamespace(knock_debounce_s=0.0, reply_gate_fail_open=True),
+        )
+        inv.run_cycle()
+        agent.run_conversation.assert_called_once()
+
+    def test_gate_disabled_starts_the_turn_from_the_tray(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, agent, gate_calls = _invoker(
+            monkeypatch,
+            trays=[_tray(_card("a"))],
+            gate_result=_llm_result(("a",)),
+            config=SimpleNamespace(knock_debounce_s=0.0, reply_gate_enabled=False),
+        )
+        result = inv.run_cycle()
+        assert result is not None and result.source == "disabled"
+        assert gate_calls == [], "gate off → the model is not asked by the doorbell"
+        agent.run_conversation.assert_called_once_with(knock_turn_prompt(("a",)), conversation_history=[])
+
+    def test_tray_read_failure_reknocks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, agent, _calls = _invoker(
+            monkeypatch, trays=[MainLineError("503", status=503)], gate_result=_llm_result()
+        )
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "knock_after", scheduled.append)
+        assert inv.run_cycle() is None
+        agent.run_conversation.assert_not_called()
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+
+    def test_truncated_tray_knocks_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, _agent, _calls = _invoker(
+            monkeypatch,
+            trays=[_tray(_card("a"), truncated=True)],
+            gate_result=_llm_result((), cards=1, posted=1, truncated=True),
+        )
+        knocks: list[int] = []
+        monkeypatch.setattr(inv._coalescer, "knock", lambda: knocks.append(1))
+        inv.run_cycle()
+        assert knocks == [1]
+
+    def test_undecided_or_failed_posts_reknock(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, _agent, _calls = _invoker(
+            monkeypatch,
+            trays=[_tray(_card("a"), _card("b"))],
+            gate_result=_llm_result(("a",), cards=2, undecided=("b",)),
+        )
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "knock_after", scheduled.append)
+        inv.run_cycle()
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+
+    def test_turn_failure_is_contained(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, agent, _calls = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], gate_result=_llm_result(("a",))
+        )
+        agent.run_conversation.side_effect = RuntimeError("provider exploded")
+        inv.run_cycle()  # must not raise
+        assert inv.turns == 0
+
+
+# ──────────────────────── the worker ────────────────────────
+
+
+def _wait_for(predicate: Any, timeout: float = 2.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return False
+
+
+class TestWorker:
+    def test_knock_runs_one_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, main_line, _agent, _calls = _invoker(
+            monkeypatch, trays=[_tray()], gate_result=_llm_result()
+        )
+        inv.start()
+        try:
+            inv.knock()
+            assert _wait_for(lambda: inv.cycles == 1)
+            assert main_line.inbox_calls == 1
+        finally:
+            inv.stop()
+
+    def test_knock_during_a_cycle_earns_one_more_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, _agent, _calls = _invoker(monkeypatch, trays=[_tray()] * 5, gate_result=_llm_result())
+        in_cycle = threading.Event()
+        release = threading.Event()
+        real_cycle = inv.run_cycle
+
+        def slow_cycle() -> Any:
+            in_cycle.set()
+            release.wait(1.0)
+            return real_cycle()
+
+        monkeypatch.setattr(inv, "run_cycle", slow_cycle)
+        inv.start()
+        try:
+            inv.knock()
+            assert in_cycle.wait(1.0)
+            inv.knock()  # lands while the first cycle runs
+            inv.knock()
+            release.set()
+            assert _wait_for(lambda: inv.cycles == 2)
+            time.sleep(0.05)
+            assert inv.cycles == 2, "two knocks during one cycle collapse into one follow-up"
+        finally:
+            inv.stop()
+
+    def test_invite_runs_its_own_fixed_prompt_turn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, agent, _calls = _invoker(monkeypatch, trays=[], gate_result=_llm_result())
+        invite = GroupInviteEvent(
+            invite_id="ginv_1",
+            group_id="grp_1",
+            group_name="Council",
+            inviter_handle="carol",
+            received_at=datetime.now(timezone.utc),
+        )
+        inv.start()
+        try:
+            inv.handle_group_invite(invite)
+            assert _wait_for(lambda: inv.invite_turns == 1)
+            agent.run_conversation.assert_called_once_with(invite_turn_prompt(), conversation_history=[])
+            assert inv.cycles == 0, "an invite is not a tray knock"
+        finally:
+            inv.stop()
+
+    def test_stop_is_idempotent_and_quick(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, _agent, _calls = _invoker(monkeypatch, trays=[], gate_result=_llm_result())
+        inv.start()
+        started = time.monotonic()
+        inv.stop()
+        inv.stop()
+        assert time.monotonic() - started < 2.5
+        inv.knock()  # ignored after stop
+
+
+class TestSessionPerTurn:
+    def test_knock_turns_get_fresh_sessions(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, _agent, _calls = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))] * 2, gate_result=_llm_result(("a",), posted=0)
+        )
+        sessions: list[str] = []
+        monkeypatch.setattr(inv, "_build_agent", lambda session_id: sessions.append(session_id) or MagicMock())
+        inv.run_cycle()
+        inv.run_cycle()
+        assert len(sessions) == 2 and sessions[0] != sessions[1]
+        assert all(s.startswith("agentchat:knock:") for s in sessions)

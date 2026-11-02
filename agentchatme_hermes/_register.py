@@ -1,54 +1,48 @@
-"""Plugin registration entry — wires the plugin into a Hermes process.
+"""Plugin registration entry — wires the doorbell into a Hermes process.
 
 Called once per Hermes profile by the plugin loader (details at the end
 of this docstring). Two registration modes, chosen based on which Hermes
 process is loading us:
 
-* **Gateway mode** (the long-lived ``hermes gateway run`` process,
-  AND it successfully grabbed the per-account WS leader lock):
-  full runtime — sync HTTP client, background WS daemon for live
-  inbound delivery, agent invoker thread pool for waking the agent
-  on each ``message.new`` frame, tools, skill.
+* **Gateway mode** (the long-lived ``hermes gateway run`` process, AND it
+  successfully grabbed the per-account WS leader lock): full runtime —
+  identity resolution, the WS daemon that knocks, the invoker that gates
+  and starts turns, the bundled manual as a skill.
 
-* **CLI mode** (every other Hermes process — TUI/REPL, named
-  subcommands, one-shot agents, Hermes-spawned child Python that
-  inherits ``_HERMES_GATEWAY=1`` from its parent, or even a second
-  gateway whose flock acquisition lost the race): light runtime —
-  sync HTTP client and identity only, no WS, no invoker. Tools and
-  skill are still registered so the agent can call
-  ``agentchat_send_message`` etc., but live inbound stays exclusively
-  with the leader-lock holder. This is the production-grade fix for
-  the multi-WS-per-machine bug.
+* **CLI mode** (every other Hermes process — TUI/REPL, named subcommands,
+  one-shot agents, Hermes-spawned child Python that inherits
+  ``_HERMES_GATEWAY=1`` from its parent, or a second gateway whose flock
+  acquisition lost the race): light runtime — identity only, no WS, no
+  invoker. The skill is still registered; the agent's tools are the hosted
+  MCP server declared in ``config.yaml`` and are available in every mode.
+  Live inbound stays exclusively with the leader-lock holder.
 
 Mode selection has two layered signals (see :mod:`.leader_lock`):
 
-1. ``_HERMES_GATEWAY=1`` env var, set by ``gateway/run.py:370`` at
-   module load (before plugin discovery), and used by Hermes' own
-   ``cli.py:538``. This is the authoritative "am I the gateway?"
-   marker.
-2. ``fcntl.flock(LOCK_EX | LOCK_NB)`` on the per-account lock file
-   under ``<hermes root>/agentchat-locks/``. Even with the env var set,
-   only one process can hold this OS-level lock for a given account at
-   a time. Losers fall back to CLI mode.
+1. argv says ``hermes gateway run`` (the ``_HERMES_GATEWAY=1`` marker alone
+   is no longer enough — every child the gateway spawns inherits it).
+2. ``fcntl.flock(LOCK_EX | LOCK_NB)`` on the per-account lock file under
+   ``<hermes root>/agentchat-locks/``. Even with the argv signal, only one
+   process can hold this OS-level lock for a given account at a time.
+   Losers fall back to CLI mode and retry the election.
 
-The earlier 0.2.0 detector used ``ctx._manager._cli_ref is None``,
-which silently misfired: Hermes sets ``_cli_ref`` *after* plugin
-discovery, so it's ``None`` in both gateway and TUI processes when
-``register()`` runs. That's why every TUI invocation was opening a
-second WS. Fixed in 0.2.1.
+What this plugin does NOT register: tools. The pre-v3 plugin registered 47
+native ``agentchat_*`` tools and a reply gate of its own; both were one of
+three drifting copies of the product. Since 0.3.0 the tools are the
+hosted MCP server (one definition for every runtime) and the gate question
+and cards come from the server — see ``docs/decisions/2026-11-main-line.md``.
 
-There is NO ``on_session_end`` hook. Hermes fires that on every
-individual session ending (TUI sessions, cron jobs, adapter chats —
-not just process shutdown), which would spuriously stop the runtime
-mid-flight. Daemon threads (``daemon=True``) die with the process on
-real shutdown; no explicit cleanup hook is needed or wanted.
+There is NO ``on_session_end`` hook. Hermes fires that on every individual
+session ending (TUI sessions, cron jobs, adapter chats — not just process
+shutdown), which would spuriously stop the runtime mid-flight. Daemon
+threads (``daemon=True``) die with the process on real shutdown; no explicit
+cleanup hook is needed or wanted.
 
-Called once per Hermes **profile**: once per process in a classic
-gateway, once per served profile in a multiplexed gateway (Hermes keeps
-one plugin manager per profile home). Every call resolves its own
-profile home and its own ``AGENTCHATME_*`` settings and gets its own
-:class:`runtime.Runtime`, keyed by profile and account — see
-:mod:`.profile_scope`.
+Called once per Hermes **profile**: once per process in a classic gateway,
+once per served profile in a multiplexed gateway (Hermes keeps one plugin
+manager per profile home). Every call resolves its own profile home and its
+own settings and gets its own :class:`runtime.Runtime`, keyed by profile
+and account — see :mod:`.profile_scope`.
 """
 from __future__ import annotations
 
@@ -57,13 +51,14 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 from ._version import __version__
-from .config import ConfigError, load_config
+from .config import ENV_API_KEY, ENV_API_KEY_LEGACY, ConfigError, load_config
 from .leader_lock import is_hermes_gateway_process
 from .profile_scope import profile_label, resolve_hermes_home
-from .runtime import RuntimeHandle
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+    from .runtime import Runtime
 
 logger = logging.getLogger(__name__)
 
@@ -93,15 +88,12 @@ def register(ctx: Any) -> None:
     profile = profile_label(hermes_home)
     gateway_mode = _is_gateway_context(ctx)
 
-    # Tools and skill are registered unconditionally, bound to a handle
-    # that the runtime fills in when it comes up. The agent therefore
-    # always sees its AgentChat tools; before activation they answer
-    # NOT_CONFIGURED with the fix instead of not existing at all.
-    handle = RuntimeHandle()
-    _register_surface(ctx, handle)
+    # The manual is registered unconditionally as the ``agentchat:agentchat``
+    # skill. Tools are not registered here: they are the hosted MCP server
+    # declared in the profile's config.yaml (see mcp_registration).
+    _register_surface(ctx)
 
     watcher = ActivationWatcher(
-        handle=handle,
         hermes_home=hermes_home,
         profile=profile,
         gateway_mode=gateway_mode,
@@ -137,15 +129,8 @@ def register(ctx: Any) -> None:
         )
 
 
-def _register_surface(ctx: Any, handle: RuntimeHandle) -> None:
-    """Register tools and skill against a late-bound runtime handle."""
-    try:
-        from .tools import register_tools
-
-        register_tools(ctx, handle)
-    except ImportError:
-        logger.debug("agentchatme_hermes.tools not yet present; skipping tool registration")
-
+def _register_surface(ctx: Any) -> None:
+    """Register the bundled manual as a skill. No tools — see module docstring."""
     try:
         from .skills import register_skill
 
@@ -166,12 +151,11 @@ class ActivationWatcher:
     def __init__(
         self,
         *,
-        handle: RuntimeHandle,
         hermes_home: Path,
         profile: str,
         gateway_mode: bool,
     ) -> None:
-        self._handle = handle
+        self._runtime: Runtime | None = None
         self._hermes_home = hermes_home
         self._profile = profile
         self._gateway_mode = gateway_mode
@@ -179,9 +163,13 @@ class ActivationWatcher:
         self._thread: threading.Thread | None = None
         self._failures = 0
 
+    @property
+    def runtime(self) -> Runtime | None:
+        return self._runtime
+
     def try_activate(self) -> str:
         """One attempt. Returns ``"active"``, ``"unconfigured"`` or ``"failed"``."""
-        if self._handle.is_bound:
+        if self._runtime is not None:
             return "active"
         try:
             config = load_config(hermes_home=self._hermes_home)
@@ -201,15 +189,17 @@ class ActivationWatcher:
             self._failures += 1
             return "failed"
 
-        self._handle.bind(runtime)
+        self._runtime = runtime
         self._failures = 0
 
-        # Identity reconciliation. Wizard users (`hermes agentchat
-        # register/login`) already got the SOUL.md anchor written at that
-        # step; this backfills it for env-var-direct / scripted /
-        # container setups — and refuses to stay quiet when the anchor
-        # and the key disagree about who this profile is.
+        # Placement reconciliation. Wizard users (`hermes agentchat
+        # register/login`) already got everything placed at that step; this
+        # backfills it for env-var-direct / scripted / container setups and
+        # for profiles upgraded from a pre-v3 release — and refuses to stay
+        # quiet when the anchor and the key disagree about who this profile is.
         _reconcile_soul_anchor(runtime)
+        _reconcile_key_name(config)
+        _reconcile_mcp_registration(runtime)
 
         logger.info(
             "agentchat plugin registered (version=%s, profile=%s, home=%s, "
@@ -299,9 +289,8 @@ def _try_start_runtime(config: Any, *, gateway_mode: bool) -> Any:
         runtime.start()
     except Exception as exc:
         logger.error(
-            "agentchat plugin: runtime startup failed — tools answer "
-            "NOT_CONFIGURED and there is no live inbound until it starts. "
-            "Reason: %s. See the Hermes errors log for the full traceback. "
+            "agentchat plugin: runtime startup failed — there is no live "
+            "inbound until it starts. Reason: %s. See the Hermes errors log for the full traceback. "
             "Try `hermes agentchat doctor` to diagnose, or `hermes "
             "agentchat login` to rotate to a known-good key.",
             exc,
@@ -315,7 +304,7 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
     """Backfill the SOUL.md identity anchor, and flag an identity mismatch.
 
     The wizard writes the anchor on register/login (``cli.py``). This
-    is the non-wizard path: a user who set ``AGENTCHATME_API_KEY``
+    is the non-wizard path: a user who set ``AGENTCHAT_API_KEY``
     directly (env var, hand-edited profile ``.env``, container secrets,
     scripted setup) reaches the plugin's startup with a valid runtime +
     resolved handle but no anchor in SOUL.md. We write it on their
@@ -336,6 +325,7 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
     try:
         from .soul_anchor import (
             AnchorError,
+            anchor_is_current,
             has_anchor,
             read_anchor_handle,
             resolve_soul_path,
@@ -352,7 +342,7 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
             if anchored is not None and anchored != actual:
                 logger.error(
                     "agentchat plugin: IDENTITY MISMATCH for profile=%s — "
-                    "%s says this agent is @%s but AGENTCHATME_API_KEY "
+                    "%s says this agent is @%s but AGENTCHAT_API_KEY "
                     "authenticates as @%s. This profile is configured with "
                     "another agent's key (or another agent's SOUL.md). Fix "
                     "the key with `hermes agentchat login` in this profile, "
@@ -363,6 +353,19 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
                     anchored,
                     actual,
                     actual,
+                )
+                return
+            if anchored is not None and anchor_is_current() is False:
+                # Our own block from an older release: same handle, older
+                # text. The published identity line is the one every
+                # doorbell places; refresh it. A hand-edited block
+                # (``anchored is None``) is the user's and is left alone.
+                path = write_soul_anchor(actual)
+                logger.info(
+                    "agentchat plugin: SOUL.md identity line refreshed to the published "
+                    "text (handle=@%s, path=%s)",
+                    actual,
+                    path,
                 )
             return
         path = write_soul_anchor(runtime.identity.handle)
@@ -380,6 +383,75 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
             "wizard's anchor write, or hand-edit SOUL.md.",
             exc,
         )
+
+
+def _reconcile_key_name(config: Any) -> None:
+    """Mirror a legacy ``AGENTCHATME_API_KEY`` into ``AGENTCHAT_API_KEY`` once.
+
+    The hosted MCP declaration authenticates with ``Bearer
+    ${AGENTCHAT_API_KEY}``; a profile configured before v3 has only the
+    legacy name, so without this the socket would connect and every tool
+    call would fail closed on an unset variable. Writes through Hermes'
+    own ``.env`` helpers; a no-op where Hermes is not importable or the
+    canonical name already exists.
+    """
+    if getattr(config, "api_key_source", ENV_API_KEY) != ENV_API_KEY_LEGACY:
+        return
+    try:
+        from hermes_cli.config import get_env_value, save_env_value
+    except ImportError:
+        logger.debug("hermes_cli.config not importable; skipping key-name migration")
+        return
+    try:
+        from .placement import migrate_legacy_key
+
+        if migrate_legacy_key(save_env_value, get_env_value):
+            logger.info(
+                "agentchat plugin: %s was the only key name set — mirrored into %s so the "
+                "hosted tools can authenticate (restart the gateway if they still report an "
+                "unset variable)",
+                ENV_API_KEY_LEGACY,
+                ENV_API_KEY,
+            )
+    except Exception as exc:
+        logger.warning(
+            "agentchat plugin: could not mirror %s into %s (%s). Run `hermes agentchat "
+            "login` in this profile, or copy the value by hand.",
+            ENV_API_KEY_LEGACY,
+            ENV_API_KEY,
+            exc,
+        )
+
+
+def _reconcile_mcp_registration(runtime: Any) -> None:
+    """Ensure ``mcp_servers.agentchat`` exists in this profile's ``config.yaml``.
+
+    The agent's tools live on the hosted MCP server; without this entry a
+    knock starts a turn that has no AgentChat tools. The wizard writes it;
+    this is the non-wizard path (upgrade from pre-v3, env-var-direct
+    install). Adds only when absent — a user-managed entry is never
+    touched. The gateway's config watcher connects a new entry within
+    about a minute. Non-fatal: failures are logged with the fix.
+    """
+    try:
+        from .placement import place_mcp
+    except ImportError:
+        logger.debug("agentchatme_hermes.placement not importable; skipping MCP registration")
+        return
+    api_base = getattr(getattr(runtime, "config", None), "api_base", None)
+    if not isinstance(api_base, str) or not api_base:
+        return
+    step = place_mcp(api_base)
+    if step.failed:
+        logger.warning(
+            "agentchat plugin: hosted tools not registered for profile=%s — %s",
+            profile_label(runtime.hermes_home),
+            step.detail,
+        )
+    elif step.status == "changed":
+        logger.info("agentchat plugin: %s", step.detail)
+    else:
+        logger.debug("agentchat plugin: mcp registration %s — %s", step.status, step.detail)
 
 
 # NOTE: there is intentionally NO ``on_session_end`` hook in this

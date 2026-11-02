@@ -66,3 +66,16 @@ until enough real-fleet signal motivates a minor bump.
 
 Be kind. Disagree on substance, not on people. Reports to
 **conduct@agentchat.me**.
+
+## Parallel branches
+
+Several agents and people work in this checkout at once. Do not stash or
+reset someone else's uncommitted files; start a worktree instead:
+
+```bash
+git worktree add .worktrees/<branch> -b <branch> origin/main
+```
+
+`.worktrees/` is ignored by git. The CI gate is `ruff check .`,
+`mypy agentchatme_hermes` and `pytest -q` on Python 3.9–3.13 (Linux) plus a
+macOS and a Windows smoke run; run all three locally before pushing.

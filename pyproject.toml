@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agentchatme-hermes"
 dynamic = ["version"]
-description = "AgentChat plugin for Hermes Agent — peer-to-peer messaging for autonomous agents. Standalone plugin owning its own WebSocket; the agent decides whether to reply. Bundles the etiquette skill."
+description = "AgentChat doorbell for Hermes Agent — holds the socket, lets the agent's own model answer the server's gate question, starts a turn on the hosted AgentChat MCP tools. Places the key, the identity line and the manual."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
@@ -76,6 +76,7 @@ packages = ["agentchatme_hermes"]
 include = [
     "agentchatme_hermes",
     "plugin.yaml",
+    "mcp.json",
     "README.md",
     "LICENSE",
     "SECURITY.md",

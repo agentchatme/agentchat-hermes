@@ -1,754 +1,383 @@
-"""Mechanism A — the only path from a WS poke to an agent turn.
+"""Knock → gate → turn. The only path from the socket to the agent.
 
-Why it exists
--------------
-A platform/channel adapter would force a mandatory reply via
-``send()`` and create infinite loops between two agents. We bypass
-that machinery entirely. Per inbound:
+What happens on a knock
+───────────────────────
+1. **Coalesce.** Frames inside a short window become one knock
+   (:class:`.knock.KnockCoalescer`). A group waking up is one cycle, not
+   twenty.
+2. **Read the tray.** ``GET /v1/inbox?wait_ms=0`` — the server's briefing
+   cards and its gate question, as it built them (:mod:`.main_line`).
+3. **Gate.** The agent's own model answers the question per card
+   (:mod:`.gate`); ``no_reply`` / ``defer`` verdicts are recorded on the
+   server, which settles those conversations. ``reply`` cards stay on the
+   tray.
+4. **Turn.** If anything was decided ``reply``, start ONE Hermes agent turn
+   with the fixed prompt (:mod:`.turn`). The agent reads and answers through
+   the hosted MCP tools; the send is its verdict. The turn's return value is
+   discarded — nothing is auto-routed anywhere.
 
-1. **Reply gate** (:mod:`.reply_gate`). A forced reply/no-reply
-   decision on the agent's own model. ``no_reply`` ends the turn
-   right here — this is what stops two agents looping forever. Only
-   a ``reply`` decision proceeds to the steps below, so a no-reply
-   turn never pays for AIAgent construction.
-2. Construct an :class:`AIAgent` configured with our session_id
-   namespace (``agentchat:<conversation_id>``). The agent loads
-   prior turns of THIS conversation from the session DB
-   automatically.
-3. Hand it a short notification prompt
-   (``prompts.build_notification_prompt``).
-4. Call :meth:`AIAgent.run_conversation`.
-5. **Discard the return value.** No auto-routing anywhere. The
-   agent's only way to actually send something on AgentChat is to
-   call the ``agentchat_send_message`` tool during the turn.
+One cycle at a time per account: a knock that lands while a cycle runs is
+remembered and runs once the cycle ends (the tray is re-read, so whatever
+the earlier knock announced is covered). A cycle that could not complete —
+model unreachable, server error, verdicts rejected — re-knocks itself on a
+local ladder (1 m, 5 m, 30 m) because a connected socket gets no re-ring
+from the server; the cards wait on the tray meanwhile.
 
-This mirrors the pattern Hermes' cron scheduler uses
-(``cron/scheduler.py:1425-1492``): build a transient agent, run a
-turn, ignore the response. Cron has done it in production for many
-versions — we are not inventing a primitive.
+Group invites are a second knock kind: not on the tray, not gated, one turn
+each with the fixed invite prompt, serialized on the same worker.
 
-Concurrency
------------
-* A single dispatcher thread reads from the
-  :class:`MessageQueue` and submits tasks to a thread pool.
-* The pool's ``max_workers`` is ``config.max_inflight_turns`` —
-  backpressure against a thundering-herd group blast.
-* A per-conversation :class:`threading.Lock` serializes turns for
-  one conversation. Different conversations run in parallel.
-
-Lifecycle
----------
-* :meth:`start` spins up the dispatcher; :meth:`on_new_event` is the
-  callback the WS daemon fires when something landed.
-* :meth:`stop` signals shutdown, drains the pool, joins the
-  dispatcher.
+This mirrors the pattern Hermes' cron scheduler uses: build a transient
+agent, run a turn, ignore the response. What changed from the pre-v3
+invoker: no message bodies, no history rehydration, no prompt of its own,
+no gate wording of its own, no native tools — all of that lives on the main
+line now (``docs/decisions/2026-11-main-line.md``).
 """
 from __future__ import annotations
 
+import collections
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
-from . import reply_gate
+from . import gate
 from .config import (
     DEFAULT_GATE_TIMEOUT_S,
+    DEFAULT_KNOCK_DEBOUNCE_S,
     DEFAULT_REPLY_GATE_ENABLED,
     DEFAULT_REPLY_GATE_FAIL_OPEN,
 )
+from .knock import KnockCoalescer
+from .main_line import MainLineError
+from .turn import invite_session_id, invite_turn_prompt, knock_session_id, knock_turn_prompt
 
 if TYPE_CHECKING:
     from .config import Config
-    from .message_queue import MessageQueue
-    from .types import AgentIdentity, GroupInviteEvent, InboundEvent
+    from .types import AgentIdentity, GroupInviteEvent
 
 logger = logging.getLogger(__name__)
 
-_DISPATCHER_THREAD_NAME = "agentchat-invoker"
-_DRAIN_GRACE_SECONDS = 30.0
+_WORKER_THREAD_NAME = "agentchat-invoker"
+_WORKER_IDLE_WAIT_S = 60.0
 
-# Hermes' SessionDB is process-wide. We construct it once and pass
-# the same instance into every transient AIAgent so a multi-turn
-# conversation accumulates history under one session row.
+# Fallback model when Hermes' config helpers are unavailable.
 _FALLBACK_MODEL = "claude-sonnet-4-6"
 
-# How many prior messages to rehydrate as conversation_history on
-# each wake. 30 is empirically enough for a typical back-and-forth
-# to make sense without bloating the prompt for long conversations.
-# Power users with chatty groups can scroll further via the
-# agentchat_get_conversation_messages tool.
-_HISTORY_FETCH_LIMIT = 30
+# Local re-knock ladder after a cycle that could not complete. Mirrors the
+# server's webhook ladder (1m, 5m, 30m) — a connected socket never gets that
+# re-ring, so the doorbell carries it. After the last rung the cycle waits
+# for the next knock; the cards are still on the tray.
+RETRY_LADDER_S: tuple[float, ...] = (60.0, 300.0, 1800.0)
 
 
 class AgentInvoker:
-    """Drives Mechanism A.
-
-    Owned by the :class:`Runtime`. Single-use — call :meth:`start`
-    once and :meth:`stop` once.
-    """
+    """Owns the knock worker. Single-use — :meth:`start` once, :meth:`stop` once."""
 
     def __init__(
         self,
         *,
         config: Config,
         identity: AgentIdentity,
-        queue: MessageQueue,
-        runtime: Any | None = None,
+        runtime: Any,
     ) -> None:
         self._config = config
         self._identity = identity
-        self._queue = queue
-        # The runtime this invoker belongs to. Injected by Runtime.start()
-        # so a process serving several profiles never resolves a sibling
-        # profile's runtime; ``None`` keeps the legacy singleton lookup
-        # for callers that construct an invoker standalone.
-        self._runtime_ref = runtime
+        # The runtime this invoker belongs to (one per profile and account).
+        # Supplies the main-line client; never resolved from a registry.
+        self._runtime = runtime
 
-        # Reply-gate settings resolved once. getattr-with-default so partial
-        # configs in tests construct cleanly; the production Config dataclass
-        # always carries these fields.
-        self._gate_enabled = getattr(
-            config, "reply_gate_enabled", DEFAULT_REPLY_GATE_ENABLED
+        # Gate settings resolved once. getattr-with-default so light
+        # config doubles in tests construct cleanly.
+        self._gate_enabled = bool(getattr(config, "reply_gate_enabled", DEFAULT_REPLY_GATE_ENABLED))
+        self._gate_fail_open = bool(
+            getattr(config, "reply_gate_fail_open", DEFAULT_REPLY_GATE_FAIL_OPEN)
         )
-        self._gate_fail_open = getattr(
-            config, "reply_gate_fail_open", DEFAULT_REPLY_GATE_FAIL_OPEN
-        )
-        self._gate_timeout_s = getattr(
-            config, "gate_timeout_s", DEFAULT_GATE_TIMEOUT_S
-        )
+        self._gate_timeout_s = float(getattr(config, "gate_timeout_s", DEFAULT_GATE_TIMEOUT_S))
+        debounce_s = float(getattr(config, "knock_debounce_s", DEFAULT_KNOCK_DEBOUNCE_S))
 
-        self._executor: ThreadPoolExecutor | None = None
-        self._dispatcher: threading.Thread | None = None
+        self._coalescer = KnockCoalescer(on_fire=self._on_knock_fired, debounce_s=debounce_s)
         self._wake = threading.Event()
+        self._knock_due = threading.Event()
         self._stopped = threading.Event()
-        self._conv_locks_guard = threading.Lock()
-        self._conv_locks: dict[str, threading.Lock] = {}
+        self._worker: threading.Thread | None = None
+        self._invites: collections.deque[GroupInviteEvent] = collections.deque()
+        self._invites_lock = threading.Lock()
+        self._retry_rung = 0
 
-        # Hermes-side handles, resolved lazily on first dispatch so the
-        # plugin can register cleanly even in environments where
-        # Hermes' runtime isn't fully importable yet (e.g., during
-        # pytest collection from outside Hermes).
+        # Counters for the heartbeat / doctor and for tests.
+        self.cycles = 0
+        self.turns = 0
+        self.invite_turns = 0
+
+        # Hermes-side handles, resolved lazily on first turn so the plugin
+        # registers cleanly where Hermes' runtime isn't importable yet.
         self._session_db: Any = None
         self._resolved_hermes = False
 
     # -- lifecycle ----------------------------------------------------------
 
     def start(self) -> None:
-        if self._dispatcher is not None:
+        if self._worker is not None:
             return
-
-        self._executor = ThreadPoolExecutor(
-            max_workers=self._config.max_inflight_turns,
-            thread_name_prefix="agentchat-turn",
+        self._worker = threading.Thread(
+            target=self._worker_loop, name=_WORKER_THREAD_NAME, daemon=True
         )
-        self._dispatcher = threading.Thread(
-            target=self._dispatch_loop,
-            name=_DISPATCHER_THREAD_NAME,
-            daemon=True,
-        )
-        self._dispatcher.start()
+        self._worker.start()
 
     def stop(self) -> None:
         if self._stopped.is_set():
             return
         self._stopped.set()
+        self._coalescer.stop()
         self._wake.set()
+        worker = self._worker
+        if worker is not None and worker.is_alive():
+            # A turn in flight finishes on its own; the worker checks
+            # ``_stopped`` between cycles. Bounded join so a stop never hangs
+            # the gateway's shutdown on a slow provider.
+            worker.join(timeout=2.0)
+            if worker.is_alive():
+                logger.info("AgentInvoker: worker still finishing a turn at stop()")
 
-        dispatcher = self._dispatcher
-        if dispatcher is not None and dispatcher.is_alive():
-            dispatcher.join(timeout=2.0)
-            if dispatcher.is_alive():
-                logger.warning("AgentInvoker: dispatcher did not exit cleanly")
+    # -- knocks -------------------------------------------------------------
 
-        executor = self._executor
-        if executor is not None:
-            # wait=True so in-flight turns get a chance to finish
-            # before the runtime exits. SDK calls inside the tool
-            # handlers are short, agent loops can be longer — the
-            # grace is bounded by ``stop`` callers' patience.
-            executor.shutdown(wait=True, cancel_futures=False)
-
-    def on_new_event(self) -> None:
-        """Signal-only — called by the WS daemon when something landed.
-
-        Logs at DEBUG (not INFO) because this fires on every frame
-        and the ws_daemon already logs the receipt. INFO would
-        duplicate signal without adding information.
-        """
-        logger.debug("AgentInvoker: wake signal received")
-        self._wake.set()
+    def knock(self) -> None:
+        """A knock from the socket (or any other source). Coalesced, then cycled."""
+        self._coalescer.knock()
 
     def handle_group_invite(self, invite: GroupInviteEvent) -> None:
-        """Wake the agent to decide on a group invite (accept / reject / ignore).
-
-        Called by the WS daemon on a ``group.invite.received`` frame. Invites do
-        NOT go through the message queue or the reply-gate — they are a one-shot
-        consent decision, not a message to reply to. We submit the decision turn
-        straight to the worker pool, serialized per-group via the same conv lock
-        as message turns so an invite decision and a concurrent group message on
-        that group can't race.
-
-        Runs on the WS daemon thread; must not block it — ``submit`` returns
-        immediately. If the pool is gone (never started / shutting down) the
-        invite is dropped from the reactive path but remains pending server-side
-        and is still reachable via ``agentchat_list_group_invites``.
-        """
-        executor = self._executor
-        if executor is None:
+        """Queue one invite-decision turn. Runs on the WS thread; never blocks."""
+        if self._stopped.is_set():
             logger.warning(
-                "AgentInvoker: group-invite dropped — invoker not started "
-                "(group=%s invite=%s)",
+                "AgentInvoker: group invite dropped at shutdown (group=%s invite=%s) — it stays "
+                "pending server-side and is reachable through the hosted tools",
                 invite.group_id,
                 invite.invite_id,
             )
             return
-        try:
-            executor.submit(self._run_invite, invite)
-        except RuntimeError:
-            logger.debug(
-                "AgentInvoker: executor refused group-invite submission "
-                "(shutdown in progress?) group=%s invite=%s",
-                invite.group_id,
-                invite.invite_id,
-            )
+        with self._invites_lock:
+            self._invites.append(invite)
+        self._wake.set()
 
-    # -- dispatcher ---------------------------------------------------------
+    def _on_knock_fired(self) -> None:
+        """Timer-thread callback from the coalescer: mark a cycle due, wake the worker."""
+        self._knock_due.set()
+        self._wake.set()
 
-    def _dispatch_loop(self) -> None:
-        logger.info("AgentInvoker: dispatcher loop started")
+    # -- worker -------------------------------------------------------------
+
+    def _worker_loop(self) -> None:
+        logger.info("AgentInvoker: worker started")
         try:
             while not self._stopped.is_set():
-                self._wake.wait(timeout=60.0)
+                self._wake.wait(timeout=_WORKER_IDLE_WAIT_S)
                 if self._stopped.is_set():
                     return
-                # Clear AFTER the stopped check so a stop()+wake set
-                # in the same instant doesn't get swallowed below.
-                woke_by_event = self._wake.is_set()
                 self._wake.clear()
-                if woke_by_event:
-                    logger.debug("AgentInvoker: dispatcher woke (event-driven)")
-                self._drain_queue()
+                self._drain_invites()
+                if self._knock_due.is_set():
+                    # Clear BEFORE the cycle: a knock landing during the cycle
+                    # sets it again and earns one more cycle afterwards.
+                    self._knock_due.clear()
+                    self._guarded_cycle()
         except Exception:
-            # The dispatcher thread is the only path from WS to agent
-            # — losing it silently is exactly the "gateway runtime
-            # appears dead" failure mode the first spike hit. Re-raise
-            # here is not useful (thread is daemonic, no one's
-            # joining), so log loudly instead. A future enhancement
-            # could restart the loop from a supervisor, but the
-            # diagnostic comes first.
             logger.exception(
-                "AgentInvoker: dispatcher loop crashed — no more turns "
-                "will be triggered until the gateway restarts. Check "
-                "the error and restart `hermes gateway`."
+                "AgentInvoker: worker crashed — no further cycles until the gateway restarts"
             )
         finally:
-            logger.info("AgentInvoker: dispatcher loop exiting")
+            logger.info("AgentInvoker: worker exiting")
 
-    def _drain_queue(self) -> None:
-        executor = self._executor
-        if executor is None:
-            return
-
-        drained = 0
+    def _drain_invites(self) -> None:
         while True:
-            event = self._queue.pop()
-            if event is None:
-                if drained:
-                    logger.info(
-                        "AgentInvoker: drained %d event(s) from queue",
-                        drained,
-                    )
+            with self._invites_lock:
+                if not self._invites:
+                    return
+                invite = self._invites.popleft()
+            if self._stopped.is_set():
                 return
-
-            if self._runtime.thread_closures.is_closed(event.conversation_id):
-                logger.info(
-                    "AgentInvoker: skipped queued event for locally closed "
-                    "thread conv=%s msg=%s",
-                    event.conversation_id,
-                    event.message_id,
-                )
-                continue
-
-            drained += 1
-            logger.info(
-                "AgentInvoker: dispatching turn conv=%s msg=%s from=@%s",
-                event.conversation_id,
-                event.message_id,
-                event.sender_handle,
-            )
-            conv_lock = self._lock_for(event.conversation_id)
             try:
-                future = executor.submit(self._run_one, event, conv_lock)
-            except RuntimeError:
-                # ThreadPoolExecutor refuses submissions after shutdown.
-                # Happens during stop() if a queued event was still
-                # waiting — not a bug, but worth a debug line.
-                logger.debug(
-                    "AgentInvoker: executor refused submission "
-                    "(shutdown in progress?) for conv=%s msg=%s",
-                    event.conversation_id,
-                    event.message_id,
-                )
-                return
-            # Future done-callback: belt-and-suspenders catch for
-            # any exception that escaped `_run_one`'s own outer
-            # try/except. Without this, a silent crash inside an
-            # exception handler itself (rare, but possible) would
-            # vanish into ThreadPoolExecutor's future without ever
-            # being logged. We learned this the hard way after the
-            # 0.2.1 inbound silently failed at the AIAgent build
-            # stage and produced no log line, no traceback, no
-            # visible error.
-            # Bind ids as default args so the callback captures THIS
-            # event's ids, not the loop-final values (B023 late-binding).
-            # Pulling the ids into locals first lets mypy narrow them
-            # away from ``InboundEvent | None``.
-            ev_conv = event.conversation_id
-            ev_msg = event.message_id
-
-            def _callback(
-                f: Any,
-                _conv: str = ev_conv,
-                _msg: str = ev_msg,
-            ) -> None:
-                self._log_future_outcome(f, _conv, _msg)
-
-            future.add_done_callback(_callback)
-
-    def _lock_for(self, conversation_id: str) -> threading.Lock:
-        with self._conv_locks_guard:
-            lock = self._conv_locks.get(conversation_id)
-            if lock is None:
-                lock = threading.Lock()
-                self._conv_locks[conversation_id] = lock
-            return lock
-
-    # -- one turn -----------------------------------------------------------
-
-    def _run_one(self, event: InboundEvent, conv_lock: threading.Lock) -> None:
-        """Execute one agent turn for one inbound event.
-
-        Runs on a worker thread from the pool. Each thread holds the
-        per-conversation lock for the duration of the turn so a
-        second event on the same conversation queues behind it
-        instead of racing.
-
-        Wraps the entire body in an outer ``try/except Exception`` —
-        ``ThreadPoolExecutor.submit()`` silently captures unhandled
-        exceptions into the future, and we don't ``.result()`` (can't
-        — it'd block the dispatcher). Without this outer handler an
-        exception in :meth:`_build_agent`, :meth:`_build_conversation_history`,
-        or :meth:`_ensure_hermes_resolved` vanishes into the void.
-        The 0.2.1 production hang was exactly this: ``AIAgent.__init__``
-        raised AFTER our "turn start" log but BEFORE the inner
-        ``run_conversation`` try-block; the exception escaped silently
-        and no operator-visible signal existed.
-        """
-        from .prompts import build_notification_prompt
-
-        # Record contention so a slow conversation is observable.
-        # ``acquire(blocking=False)`` first to distinguish uncontested
-        # vs queued-behind-prior-turn — the latter is normal but
-        # worth marking when chasing latency regressions.
-        if not conv_lock.acquire(blocking=False):
-            logger.info(
-                "AgentInvoker: turn queued behind prior turn for "
-                "conv=%s msg=%s",
-                event.conversation_id,
-                event.message_id,
-            )
-            conv_lock.acquire()
-        try:
-            try:
-                self._run_one_inner(event, build_notification_prompt)
-            except Exception:
-                # Outer catch — covers _build_agent, history fetch,
-                # Hermes imports, anything else above the inner
-                # run_conversation try/except. Logs with traceback so
-                # the next time this fails we see exactly where.
-                logger.exception(
-                    "AgentInvoker: turn FAILED with unhandled exception "
-                    "(outer catch) conv=%s msg=%s — the agent did not "
-                    "produce a reply. See traceback for the failing call.",
-                    event.conversation_id,
-                    event.message_id,
-                )
-        finally:
-            conv_lock.release()
-
-    def _run_one_inner(
-        self,
-        event: InboundEvent,
-        build_notification_prompt: Any,
-    ) -> None:
-        """Inner turn body, separated so the outer wrapper can catch."""
-        if self._stopped.is_set():
-            logger.debug(
-                "AgentInvoker: skipping turn — runtime stopping (conv=%s)",
-                event.conversation_id,
-            )
-            return
-        if self._runtime.thread_closures.is_closed(event.conversation_id):
-            logger.info(
-                "AgentInvoker: skipping turn for locally closed thread "
-                "conv=%s msg=%s",
-                event.conversation_id,
-                event.message_id,
-            )
-            return
-
-        logger.info(
-            "AgentInvoker: turn start conv=%s msg=%s from=@%s kind=%s",
-            event.conversation_id,
-            event.message_id,
-            event.sender_handle,
-            event.conversation_kind,
-        )
-
-        self._ensure_hermes_resolved()
-
-        history, raw_messages = self._build_conversation_history(
-            conversation_id=event.conversation_id,
-            conversation_kind=event.conversation_kind,
-            trigger_message_id=event.message_id,
-        )
-        # Derive the conversation signals ONCE (pure, no fetch — over the
-        # messages already in hand) and feed them to BOTH the reply-gate
-        # decision AND the compose wake, so the model that WRITES the reply sees
-        # the same when/who/where/pace the gate judged on instead of a bare
-        # one-liner. Computed unconditionally (cheap) so the wake stays enriched
-        # even when the gate is disabled.
-        signals = reply_gate.compute_conversation_signals(
-            raw_messages,
-            own_handle=self._identity.handle,
-            trigger_message_id=event.message_id,
-            now=event.received_at,
-        )
-        prompt = build_notification_prompt(
-            event,
-            handle=self._identity.handle,
-            signals=signals,
-            prior_count=len(history),
-        )
-
-        # --- reply gate ------------------------------------------------------
-        # Forced reply/no-reply decision BEFORE anything is composed. "No
-        # reply" is a first-class outcome that ends the turn here — this is
-        # what stops two agents ping-ponging acknowledgements forever. The
-        # agent is built only on the reply branch, so a no-reply turn never
-        # pays for AIAgent construction. Kill switch:
-        # AGENTCHATME_REPLY_GATE_ENABLED=0.
-        if self._gate_enabled:
-            decision = self._decide_reply(event, history, signals)
-            logger.info(
-                "AgentInvoker: gate conv=%s msg=%s reply=%s source=%s "
-                "category=%s latency_ms=%d reason=%r",
-                event.conversation_id,
-                event.message_id,
-                decision.reply,
-                decision.source,
-                decision.category,
-                decision.latency_ms,
-                decision.reason,
-            )
-            if not decision.reply:
-                return  # no-reply ends the turn; nothing composed or sent
-
-        agent = self._build_agent(event.conversation_id)
-        if agent is None:
-            logger.warning(
-                "AgentInvoker: agent construction returned None for "
-                "conv=%s msg=%s — turn dropped",
-                event.conversation_id,
-                event.message_id,
-            )
-            return  # already logged inside _build_agent
-
-        try:
-            result = agent.run_conversation(
-                prompt, conversation_history=history
-            )
-        except Exception:
-            logger.exception(
-                "AgentInvoker: run_conversation raised for conv=%s msg=%s",
-                event.conversation_id,
-                event.message_id,
-            )
-            return
-
-        # We deliberately do NOT route the agent's final_response
-        # anywhere. Any actual outbound went through the
-        # agentchat_send_message tool during the turn. The text
-        # here is the model's post-tool reasoning — useful for
-        # operator visibility, not for transmission.
-        final = (
-            result.get("final_response") if isinstance(result, dict) else None
-        )
-        logger.info(
-            "AgentInvoker: turn complete conv=%s msg=%s history_len=%d final_chars=%d",
-            event.conversation_id,
-            event.message_id,
-            len(history),
-            len(final) if isinstance(final, str) else 0,
-        )
-
-    # -- group invites ------------------------------------------------------
-
-    def _run_invite(self, invite: GroupInviteEvent) -> None:
-        """Execute one group-invite decision turn on a worker thread.
-
-        Serialized per-group via the conv lock (same lock message turns on this
-        group use) so an invite decision and a group message can't interleave.
-        Wrapped in the same outer ``try/except`` as :meth:`_run_one` — a turn
-        that raises above the inner ``run_conversation`` guard would otherwise
-        vanish into the ThreadPoolExecutor future.
-        """
-        conv_lock = self._lock_for(invite.group_id)
-        if not conv_lock.acquire(blocking=False):
-            logger.info(
-                "AgentInvoker: group-invite queued behind prior turn for "
-                "group=%s invite=%s",
-                invite.group_id,
-                invite.invite_id,
-            )
-            conv_lock.acquire()
-        try:
-            try:
-                self._run_invite_inner(invite)
+                self._run_invite_turn(invite)
             except Exception:
                 logger.exception(
-                    "AgentInvoker: group-invite turn FAILED with unhandled "
-                    "exception (outer catch) group=%s invite=%s — the agent "
-                    "did not decide. The invite stays pending server-side.",
+                    "AgentInvoker: group-invite turn FAILED (outer catch) group=%s invite=%s — "
+                    "the invite stays pending server-side",
                     invite.group_id,
                     invite.invite_id,
                 )
-        finally:
-            conv_lock.release()
 
-    def _run_invite_inner(self, invite: GroupInviteEvent) -> None:
-        """Inner invite-decision body, separated so the outer wrapper can catch.
+    def _guarded_cycle(self) -> None:
+        try:
+            self.run_cycle()
+        except Exception:
+            # Outer catch: whatever escaped the cycle must not kill the
+            # worker. Re-knock on the ladder so the tray is read again.
+            logger.exception("AgentInvoker: cycle FAILED with unhandled exception (outer catch)")
+            self._schedule_retry("unhandled exception")
 
-        No reply-gate: an invite is a consent decision, not a message to reply
-        to, so it always warrants a turn. The agent is built against the group's
-        own session namespace so the decision (and, if it accepts, the group it
-        joins) share one continuous memory. The agent acts via
-        ``agentchat_accept_group_invite`` / ``agentchat_reject_group_invite``
-        during the turn — we route nothing from its final text.
+    # -- one cycle ----------------------------------------------------------
+
+    def run_cycle(self) -> gate.GateResult | None:
+        """Read the tray, gate it, start a turn when warranted.
+
+        Returns the gate result (``None`` when the tray could not be read).
+        Public so tests and ``doctor``-style tooling can drive one cycle.
         """
-        from .prompts import build_group_invite_prompt
+        self.cycles += 1
+        try:
+            tray = self._runtime.main_line.inbox(wait_ms=0)
+        except MainLineError as exc:
+            logger.warning("AgentInvoker: tray read failed: %s", exc)
+            self._schedule_retry("tray read failed")
+            return None
 
-        if self._stopped.is_set():
-            logger.debug(
-                "AgentInvoker: skipping group-invite — runtime stopping "
-                "(group=%s)",
-                invite.group_id,
+        cards = gate.cards_of(tray)
+        truncated = bool(tray.get("truncated"))
+        if not cards:
+            logger.info(
+                "AgentInvoker: tray empty (deferred=%s) — nothing to decide",
+                tray.get("deferred", 0),
+            )
+            self._retry_rung = 0
+            return gate.GateResult(source="empty", truncated=truncated)
+
+        if not self._gate_enabled:
+            # Gate off: the agent judges in-turn with the hosted tools.
+            logger.info(
+                "AgentInvoker: %d card(s) on the tray, gate disabled — starting the turn",
+                len(cards),
+            )
+            result = gate.GateResult(
+                source="disabled",
+                cards=len(cards),
+                reply_conversations=tuple(gate.card_ids(cards)),
+                truncated=truncated,
+            )
+        else:
+            result = gate.run_gate(
+                tray,
+                main_line=self._runtime.main_line,
+                main_runtime=self._gate_runtime(),
+                fail_open=self._gate_fail_open,
+                timeout_s=self._gate_timeout_s,
+            )
+            counts = result.counts()
+            logger.info(
+                "AgentInvoker: gate cards=%d reply=%d no_reply=%d defer=%d undecided=%d "
+                "posted=%d post_failures=%d source=%s latency_ms=%d%s",
+                result.cards,
+                counts[gate.REPLY],
+                counts[gate.NO_REPLY],
+                counts[gate.DEFER],
+                len(result.undecided),
+                result.posted,
+                result.post_failures,
+                result.source,
+                result.latency_ms,
+                f" failure={result.failure!r}" if result.failure else "",
+            )
+
+        if result.source == "fail_closed":
+            # Nothing posted, no turn. The cards stay on the tray; re-knock
+            # on the ladder so a transient provider outage does not leave
+            # peers unanswered until the next message happens to arrive.
+            self._schedule_retry(result.failure or "gate failed")
+            return result
+
+        if result.start_turn:
+            self._run_knock_turn(result)
+
+        if result.post_failures or result.undecided:
+            # Some cards were not settled (verdict rejected, or the model
+            # skipped them). They are still on the tray; look again later.
+            self._schedule_retry("cards left on the tray")
+        else:
+            self._retry_rung = 0
+
+        if truncated:
+            # More conversations are waiting than one tray shows.
+            logger.info("AgentInvoker: tray truncated — knocking again for the rest")
+            self._coalescer.knock()
+        return result
+
+    def _schedule_retry(self, reason: str) -> None:
+        if self._coalescer.delayed_pending:
+            # A retry is already on its way (a knock landed mid-outage and
+            # failed again). One outage climbs the ladder once; climbing per
+            # failed cycle would replace the sooner retry with a later one.
+            logger.info("AgentInvoker: %s — a re-knock is already scheduled; not climbing the ladder", reason)
+            return
+        if self._retry_rung >= len(RETRY_LADDER_S):
+            logger.warning(
+                "AgentInvoker: %s — retry ladder exhausted; waiting for the next knock "
+                "(the cards stay on the tray)",
+                reason,
             )
             return
+        delay = RETRY_LADDER_S[self._retry_rung]
+        self._retry_rung += 1
+        logger.warning(
+            "AgentInvoker: %s — re-knocking in %.0fs (rung %d/%d)",
+            reason,
+            delay,
+            self._retry_rung,
+            len(RETRY_LADDER_S),
+        )
+        self._coalescer.knock_after(delay)
 
+    # -- turns --------------------------------------------------------------
+
+    def _run_knock_turn(self, result: gate.GateResult) -> None:
+        session_id = knock_session_id()
         logger.info(
-            "AgentInvoker: group-invite decision turn group=%s (%s) from=@%s "
-            "invite=%s",
+            "AgentInvoker: turn start session=%s reply_cards=%d source=%s",
+            session_id,
+            len(result.reply_conversations),
+            result.source,
+        )
+        if self._run_turn(
+            prompt=knock_turn_prompt(result.reply_conversations), session_id=session_id
+        ):
+            self.turns += 1
+
+    def _run_invite_turn(self, invite: GroupInviteEvent) -> None:
+        if self._stopped.is_set():
+            return
+        session_id = invite_session_id(invite.invite_id)
+        logger.info(
+            "AgentInvoker: group-invite turn start group=%s (%s) from=@%s invite=%s",
             invite.group_name,
             invite.group_id,
             invite.inviter_handle,
             invite.invite_id,
         )
+        if self._run_turn(prompt=invite_turn_prompt(), session_id=session_id):
+            self.invite_turns += 1
 
+    def _run_turn(self, *, prompt: str, session_id: str) -> bool:
+        """Build a transient AIAgent and run one turn. ``True`` when it ran.
+
+        The return value of ``run_conversation`` is deliberately discarded:
+        the agent's only way to say anything on AgentChat is the hosted
+        ``agentchat_send_message`` tool during the turn.
+        """
         self._ensure_hermes_resolved()
-
-        agent = self._build_agent(invite.group_id)
+        agent = self._build_agent(session_id)
         if agent is None:
-            logger.warning(
-                "AgentInvoker: agent construction returned None for "
-                "group-invite group=%s invite=%s — dropped",
-                invite.group_id,
-                invite.invite_id,
-            )
-            return
-
-        prompt = build_group_invite_prompt(invite)
+            logger.warning("AgentInvoker: agent construction failed for %s — turn dropped", session_id)
+            return False
         try:
-            agent.run_conversation(prompt, conversation_history=[])
+            result = agent.run_conversation(prompt, conversation_history=[])
         except Exception:
-            logger.exception(
-                "AgentInvoker: run_conversation raised for group-invite "
-                "group=%s invite=%s",
-                invite.group_id,
-                invite.invite_id,
-            )
-            return
-
+            logger.exception("AgentInvoker: run_conversation raised for %s", session_id)
+            return False
+        final = result.get("final_response") if isinstance(result, dict) else None
         logger.info(
-            "AgentInvoker: group-invite turn complete group=%s invite=%s",
-            invite.group_id,
-            invite.invite_id,
+            "AgentInvoker: turn complete session=%s final_chars=%d",
+            session_id,
+            len(final) if isinstance(final, str) else 0,
         )
+        return True
 
-    # -- reply gate ---------------------------------------------------------
-
-    def _decide_reply(
-        self,
-        event: InboundEvent,
-        history: list[dict[str, Any]],
-        signals: reply_gate.ConversationSignals,
-    ) -> reply_gate.GateDecision:
-        """Decide reply / no-reply for one inbound.
-
-        The decision is handed the pre-derived conversation signals
-        (relationship + cadence, computed once by the caller and also fed to the
-        compose wake) and runs on the agent's own model — so nothing here
-        touches the AgentChat server; the judgement lives at the edge.
-        """
-        model, runtime_kwargs = self._resolve_model_and_runtime()
-        main_runtime: dict[str, str] = {"model": model}
-        main_runtime.update(runtime_kwargs)
-        return reply_gate.decide(
-            handle=self._identity.handle,
-            event=event,
-            history=history,
-            signals=signals,
-            main_runtime=main_runtime,
-            fail_open=self._gate_fail_open,
-            timeout_s=self._gate_timeout_s,
-        )
-
-    def _log_future_outcome(
-        self, future: Any, conversation_id: str, message_id: str
-    ) -> None:
-        """Done-callback on the submitted future.
-
-        Belt-and-suspenders: if ``_run_one``'s outer except itself
-        crashed (e.g. logger blew up), the exception would still go
-        into the future. This callback fires when the future
-        finishes — failure or success — and surfaces any remaining
-        hidden exception. The cost is one callback invocation per
-        turn; the benefit is "never silently lose a turn failure
-        again."
-        """
-        try:
-            exc = future.exception()
-        except Exception:
-            # The future was cancelled, or .exception() itself raised.
-            # Either way, nothing more we can do — log and move on.
-            logger.exception(
-                "AgentInvoker: future.exception() raised for conv=%s msg=%s",
-                conversation_id,
-                message_id,
-            )
-            return
-        if exc is not None:
-            logger.error(
-                "AgentInvoker: turn FAILED (future-callback catch) "
-                "conv=%s msg=%s exc=%r — this should already have been "
-                "logged with traceback by the outer except in _run_one; "
-                "if you only see this line, the outer handler itself "
-                "failed.",
-                conversation_id,
-                message_id,
-                exc,
-            )
-
-    # -- conversation-history rehydration -----------------------------------
-
-    def _build_conversation_history(
-        self,
-        *,
-        conversation_id: str,
-        conversation_kind: str,
-        trigger_message_id: str,
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Fetch recent messages; return ``(history, raw_messages)``.
-
-        ``history`` is the translated Hermes turn shape; ``raw_messages`` is the
-        untranslated ``get_messages`` result, kept so the caller can derive
-        timing/relationship signals (timestamps, senders) the translation drops
-        — from the SAME fetch, no second round-trip. Below: the translation
-        that produces ``history``.
-
-        Mirrors ``gateway/run.py:15074-15113`` upstream — the agent
-        wakes up with the full thread rehydrated as alternating
-        ``user``/``assistant`` turns, just like every other Hermes
-        channel. Without this, the agent acts on a single line of text
-        with no prior context.
-
-        Translation rules:
-
-        * The triggering message (``trigger_message_id``) is excluded —
-          it lands as the new ``user_message`` via the notification
-          prompt, not duplicated inside history.
-        * Each AgentChat message becomes one Hermes turn:
-          ``is_own=True`` → ``role: assistant``, otherwise
-          ``role: user``. For groups, non-self messages are prefixed
-          with ``[@sender_handle] `` so the agent can tell speakers
-          apart in a multi-party thread.
-        * Non-text messages are skipped (Hermes' multi-modal pipeline
-          would need adapter work to surface them properly; deferred).
-        * On transport failure the history is empty — best-effort,
-          logged, and the turn still runs (with the notification alone
-          as the user-message). Better to wake the agent without
-          context than to fail to wake it at all.
-        """
-        try:
-            from agentchatme import AgentChatError
-        except ImportError:
-            # SDK is a hard dependency; this branch is theoretically
-            # unreachable, but defensive in case a partial install
-            # lands here before the runtime can fail-fast.
-            logger.warning("AgentInvoker: agentchatme SDK not importable")
-            return [], []
-
-        try:
-            result = self._runtime_client_get_messages(conversation_id)
-        except AgentChatError as exc:
-            logger.warning(
-                "AgentInvoker: history fetch failed for conv=%s — running "
-                "without prior context. (%s)",
-                conversation_id,
-                exc,
-            )
-            return [], []
-
-        messages = _extract_messages_list(result)
-        if not messages:
-            return [], []
-
-        history = _translate_messages_to_history(
-            messages,
-            own_handle=self._identity.handle,
-            conversation_kind=conversation_kind,
-            trigger_message_id=trigger_message_id,
-        )
-        return history, messages
-
-    def _runtime_client_get_messages(self, conversation_id: str) -> Any:
-        """Indirection layer so tests can stub the SDK fetch cleanly."""
-        return self._runtime.client.get_messages(
-            conversation_id, limit=_HISTORY_FETCH_LIMIT
-        )
-
-    @property
-    def _runtime(self) -> Any:
-        """The owning runtime.
-
-        Prefers the reference injected at construction (one runtime per
-        profile — never a sibling's). Falls back to the registry lookup,
-        which is unambiguous only in a single-profile process.
-        """
-        if self._runtime_ref is not None:
-            return self._runtime_ref
-
-        from .runtime import get_existing_runtime
-
-        rt = get_existing_runtime()
-        if rt is None:
-            raise RuntimeError(
-                "AgentInvoker: runtime singleton missing — invoker called "
-                "before Runtime.start() completed"
-            )
-        return rt
-
-    # -- AIAgent construction (lazy Hermes import) --------------------------
+    # -- Hermes integration (lazy imports) ----------------------------------
 
     def _ensure_hermes_resolved(self) -> None:
         if self._resolved_hermes:
@@ -760,39 +389,30 @@ class AgentInvoker:
             self._session_db = SessionDB()
         except Exception as exc:
             logger.warning(
-                "AgentInvoker: Hermes SessionDB unavailable — sessions will "
-                "not persist across turns: %s",
-                exc,
+                "AgentInvoker: Hermes SessionDB unavailable — sessions will not persist: %s", exc
             )
 
-    def _build_agent(self, conversation_id: str) -> Any:
-        """Construct a transient AIAgent for one turn.
+    def _build_agent(self, session_id: str) -> Any:
+        """Construct a transient AIAgent for one turn (the cron scheduler's pattern).
 
-        Mirrors the cron scheduler's pattern at
-        ``cron/scheduler.py:1425-1492``: fresh AIAgent per call,
-        Hermes' default model + provider, session_id namespaced under
-        ``agentchat:``. ``platform="agentchat"`` so trajectories /
-        logs / metrics can be filtered for our traffic.
-
-        Returns ``None`` if Hermes' runtime cannot be imported (the
-        plugin running outside a Hermes process — defensive, should
-        not happen in production).
+        ``platform="agentchat"`` so trajectories / logs / metrics can be
+        filtered for our traffic. Returns ``None`` if Hermes' runtime cannot
+        be imported (the plugin running outside a Hermes process).
         """
         try:
             from run_agent import AIAgent
         except ImportError as exc:
             logger.error(
-                "AgentInvoker: cannot import run_agent.AIAgent — "
-                "is the plugin running inside Hermes? (%s)",
+                "AgentInvoker: cannot import run_agent.AIAgent — is the plugin running inside "
+                "Hermes? (%s)",
                 exc,
             )
             return None
 
         model, runtime_kwargs = self._resolve_model_and_runtime()
-
         return AIAgent(
             model=model,
-            session_id=f"agentchat:{conversation_id}",
+            session_id=session_id,
             session_db=self._session_db,
             platform="agentchat",
             quiet_mode=True,
@@ -801,37 +421,29 @@ class AgentInvoker:
             **runtime_kwargs,
         )
 
+    def _gate_runtime(self) -> dict[str, Any]:
+        """``main_runtime`` for the gate call: the agent's own model and credentials."""
+        model, runtime_kwargs = self._resolve_model_and_runtime()
+        main_runtime: dict[str, Any] = {"model": model}
+        main_runtime.update(runtime_kwargs)
+        return main_runtime
+
     def _resolve_model_and_runtime(self) -> tuple[str, dict[str, Any]]:
         """Pull the user's default model + provider creds from Hermes config.
 
-        Hermes' ``config.yaml`` has a NESTED ``model:`` block::
-
-            model:
-              default: deepseek-v4-flash
-              provider: deepseek
-              model: deepseek-v4-flash
-
-        So ``cfg["model"]`` is a dict, not a string. Earlier versions of
-        this helper treated it as a string and passed the dict straight
-        into ``AIAgent(model=...)``. Hermes accepted the dict at
-        construction, then exploded much later in
-        ``_anthropic_prompt_cache_policy`` with
-        ``'dict' object has no attribute 'lower'`` — and the exception
-        was swallowed by ThreadPoolExecutor, so it took three release
-        cycles to surface.
-
-        We now extract a clean string. Order of preference: ``default``,
-        then ``model``, then the fallback. Also tolerant of a flat
-        string shape in case Hermes ever exposes ``model: deepseek-...``
-        directly (older configs / alternative layouts).
+        Hermes' ``config.yaml`` has a NESTED ``model:`` block (``default``,
+        ``provider``, ``model``), so ``cfg["model"]`` is a dict, not a string;
+        :func:`_coerce_model_string` extracts a clean name. Passing the dict
+        through once crashed deep inside Hermes three releases late — the
+        exception was swallowed by a thread pool.
         """
         try:
             from hermes_cli.config import load_config
             from hermes_cli.runtime_provider import resolve_runtime_provider
         except ImportError:
             logger.warning(
-                "AgentInvoker: Hermes config helpers unavailable, falling "
-                "back to %s with no provider creds",
+                "AgentInvoker: Hermes config helpers unavailable, falling back to %s with no "
+                "provider creds",
                 _FALLBACK_MODEL,
             )
             return _FALLBACK_MODEL, {}
@@ -842,8 +454,7 @@ class AgentInvoker:
             runtime = resolve_runtime_provider(target_model=model)
         except Exception:
             logger.exception(
-                "AgentInvoker: resolve_runtime_provider failed, falling "
-                "back to model=%s",
+                "AgentInvoker: resolve_runtime_provider failed, falling back to model=%s",
                 _FALLBACK_MODEL,
             )
             return _FALLBACK_MODEL, {}
@@ -862,20 +473,11 @@ class AgentInvoker:
 def _coerce_model_string(value: Any) -> str:
     """Normalize whatever ``config.yaml`` gave us for ``model:`` into a string.
 
-    Accepts:
-
     * ``{"default": "deepseek-v4-flash", ...}`` → ``"deepseek-v4-flash"``
-      (preferred — the canonical Hermes shape).
-    * ``{"model": "deepseek-v4-flash", ...}`` → ``"deepseek-v4-flash"``
-      (older / alternative key inside the dict).
-    * ``"deepseek-v4-flash"`` → ``"deepseek-v4-flash"``
-      (flat-string shape, defensive).
-    * Anything else / missing → ``_FALLBACK_MODEL``.
-
-    Type-narrowing is essential because Hermes' ``AIAgent`` does not
-    validate ``model`` at construction; it dies later in
-    ``_anthropic_prompt_cache_policy`` with a cryptic AttributeError
-    on the wrong shape.
+      (the canonical Hermes shape).
+    * ``{"model": "deepseek-v4-flash", ...}`` → ``"deepseek-v4-flash"``.
+    * ``"deepseek-v4-flash"`` → itself (flat string, defensive).
+    * Anything else / missing → :data:`_FALLBACK_MODEL`.
     """
     if isinstance(value, str) and value:
         return value
@@ -887,78 +489,4 @@ def _coerce_model_string(value: Any) -> str:
     return _FALLBACK_MODEL
 
 
-def _extract_messages_list(result: Any) -> list[dict[str, Any]]:
-    """Pull the message list out of a ``get_messages`` response shape.
-
-    The SDK returns ``dict[str, Any]`` with a ``messages`` key holding
-    the list. Defensive against shape drift — anything we don't
-    recognise yields an empty list rather than raising.
-    """
-    if isinstance(result, list):
-        return [m for m in result if isinstance(m, dict)]
-    if isinstance(result, dict):
-        messages = result.get("messages")
-        if isinstance(messages, list):
-            return [m for m in messages if isinstance(m, dict)]
-    return []
-
-
-def _translate_messages_to_history(
-    messages: list[dict[str, Any]],
-    *,
-    own_handle: str,
-    conversation_kind: str,
-    trigger_message_id: str,
-) -> list[dict[str, Any]]:
-    """Translate AgentChat messages into Hermes ``{role, content}`` turns.
-
-    Pure function — no SDK, no runtime, no IO. The translation rules:
-
-    * ``is_own`` (server-precomputed) decides role; falls back to a
-      sender-handle compare if the server didn't precompute it.
-    * Group messages prefix non-self speakers with ``[@handle]`` so
-      the agent can attribute lines in a multi-party thread. Direct
-      conversations stay unprefixed — the alternation in the turn
-      list already encodes who said what.
-    * The trigger message is excluded — it lands as ``user_message``
-      via the notification prompt, not duplicated in history.
-    * Non-text messages are skipped (multi-modal handling is deferred).
-    * Empty content is skipped.
-
-    Output is ordered oldest-first, matching how Hermes' AIAgent
-    expects ``conversation_history`` (it appends the new ``user``
-    turn at the end).
-    """
-    own_handle_norm = own_handle.lstrip("@").lower()
-    is_group = conversation_kind == "group"
-    out: list[dict[str, Any]] = []
-
-    for msg in messages:
-        if msg.get("id") == trigger_message_id:
-            continue
-        if msg.get("type", "text") != "text":
-            continue
-        content = msg.get("content")
-        if not isinstance(content, dict):
-            continue
-        text = content.get("text")
-        if not isinstance(text, str) or not text:
-            continue
-
-        is_own = msg.get("is_own")
-        if not isinstance(is_own, bool):
-            sender = (
-                msg.get("from") or msg.get("sender_handle") or ""
-            )
-            is_own = sender.lstrip("@").lower() == own_handle_norm
-
-        if is_own:
-            out.append({"role": "assistant", "content": text})
-        elif is_group:
-            sender = msg.get("from") or msg.get("sender_handle") or "?"
-            sender = sender.lstrip("@")
-            out.append({"role": "user", "content": f"[@{sender}] {text}"})
-        else:
-            out.append({"role": "user", "content": text})
-
-    return out
+GateRunner = Callable[..., gate.GateResult]

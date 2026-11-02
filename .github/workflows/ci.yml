@@ -13,7 +13,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        # Pinned: ubuntu-latest moved to 26.04 (Nov 2026), where
+        # actions/setup-python has no 3.9 build; 24.04 carries 3.9–3.13.
+        os: [ubuntu-24.04]
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
         include:
           # Smoke matrix on macOS + Windows — one Python each, just to

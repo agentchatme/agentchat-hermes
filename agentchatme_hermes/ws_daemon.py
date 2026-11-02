@@ -1,29 +1,41 @@
-"""Background thread that owns the AgentChat WebSocket.
+"""Background thread that holds the AgentChat WebSocket — the doorbell's knock.
 
-A single daemon thread runs a private asyncio event loop and hosts
-the SDK's :class:`agentchatme.RealtimeClient`. Lifecycle:
+A single daemon thread runs a private asyncio event loop and hosts the SDK's
+:class:`agentchatme.RealtimeClient`. Lifecycle:
 
-* :meth:`start` spins up the thread, schedules ``connect()`` on the
-  loop, returns immediately. Initial WS handshake runs in the
-  background — does not block plugin registration.
-* The SDK owns reconnect, HELLO handshake, per-conversation seq
-  ordering, gap-fill, and offline ``/sync`` drain on reconnect. We
-  don't reimplement any of that.
-* :meth:`stop` schedules a clean disconnect and joins the thread
-  within a bounded grace period.
+* :meth:`start` spins up the thread, schedules ``connect()`` on the loop,
+  returns immediately. Initial WS handshake runs in the background — does
+  not block plugin registration.
+* The SDK owns reconnect, HELLO handshake, per-conversation seq ordering and
+  message-id dedup. We don't reimplement any of that.
+* :meth:`stop` schedules a clean disconnect and joins the thread within a
+  bounded grace period.
 
-Inbound ``message.new`` frames go through :meth:`_on_message_frame`
-which:
+The socket is a knock, not a carrier
+────────────────────────────────────
+A ``message.new`` frame means *the tray changed*. The daemon reads only the
+sender (to skip the echo of its own sends) and the ids (for the log line),
+then calls ``on_knock``. What the message says is read by the agent, through
+the hosted tools, inside its turn. Nothing is parsed, queued or acknowledged
+here:
 
-1. Skips frames where ``sender == own_handle`` — our own outbound
-   echoes back through the WS (server-side fan-out) and would
-   otherwise wake the agent with its own reply.
-2. Maps the payload into an :class:`InboundEvent`.
-3. Pushes to the :class:`MessageQueue`.
-4. Notifies the invoker that there's work to do.
+* **Never acknowledged.** The SDK negotiates the ``ack`` capability, so the
+  server keeps every envelope ``stored`` until it is acknowledged — and this
+  client never acknowledges (:func:`_knock_realtime_client_class`). A verdict
+  recorded by the gate, or a send by the agent, is what settles delivery;
+  the tray (``GET /v1/inbox``) shows exactly the conversations still
+  undecided. A daemon that acknowledged on receipt would empty the tray
+  before anyone judged it, and a crash between ack and turn would lose the
+  message — the pre-v3 known limitation, fixed by construction.
+* **No REST drain on reconnect.** The SDK's offline drain pulls and acks
+  through ``/v1/messages/sync``; the knock does not want it. Instead every
+  (re)connect knocks once, and the gate reads the tray.
+* **Group invites** arrive on their own frame (``group.invite.received``) and
+  are not on the tray; they are handed to the invoker as a second knock
+  kind, deduplicated by invite id and caught up on connect.
 
-Pattern mirrors ``plugins/memory/hindsight/__init__.py:_get_loop``:
-one long-lived loop, one daemon thread.
+Pattern mirrors ``plugins/memory/hindsight/__init__.py:_get_loop``: one
+long-lived loop, one daemon thread.
 """
 from __future__ import annotations
 
@@ -44,8 +56,6 @@ if TYPE_CHECKING:
     from agentchatme import AsyncAgentChatClient, RealtimeClient
 
     from .config import Config
-    from .message_queue import MessageQueue
-    from .thread_closures import ThreadClosures
     from .types import AgentIdentity, GroupInviteEvent
 
 logger = logging.getLogger(__name__)
@@ -61,6 +71,33 @@ _SUPERVISOR_BACKOFF_BASE_S = 1.0
 _SUPERVISOR_BACKOFF_MAX_S = 60.0
 _STABLE_CONNECTION_S = 30.0
 
+_knock_client_class: type[Any] | None = None
+
+
+def _knock_realtime_client_class() -> type[Any]:
+    """The SDK's :class:`RealtimeClient` with delivery acks turned off.
+
+    The SDK advertises the ``ack`` capability and, by default, confirms every
+    dispatched envelope so the server marks it ``delivered``
+    (``docs/realtime-delivery-ack.md``). For the doorbell that is the wrong
+    moment: nothing has been judged yet. With the capability negotiated and
+    no ack ever sent, the server keeps the envelope ``stored`` — "the
+    at-least-once contract working as designed" — until the gate's verdict
+    or the agent's send settles it. The override is the one private SDK
+    seam this plugin relies on; ``test_ws_daemon`` pins its presence so an
+    SDK rename fails loudly instead of silently acking again.
+    """
+    global _knock_client_class
+    if _knock_client_class is None:
+        from agentchatme import RealtimeClient
+
+        class _KnockRealtimeClient(RealtimeClient):
+            async def _send_delivery_ack(self, message_id: str) -> None:
+                return None
+
+        _knock_client_class = _KnockRealtimeClient
+    return _knock_client_class
+
 
 class WSDaemon:
     """Owns the long-lived AgentChat WebSocket.
@@ -75,17 +112,13 @@ class WSDaemon:
         *,
         config: Config,
         identity: AgentIdentity,
-        queue: MessageQueue,
-        thread_closures: ThreadClosures,
-        on_new_event: Callable[[], None],
+        on_knock: Callable[[], None],
         on_group_invite: Callable[[GroupInviteEvent], None],
         health_path: Path | None = None,
     ) -> None:
         self._config = config
         self._identity = identity
-        self._queue = queue
-        self._thread_closures = thread_closures
-        self._on_new_event = on_new_event
+        self._on_knock = on_knock
         self._on_group_invite = on_group_invite
         # Where the liveness record for THIS account is written. ``None``
         # falls back to the legacy per-machine file (test doubles only;
@@ -114,8 +147,7 @@ class WSDaemon:
         # can report what's flowing without coordinating locks.
         self._frames_seen = 0
         self._frames_self_filtered = 0
-        self._frames_queued = 0
-        self._frames_thread_closed = 0
+        self._knocks = 0
         self._invites_seen = 0
 
         # Invite-ids already routed to the decision path. Both the live
@@ -238,26 +270,25 @@ class WSDaemon:
         self._write_health("stopped")
 
     async def _main(self) -> None:
-        from agentchatme import AsyncAgentChatClient, RealtimeClient
+        from agentchatme import AsyncAgentChatClient
 
-        # AsyncAgentChatClient on the RealtimeClient enables two
-        # SDK-provided guarantees we depend on:
-        #   1. Auto-drain of offline envelopes on (re)connect via
-        #      `GET /v1/messages/sync` — no inbound is lost across
-        #      a disconnect.
-        #   2. Per-conversation seq-gap recovery via `GET
-        #      /v1/messages/{conv_id}` — eliminates duplicate /
-        #      out-of-order delivery during fan-out.
+        # The HTTP client serves the connect-time group-invite catch-up only.
+        # It is deliberately NOT handed to the RealtimeClient: with a client
+        # attached the SDK drains and acknowledges offline envelopes through
+        # /v1/messages/sync on every (re)connect, which would mark them
+        # delivered before anyone judged them (module docstring).
         self._http_client = AsyncAgentChatClient(
             api_key=self._config.api_key,
             base_url=self._config.api_base,
             client_identity=hermes_client_identity(),
         )
 
-        self._rt_client = RealtimeClient(
+        realtime_class = _knock_realtime_client_class()
+        self._rt_client = realtime_class(
             api_key=self._config.api_key,
             base_url=self._config.ws_url,
-            client=self._http_client,
+            client=None,
+            auto_drain_on_connect=False,
             client_identity=hermes_client_identity(),
         )
         self._rt_client.on("message.new", self._on_message_frame)
@@ -348,14 +379,13 @@ class WSDaemon:
             try:
                 logger.info(
                     "WSDaemon heartbeat: connected=%s handle=@%s "
-                    "frames=%d self_filtered=%d thread_closed=%d queued=%d pending_convs=%d",
+                    "frames=%d self_filtered=%d knocks=%d invites=%d",
                     connected,
                     self._identity.handle,
                     self._frames_seen,
                     self._frames_self_filtered,
-                    self._frames_thread_closed,
-                    self._frames_queued,
-                    self._queue.pending_count(),
+                    self._knocks,
+                    self._invites_seen,
                 )
             except Exception:
                 # The heartbeat must never crash the daemon. Log and
@@ -418,6 +448,11 @@ class WSDaemon:
         self._last_connected_at = time.time()
         self._write_health("connected")
         logger.info("WSDaemon: connected as @%s", self._identity.handle)
+        # Whatever landed while the socket was down is on the tray now; the
+        # server also re-offers stored envelopes to a fresh socket, but the
+        # SDK's dedup swallows the ones this process already saw, so the
+        # connect itself is the knock that covers the gap.
+        self._knock("connect")
         # Catch up on invites that landed while we were offline or before the
         # live subscription existed. Group-invite frames are live-only (unlike
         # messages, they are NOT part of the ``/sync`` drain), so without this
@@ -511,24 +546,20 @@ class WSDaemon:
         logger.warning("WSDaemon: error from SDK: %s", exc)
 
     def _on_message_frame(self, frame: dict[str, Any]) -> None:
-        """Inbound ``message.new`` callback.
+        """Inbound ``message.new`` callback: a knock.
 
-        Receives the full envelope ``{type: "message.new", payload:
-        {...}}``. The SDK guarantees seq-ordered, deduplicated
-        delivery — we don't need to defend against either at this
-        layer.
+        Receives the full envelope ``{type: "message.new", payload: {...}}``.
+        Only two facts are read — the sender, so our own outbound echoed back
+        by server-side fan-out does not wake us, and the ids for the log
+        line. The body is never looked at; the agent reads it through the
+        hosted tools inside its turn.
 
-        Every frame is logged at INFO. The first spike had us
-        unable to tell whether a peer's message had reached our
-        plugin or not, because the only log signal was a turn
-        completing at the far end of the pipeline. With per-frame
-        logging the receipt is visible the instant it arrives.
-
-        Defensive try/except around the queue push and the wake
-        callback — a single bad frame must NOT take down the daemon.
+        Every frame is logged at INFO so a peer's message reaching this
+        process is visible the instant it arrives. Nothing in here may raise
+        into the SDK's dispatch: a handler exception is how the SDK withholds
+        an ack, and this client never acks anyway — but a crashed callback
+        would still take the receive loop down.
         """
-        from .types import InboundEvent
-
         self._frames_seen += 1
 
         payload = frame.get("payload")
@@ -541,73 +572,34 @@ class WSDaemon:
             )
             return
 
-        sender = (payload.get("from") or payload.get("sender") or "").lstrip("@").lower()
+        sender_raw = payload.get("from") or payload.get("sender") or ""
+        sender = sender_raw.lstrip("@").lower() if isinstance(sender_raw, str) else ""
         msg_id = payload.get("id", "<no-id>")
         conv_id = payload.get("conversation_id", "<no-conv>")
 
         if sender == self._identity.handle:
-            # Own outbound, echoed back by server-side fan-out. Suppress
-            # so we don't wake the agent on its own reply.
             self._frames_self_filtered += 1
-            logger.debug(
-                "WSDaemon: filtered own echo conv=%s msg=%s",
-                conv_id,
-                msg_id,
-            )
-            return
-
-        event = InboundEvent.from_ws_message(payload)
-        if event is None:
-            logger.warning(
-                "WSDaemon: dropping malformed payload conv=%s msg=%s keys=%s",
-                conv_id,
-                msg_id,
-                sorted(payload.keys()),
-            )
+            logger.debug("WSDaemon: filtered own echo conv=%s msg=%s", conv_id, msg_id)
             return
 
         logger.info(
-            "WSDaemon: received message.new conv=%s msg=%s from=@%s "
-            "kind=%s text_chars=%d",
-            event.conversation_id,
-            event.message_id,
-            event.sender_handle,
-            event.conversation_kind,
-            len(event.content_text),
+            "WSDaemon: knock — message.new conv=%s msg=%s from=@%s",
+            conv_id,
+            msg_id,
+            sender or "?",
         )
+        self._knock("message")
 
-        if self._thread_closures.is_closed(event.conversation_id):
-            self._frames_thread_closed += 1
-            logger.info(
-                "WSDaemon: suppressed inbound for locally closed thread "
-                "conv=%s msg=%s from=@%s",
-                event.conversation_id,
-                event.message_id,
-                event.sender_handle,
-            )
-            return
-
+    def _knock(self, source: str) -> None:
+        """Hand a knock to the invoker; a failing callback never kills the daemon."""
+        self._knocks += 1
         try:
-            self._queue.push(event)
-            self._frames_queued += 1
+            self._on_knock()
         except Exception:
             logger.exception(
-                "WSDaemon: queue.push raised for conv=%s msg=%s — "
-                "dropping (daemon survives, future frames continue)",
-                event.conversation_id,
-                event.message_id,
-            )
-            return
-
-        try:
-            self._on_new_event()
-        except Exception:
-            logger.exception(
-                "WSDaemon: on_new_event callback raised for conv=%s — "
-                "daemon survives, but the invoker may not have woken; "
-                "the next frame's wake signal will pick up this event "
-                "from the queue.",
-                event.conversation_id,
+                "WSDaemon: on_knock callback raised (source=%s) — daemon survives; "
+                "the next frame knocks again and the tray keeps the cards",
+                source,
             )
 
     def _on_group_invite_frame(self, frame: dict[str, Any]) -> None:
@@ -615,9 +607,9 @@ class WSDaemon:
 
         Receives ``{type: "group.invite.received", payload: {...}}``. Parses the
         payload into a :class:`GroupInviteEvent` and hands it to the invoker's
-        consent-decision path via ``on_group_invite``. Unlike a peer message an
-        invite is not queued and does not go through the reply-gate — it is a
-        one-shot decision (accept / reject / ignore) the agent makes for itself.
+        consent-decision path via ``on_group_invite``. An invite is not on the
+        tray and does not go through the gate — it is a one-shot decision
+        (accept / reject / ignore) the agent makes for itself in a turn.
 
         Same defensive contract as :meth:`_on_message_frame`: a single bad
         frame — or a callback that raises — must NEVER take down the daemon.

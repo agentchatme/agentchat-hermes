@@ -13,13 +13,16 @@ if TYPE_CHECKING:
 
 from agentchatme_hermes.config import (
     DEFAULT_API_BASE,
+    DEFAULT_DOORBELL,
     DEFAULT_GATE_TIMEOUT_S,
-    DEFAULT_MAX_INFLIGHT_TURNS,
+    DEFAULT_KNOCK_DEBOUNCE_S,
     DEFAULT_REPLY_GATE_ENABLED,
     DEFAULT_REPLY_GATE_FAIL_OPEN,
-    DEFAULT_TURN_INACTIVITY_TIMEOUT_S,
+    ENV_API_KEY,
+    ENV_API_KEY_LEGACY,
     ConfigError,
     load_config,
+    resolve_api_key,
 )
 
 
@@ -45,16 +48,16 @@ def env_set(values: dict[str, str | None]) -> Iterator[None]:
 def _isolated(monkeypatch: pytest.MonkeyPatch, **values: str | None) -> None:
     """Clear all our env vars first, then apply the test's settings."""
     for k in (
+        "AGENTCHAT_API_KEY",
         "AGENTCHATME_API_KEY",
         "AGENTCHATME_API_BASE",
         "AGENTCHATME_WS_URL",
-        "AGENTCHATME_MAX_INFLIGHT_TURNS",
-        "AGENTCHATME_TURN_INACTIVITY_TIMEOUT_S",
+        "AGENTCHATME_DOORBELL",
+        "AGENTCHATME_KNOCK_DEBOUNCE_S",
         "AGENTCHATME_REPLY_GATE_ENABLED",
         "AGENTCHATME_REPLY_GATE_FAIL_OPEN",
-        "AGENTCHATME_GATE_MAX_REPLIES_PER_WINDOW",
-        "AGENTCHATME_GATE_WINDOW_SECONDS",
         "AGENTCHATME_GATE_TIMEOUT_S",
+        "AGENTCHATME_LOCK_DIR",
     ):
         monkeypatch.delenv(k, raising=False)
     for k, v in values.items():
@@ -80,8 +83,6 @@ class TestLoadConfig:
         assert cfg.api_key == "ac_live_abc"
         assert cfg.api_base == DEFAULT_API_BASE
         assert cfg.ws_url == "wss://api.agentchat.me"
-        assert cfg.max_inflight_turns == DEFAULT_MAX_INFLIGHT_TURNS
-        assert cfg.turn_inactivity_timeout_s == DEFAULT_TURN_INACTIVITY_TIMEOUT_S
 
     def test_ws_url_derived_from_https_api_base(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _isolated(
@@ -151,65 +152,6 @@ class TestLoadConfig:
             AGENTCHATME_WS_URL="https://wrong.example.com",
         )
         with pytest.raises(ConfigError, match="AGENTCHATME_WS_URL"):
-            load_config()
-
-    def test_max_inflight_turns_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _isolated(
-            monkeypatch,
-            AGENTCHATME_API_KEY="k",
-            AGENTCHATME_MAX_INFLIGHT_TURNS="16",
-        )
-        cfg = load_config()
-        assert cfg is not None
-        assert cfg.max_inflight_turns == 16
-
-    def test_max_inflight_turns_below_minimum_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _isolated(
-            monkeypatch,
-            AGENTCHATME_API_KEY="k",
-            AGENTCHATME_MAX_INFLIGHT_TURNS="0",
-        )
-        with pytest.raises(ConfigError, match="below the minimum"):
-            load_config()
-
-    def test_max_inflight_turns_not_integer_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _isolated(
-            monkeypatch,
-            AGENTCHATME_API_KEY="k",
-            AGENTCHATME_MAX_INFLIGHT_TURNS="four",
-        )
-        with pytest.raises(ConfigError, match="not an integer"):
-            load_config()
-
-    def test_inactivity_timeout_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _isolated(
-            monkeypatch,
-            AGENTCHATME_API_KEY="k",
-            AGENTCHATME_TURN_INACTIVITY_TIMEOUT_S="120.5",
-        )
-        cfg = load_config()
-        assert cfg is not None
-        assert cfg.turn_inactivity_timeout_s == 120.5
-
-    def test_inactivity_timeout_zero_is_valid_disable_marker(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _isolated(
-            monkeypatch,
-            AGENTCHATME_API_KEY="k",
-            AGENTCHATME_TURN_INACTIVITY_TIMEOUT_S="0",
-        )
-        cfg = load_config()
-        assert cfg is not None
-        assert cfg.turn_inactivity_timeout_s == 0.0
-
-    def test_inactivity_timeout_negative_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _isolated(
-            monkeypatch,
-            AGENTCHATME_API_KEY="k",
-            AGENTCHATME_TURN_INACTIVITY_TIMEOUT_S="-1",
-        )
-        with pytest.raises(ConfigError, match="below the minimum"):
             load_config()
 
     def test_api_key_whitespace_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -354,3 +296,85 @@ class TestProfileScopedConfig:
             set_setting_resolver_for_tests(None)
         assert cfg is not None
         assert cfg.api_key == "growth-key"
+
+
+# ───────────────────────── key names ─────────────────────────
+
+
+class TestKeyNames:
+    def test_canonical_name_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="new", AGENTCHATME_API_KEY="old")
+        assert resolve_api_key() == ("new", ENV_API_KEY)
+        cfg = load_config()
+        assert cfg is not None
+        assert cfg.api_key == "new"
+        assert cfg.api_key_source == ENV_API_KEY
+
+    def test_legacy_name_is_the_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHATME_API_KEY="old")
+        assert resolve_api_key() == ("old", ENV_API_KEY_LEGACY)
+        cfg = load_config()
+        assert cfg is not None
+        assert cfg.api_key == "old"
+        assert cfg.api_key_source == ENV_API_KEY_LEGACY
+
+    def test_neither_name_means_unconfigured(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch)
+        assert resolve_api_key() is None
+        assert load_config() is None
+
+    def test_blank_canonical_falls_through_to_legacy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="  ", AGENTCHATME_API_KEY="old")
+        assert resolve_api_key() == ("old", ENV_API_KEY_LEGACY)
+
+
+# ───────────────────────── doorbell ─────────────────────────
+
+
+class TestDoorbellConfig:
+    def test_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k")
+        cfg = load_config()
+        assert cfg is not None
+        assert cfg.doorbell == DEFAULT_DOORBELL == "v3"
+        assert cfg.doorbell_enabled is True
+        assert cfg.knock_debounce_s == DEFAULT_KNOCK_DEBOUNCE_S == 2.0
+
+    def test_off_switch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_DOORBELL="OFF")
+        cfg = load_config()
+        assert cfg is not None
+        assert cfg.doorbell == "off"
+        assert cfg.doorbell_enabled is False
+
+    def test_v2_is_rejected_with_the_pin_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_DOORBELL="v2")
+        with pytest.raises(ConfigError, match=r"0\.2\.3111111"):
+            load_config()
+
+    def test_unknown_value_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_DOORBELL="loud")
+        with pytest.raises(ConfigError, match="AGENTCHATME_DOORBELL"):
+            load_config()
+
+    def test_debounce_override_and_floor(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_KNOCK_DEBOUNCE_S="0.5")
+        cfg = load_config()
+        assert cfg is not None and cfg.knock_debounce_s == 0.5
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_KNOCK_DEBOUNCE_S="-1")
+        with pytest.raises(ConfigError, match="below the minimum"):
+            load_config()
+
+
+class TestGateDefaultsAreTheMainLines:
+    def test_fail_closed_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The main-line decision picked one failure behaviour for every runtime."""
+        assert DEFAULT_REPLY_GATE_FAIL_OPEN is False
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k")
+        cfg = load_config()
+        assert cfg is not None and cfg.reply_gate_fail_open is False
+
+    def test_fail_open_opt_in(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_REPLY_GATE_FAIL_OPEN="true")
+        cfg = load_config()
+        assert cfg is not None and cfg.reply_gate_fail_open is True

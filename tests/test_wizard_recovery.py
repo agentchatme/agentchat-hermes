@@ -346,9 +346,11 @@ def _run_flow(
 
     monkeypatch.setattr(wizard, "_recover_start", start)
     monkeypatch.setattr(wizard, "_recover_verify", verify)
-    # Never touch the real ~/.hermes/SOUL.md from a unit test.
+    # Never touch the real SOUL.md / config.yaml from a unit test.
     monkeypatch.setattr(
-        wizard, "write_soul_anchor", lambda handle: anchored.append(handle) or "/tmp/SOUL.md"
+        wizard,
+        "place_identity_and_tools",
+        lambda *, handle, api_base, soul_path=None: anchored.append(handle) or [],
     )
 
     ok = _recover_lost_key_flow(
@@ -384,7 +386,7 @@ class TestRecoverLostKeyFlow:
         assert ok is True
         assert starts == [{"email": "a@b.co", "handle": "alice"}]
         assert out.env == {
-            "AGENTCHATME_API_KEY": "ac_live_newkey_000000000000",
+            "AGENTCHAT_API_KEY": "ac_live_newkey_000000000000",
             "AGENTCHATME_HANDLE": "alice",
         }
         assert anchored == ["alice"]
