@@ -333,10 +333,17 @@ class AgentInvoker:
             len(result.reply_conversations),
             result.source,
         )
-        if self._run_turn(
-            prompt=knock_turn_prompt(result.reply_conversations), session_id=session_id
-        ):
+        # Only a verdict the model actually gave is stated to the turn. Under
+        # fail-open or with the gate disabled every card is handed to the turn
+        # undecided, and the agent judges from the tray's own question.
+        decided = result.reply_conversations if result.source == "llm" else ()
+        if self._run_turn(prompt=knock_turn_prompt(decided), session_id=session_id):
             self.turns += 1
+        else:
+            # The turn never started (Hermes runtime unavailable, agent build
+            # failed, run_conversation raised): the cards are still stored, so
+            # look again on the ladder instead of waiting for the next peer.
+            self._schedule_retry("turn not started")
 
     def _run_invite_turn(self, invite: GroupInviteEvent) -> None:
         if self._stopped.is_set():

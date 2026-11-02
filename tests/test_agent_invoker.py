@@ -216,6 +216,19 @@ class TestRunCycle:
         )
         inv.run_cycle()
         agent.run_conversation.assert_called_once()
+        # No gate ran, so the turn is told nothing about verdicts.
+        agent.run_conversation.assert_called_once_with(knock_turn_prompt(()), conversation_history=[])
+
+    def test_turn_that_fails_to_start_reknocks(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _ml, agent, _calls = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], gate_result=_llm_result(("a",), cards=1)
+        )
+        agent.run_conversation.side_effect = RuntimeError("provider down")
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "knock_after", scheduled.append)
+        inv.run_cycle()
+        assert inv.turns == 0
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]], "cards stay stored; the ladder looks again"
 
     def test_gate_disabled_starts_the_turn_from_the_tray(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, _ml, agent, gate_calls = _invoker(
@@ -227,7 +240,7 @@ class TestRunCycle:
         result = inv.run_cycle()
         assert result is not None and result.source == "disabled"
         assert gate_calls == [], "gate off → the model is not asked by the doorbell"
-        agent.run_conversation.assert_called_once_with(knock_turn_prompt(("a",)), conversation_history=[])
+        agent.run_conversation.assert_called_once_with(knock_turn_prompt(()), conversation_history=[])
 
     def test_tray_read_failure_reknocks(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, _ml, agent, _calls = _invoker(
