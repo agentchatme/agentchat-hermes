@@ -8,7 +8,7 @@ What happens on a knock
 2. **Read the tray.** ``GET /v1/inbox?wait_ms=0`` — the server's briefing
    cards and its gate question, as it built them (:mod:`.main_line`).
 3. **Gate.** The agent's own model answers the question per card
-   (:mod:`.gate`); ``no_reply`` / ``defer`` verdicts are recorded on the
+   (:mod:`.gate`); ``dismiss`` / ``defer`` verdicts are recorded on the
    server, which settles those conversations. ``reply`` cards stay on the
    tray.
 4. **Turn.** If anything was decided ``reply``, start ONE Hermes agent turn
@@ -261,11 +261,11 @@ class AgentInvoker:
             )
             counts = result.counts()
             logger.info(
-                "AgentInvoker: gate cards=%d reply=%d no_reply=%d defer=%d undecided=%d "
+                "AgentInvoker: gate cards=%d reply=%d dismiss=%d defer=%d undecided=%d "
                 "posted=%d post_failures=%d source=%s latency_ms=%d%s",
                 result.cards,
                 counts[gate.REPLY],
-                counts[gate.NO_REPLY],
+                counts[gate.DISMISS],
                 counts[gate.DEFER],
                 len(result.undecided),
                 result.posted,

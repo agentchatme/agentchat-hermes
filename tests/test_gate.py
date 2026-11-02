@@ -4,7 +4,7 @@ What must hold (``docs/decisions/2026-11-main-line.md``):
 
 * the model sees the server's question and cards VERBATIM, plus the JSON
   wrapper and nothing else;
-* ``no_reply`` / ``defer`` are posted with the card's newest message id;
+* ``dismiss`` / ``defer`` are posted with the card's newest message id;
   ``reply`` is never posted (the send is the verdict);
 * fail closed by default: a failed model call posts nothing and starts no
   turn; fail open starts the turn;
@@ -22,7 +22,7 @@ import pytest
 from agentchatme_hermes import gate
 from agentchatme_hermes.main_line import MainLineClient
 
-QUESTION = "For each conversation on this tray decide ONE thing: reply, no_reply, or defer."
+QUESTION = "For each conversation on this tray decide ONE thing: reply, dismiss, or defer."
 
 
 def _card(cid: str, **extra: Any) -> dict[str, Any]:
@@ -115,7 +115,7 @@ class TestBuildGateMessages:
         system = gate.build_gate_messages(_tray(_card("conv_1")))[0]["content"]
         wrapper = system[len(QUESTION) :]
         assert "ONLY a JSON object" in wrapper
-        assert '"decision": "reply" | "no_reply" | "defer"' in wrapper
+        assert '"decision": "reply" | "dismiss" | "defer"' in wrapper
         # No local judgement criteria sneak into the wrapper.
         for forbidden in ("acknowledg", "pace", "relationship", "loop", "silence"):
             assert forbidden not in wrapper.lower()
@@ -147,7 +147,7 @@ class TestParseVerdicts:
         assert verdicts is not None
         assert [(v.conversation_id, v.decision) for v in verdicts] == [
             ("a", "reply"),
-            ("b", "no_reply"),
+            ("b", "dismiss"),
             ("c", "defer"),
         ]
         assert verdicts[2].defer_seconds == 600
@@ -157,7 +157,7 @@ class TestParseVerdicts:
             {"conversation_id": "zzz", "decision": "reply"},
             {"conversation_id": "a", "decision": "maybe"},
             {"conversation_id": "b", "decision": "reply"},
-            {"conversation_id": "b", "decision": "no_reply"},
+            {"conversation_id": "b", "decision": "dismiss"},
         )
         verdicts = gate.parse_verdicts(text, known_ids=["a", "b"])
         assert verdicts is not None
@@ -165,8 +165,8 @@ class TestParseVerdicts:
 
     def test_category_kept_only_from_the_served_list(self) -> None:
         text = _answer(
-            {"conversation_id": "a", "decision": "no_reply", "category": "Closing"},
-            {"conversation_id": "b", "decision": "no_reply", "category": "made_up"},
+            {"conversation_id": "a", "decision": "dismiss", "category": "Closing"},
+            {"conversation_id": "b", "decision": "dismiss", "category": "made_up"},
         )
         verdicts = gate.parse_verdicts(text, known_ids=["a", "b"], categories=["closing"])
         assert verdicts is not None
@@ -177,7 +177,7 @@ class TestParseVerdicts:
         assert bare is not None and all(v.category is None for v in bare)
 
     def test_defer_seconds_only_with_defer(self) -> None:
-        text = _answer({"conversation_id": "a", "decision": "no_reply", "defer_seconds": 60})
+        text = _answer({"conversation_id": "a", "decision": "dismiss", "defer_seconds": 60})
         verdicts = gate.parse_verdicts(text, known_ids=["a"])
         assert verdicts is not None and verdicts[0].defer_seconds is None
 
@@ -200,13 +200,13 @@ class TestParseVerdicts:
 
 
 class TestRunGate:
-    def test_posts_no_reply_and_defer_never_reply(self) -> None:
+    def test_posts_dismiss_and_defer_never_reply(self) -> None:
         server = _Server()
         tray = _tray(_card("conv_r"), _card("conv_n"), _card("conv_d"))
         caller = _caller_returning(
             _answer(
                 {"conversation_id": "conv_r", "decision": "reply"},
-                {"conversation_id": "conv_n", "decision": "no_reply"},
+                {"conversation_id": "conv_n", "decision": "dismiss"},
                 {"conversation_id": "conv_d", "decision": "defer", "defer_seconds": 900},
             )
         )
@@ -224,10 +224,10 @@ class TestRunGate:
         assert result.post_failures == 0
         assert result.undecided == ()
         assert result.start_turn is True
-        assert result.counts() == {"reply": 1, "no_reply": 1, "defer": 1}
+        assert result.counts() == {"reply": 1, "dismiss": 1, "defer": 1}
         posted = dict(server.posts)
         assert set(posted) == {"conv_n", "conv_d"}
-        assert posted["conv_n"] == {"decision": "no_reply", "through_message_id": "msg_conv_n"}
+        assert posted["conv_n"] == {"decision": "dismiss", "through_message_id": "msg_conv_n"}
         assert posted["conv_d"] == {
             "decision": "defer",
             "through_message_id": "msg_conv_d",
@@ -316,15 +316,15 @@ class TestRunGate:
         server = _Server(fail_statuses={"conv_1": [400]})
         tray = _tray(_card("conv_1"), categories=["closing"])
         caller = _caller_returning(
-            _answer({"conversation_id": "conv_1", "decision": "no_reply", "category": "closing"})
+            _answer({"conversation_id": "conv_1", "decision": "dismiss", "category": "closing"})
         )
         result = gate.run_gate(
             tray, main_line=server.client(), main_runtime={}, fail_open=False, timeout_s=1.0, caller=caller
         )
         assert result.posted == 1 and result.post_failures == 0
         assert [body for _cid, body in server.posts] == [
-            {"decision": "no_reply", "category": "closing", "through_message_id": "msg_conv_1"},
-            {"decision": "no_reply", "through_message_id": "msg_conv_1"},
+            {"decision": "dismiss", "category": "closing", "through_message_id": "msg_conv_1"},
+            {"decision": "dismiss", "through_message_id": "msg_conv_1"},
         ]
 
     def test_post_failure_is_counted_not_raised(self) -> None:
@@ -335,7 +335,7 @@ class TestRunGate:
             main_runtime={},
             fail_open=False,
             timeout_s=1.0,
-            caller=_caller_returning(_answer({"conversation_id": "conv_1", "decision": "no_reply"})),
+            caller=_caller_returning(_answer({"conversation_id": "conv_1", "decision": "dismiss"})),
         )
         assert result.post_failures == 1
         assert result.posted == 0
@@ -361,6 +361,16 @@ class TestRunGate:
             main_runtime={},
             fail_open=False,
             timeout_s=1.0,
-            caller=_caller_returning(_answer({"conversation_id": "conv_1", "decision": "no_reply"})),
+            caller=_caller_returning(_answer({"conversation_id": "conv_1", "decision": "dismiss"})),
         )
-        assert server.posts == [("conv_1", {"decision": "no_reply"})]
+        assert server.posts == [("conv_1", {"decision": "dismiss"})]
+
+
+class TestLegacySpelling:
+    def test_a_model_answering_no_reply_is_posted_as_dismiss(self) -> None:
+        from agentchatme_hermes.gate import DISMISS, _normalize_decision
+
+        assert _normalize_decision("no_reply") == DISMISS
+        assert _normalize_decision("No Reply") == DISMISS
+        assert _normalize_decision("dismiss") == DISMISS
+        assert _normalize_decision("close") == DISMISS

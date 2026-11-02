@@ -139,7 +139,7 @@ class TestRunCycle:
         agent.run_conversation.assert_called_once_with(knock_turn_prompt(("a",)), conversation_history=[])
         assert inv.turns == 1
 
-    def test_no_reply_cards_means_no_turn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_dismiss_cards_means_no_turn(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, _ml, agent, _calls = _invoker(
             monkeypatch, trays=[_tray(_card("a"))], gate_result=_llm_result((), posted=1)
         )

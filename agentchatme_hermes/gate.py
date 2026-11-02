@@ -12,7 +12,7 @@ computes, the agent's model judges, the doorbell carries.
 
 What gets recorded
 ──────────────────
-``no_reply`` and ``defer`` are posted; a recorded verdict settles delivery for
+``dismiss`` and ``defer`` are posted; a recorded verdict settles delivery for
 what it covers, so the sender's tick is honest and the conversation leaves the
 tray. ``reply`` is deliberately *not* posted: the send is the reply verdict
 (``WIRE-CONTRACT.md``, *Reply-gate verdicts*), and posting it would settle the
@@ -47,14 +47,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_TOKENS = 2048
 
 REPLY = "reply"
-NO_REPLY = "no_reply"
+DISMISS = "dismiss"
 DEFER = "defer"
-DECISIONS = (REPLY, NO_REPLY, DEFER)
+DECISIONS = (REPLY, DISMISS, DEFER)
 
 # Tolerated spellings. Anything else leaves the card undecided.
 _REPLY_TOKENS = frozenset({"reply", "respond", "answer", "yes", "true"})
-_NO_REPLY_TOKENS = frozenset(
-    {"no_reply", "no-reply", "noreply", "silent", "silence", "skip", "ignore", "no", "false"}
+_DISMISS_TOKENS = frozenset(
+    {"dismiss", "dismissed", "close", "closed", "no_reply", "no-reply", "noreply", "silent", "silence", "skip", "ignore", "no", "false"}
 )
 _DEFER_TOKENS = frozenset({"defer", "deferred", "later", "wait", "postpone"})
 
@@ -79,7 +79,7 @@ class GateResult:
 
     ``source``:
 
-    * ``"llm"`` — the model answered; ``verdicts`` is what it said.
+    * ``"llm"`` — the model answered; ``verdicts`` is what it said (reply | dismiss | defer).
     * ``"empty"`` — the tray had no cards; nothing to decide.
     * ``"fail_closed"`` — the model call failed or was unusable; nothing
       posted, no turn (default policy).
@@ -162,7 +162,7 @@ def build_gate_messages(tray: Mapping[str, Any]) -> list[dict[str, str]]:
 
     shape = (
         '{"decisions": [{"conversation_id": "<conversation_id from a card>", '
-        '"decision": "reply" | "no_reply" | "defer"'
+        '"decision": "reply" | "dismiss" | "defer"'
     )
     if categories:
         shape += ', "category": "<one of: ' + ", ".join(categories) + '>"'
@@ -270,8 +270,8 @@ def _normalize_decision(value: Any) -> str | None:
     token = value.strip().lower().replace(" ", "_")
     if token in _REPLY_TOKENS:
         return REPLY
-    if token in _NO_REPLY_TOKENS:
-        return NO_REPLY
+    if token in _DISMISS_TOKENS:
+        return DISMISS
     if token in _DEFER_TOKENS:
         return DEFER
     return None
@@ -396,7 +396,7 @@ def _failed(
 def _post_verdict(
     main_line: MainLineClient, verdict: Verdict, card: Mapping[str, Any] | None
 ) -> bool:
-    """Record one ``no_reply``/``defer`` verdict. ``True`` when the server took it.
+    """Record one ``dismiss``/``defer`` verdict. ``True`` when the server took it.
 
     ``through_message_id`` is the card's newest stored message, so only what
     the model actually saw is settled; anything that landed since stays
