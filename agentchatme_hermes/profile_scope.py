@@ -30,12 +30,14 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from contextlib import AbstractContextManager
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +110,108 @@ def profile_context(home: Path) -> Iterator[None]:
             reset_hermes_home_override(token)
         except Exception:
             logger.debug("profile_context: reset raised", exc_info=True)
+
+
+class ProfileScopeError(RuntimeError):
+    """The profile's runtime scope could not be entered; the work must not run unscoped."""
+
+
+@contextmanager
+def profile_turn_scope(home: Path) -> Iterator[None]:
+    """Run one cycle (tray, gate, turn) in the scope Hermes runs ``home``'s own turns in.
+
+    The HERMES_HOME override (:func:`profile_context`) picks the profile's
+    home, registry overlay and config; it does NOT pick its credentials.
+    Under a multiplexed gateway those come from a per-profile *secret
+    scope*: ``get_secret`` reads the bound mapping and never another
+    profile's ``os.environ`` (``agent/secret_scope.py``). The gateway binds
+    it around every served profile's turn (``gateway/run.py``
+    ``_profile_runtime_scope``: override + ``set_secret_scope`` + terminal
+    policy). A turn this plugin starts must do the same, or a served
+    profile's provider key, ``key_env`` and other secrets resolve to the
+    launch profile's values (or fail closed).
+
+    * Multiplexing (``is_multiplex_active()``): Hermes's own
+      ``_profile_runtime_scope(home)`` — the exact scope its turns use; if
+      that helper is not importable, the same override + secret scope built
+      by ``build_profile_secret_scope(home)``.
+    * Single profile: ``GatewayTurnMixin._standalone_launch_scope()`` — what
+      the gateway enters for its own turns (a no-op unless the process also
+      hosts another profile).
+    * Outside Hermes: nothing.
+
+    Entered per cycle, not per thread: the multiplex flag is the gateway's,
+    secrets are re-read the way the gateway re-reads them per turn, and the
+    scope never outlives the work. Raises :class:`ProfileScopeError` when a
+    multiplexed scope cannot be entered — the cycle must not run with
+    another profile's credentials; the caller re-wakes later.
+    """
+    if _multiplexing():
+        helper = _hermes_profile_runtime_scope()
+        scope = helper(Path(home)) if helper is not None else _replicated_profile_scope(Path(home))
+        try:
+            scope.__enter__()
+        except Exception as exc:
+            raise ProfileScopeError(f"could not enter profile scope for {home}: {exc!r}") from exc
+        try:
+            yield
+        except BaseException:
+            if not scope.__exit__(*sys.exc_info()):
+                raise
+        else:
+            scope.__exit__(None, None, None)
+        return
+    standalone = _hermes_standalone_launch_scope()
+    if standalone is None:
+        yield
+        return
+    with standalone():
+        yield
+
+
+def _multiplexing() -> bool:
+    try:
+        from agent.secret_scope import is_multiplex_active
+    except Exception:
+        return False
+    try:
+        return bool(is_multiplex_active())
+    except Exception:
+        return False
+
+
+def _hermes_profile_runtime_scope() -> Callable[[Path], AbstractContextManager[None]] | None:
+    try:
+        from gateway.run import _profile_runtime_scope  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    return _profile_runtime_scope if callable(_profile_runtime_scope) else None
+
+
+def _hermes_standalone_launch_scope() -> Callable[[], AbstractContextManager[None]] | None:
+    try:
+        from gateway.run_turn import GatewayTurnMixin  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    scope = getattr(GatewayTurnMixin, "_standalone_launch_scope", None)
+    return scope if callable(scope) else None
+
+
+@contextmanager
+def _replicated_profile_scope(home: Path) -> Iterator[None]:
+    """What ``_profile_runtime_scope`` enters, from Hermes's public pieces (override + secret scope)."""
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+
+    with profile_context(home):
+        token = set_secret_scope(build_profile_secret_scope(home), profile_home=str(home))
+        try:
+            yield
+        finally:
+            reset_secret_scope(token)
 
 
 def hermes_root_of(home: Path) -> Path:

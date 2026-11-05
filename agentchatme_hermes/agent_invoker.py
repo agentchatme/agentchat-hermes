@@ -76,7 +76,12 @@ from .config import (
 from .hosted_tools import wait_for_hosted_tools
 from .invites import InviteLedger
 from .model_call import build_call_model
-from .profile_scope import profile_context, resolve_hermes_home
+from .profile_scope import (
+    ProfileScopeError,
+    profile_context,
+    profile_turn_scope,
+    resolve_hermes_home,
+)
 from .turn import (
     MCP_SERVER_NAME,
     MCP_TOOL_PREFIX,
@@ -327,7 +332,12 @@ class AgentInvoker:
                     )
                     continue
                 self._ledger.offer(invite)
-                self._run_invite_turn(invite)
+                with profile_turn_scope(self._profile_home()):
+                    self._run_invite_turn(invite)
+            except ProfileScopeError as exc:
+                # Offered, not started: the next wake retries it in scope.
+                logger.warning("AgentInvoker: group-invite turn not started — %s", exc)
+                self._schedule_retry("profile scope unavailable")
             except Exception:
                 # Whatever escaped must not kill the worker, and the invite
                 # must not wait for an unrelated wake: it stays offered in the
@@ -342,7 +352,17 @@ class AgentInvoker:
 
     def _guarded_cycle(self) -> None:
         try:
-            self.run_cycle()
+            # The tray read, the gate's model call, the hosted-tools hold and
+            # the turn all run in the profile's own runtime scope — the one the
+            # gateway uses for this profile's turns — so its provider key and
+            # secrets are its own, never the launch profile's.
+            with profile_turn_scope(self._profile_home()):
+                self.run_cycle()
+        except ProfileScopeError as exc:
+            # Never run a cycle with another profile's credentials: nothing is
+            # read or recorded, the cards stay on the tray, the ladder re-wakes.
+            logger.warning("AgentInvoker: cycle not run — %s", exc)
+            self._schedule_retry("profile scope unavailable")
         except Exception:
             # Outer catch: whatever escaped the cycle must not kill the
             # worker. Re-wake on the ladder so the tray is read again.

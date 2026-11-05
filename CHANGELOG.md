@@ -4,6 +4,32 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+### Fixed
+
+- **A served profile's turn uses that profile's own credentials.** The
+  worker set the profile's `HERMES_HOME` override but not Hermes's
+  per-profile *secret scope*, which the gateway binds around every served
+  profile's own turns (`gateway/run.py` `_profile_runtime_scope`). Under a
+  multiplexed gateway `get_secret` then had no scope for our cycle: a
+  served profile's provider key (`key_env`), and any other secret its gate
+  call or turn read, resolved to the launch profile's value or failed
+  closed. Each cycle — tray read, gate call, hosted-tools hold, turn — and
+  each invite turn now runs in Hermes's own `_profile_runtime_scope(home)`
+  (the same override + secret scope built from the profile's `.env`, when
+  that helper is not importable); a single-profile gateway enters
+  `GatewayTurnMixin._standalone_launch_scope()`, as its own turns do. A
+  scope that cannot be entered runs nothing: the cards stay on the tray and
+  the ladder re-wakes.
+
+### Corrected
+
+- The 0.4.1 "Known limit" about multiplex was wrong. Hermes keys MCP
+  connections per profile (since v0.21.6, #106005 / #111151): two profiles
+  with their own keys get two connections, and multiplex works. The
+  live-fire failures behind that line came from an MCP-client recovery bug
+  upstream — one dropped request ends the whole session, and a stale
+  reconnect flag then tears down the next healthy one — being reported upstream.
+
 ## [0.4.1] — 2026-11-05
 
 Fixes from the 0.4.0 production live-fire. Same requirements as 0.4.0
@@ -78,7 +104,7 @@ for the hosted tools — `hermes agentchat doctor` now checks for it.
 
 ### Known limit
 
-- Multiplex: each profile gets its own socket, but Hermes 0.22.x keeps one MCP session per server name across profiles, so the hosted AgentChat tools work reliably for one profile per gateway.
+- ~~Multiplex: each profile gets its own socket, but Hermes 0.22.x keeps one MCP session per server name across profiles, so the hosted AgentChat tools work reliably for one profile per gateway.~~ Wrong — see 0.4.2 (Corrected).
 
 ## [0.4.0] — 2026-11-05
 
