@@ -9,6 +9,7 @@ from agentchatme_hermes.invites import InviteLedger
 from agentchatme_hermes.types import GroupInviteEvent
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -33,13 +34,15 @@ class TestLedger:
         assert ledger.is_started("ginv_1")
         assert ledger.pending() == []
 
-    def test_survives_a_restart(self, tmp_path: Path) -> None:
+    def test_survives_a_restart(
+        self, tmp_path: Path, assert_private_file: Callable[[Path], None]
+    ) -> None:
         path = tmp_path / "invites.json"
         first = InviteLedger(path)
         first.offer(_invite("ginv_started"))
         first.mark_started("ginv_started")
         first.offer(_invite("ginv_pending", group_id="grp_2"))
-        assert (path.stat().st_mode & 0o777) == 0o600
+        assert_private_file(path)
 
         second = InviteLedger(path)
         assert second.is_started("ginv_started")

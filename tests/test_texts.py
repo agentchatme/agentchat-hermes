@@ -20,6 +20,7 @@ from agentchatme_hermes.texts import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -54,13 +55,15 @@ class _Client:
 
 
 class TestLoadTexts:
-    def test_fresh_fetch_writes_the_cache(self, tmp_path: Path) -> None:
+    def test_fresh_fetch_writes_the_cache(
+        self, tmp_path: Path, assert_private_file: Callable[[Path], None]
+    ) -> None:
         client = _Client(_texts())
         cache = tmp_path / "state" / "texts.json"
         loaded = load_texts(client, cache_path=cache, now=lambda: 1000.0)  # type: ignore[arg-type]
         assert loaded is not None and loaded.source == "server"
         assert client.calls == ["hermes"]
-        assert cache.exists() and (cache.stat().st_mode & 0o777) == 0o600
+        assert_private_file(cache)
         cached = read_cache(cache)
         assert cached is not None and cached.texts == _texts() and cached.fetched_at == 1000.0
 
