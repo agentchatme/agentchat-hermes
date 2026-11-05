@@ -8,9 +8,12 @@ and the recording. What must hold:
 * a wake becomes exactly one cycle: one tray read, one gate call;
 * ``dismiss`` / ``defer`` are recorded at once, with the card's anchor;
 * ``reply`` starts ONE turn with the served wake instruction, and each
-  ``reply`` is recorded right after the turn has started — after the agent
-  is built, before ``run_conversation`` is entered;
-* a turn that fails to start records nothing and re-wakes on the ladder;
+  ``reply`` is recorded only once the turn has COMPLETED — after
+  ``run_conversation`` returned — so the turn's own inbox read still sees
+  the card;
+* a turn that fails to start, or that raises, records nothing and re-wakes
+  on the ladder; a turn is not started while Hermes has not registered the
+  hosted ``mcp__agentchat__*`` tools (bounded hold);
 * fail-closed records nothing, starts nothing, and re-wakes on the ladder;
 * gate disabled → the turn starts straight from the tray, nothing recorded;
 * no served texts → no turn, nothing recorded for ``reply``;
@@ -33,6 +36,7 @@ import pytest
 from agentchatme.types import InboxTray, Texts
 
 from agentchatme_hermes import agent_invoker as invoker_module
+from agentchatme_hermes import hosted_tools as hosted_tools_module
 from agentchatme_hermes.agent_invoker import _FALLBACK_MODEL, AgentInvoker, _coerce_model_string
 from agentchatme_hermes.invites import InviteLedger
 from agentchatme_hermes.turn import invite_turn_prompt, wake_turn_prompt
@@ -167,6 +171,8 @@ def _invoker(
     monkeypatch.setattr(inv, "_ensure_hermes_resolved", lambda: None)
     monkeypatch.setattr(inv, "_build_agent", build_agent)
     monkeypatch.setattr(inv, "_resolve_model_and_runtime", lambda: ("m", {"provider": "p"}))
+    # Hermes has the hosted tools registered unless a test says otherwise.
+    monkeypatch.setattr(hosted_tools_module, "hosted_tool_names", lambda: ["mcp__agentchat__agentchat_inbox"])
 
     if answer is not None:
 
@@ -208,7 +214,7 @@ class TestCoerceModelString:
 
 
 class TestRunCycle:
-    def test_reply_starts_one_turn_and_records_after_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_reply_starts_one_turn_and_records_after_the_turn(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, client, agent, events = _invoker(
             monkeypatch,
             trays=[_tray(_card("a"), _card("b"))],
@@ -218,8 +224,8 @@ class TestRunCycle:
         assert result is not None and result.outcome == "decided"
         assert client.tray_calls == [{"wait_ms": 0, "limit": 50}]
         # dismiss recorded by the SDK gate at once, with the card's anchor;
-        # reply recorded by the host after the agent is built, before the turn runs.
-        assert events == ["model", "record:b:dismiss", "build", "record:a:reply", "run"]
+        # reply recorded by the host only after the turn has completed.
+        assert events == ["model", "record:b:dismiss", "build", "run", "record:a:reply"]
         assert client.recorded == [("b", "dismiss", "msg_b"), ("a", "reply", "msg_a")]
         agent.run_conversation.assert_called_once_with(
             wake_turn_prompt(TEXTS, ["a"]), conversation_history=[]
@@ -339,16 +345,117 @@ class TestRunCycle:
         assert inv.turns == 0 and inv.recorded_replies == 0
         assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
 
-    def test_crash_after_start_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """``run_conversation`` raising is a crash after the turn started: the
-        accepted trade-off — the verdict is recorded, the worker survives."""
+    def test_crashed_turn_records_nothing_and_rewakes(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``run_conversation`` raising: the turn did not look, so nothing is
+        recorded — the card stays on the tray, the ladder brings the next
+        wake, the worker survives."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"), _card("b"))], answer=_answer(a="reply", b="dismiss")
+        )
+        agent.run_conversation.side_effect = RuntimeError("provider exploded")
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
+            inv.run_cycle()  # must not raise
+        assert client.recorded == [("b", "dismiss", "msg_b")], "reply NOT recorded"
+        assert "record:a:reply" not in events
+        assert inv.turns == 0 and inv.recorded_replies == 0
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert any("NOT recorded" in r.getMessage() for r in caplog.records)
+
+    def test_turn_reads_the_card_before_reply_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """What the ordering is for: the turn's first ``agentchat_inbox`` must
+        still see the card. A fake hosted inbox serves the card while the
+        conversation is unread and an empty tray (as the server does) once a
+        ``reply`` / ``dismiss`` verdict has been recorded for it."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
+        )
+        read_by_turn: list[list[str]] = []
+
+        def hosted_inbox() -> list[str]:
+            read = {cid for cid, decision, _anchor in client.recorded if decision in ("reply", "dismiss")}
+            return [cid for cid in ("a",) if cid not in read]
+
+        def run_conversation(prompt: str, conversation_history: list[Any]) -> dict[str, Any]:
+            events.append("run")
+            read_by_turn.append(hosted_inbox())  # the turn's first step, per the wake instruction
+            return {"final_response": "sent"}
+
+        agent.run_conversation.side_effect = run_conversation
+        inv.run_cycle()
+        assert read_by_turn == [["a"]], "the card was on the tray when the turn looked — no empty park"
+        assert client.recorded == [("a", "reply", "msg_a")]
+        assert events.index("run") < events.index("record:a:reply")
+
+    def test_completed_turn_that_chose_silence_still_counts_as_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, client, agent, _events = _invoker(
             monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
         )
-        agent.run_conversation.side_effect = RuntimeError("provider exploded")
-        inv.run_cycle()  # must not raise
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": ""}
+        inv.run_cycle()
+        assert client.recorded == [("a", "reply", "msg_a")], "it looked; the conversation is read"
+        assert inv.turns == 1
+
+    def test_turn_waits_for_the_hosted_tools(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        """Hermes registers the ``agentchat`` MCP tools after the gateway starts;
+        the turn is held until they are there, then runs and records."""
+        inv, client, _agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
+        )
+        answers: list[list[str]] = [[], []]
+        monkeypatch.setattr(
+            hosted_tools_module, "hosted_tool_names",
+            lambda: answers.pop(0) if answers else ["mcp__agentchat__agentchat_inbox"],
+        )
+        slept: list[float] = []
+        monkeypatch.setattr(hosted_tools_module.time, "sleep", slept.append)
+        with caplog.at_level(logging.INFO, logger="agentchatme_hermes.hosted_tools"):
+            inv.run_cycle()
+        assert slept == [hosted_tools_module.HOSTED_TOOLS_POLL_S] * 2
+        assert events[-2:] == ["run", "record:a:reply"]
         assert client.recorded == [("a", "reply", "msg_a")]
-        assert inv.turns == 0
+        assert any("holding the turn" in r.getMessage() for r in caplog.records)
+
+    def test_no_hosted_tools_within_the_bound_is_a_turn_not_started(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Past the bound nothing is recorded, no turn runs, the ladder re-wakes
+        (leg 7a of the 0.4.0 live-fire: a tool-less turn had recorded the reply)."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"), _card("b"))], answer=_answer(a="reply", b="dismiss")
+        )
+        monkeypatch.setattr(hosted_tools_module, "hosted_tool_names", lambda: [])
+        clock = {"t": 0.0}
+
+        def sleep(s: float) -> None:
+            clock["t"] += s
+
+        monkeypatch.setattr(hosted_tools_module.time, "sleep", sleep)
+        monkeypatch.setattr(hosted_tools_module.time, "monotonic", lambda: clock["t"])
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.hosted_tools"):
+            inv.run_cycle()
+        agent.run_conversation.assert_not_called()
+        assert "build" not in events, "no agent is even built"
+        assert client.recorded == [("b", "dismiss", "msg_b")], "reply NOT recorded"
+        assert inv.turns == 0 and inv.recorded_replies == 0
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert clock["t"] == pytest.approx(hosted_tools_module.HOSTED_TOOLS_WAIT_S)
+        assert any("not started" in r.getMessage() for r in caplog.records)
+
+    def test_outside_hermes_the_hold_is_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _client, _agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
+        )
+        monkeypatch.setattr(hosted_tools_module, "hosted_tool_names", lambda: None)
+        slept: list[float] = []
+        monkeypatch.setattr(hosted_tools_module.time, "sleep", slept.append)
+        inv.run_cycle()
+        assert slept == [] and events[-1] == "record:a:reply"
 
     def test_record_failure_after_start_is_logged_not_raised(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -365,7 +472,7 @@ class TestRunCycle:
             inv.run_cycle()
         agent.run_conversation.assert_called_once()
         assert any("not recorded" in r.getMessage() for r in caplog.records)
-        assert inv.turns == 1 and inv.recorded_replies == 0
+        assert inv.turns == 1 and inv.recorded_replies == 0, "the turn ran; the verdict did not land"
 
     def test_without_texts_no_turn_and_reply_stays_unrecorded(
         self, monkeypatch: pytest.MonkeyPatch

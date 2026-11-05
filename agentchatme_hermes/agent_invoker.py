@@ -13,26 +13,33 @@ What happens on a wake
    once. ``reply`` entries come back with a ``record()`` for the host.
 4. **Turn.** If anything was decided ``reply``, start ONE Hermes agent turn
    with the served wake instruction (:mod:`.turn`) naming the ids the gate
-   chose, then call ``record()`` on every ``reply`` entry — right after the
-   turn has started, never before: a turn that fails to start records
-   nothing, the conversation stays unread, and the next wake gates it
-   again. The agent reads and answers through the hosted MCP tools; the
+   chose. The agent reads and answers through the hosted MCP tools; the
    turn's return value is discarded — nothing is auto-routed anywhere.
+5. **Record.** When that turn has **completed**, call ``record()`` on every
+   ``reply`` entry: a completed turn looked, so the conversation counts as
+   read — whether or not it chose to send. Never earlier: recording marks
+   the conversation read and takes the card off the tray, so a turn that
+   records first finds an empty tray (the 0.4.0 live-fire: 25 s parked in
+   ``agentchat_inbox`` for nothing). A turn that could not start (Hermes
+   runtime not importable, texts not loaded, agent construction failed,
+   the hosted tools not registered in Hermes) or that raised records
+   nothing: the conversation stays unread, the card stays on the tray,
+   and the next wake gates it again.
 
-"Started", for Hermes: ``AIAgent.run_conversation`` is synchronous, so the
-turn has started once the agent is constructed and the call is being
-entered. Everything that can stop a turn from starting (Hermes runtime not
-importable, texts not loaded, agent construction failed) happens before
-that point and records nothing; an exception out of ``run_conversation``
-itself is a crash after start — the trade-off the gate contract accepts.
+The hosted tools must be there before a turn starts. Hermes registers the
+``agentchat`` MCP server's tools some seconds after the gateway starts
+(longer on a cold tool cache, or never without the ``mcp`` SDK); a turn
+without them cannot look. :mod:`.hosted_tools` asks Hermes' registry and
+the turn is held, bounded, until they are registered — after the bound it
+is a turn not started.
 
 One cycle at a time per account: a wake that lands while a cycle runs is
 remembered and runs once the cycle ends (the tray is re-read, so whatever
 the earlier wake announced is covered). A cycle that could not complete —
-model unreachable, server error, verdicts rejected, turn not started —
-re-wakes itself on a local ladder (1 m, 5 m, 30 m) because a connected
-socket gets no re-ring from the server; the cards wait on the tray meanwhile.
-A gate that failed closed logs once and starts nothing.
+model unreachable, server error, verdicts rejected, turn not started or
+crashed — re-wakes itself on a local ladder (1 m, 5 m, 30 m) because a
+connected socket gets no re-wake from the server; the cards wait on the
+tray meanwhile. A gate that failed closed logs once and starts nothing.
 
 Group invites are a second wake kind: not on the tray, not gated, one turn
 each with the served invite prompt, serialized on the same worker. The
@@ -48,7 +55,7 @@ from __future__ import annotations
 import collections
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from agentchatme import gate
 
@@ -57,6 +64,7 @@ from .config import (
     DEFAULT_REPLY_GATE_ENABLED,
     DEFAULT_WAKE_DEBOUNCE_S,
 )
+from .hosted_tools import wait_for_hosted_tools
 from .invites import InviteLedger
 from .model_call import build_call_model
 from .turn import (
@@ -88,12 +96,17 @@ TRAY_LIMIT = 50
 
 # Local re-wake ladder after a cycle that could not complete. Mirrors the
 # server's webhook ladder (1m, 5m, 30m) — a connected socket never gets that
-# re-ring, so the integration carries it. After the last rung the cycle
+# re-wake, so the integration carries it. After the last rung the cycle
 # waits for the next wake; the cards are still on the tray.
 RETRY_LADDER_S: tuple[float, ...] = (60.0, 300.0, 1800.0)
 
-# A turn ready to run: the agent is built, ``run_conversation`` is next.
+# A turn ready to run: the hosted tools are registered, the agent is built,
+# ``run_conversation`` is next. Calling it runs the turn and reports whether
+# it completed.
 StartedTurn = Callable[[], bool]
+
+# What became of the cycle's turn: only ``completed`` records ``reply``.
+TurnOutcome = Literal["completed", "crashed", "not_started"]
 
 
 class AgentInvoker:
@@ -318,8 +331,9 @@ class AgentInvoker:
                 "AgentInvoker: %d card(s) on the tray, gate disabled — starting the turn",
                 len(cards),
             )
-            if not self._run_wake_turn(reply=[]):
-                self._schedule_retry("turn not started")
+            turn: TurnOutcome = self._run_wake_turn(reply=[])
+            if turn != "completed":
+                self._schedule_retry(f"turn {turn.replace('_', ' ')}")
             else:
                 self._retry_rung = 0
             if truncated:
@@ -363,14 +377,14 @@ class AgentInvoker:
             self._schedule_retry(result.failure or "gate failed closed")
             return result
 
-        turn_started = True
+        turn = "completed"
         if result.reply:
-            turn_started = self._run_wake_turn(reply=result.reply)
+            turn = self._run_wake_turn(reply=result.reply)
 
-        if not turn_started:
-            self._schedule_retry("turn not started")
+        if turn != "completed":
+            self._schedule_retry(f"turn {turn.replace('_', ' ')}")
         elif result.record_failures or result.undecided:
-            # Some cards were not settled (verdict rejected, or the model
+            # Some cards were not read (verdict rejected, or the model
             # skipped them). They are still on the tray; look again later.
             self._schedule_retry("cards left on the tray")
         else:
@@ -418,17 +432,19 @@ class AgentInvoker:
             )
         return texts
 
-    def _run_wake_turn(self, *, reply: list[gate.GateReply]) -> bool:
-        """One turn for the cycle; ``True`` when it started.
+    def _run_wake_turn(self, *, reply: list[gate.GateReply]) -> TurnOutcome:
+        """One turn for the cycle.
 
-        Every ``reply`` entry is recorded right after the turn has started
-        (see the module docstring for what "started" means here). An entry
-        whose record fails is logged: the conversation stays unread and the
-        next wake gates it again.
+        ``reply`` entries are recorded only when the turn has **completed**
+        (``run_conversation`` returned): a completed turn looked, so the
+        conversation is read — whether or not it sent. A turn that could
+        not start or that raised records nothing; the cards stay on the
+        tray and the ladder brings the next wake. An entry whose record
+        fails is logged: it stays unread and the next wake gates it again.
         """
         texts = self._texts()
         if texts is None:
-            return False
+            return "not_started"
         session_id = wake_session_id()
         ids = [entry.conversation_id for entry in reply]
         logger.info(
@@ -438,7 +454,16 @@ class AgentInvoker:
         )
         started = self._start_turn(prompt=wake_turn_prompt(texts, ids), session_id=session_id)
         if started is None:
-            return False
+            return "not_started"
+        if not started():
+            logger.warning(
+                "AgentInvoker: turn %s did not complete — reply verdict(s) for %s NOT recorded; "
+                "the conversation(s) stay unread and the next wake gates them again",
+                session_id,
+                ", ".join(ids) or "no card",
+            )
+            return "crashed"
+        self.turns += 1
         for entry in reply:
             try:
                 entry.record()
@@ -450,9 +475,7 @@ class AgentInvoker:
                     entry.conversation_id,
                     exc,
                 )
-        if started():
-            self.turns += 1
-        return True
+        return "completed"
 
     def _run_invite_turn(self, invite: GroupInviteEvent) -> None:
         if self._stopped.is_set():
@@ -481,11 +504,16 @@ class AgentInvoker:
     def _start_turn(self, *, prompt: str, session_id: str) -> StartedTurn | None:
         """Build a transient AIAgent for one turn. ``None`` when it cannot start.
 
-        Returns a callable that runs the turn and reports whether it
-        completed. The return value of ``run_conversation`` is deliberately
-        discarded: the agent's only way to say anything on AgentChat is the
-        hosted ``agentchat_send_message`` tool during the turn.
+        First holds, bounded, until Hermes has registered the hosted
+        AgentChat tools (:mod:`.hosted_tools`): a turn without them cannot
+        look and must not count as started. Returns a callable that runs
+        the turn and reports whether it completed. The return value of
+        ``run_conversation`` is deliberately discarded: the agent's only way
+        to say anything on AgentChat is the hosted ``agentchat_send_message``
+        tool during the turn.
         """
+        if not wait_for_hosted_tools(label=f"turn {session_id}"):
+            return None
         self._ensure_hermes_resolved()
         agent = self._build_agent(session_id)
         if agent is None:

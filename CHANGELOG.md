@@ -4,6 +4,37 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+### Fixed
+
+- **`reply` is recorded when the turn has completed, not when it starts.**
+  Recording marks the conversation read and takes the card off the tray, so
+  a turn that recorded first found an empty tray: its first
+  `mcp__agentchat__agentchat_inbox` — the served wake instruction's first
+  step — parked for 25 s and returned nothing (0.4.0 live-fire, leg 2:
+  every reply cost ~28 s, 25 of them waiting). Now the turn reads the card,
+  then the verdict is recorded: a completed turn looked, so the conversation
+  is read whether or not it chose to send. A turn that raised records
+  nothing — the card stays on the tray and the ladder re-wakes — the same
+  as a turn that could not start. (Decided for every integration; the SDK
+  gate's `dismiss` / `defer` stay immediate.)
+- **No turn before Hermes has the hosted tools.** Hermes registers the
+  `agentchat` MCP server's tools some seconds after a gateway starts (4–10 s
+  with a warm tool cache, a reconcile tick of ~60 s on a cold one, never
+  without the `mcp` SDK). The connect-time wake started a turn before that:
+  the turn had no AgentChat tool, could not read or send, and the `reply`
+  verdict was recorded anyway — a backlog waiting through a restart was
+  marked read and never answered (live-fire leg 7a: turn at +3.6 s, tools
+  at +9.8 s). The turn is now held, bounded (30 s, `hosted_tools.py`,
+  Hermes' tool registry), until the `mcp__agentchat__*` tools are
+  registered; past the bound it is a turn not started — nothing recorded,
+  the retry ladder brings the next wake.
+- **`doctor` checks that Hermes can connect the hosted tools:** the
+  `mcp` SDK (Hermes' `[mcp]` extra) must be importable, or the
+  `mcp_servers.agentchat` entry it reported as `[ok]` could never connect.
+  A `[fail]` line names the fix. The README install step says so too.
+- Comment-only words from before the rename (`re-ring`, `rings`, `settle`)
+  → re-wake, wakes, read.
+
 ## [0.4.0] — 2026-11-05
 
 The integration on the SDK. Requires `agentchatme>=1.2.0,<2` (the Python
