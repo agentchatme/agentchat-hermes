@@ -103,11 +103,16 @@ class _Client:
         self.tray_calls: list[dict[str, Any]] = []
         self.recorded: list[tuple[str, str, str | None]] = []
         self.record_error: Exception | None = None
+        # A live fake inbox: a callable that builds the tray from the state
+        # the server would hold (what is unread given what was recorded).
+        self.live_inbox: Any = None
         self.inbox = SimpleNamespace(tray=self._tray)
         self.decisions = SimpleNamespace(record=self._record)
 
     def _tray(self, *, wait_ms: int = 0, limit: int | None = None) -> InboxTray:
         self.tray_calls.append({"wait_ms": wait_ms, "limit": limit})
+        if self.live_inbox is not None:
+            return self.live_inbox()
         nxt = self.trays.pop(0) if self.trays else _tray()
         if isinstance(nxt, Exception):
             raise nxt
@@ -625,6 +630,136 @@ class TestWorker:
         inv.stop()
         assert time.monotonic() - started < 2.5
         inv.wake()  # ignored after stop
+
+
+def _server_like_inbox(client: _Client, unread: dict[str, str]) -> Any:
+    """The tray as the server builds it: one card per conversation with a
+    message newer than its last ``reply``/``dismiss`` anchor. ``unread`` maps
+    conversation id → newest message id and is mutated by the test as peers
+    write."""
+
+    def tray() -> InboxTray:
+        read_through = {
+            cid: anchor for cid, decision, anchor in client.recorded if decision in ("reply", "dismiss")
+        }
+        cards = []
+        for cid, newest in unread.items():
+            if read_through.get(cid) == newest:
+                continue
+            card = _card(cid)
+            card["preview"]["message_id"] = newest
+            cards.append(card)
+        return _tray(*cards)
+
+    return tray
+
+
+class TestInFlightConversations:
+    """``reply`` is recorded at the end of the turn, so the card is on the
+    tray for the whole turn. Through the worker — the production path — a
+    wake that lands mid-turn re-reads the tray only after the turn has
+    ended and recorded: one turn, one record. A message newer than the
+    anchor, arriving after the turn, earns a new turn."""
+
+    def test_wake_during_a_turn_does_not_gate_the_conversation_again(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        inv, client, agent, events = _invoker(monkeypatch, trays=[], answer=_answer(a="reply"))
+        unread = {"a": "msg_a"}
+        client.live_inbox = _server_like_inbox(client, unread)
+        in_turn = threading.Event()
+        release = threading.Event()
+
+        def long_turn(prompt: str, conversation_history: list[Any]) -> dict[str, Any]:
+            events.append("run")
+            in_turn.set()
+            assert release.wait(5.0)
+            return {"final_response": "sent"}
+
+        agent.run_conversation.side_effect = long_turn
+        inv.start()
+        try:
+            inv.wake()
+            assert in_turn.wait(2.0), "turn 1 is running"
+            assert inv.in_flight() == {"a"}
+            inv.wake()  # another wake while the turn runs: the card is still on the tray
+            inv.wake()
+            release.set()
+            assert _wait_for(lambda: inv.cycles == 2, timeout=3.0)
+            time.sleep(0.05)
+            assert inv.cycles == 2 and inv.in_flight() == set()
+            assert agent.run_conversation.call_count == 1, "one turn for the conversation"
+            assert client.recorded == [("a", "reply", "msg_a")], "one record"
+            assert events.count("model") == 1, "gated once: the second cycle saw an empty tray"
+
+            # A newer message after the turn: a new card, a new turn, a new record.
+            in_turn.clear()
+            unread["a"] = "msg_a2"
+            inv.wake()
+            assert in_turn.wait(2.0)
+            assert _wait_for(lambda: client.recorded == [("a", "reply", "msg_a"), ("a", "reply", "msg_a2")], timeout=3.0)
+            assert agent.run_conversation.call_count == 2
+        finally:
+            release.set()
+            inv.stop()
+
+    def test_concurrent_cycle_skips_the_in_flight_card_and_rereads_later(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Belt and braces for any caller that is not the worker: a cycle run
+        while a turn is in flight drops that card before the gate, records
+        nothing for it, and asks for one re-read once the turn has ended."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[], answer=_answer(a="reply", b="dismiss")
+        )
+        unread = {"a": "msg_a"}
+        client.live_inbox = _server_like_inbox(client, unread)
+        in_turn = threading.Event()
+        release = threading.Event()
+
+        def long_turn(prompt: str, conversation_history: list[Any]) -> dict[str, Any]:
+            events.append("run")
+            in_turn.set()
+            assert release.wait(5.0)
+            return {"final_response": "sent"}
+
+        agent.run_conversation.side_effect = long_turn
+        rereads: list[int] = []
+        monkeypatch.setattr(inv._coalescer, "wake", lambda: rereads.append(1))
+        first = threading.Thread(target=inv.run_cycle)
+        first.start()
+        try:
+            assert in_turn.wait(2.0)
+            unread["b"] = "msg_b"  # a second peer writes while a's turn runs
+            with caplog.at_level(logging.INFO, logger="agentchatme_hermes.agent_invoker"):
+                result = inv.run_cycle()  # a concurrent caller, mid-turn
+            assert result is not None and result.outcome == "decided"
+            assert client.recorded == [("b", "dismiss", "msg_b")], "a is not gated again, b is"
+            assert rereads == [1], "one re-read asked for, for when the turn ends"
+            assert any("already have a turn in flight (a)" in r.getMessage() for r in caplog.records)
+        finally:
+            release.set()
+            first.join(5.0)
+        assert client.recorded == [("b", "dismiss", "msg_b"), ("a", "reply", "msg_a")]
+        assert inv.in_flight() == set()
+        assert agent.run_conversation.call_count == 1
+
+    def test_in_flight_is_cleared_when_the_turn_crashes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, agent, _events = _invoker(monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply"))
+        agent.run_conversation.side_effect = RuntimeError("boom")
+        inv.run_cycle()
+        assert inv.in_flight() == set() and client.recorded == []
+
+    def test_gate_less_turn_covers_every_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _client, agent, _events = _invoker(
+            monkeypatch,
+            trays=[_tray(_card("a"), _card("b"))],
+            config=SimpleNamespace(wake_debounce_s=0.0, reply_gate_enabled=False),
+        )
+        seen: list[set[str]] = []
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: seen.append(inv.in_flight()) or {"final_response": ""}
+        inv.run_cycle()
+        assert seen == [{"a", "b"}] and inv.in_flight() == set()
 
 
 class TestInviteRetry:

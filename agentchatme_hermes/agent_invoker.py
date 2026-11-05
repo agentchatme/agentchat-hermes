@@ -35,7 +35,14 @@ is a turn not started.
 
 One cycle at a time per account: a wake that lands while a cycle runs is
 remembered and runs once the cycle ends (the tray is re-read, so whatever
-the earlier wake announced is covered). A cycle that could not complete —
+the earlier wake announced is covered). Because ``reply`` is recorded only
+when the turn ends, the card stays on the tray for the whole turn; the
+worker's serialisation is what keeps a second cycle from gating it again
+mid-turn, and an explicit per-conversation in-flight set backs that up:
+cards whose turn is running are dropped before the gate (never gated,
+never recorded twice), the set is cleared when the turn ends — completed
+or crashed — and a cycle that skipped a card re-reads the tray once the
+turn is over, so a message newer than the anchor is not missed. A cycle that could not complete —
 model unreachable, server error, verdicts rejected, turn not started or
 crashed — re-wakes itself on a local ladder (1 m, 5 m, 30 m) because a
 connected socket gets no re-wake from the server; the cards wait on the
@@ -77,6 +84,8 @@ from .turn import (
 from .wake import WakeCoalescer
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from agentchatme.types import InboxTray, Texts
 
     from .config import Config
@@ -142,6 +151,11 @@ class AgentInvoker:
         self._invites: collections.deque[GroupInviteEvent] = collections.deque()
         self._invites_lock = threading.Lock()
         self._retry_rung = 0
+        # Conversations whose turn is running right now. See the module
+        # docstring: the record happens when the turn ends, so until then
+        # the card is still on the tray and must not be gated again.
+        self._in_flight: set[str] = set()
+        self._in_flight_lock = threading.Lock()
 
         # Counters for the heartbeat / doctor and for tests.
         self.cycles = 0
@@ -178,6 +192,23 @@ class AgentInvoker:
             worker.join(timeout=2.0)
             if worker.is_alive():
                 logger.info("AgentInvoker: worker still finishing a turn at stop()")
+
+    def in_flight(self) -> set[str]:
+        """Conversation ids whose turn is running right now (diagnostics, tests)."""
+        with self._in_flight_lock:
+            return set(self._in_flight)
+
+    def _skip_in_flight(self, tray: InboxTray) -> tuple[InboxTray, list[str]]:
+        """``(tray without the cards whose turn is running, the ids dropped)``."""
+        with self._in_flight_lock:
+            busy = set(self._in_flight)
+        if not busy:
+            return tray, []
+        skipped = [c.conversation_id for c in tray.conversations if c.conversation_id in busy]
+        if not skipped:
+            return tray, []
+        kept = [c for c in tray.conversations if c.conversation_id not in busy]
+        return tray.model_copy(update={"conversations": kept}), skipped
 
     # -- wakes --------------------------------------------------------------
 
@@ -314,6 +345,19 @@ class AgentInvoker:
             self._schedule_retry("tray read failed")
             return None
 
+        tray, skipped = self._skip_in_flight(tray)
+        if skipped:
+            # A turn is running for these conversations (a concurrent caller
+            # of this method; the worker itself never overlaps). They are not
+            # gated again; the tray is re-read once that turn has ended, so a
+            # message newer than its anchor is seen.
+            logger.info(
+                "AgentInvoker: %d card(s) already have a turn in flight (%s) — not gated "
+                "again; the tray is re-read when it ends",
+                len(skipped),
+                ", ".join(skipped),
+            )
+            self._coalescer.wake()
         cards = gate.cards_of(tray)
         truncated = bool(tray.truncated)
         if not cards:
@@ -321,7 +365,8 @@ class AgentInvoker:
                 "AgentInvoker: tray empty (deferred=%s) — nothing to decide",
                 tray.deferred,
             )
-            self._retry_rung = 0
+            if not skipped:
+                self._retry_rung = 0
             return gate.GateResult(outcome="empty")
 
         if not self._gate_enabled:
@@ -331,7 +376,9 @@ class AgentInvoker:
                 "AgentInvoker: %d card(s) on the tray, gate disabled — starting the turn",
                 len(cards),
             )
-            turn: TurnOutcome = self._run_wake_turn(reply=[])
+            turn: TurnOutcome = self._run_wake_turn(
+                reply=[], covering=[c["conversation_id"] for c in cards]
+            )
             if turn != "completed":
                 self._schedule_retry(f"turn {turn.replace('_', ' ')}")
             else:
@@ -432,7 +479,9 @@ class AgentInvoker:
             )
         return texts
 
-    def _run_wake_turn(self, *, reply: list[gate.GateReply]) -> TurnOutcome:
+    def _run_wake_turn(
+        self, *, reply: list[gate.GateReply], covering: Sequence[str] = ()
+    ) -> TurnOutcome:
         """One turn for the cycle.
 
         ``reply`` entries are recorded only when the turn has **completed**
@@ -441,6 +490,10 @@ class AgentInvoker:
         not start or that raised records nothing; the cards stay on the
         tray and the ladder brings the next wake. An entry whose record
         fails is logged: it stays unread and the next wake gates it again.
+
+        While the turn runs its conversations (``reply``, plus ``covering``
+        for a gate-less turn) are in flight: a cycle that reads the tray
+        meanwhile does not gate them again.
         """
         texts = self._texts()
         if texts is None:
@@ -455,7 +508,15 @@ class AgentInvoker:
         started = self._start_turn(prompt=wake_turn_prompt(texts, ids), session_id=session_id)
         if started is None:
             return "not_started"
-        if not started():
+        busy = set(ids) | {cid for cid in covering if isinstance(cid, str) and cid}
+        with self._in_flight_lock:
+            self._in_flight |= busy
+        try:
+            completed = started()
+        finally:
+            with self._in_flight_lock:
+                self._in_flight -= busy
+        if not completed:
             logger.warning(
                 "AgentInvoker: turn %s did not complete — reply verdict(s) for %s NOT recorded; "
                 "the conversation(s) stay unread and the next wake gates them again",

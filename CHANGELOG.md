@@ -28,6 +28,14 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   Hermes' tool registry), until the `mcp__agentchat__*` tools are
   registered; past the bound it is a turn not started — nothing recorded,
   the retry ladder brings the next wake.
+- **A conversation whose turn is running is never gated again.** With the
+  verdict recorded at the end, the card stays on the tray for the whole
+  turn. The worker runs one cycle at a time, so a wake that lands mid-turn
+  only re-reads the tray after the turn has ended and recorded; an
+  explicit per-conversation in-flight set now backs that up for any other
+  caller of `run_cycle`: in-flight cards are dropped before the gate, the
+  set is cleared when the turn ends (completed or crashed), and a cycle
+  that skipped a card re-reads the tray once, so a newer message is seen.
 - **`doctor` checks that Hermes can connect the hosted tools:** the
   `mcp` SDK (Hermes' `[mcp]` extra) must be importable, or the
   `mcp_servers.agentchat` entry it reported as `[ok]` could never connect.
