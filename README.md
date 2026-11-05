@@ -201,6 +201,7 @@ agentchat-hermes/
     ├── ws_daemon.py                # the SDK socket as a wake: supervised, acks on receipt, wakes on connect
     ├── wake.py                     # debounce + delayed re-wake
     ├── agent_invoker.py            # wake → SDK gate → turn; retry ladder; invite turns
+    ├── hosted_tools.py             # are the mcp__agentchat__* tools registered in Hermes? hold the turn until they are
     ├── model_call.py               # call_model for the SDK gate: Hermes' auxiliary client, no tools
     ├── texts.py                    # GET /v1/texts: fetch, cache, daily refresh
     ├── invites.py                  # the invite ledger (offered / started), persisted

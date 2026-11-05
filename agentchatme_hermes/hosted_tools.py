@@ -23,9 +23,12 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from .turn import MCP_SERVER_NAME, MCP_TOOL_PREFIX
+
+if TYPE_CHECKING:
+    import threading
 
 logger = logging.getLogger(__name__)
 
@@ -52,22 +55,35 @@ def hosted_tool_names() -> list[str] | None:
     """
     try:
         from tools.registry import registry
-    except ImportError:
+    except Exception:
+        # Not a Hermes process (or a registry that does not import): unknown.
+        return None
+    by_toolset = getattr(registry, "get_tool_names_for_toolset", None)
+    all_names = getattr(registry, "get_all_tool_names", None)
+    if not callable(by_toolset) or not callable(all_names):
+        # A stray ``tools/registry.py`` that is not Hermes': unknown, no hold.
+        _warn_once("hosted_tools: tools.registry has no Hermes tool registry — not holding turns")
         return None
     try:
-        names = [str(n) for n in registry.get_tool_names_for_toolset(HOSTED_TOOLSET)]
+        names = [str(n) for n in by_toolset(HOSTED_TOOLSET)]
         if not names:
-            names = [
-                str(n)
-                for n in registry.get_all_tool_names()
-                if str(n).startswith(HOSTED_TOOL_NAME_PREFIX)
-            ]
-    except Exception:
-        # A registry shape we do not know is "nothing registered": a turn
-        # waits and, if it comes to it, does not start — never a crash.
-        logger.debug("hosted_tools: registry probe raised", exc_info=True)
-        return []
+            names = [str(n) for n in all_names() if str(n).startswith(HOSTED_TOOL_NAME_PREFIX)]
+    except Exception as exc:
+        # Registry drift: unknown rather than "none registered", so a probe
+        # that cannot work does not hold and ladder every cycle.
+        _warn_once(f"hosted_tools: registry probe raised ({exc!r}) — not holding turns")
+        return None
     return sorted(names)
+
+
+_warned: set[str] = set()
+
+
+def _warn_once(message: str) -> None:
+    if message in _warned:
+        return
+    _warned.add(message)
+    logger.warning(message)
 
 
 def hosted_tools_ready(probe: Probe | None = None) -> bool | None:
@@ -86,18 +102,32 @@ def wait_for_hosted_tools(
     probe: Probe | None = None,
     sleep: Callable[[float], None] | None = None,
     now: Callable[[], float] | None = None,
+    stopped: threading.Event | None = None,
     label: str = "turn",
-) -> bool:
+) -> bool | None:
     """Hold until the hosted tools are registered, at most ``timeout_s``.
 
     Returns ``True`` when they are there (or when it cannot be known —
-    outside Hermes), ``False`` after the bound. Logs once when it starts
-    waiting and once when the wait ends, so a slow start is visible. The
-    probe and the clock are resolved at call time (tests swap them).
+    outside Hermes), ``False`` after the bound, ``None`` when ``stopped``
+    was set meanwhile (the invoker is stopping — its leader lease is gone,
+    nothing may start). Logs once when it starts waiting and once when the
+    wait ends, so a slow start is visible. The probe and the clock are
+    resolved at call time (tests swap them); with ``stopped`` the poll
+    waits on the event, so a stop ends the hold at once.
     """
     probe = probe or hosted_tool_names
-    sleep = sleep or time.sleep
     now = now or time.monotonic
+    if sleep is None:
+        if stopped is not None:
+            event = stopped
+
+            def sleep(seconds: float) -> None:
+                event.wait(seconds)
+
+        else:
+            sleep = time.sleep
+    if stopped is not None and stopped.is_set():
+        return None
     ready = hosted_tools_ready(probe)
     if ready is None or ready:
         return True
@@ -121,6 +151,9 @@ def wait_for_hosted_tools(
             )
             return False
         sleep(min(poll_s, max(0.0, timeout_s - elapsed)))
+        if stopped is not None and stopped.is_set():
+            logger.info("AgentInvoker: stopping while holding the %s — it is not started", label)
+            return None
         ready = hosted_tools_ready(probe)
         if ready is None or ready:
             logger.info(

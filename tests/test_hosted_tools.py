@@ -68,9 +68,35 @@ class TestProbe:
         assert hosted_tools.hosted_tools_ready() is False
 
     @pytest.mark.parametrize("raise_on", ["toolset", "all"])
-    def test_registry_raising_means_nothing_registered(self, monkeypatch: pytest.MonkeyPatch, raise_on: str) -> None:
+    def test_registry_raising_is_unknown_not_a_hold(self, monkeypatch: pytest.MonkeyPatch, raise_on: str, caplog: pytest.LogCaptureFixture) -> None:
+        """Registry drift must not hold and ladder every cycle: unknown, warned once."""
         _fake_registry(monkeypatch, toolset=[], all_names=[], raise_on=raise_on)
-        assert hosted_tools.hosted_tool_names() == []
+        hosted_tools._warned.clear()
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.hosted_tools"):
+            assert hosted_tools.hosted_tool_names() is None
+            assert hosted_tools.hosted_tool_names() is None
+        assert len([r for r in caplog.records if "registry probe raised" in r.getMessage()]) == 1
+
+    def test_registry_import_error_other_than_importerror_is_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import types
+
+        tools_pkg = types.ModuleType("tools")
+        tools_pkg.__path__ = []  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+        monkeypatch.setitem(sys.modules, "tools.registry", None)  # import raises ImportError
+        assert hosted_tools.hosted_tool_names() is None
+
+    def test_stray_registry_without_hermes_api_is_unknown(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import types
+
+        tools_pkg = types.ModuleType("tools")
+        tools_pkg.__path__ = []  # type: ignore[attr-defined]
+        module = types.ModuleType("tools.registry")
+        module.registry = object()  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+        monkeypatch.setitem(sys.modules, "tools.registry", module)
+        hosted_tools._warned.clear()
+        assert hosted_tools.hosted_tool_names() is None
 
 
 class _Clock:
@@ -121,6 +147,44 @@ class TestWait:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1 and "not started" in warnings[0].getMessage()
         assert "hermes agentchat doctor" in warnings[0].getMessage()
+
+    def test_stopped_ends_the_hold(self, caplog: pytest.LogCaptureFixture) -> None:
+        import threading
+
+        stopped = threading.Event()
+        clock = _Clock()
+        polls = {"n": 0}
+
+        def probe() -> list[str]:
+            polls["n"] += 1
+            if polls["n"] == 2:
+                stopped.set()  # the stop lands between two polls
+            return []
+
+        with caplog.at_level(logging.INFO, logger="agentchatme_hermes.hosted_tools"):
+            result = hosted_tools.wait_for_hosted_tools(timeout_s=30.0, poll_s=0.5, probe=probe, sleep=clock.sleep, now=clock.now, stopped=stopped)
+        assert result is None
+        assert clock.sleeps == [0.5, 0.5], "the stop landed between polls; the next poll wait ended the hold"
+        assert any("stopping while holding" in r.getMessage() for r in caplog.records)
+
+    def test_already_stopped_does_not_probe(self) -> None:
+        import threading
+
+        stopped = threading.Event()
+        stopped.set()
+        probed: list[int] = []
+        assert hosted_tools.wait_for_hosted_tools(probe=lambda: probed.append(1) or [], stopped=stopped) is None
+        assert probed == []
+
+    def test_poll_waits_on_the_stop_event_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import threading
+
+        stopped = threading.Event()
+        waits: list[float] = []
+        monkeypatch.setattr(stopped, "wait", lambda s: waits.append(s) or False)
+        answers: list[list[str]] = [[], ["mcp__agentchat__agentchat_inbox"]]
+        hosted_tools.wait_for_hosted_tools(poll_s=0.25, probe=lambda: answers.pop(0), stopped=stopped)
+        assert waits == [0.25]
 
     def test_default_bound_is_thirty_seconds(self) -> None:
         assert hosted_tools.HOSTED_TOOLS_WAIT_S == 30.0

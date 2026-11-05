@@ -36,6 +36,25 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   caller of `run_cycle`: in-flight cards are dropped before the gate, the
   set is cleared when the turn ends (completed or crashed), and a cycle
   that skipped a card re-reads the tray once, so a newer message is seen.
+- **A turn Hermes reports as failed or partial is not a completed turn.**
+  `run_conversation` does not raise on provider errors, usage limits,
+  content-policy blocks or partial turns; it returns `{"completed": False,
+  "failed": True, "error": …}` or `{"partial": True}`. Such a turn read
+  nothing: the error is logged, nothing is recorded, the ladder re-wakes.
+- **A `reply` whose record the server refused re-wakes on the ladder** like
+  any other card left on the tray, instead of waiting for an unrelated wake.
+- **The hold ends when the invoker stops** (leader lease gone): it polls on
+  the stop event and starts nothing afterwards.
+- **Multiplexed gateways: the worker runs inside its profile's context.**
+  Hermes keys the tool registry's overlay and the home by a context-local
+  `HERMES_HOME` override; a plain thread saw the launch profile's registry
+  (no `mcp__agentchat__*` tools → a held turn that never starts) and built
+  the agent for the wrong home. The invoker's worker and the activation
+  watcher now enter their profile's override for their lifetime
+  (`profile_scope.profile_context`).
+- The hosted-tools probe treats a registry that does not import, is not
+  Hermes' or raises as *unknown* (no hold, warned once), never as "nothing
+  registered".
 - **`doctor` checks that Hermes can connect the hosted tools:** the
   `mcp` SDK (Hermes' `[mcp]` extra) must be importable, or the
   `mcp_servers.agentchat` entry it reported as `[ok]` could never connect.
