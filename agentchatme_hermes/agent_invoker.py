@@ -60,6 +60,7 @@ agent, run a turn, ignore the response.
 from __future__ import annotations
 
 import collections
+import json
 import logging
 import threading
 from pathlib import Path
@@ -78,6 +79,7 @@ from .model_call import build_call_model
 from .profile_scope import profile_context, resolve_hermes_home
 from .turn import (
     MCP_SERVER_NAME,
+    MCP_TOOL_PREFIX,
     invite_session_id,
     invite_turn_prompt,
     wake_session_id,
@@ -620,6 +622,15 @@ class AgentInvoker:
                     "AgentInvoker: turn %s did not complete (%s)", session_id, failure
                 )
                 return False
+            if turn_looked(result) is False:
+                # The turn ran to the end, but every AgentChat tool call in it
+                # failed (transport down, server error): it could not look.
+                logger.warning(
+                    "AgentInvoker: turn %s ended but every AgentChat tool call in it failed — "
+                    "it could not look; nothing is recorded, the cards stay on the tray",
+                    session_id,
+                )
+                return False
             final = result.get("final_response") if isinstance(result, dict) else None
             logger.info(
                 "AgentInvoker: turn complete session=%s final_chars=%d",
@@ -730,6 +741,68 @@ class AgentInvoker:
 
 
 # ─── pure helpers (extracted for unit-testability) ─────────────────────────
+
+_HOSTED_TOOL_MARK = f"{MCP_TOOL_PREFIX}{MCP_SERVER_NAME}__"
+_UNTRUSTED_SOURCE_MARK = f'source="{_HOSTED_TOOL_MARK}'
+
+
+def turn_looked(result: Any) -> bool | None:
+    """Did a turn that ran to the end actually reach AgentChat?
+
+    Reads the transcript Hermes returns (``result["messages"]``: ``role:
+    tool`` messages carry ``name`` and ``content``; a hosted tool's result is
+    wrapped with ``source="mcp__agentchat__…"``, an error is a bare
+    ``{"error": …}`` object). ``False`` only on positive evidence: AgentChat
+    tools were called and every call errored (the MCP transport was down, the
+    server refused) — such a turn could not look and must not record.
+    ``True`` when at least one succeeded; ``None`` when the transcript shows
+    no AgentChat tool call at all (the model's own choice, or a shape this
+    code does not know), which is trusted as before.
+    """
+    messages = result.get("messages") if isinstance(result, dict) else None
+    if not isinstance(messages, list):
+        return None
+    calls = 0
+    succeeded = 0
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "tool":
+            continue
+        name = str(message.get("name") or message.get("tool_name") or "")
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content
+        elif content is None:
+            text = ""
+        else:
+            try:
+                text = json.dumps(content)
+            except (TypeError, ValueError):
+                text = str(content)
+        if not (name.startswith(_HOSTED_TOOL_MARK) or _UNTRUSTED_SOURCE_MARK in text):
+            continue
+        calls += 1
+        if not _is_tool_error(text):
+            succeeded += 1
+    if calls == 0:
+        return None
+    return succeeded > 0
+
+
+def _is_tool_error(text: str) -> bool:
+    """A Hermes tool result that is an error: a bare ``{"error": …}`` payload
+    (unwrapped, or the only object inside the untrusted wrapper)."""
+    body = text.strip()
+    if _UNTRUSTED_SOURCE_MARK in body:
+        # Wrapped data: the payload follows the wrapper's blank line.
+        start = body.find("{")
+        body = body[start:] if start >= 0 else ""
+    if not body.startswith("{"):
+        return False
+    try:
+        payload = json.loads(body[: body.rfind("}") + 1])
+    except ValueError:
+        return body.startswith('{"error"')
+    return isinstance(payload, dict) and "error" in payload and "result" not in payload
 
 
 def turn_failure(result: Any) -> str | None:

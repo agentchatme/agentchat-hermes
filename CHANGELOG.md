@@ -41,6 +41,12 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   content-policy blocks or partial turns; it returns `{"completed": False,
   "failed": True, "error": …}` or `{"partial": True}`. Such a turn read
   nothing: the error is logged, nothing is recorded, the ladder re-wakes.
+- **A turn whose AgentChat tool calls all failed did not look.** The
+  transcript Hermes returns is read: hosted tools called and every call an
+  error (the MCP transport down, the server refusing) → nothing is
+  recorded, the ladder re-wakes. Seen live under a flapping MCP session: the
+  model gave up in text and the 'completed' turn would have read the
+  conversation.
 - **A `reply` whose record the server refused re-wakes on the ladder** like
   any other card left on the tray, instead of waiting for an unrelated wake.
 - **The hold ends when the invoker stops** (leader lease gone): it polls on

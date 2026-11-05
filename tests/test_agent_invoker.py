@@ -420,6 +420,57 @@ class TestRunCycle:
         if result.get("error"):
             assert any(str(result["error"])[:20] in m for m in messages), "the error text is logged"
 
+    def test_turn_whose_agentchat_tool_calls_all_failed_records_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Seen live under a flapping MCP transport: the turn ran to the end,
+        every hosted tool call returned ``{"error": ...}``, the model gave up
+        in text — a 'completed' turn that never looked."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
+        )
+        transcript = [
+            {"role": "user", "content": "You were woken"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "function": {"name": "mcp__agentchat__agentchat_inbox", "arguments": "{}"}}]},
+            {"role": "tool", "name": "mcp__agentchat__agentchat_inbox", "tool_call_id": "c1", "content": '{"error": "MCP call failed: MCPError: Connection closed"}'},
+            {"role": "tool", "name": "tool_call", "tool_call_id": "c2", "content": '{"error": "MCP server \'agentchat\' transport is down; reconnect requested."}'},
+            {"role": "assistant", "content": "Could not reach AgentChat."},
+        ]
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": "Could not reach AgentChat.", "messages": transcript, "completed": True}
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
+            inv.run_cycle()
+        assert client.recorded == [] and "record:a:reply" not in events
+        assert inv.turns == 0 and scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert any("every AgentChat tool call in it failed" in r.getMessage() for r in caplog.records)
+
+    def test_turn_looked_helper(self) -> None:
+        ok_wrapped = '<untrusted_tool_result source="mcp__agentchat__agentchat_inbox">\nThe following content ...\n\n{"result": "{\\n  \\"you\\": \\"@me\\"}"}'
+        err = '{"error": "MCP call failed: MCPError: Connection closed"}'
+        looked = invoker_module.turn_looked
+        # one success among failures → looked
+        assert looked({"messages": [
+            {"role": "tool", "name": "mcp__agentchat__agentchat_inbox", "content": err},
+            {"role": "tool", "name": "mcp__agentchat__agentchat_get_conversation", "content": ok_wrapped},
+        ]}) is True
+        # through Hermes' tool_call bridge: the wrapper names the hosted tool
+        assert looked({"messages": [{"role": "tool", "name": "tool_call", "content": ok_wrapped}]}) is True
+        # every AgentChat call failed → did not look
+        assert looked({"messages": [
+            {"role": "tool", "name": "mcp__agentchat__agentchat_inbox", "content": err},
+            {"role": "tool", "name": "mcp__agentchat__agentchat_send_message", "content": err},
+        ]}) is False
+        # no AgentChat tool call at all, or no transcript: unknown, trusted as before
+        assert looked({"messages": [{"role": "tool", "name": "terminal", "content": err}, {"role": "assistant", "content": "hi"}]}) is None
+        assert looked({"messages": []}) is None
+        assert looked({"final_response": "ok"}) is None
+        assert looked("not a dict") is None
+        # a wrapped error payload counts as an error; a wrapped result does not
+        assert invoker_module._is_tool_error('<untrusted_tool_result source="mcp__agentchat__agentchat_inbox">\n\n{"error": "GROUP_DELETED"}') is True
+        assert invoker_module._is_tool_error(ok_wrapped) is False
+        assert invoker_module._is_tool_error("plain text") is False
+
     def test_turn_failure_helper(self) -> None:
         assert invoker_module.turn_failure({"final_response": "ok"}) is None
         assert invoker_module.turn_failure({"completed": True}) is None
