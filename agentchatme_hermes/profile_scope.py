@@ -30,8 +30,12 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +74,40 @@ def resolve_hermes_home() -> Path:
         return Path.home() / DEFAULT_HOME_DIRNAME
     home: Path = get_hermes_home()
     return Path(home).expanduser()
+
+
+@contextmanager
+def profile_context(home: Path) -> Iterator[None]:
+    """Run the block as Hermes runs ``home``'s own work.
+
+    Hermes keys everything per profile through a context-local ``HERMES_HOME``
+    override (``hermes_constants.set_hermes_home_override``): the tool
+    registry's profile overlay (where a multiplexed gateway registers the
+    ``agentchat`` MCP server's tools), ``get_hermes_home()`` for SOUL.md,
+    ``config.yaml`` and ``.env``, the MCP registry scope. The gateway sets it
+    around each served profile's turns and carries it to its workers with
+    ``copy_context()``; a thread this plugin starts has no such context, so
+    under multiplex it would read the launch profile's registry (no
+    ``mcp__agentchat__*`` tools → a held turn that never starts) and build
+    the agent for the wrong home. Our worker and activation threads enter
+    this for their lifetime. A no-op outside Hermes.
+    """
+    try:
+        from hermes_constants import (
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+    except Exception:
+        yield
+        return
+    token = set_hermes_home_override(str(home))
+    try:
+        yield
+    finally:
+        try:
+            reset_hermes_home_override(token)
+        except Exception:
+            logger.debug("profile_context: reset raised", exc_info=True)
 
 
 def hermes_root_of(home: Path) -> Path:

@@ -53,7 +53,7 @@ from typing import TYPE_CHECKING, Any
 from ._version import __version__
 from .config import ENV_API_KEY, ENV_API_KEY_LEGACY, ConfigError, load_config
 from .leader_lock import is_hermes_gateway_process
-from .profile_scope import profile_label, resolve_hermes_home
+from .profile_scope import profile_context, profile_label, resolve_hermes_home
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -235,14 +235,18 @@ class ActivationWatcher:
         self._stop.set()
 
     def _loop(self) -> None:
-        while not self._stop.wait(self.next_delay()):
-            try:
-                if self.try_activate() == "active":
-                    return
-            except Exception:
-                # The watcher must outlive any surprise; log and keep going.
-                logger.exception("agentchat plugin: activation attempt raised")
-                self._failures += 1
+        # A late activation builds the runtime from this thread: do it in the
+        # profile's own context, as register() did (multiplex: the launch
+        # profile's environment is not this profile's).
+        with profile_context(self._hermes_home):
+            while not self._stop.wait(self.next_delay()):
+                try:
+                    if self.try_activate() == "active":
+                        return
+                except Exception:
+                    # The watcher must outlive any surprise; log and keep going.
+                    logger.exception("agentchat plugin: activation attempt raised")
+                    self._failures += 1
 
 
 def _is_gateway_context(ctx: Any) -> bool:

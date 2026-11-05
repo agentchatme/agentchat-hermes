@@ -211,10 +211,13 @@ class TestDoctor:
         # normally (no file means warn), and force gateway-detection
         # off so the test doesn't depend on host process state.
         monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)  # type: ignore[attr-defined]
+        # Hermes' MCP client is present on a clean install (the [mcp] extra).
+        monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)  # type: ignore[attr-defined]
 
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         captured = capsys.readouterr()  # type: ignore[attr-defined]
         assert "Authenticated as @alice" in captured.out
+        assert "[ok]   Hermes MCP client importable" in captured.out
         assert "manual bundled" in captured.out
         # Exit code reflects failures only (warnings allowed). Plausible
         # warns from a fresh checkout: no gateway process, no SOUL.md
@@ -240,3 +243,49 @@ class TestDoctor:
         cli._dispatch_doctor(argparse.Namespace(fix=False))
         captured = capsys.readouterr()  # type: ignore[attr-defined]
         assert "pre-v3 name AGENTCHATME_API_KEY" in captured.out
+
+
+class TestDoctorHermesMcpClient:
+    """Hermes connects the hosted tools with the ``mcp`` SDK (its ``[mcp]``
+    extra). Without it the ``mcp_servers.agentchat`` entry can never connect
+    and every turn runs tool-less — the 0.4.0 live-fire's first failure."""
+
+    def _run(self, monkeypatch: object, capsys: object, importable: bool) -> tuple[int, str]:
+        import argparse
+
+        from agentchatme_hermes import cli
+
+        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: None)  # type: ignore[attr-defined]
+        monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: importable)  # type: ignore[attr-defined]
+        rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
+        return rc, capsys.readouterr().out  # type: ignore[attr-defined]
+
+    def test_missing_mcp_sdk_fails_with_the_fix(self, monkeypatch: object, capsys: object) -> None:
+        rc, out = self._run(monkeypatch, capsys, importable=False)
+        assert "[fail] Hermes cannot connect the hosted tools" in out
+        assert "hermes-agent[mcp]" in out
+        assert rc >= 2, "the missing key and the missing SDK are two failures"
+
+    def test_present_mcp_sdk_is_ok(self, monkeypatch: object, capsys: object) -> None:
+        rc, out = self._run(monkeypatch, capsys, importable=True)
+        assert "[ok]   Hermes MCP client importable" in out
+        assert rc == 1, "only the missing key fails"
+
+    def test_probe_imports_the_streamable_http_client(self, monkeypatch: object) -> None:
+        import importlib
+        import sys
+
+        from agentchatme_hermes import cli
+
+        monkeypatch.setitem(sys.modules, "mcp", None)  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "mcp.client.streamable_http", None)  # type: ignore[attr-defined]
+        assert cli._hermes_mcp_client_importable() is False
+        real = importlib.import_module
+
+        def fake_import(name: str) -> object:
+            if name == "mcp.client.streamable_http":
+                return object()
+            return real(name)
+
+        monkeypatch.setattr(importlib, "import_module", fake_import)  # type: ignore[attr-defined]
+        assert cli._hermes_mcp_client_importable() is True

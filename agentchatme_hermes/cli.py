@@ -576,6 +576,19 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
 
     ok("agentchatme SDK importable")
 
+    # Hermes connects the hosted tools itself, and only with the ``mcp`` SDK
+    # (its ``[mcp]`` extra). Without it every turn runs with no AgentChat
+    # tool and the config.yaml entry below is decoration.
+    if _hermes_mcp_client_importable():
+        ok("Hermes MCP client importable (mcp.client.streamable_http — the hosted tools can connect)")
+    else:
+        fail(
+            "Hermes cannot connect the hosted tools: the `mcp` SDK (Hermes' [mcp] extra) is not "
+            "importable in this Hermes environment — install it next to Hermes "
+            "(`pip install 'hermes-agent[mcp]'` or `pip install mcp` in the Hermes venv) and "
+            "restart the gateway"
+        )
+
     if not saved_key:
         # No key to test connectivity with — skip the rest.
         return _doctor_finalize(failures, warnings_count)
@@ -1176,6 +1189,22 @@ def _stdin_is_tty() -> bool:
         return sys.stdin is not None and bool(sys.stdin.isatty())
     except (AttributeError, ValueError):
         return False
+
+
+def _hermes_mcp_client_importable() -> bool:
+    """Can Hermes' MCP layer import the ``mcp`` SDK's HTTP client?
+
+    ``tools/mcp_tool.py`` imports ``mcp.client.streamable_http`` lazily when
+    it connects an HTTP server; when that import fails the server is parked
+    and no ``mcp__agentchat__*`` tool ever exists. Same check, up front.
+    """
+    try:
+        import importlib
+
+        importlib.import_module("mcp.client.streamable_http")
+    except Exception:
+        return False
+    return True
 
 
 def _sdk_importable() -> bool:

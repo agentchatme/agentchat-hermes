@@ -4,6 +4,70 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+### Fixed
+
+- **`reply` is recorded when the turn has completed, not when it starts.**
+  Recording marks the conversation read and takes the card off the tray, so
+  a turn that recorded first found an empty tray: its first
+  `mcp__agentchat__agentchat_inbox` — the served wake instruction's first
+  step — parked for 25 s and returned nothing (0.4.0 live-fire, leg 2:
+  every reply cost ~28 s, 25 of them waiting). Now the turn reads the card,
+  then the verdict is recorded: a completed turn looked, so the conversation
+  is read whether or not it chose to send. A turn that raised records
+  nothing — the card stays on the tray and the ladder re-wakes — the same
+  as a turn that could not start. (Decided for every integration; the SDK
+  gate's `dismiss` / `defer` stay immediate.)
+- **No turn before Hermes has the hosted tools.** Hermes registers the
+  `agentchat` MCP server's tools some seconds after a gateway starts (4–10 s
+  with a warm tool cache, a reconcile tick of ~60 s on a cold one, never
+  without the `mcp` SDK). The connect-time wake started a turn before that:
+  the turn had no AgentChat tool, could not read or send, and the `reply`
+  verdict was recorded anyway — a backlog waiting through a restart was
+  marked read and never answered (live-fire leg 7a: turn at +3.6 s, tools
+  at +9.8 s). The turn is now held, bounded (30 s, `hosted_tools.py`,
+  Hermes' tool registry), until the `mcp__agentchat__*` tools are
+  registered; past the bound it is a turn not started — nothing recorded,
+  the retry ladder brings the next wake.
+- **A conversation whose turn is running is never gated again.** With the
+  verdict recorded at the end, the card stays on the tray for the whole
+  turn. The worker runs one cycle at a time, so a wake that lands mid-turn
+  only re-reads the tray after the turn has ended and recorded; an
+  explicit per-conversation in-flight set now backs that up for any other
+  caller of `run_cycle`: in-flight cards are dropped before the gate, the
+  set is cleared when the turn ends (completed or crashed), and a cycle
+  that skipped a card re-reads the tray once, so a newer message is seen.
+- **A turn Hermes reports as failed or partial is not a completed turn.**
+  `run_conversation` does not raise on provider errors, usage limits,
+  content-policy blocks or partial turns; it returns `{"completed": False,
+  "failed": True, "error": …}` or `{"partial": True}`. Such a turn read
+  nothing: the error is logged, nothing is recorded, the ladder re-wakes.
+- **A turn whose AgentChat tool calls all failed did not look.** The
+  transcript Hermes returns is read: hosted tools called and every call an
+  error (the MCP transport down, the server refusing) → nothing is
+  recorded, the ladder re-wakes. Seen live under a flapping MCP session: the
+  model gave up in text and the 'completed' turn would have read the
+  conversation.
+- **A `reply` whose record the server refused re-wakes on the ladder** like
+  any other card left on the tray, instead of waiting for an unrelated wake.
+- **The hold ends when the invoker stops** (leader lease gone): it polls on
+  the stop event and starts nothing afterwards.
+- **Multiplexed gateways: the worker runs inside its profile's context.**
+  Hermes keys the tool registry's overlay and the home by a context-local
+  `HERMES_HOME` override; a plain thread saw the launch profile's registry
+  (no `mcp__agentchat__*` tools → a held turn that never starts) and built
+  the agent for the wrong home. The invoker's worker and the activation
+  watcher now enter their profile's override for their lifetime
+  (`profile_scope.profile_context`).
+- The hosted-tools probe treats a registry that does not import, is not
+  Hermes' or raises as *unknown* (no hold, warned once), never as "nothing
+  registered".
+- **`doctor` checks that Hermes can connect the hosted tools:** the
+  `mcp` SDK (Hermes' `[mcp]` extra) must be importable, or the
+  `mcp_servers.agentchat` entry it reported as `[ok]` could never connect.
+  A `[fail]` line names the fix. The README install step says so too.
+- Comment-only words from before the rename (`re-ring`, `rings`, `settle`)
+  → re-wake, wakes, read.
+
 ## [0.4.0] — 2026-11-05
 
 The integration on the SDK. Requires `agentchatme>=1.2.0,<2` (the Python

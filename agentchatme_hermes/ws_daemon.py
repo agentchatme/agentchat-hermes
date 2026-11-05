@@ -25,8 +25,8 @@ sends for a deferred conversation) is the same wake with no message at all.
   before any handler runs. Delivered means *this machine received it*;
   whether the agent has looked is read state, set by a verdict or a read
   through the SDK, so an early ack never empties the tray. The pre-Phase-1
-  daemon switched acks off because recording delivery used to settle the
-  conversation; that coupling is gone.
+  daemon switched acks off because recording delivery used to mark the
+  conversation read; that coupling is gone.
 * **Group invites** arrive on their own frame (``group.invite.received``) and
   are not on the tray; they are handed to the invoker as a second wake
   kind, deduplicated by invite id per process and caught up on connect.

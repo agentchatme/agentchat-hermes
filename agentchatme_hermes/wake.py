@@ -12,7 +12,7 @@ tray is the truth, the wake is not.
 Also offers :meth:`wake_after` for the local retry ladder: when a gate cycle
 could not complete (model unreachable, server error, turn not started) the
 integration schedules another wake later instead of dropping the tray. The
-server's own ladder rings webhooks; a connected socket gets no re-ring, so
+server's own ladder wakes webhooks; a connected socket gets no re-wake, so
 the integration carries that duty itself.
 
 Thread-safe; callbacks run on a timer thread and must return quickly (the

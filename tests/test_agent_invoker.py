@@ -8,9 +8,12 @@ and the recording. What must hold:
 * a wake becomes exactly one cycle: one tray read, one gate call;
 * ``dismiss`` / ``defer`` are recorded at once, with the card's anchor;
 * ``reply`` starts ONE turn with the served wake instruction, and each
-  ``reply`` is recorded right after the turn has started — after the agent
-  is built, before ``run_conversation`` is entered;
-* a turn that fails to start records nothing and re-wakes on the ladder;
+  ``reply`` is recorded only once the turn has COMPLETED — after
+  ``run_conversation`` returned — so the turn's own inbox read still sees
+  the card;
+* a turn that fails to start, or that raises, records nothing and re-wakes
+  on the ladder; a turn is not started while Hermes has not registered the
+  hosted ``mcp__agentchat__*`` tools (bounded hold);
 * fail-closed records nothing, starts nothing, and re-wakes on the ladder;
 * gate disabled → the turn starts straight from the tray, nothing recorded;
 * no served texts → no turn, nothing recorded for ``reply``;
@@ -33,6 +36,7 @@ import pytest
 from agentchatme.types import InboxTray, Texts
 
 from agentchatme_hermes import agent_invoker as invoker_module
+from agentchatme_hermes import hosted_tools as hosted_tools_module
 from agentchatme_hermes.agent_invoker import _FALLBACK_MODEL, AgentInvoker, _coerce_model_string
 from agentchatme_hermes.invites import InviteLedger
 from agentchatme_hermes.turn import invite_turn_prompt, wake_turn_prompt
@@ -40,6 +44,8 @@ from agentchatme_hermes.types import AgentIdentity, GroupInviteEvent
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+_REAL_PROBE = hosted_tools_module.hosted_tool_names
 
 TEXTS = Texts.model_validate(
     {
@@ -99,11 +105,16 @@ class _Client:
         self.tray_calls: list[dict[str, Any]] = []
         self.recorded: list[tuple[str, str, str | None]] = []
         self.record_error: Exception | None = None
+        # A live fake inbox: a callable that builds the tray from the state
+        # the server would hold (what is unread given what was recorded).
+        self.live_inbox: Any = None
         self.inbox = SimpleNamespace(tray=self._tray)
         self.decisions = SimpleNamespace(record=self._record)
 
     def _tray(self, *, wait_ms: int = 0, limit: int | None = None) -> InboxTray:
         self.tray_calls.append({"wait_ms": wait_ms, "limit": limit})
+        if self.live_inbox is not None:
+            return self.live_inbox()
         nxt = self.trays.pop(0) if self.trays else _tray()
         if isinstance(nxt, Exception):
             raise nxt
@@ -122,6 +133,22 @@ class _Client:
             raise self.record_error
         self.recorded.append((conversation_id, decision, through_message_id))
         return {"decision": decision}
+
+
+def _fake_stop_wait(monkeypatch: pytest.MonkeyPatch, inv: AgentInvoker, clock: dict[str, float] | None = None) -> list[float]:
+    """The hosted-tools hold polls on the invoker's stop event; record those
+    waits (and advance an injected clock) instead of sleeping."""
+    waits: list[float] = []
+    real_is_set = inv._stopped.is_set
+
+    def wait(seconds: float | None = None) -> bool:
+        waits.append(float(seconds or 0.0))
+        if clock is not None:
+            clock["t"] += float(seconds or 0.0)
+        return real_is_set()
+
+    monkeypatch.setattr(inv._stopped, "wait", wait)
+    return waits
 
 
 def _invoker(
@@ -167,6 +194,8 @@ def _invoker(
     monkeypatch.setattr(inv, "_ensure_hermes_resolved", lambda: None)
     monkeypatch.setattr(inv, "_build_agent", build_agent)
     monkeypatch.setattr(inv, "_resolve_model_and_runtime", lambda: ("m", {"provider": "p"}))
+    # Hermes has the hosted tools registered unless a test says otherwise.
+    monkeypatch.setattr(hosted_tools_module, "hosted_tool_names", lambda: ["mcp__agentchat__agentchat_inbox"])
 
     if answer is not None:
 
@@ -208,7 +237,7 @@ class TestCoerceModelString:
 
 
 class TestRunCycle:
-    def test_reply_starts_one_turn_and_records_after_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_reply_starts_one_turn_and_records_after_the_turn(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, client, agent, events = _invoker(
             monkeypatch,
             trays=[_tray(_card("a"), _card("b"))],
@@ -218,8 +247,8 @@ class TestRunCycle:
         assert result is not None and result.outcome == "decided"
         assert client.tray_calls == [{"wait_ms": 0, "limit": 50}]
         # dismiss recorded by the SDK gate at once, with the card's anchor;
-        # reply recorded by the host after the agent is built, before the turn runs.
-        assert events == ["model", "record:b:dismiss", "build", "record:a:reply", "run"]
+        # reply recorded by the host only after the turn has completed.
+        assert events == ["model", "record:b:dismiss", "build", "run", "record:a:reply"]
         assert client.recorded == [("b", "dismiss", "msg_b"), ("a", "reply", "msg_a")]
         agent.run_conversation.assert_called_once_with(
             wake_turn_prompt(TEXTS, ["a"]), conversation_history=[]
@@ -339,16 +368,221 @@ class TestRunCycle:
         assert inv.turns == 0 and inv.recorded_replies == 0
         assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
 
-    def test_crash_after_start_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """``run_conversation`` raising is a crash after the turn started: the
-        accepted trade-off — the verdict is recorded, the worker survives."""
+    def test_crashed_turn_records_nothing_and_rewakes(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``run_conversation`` raising: the turn did not look, so nothing is
+        recorded — the card stays on the tray, the ladder brings the next
+        wake, the worker survives."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"), _card("b"))], answer=_answer(a="reply", b="dismiss")
+        )
+        agent.run_conversation.side_effect = RuntimeError("provider exploded")
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
+            inv.run_cycle()  # must not raise
+        assert client.recorded == [("b", "dismiss", "msg_b")], "reply NOT recorded"
+        assert "record:a:reply" not in events
+        assert inv.turns == 0 and inv.recorded_replies == 0
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert any("NOT recorded" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.parametrize(
+        "result",
+        [
+            {"completed": False, "failed": True, "error": "usage limit reached", "failure_reason": "usage_limit"},
+            {"completed": False, "failed": True, "error": "content_policy_blocked: x"},
+            {"final_response": "half", "completed": False, "error": "half", "partial": True},
+            {"completed": False},
+        ],
+        ids=["failed", "policy", "partial", "not-completed"],
+    )
+    def test_failed_or_partial_result_is_a_crash_nothing_recorded(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, result: dict[str, Any]
+    ) -> None:
+        """Hermes reports provider errors, usage limits, policy blocks and partial
+        turns IN the result, not as exceptions. Such a turn read nothing."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"), _card("b"))], answer=_answer(a="reply", b="dismiss")
+        )
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: result
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
+            inv.run_cycle()
+        assert client.recorded == [("b", "dismiss", "msg_b")], "reply NOT recorded"
+        assert "record:a:reply" not in events
+        assert inv.turns == 0 and inv.recorded_replies == 0
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("did not complete" in m for m in messages)
+        if result.get("error"):
+            assert any(str(result["error"])[:20] in m for m in messages), "the error text is logged"
+
+    def test_turn_whose_agentchat_tool_calls_all_failed_records_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Seen live under a flapping MCP transport: the turn ran to the end,
+        every hosted tool call returned ``{"error": ...}``, the model gave up
+        in text — a 'completed' turn that never looked."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
+        )
+        transcript = [
+            {"role": "user", "content": "You were woken"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "function": {"name": "mcp__agentchat__agentchat_inbox", "arguments": "{}"}}]},
+            {"role": "tool", "name": "mcp__agentchat__agentchat_inbox", "tool_call_id": "c1", "content": '{"error": "MCP call failed: MCPError: Connection closed"}'},
+            {"role": "tool", "name": "tool_call", "tool_call_id": "c2", "content": '{"error": "MCP server \'agentchat\' transport is down; reconnect requested."}'},
+            {"role": "assistant", "content": "Could not reach AgentChat."},
+        ]
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": "Could not reach AgentChat.", "messages": transcript, "completed": True}
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
+            inv.run_cycle()
+        assert client.recorded == [] and "record:a:reply" not in events
+        assert inv.turns == 0 and scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert any("every AgentChat tool call in it failed" in r.getMessage() for r in caplog.records)
+
+    def test_turn_looked_helper(self) -> None:
+        ok_wrapped = '<untrusted_tool_result source="mcp__agentchat__agentchat_inbox">\nThe following content ...\n\n{"result": "{\\n  \\"you\\": \\"@me\\"}"}'
+        err = '{"error": "MCP call failed: MCPError: Connection closed"}'
+        looked = invoker_module.turn_looked
+        # one success among failures → looked
+        assert looked({"messages": [
+            {"role": "tool", "name": "mcp__agentchat__agentchat_inbox", "content": err},
+            {"role": "tool", "name": "mcp__agentchat__agentchat_get_conversation", "content": ok_wrapped},
+        ]}) is True
+        # through Hermes' tool_call bridge: the wrapper names the hosted tool
+        assert looked({"messages": [{"role": "tool", "name": "tool_call", "content": ok_wrapped}]}) is True
+        # every AgentChat call failed → did not look
+        assert looked({"messages": [
+            {"role": "tool", "name": "mcp__agentchat__agentchat_inbox", "content": err},
+            {"role": "tool", "name": "mcp__agentchat__agentchat_send_message", "content": err},
+        ]}) is False
+        # no AgentChat tool call at all, or no transcript: unknown, trusted as before
+        assert looked({"messages": [{"role": "tool", "name": "terminal", "content": err}, {"role": "assistant", "content": "hi"}]}) is None
+        assert looked({"messages": []}) is None
+        assert looked({"final_response": "ok"}) is None
+        assert looked("not a dict") is None
+        # a wrapped error payload counts as an error; a wrapped result does not
+        assert invoker_module._is_tool_error('<untrusted_tool_result source="mcp__agentchat__agentchat_inbox">\n\n{"error": "GROUP_DELETED"}') is True
+        assert invoker_module._is_tool_error(ok_wrapped) is False
+        assert invoker_module._is_tool_error("plain text") is False
+
+    def test_turn_failure_helper(self) -> None:
+        assert invoker_module.turn_failure({"final_response": "ok"}) is None
+        assert invoker_module.turn_failure({"completed": True}) is None
+        assert invoker_module.turn_failure("not a dict") is None
+        assert invoker_module.turn_failure(None) is None
+        assert invoker_module.turn_failure({"failed": True, "error": "boom", "failure_reason": "provider_error"}) == "failed, provider_error: boom"
+        assert invoker_module.turn_failure({"partial": True, "error": "cut"}) == "partial: cut"
+        assert invoker_module.turn_failure({"completed": False}) == "not completed: no error text"
+
+    def test_turn_reads_the_card_before_reply_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """What the ordering is for: the turn's first ``agentchat_inbox`` must
+        still see the card. A fake hosted inbox serves the card while the
+        conversation is unread and an empty tray (as the server does) once a
+        ``reply`` / ``dismiss`` verdict has been recorded for it."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
+        )
+        read_by_turn: list[list[str]] = []
+
+        def hosted_inbox() -> list[str]:
+            read = {cid for cid, decision, _anchor in client.recorded if decision in ("reply", "dismiss")}
+            return [cid for cid in ("a",) if cid not in read]
+
+        def run_conversation(prompt: str, conversation_history: list[Any]) -> dict[str, Any]:
+            events.append("run")
+            read_by_turn.append(hosted_inbox())  # the turn's first step, per the wake instruction
+            return {"final_response": "sent"}
+
+        agent.run_conversation.side_effect = run_conversation
+        inv.run_cycle()
+        assert read_by_turn == [["a"]], "the card was on the tray when the turn looked — no empty park"
+        assert client.recorded == [("a", "reply", "msg_a")]
+        assert events.index("run") < events.index("record:a:reply")
+
+    def test_completed_turn_that_chose_silence_still_counts_as_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, client, agent, _events = _invoker(
             monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
         )
-        agent.run_conversation.side_effect = RuntimeError("provider exploded")
-        inv.run_cycle()  # must not raise
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": ""}
+        inv.run_cycle()
+        assert client.recorded == [("a", "reply", "msg_a")], "it looked; the conversation is read"
+        assert inv.turns == 1
+
+    def test_turn_waits_for_the_hosted_tools(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        """Hermes registers the ``agentchat`` MCP tools after the gateway starts;
+        the turn is held until they are there, then runs and records."""
+        inv, client, _agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
+        )
+        answers: list[list[str]] = [[], []]
+        monkeypatch.setattr(
+            hosted_tools_module, "hosted_tool_names",
+            lambda: answers.pop(0) if answers else ["mcp__agentchat__agentchat_inbox"],
+        )
+        slept = _fake_stop_wait(monkeypatch, inv)
+        with caplog.at_level(logging.INFO, logger="agentchatme_hermes.hosted_tools"):
+            inv.run_cycle()
+        assert slept == [hosted_tools_module.HOSTED_TOOLS_POLL_S] * 2
+        assert events[-2:] == ["run", "record:a:reply"]
         assert client.recorded == [("a", "reply", "msg_a")]
-        assert inv.turns == 0
+        assert any("holding the turn" in r.getMessage() for r in caplog.records)
+
+    def test_no_hosted_tools_within_the_bound_is_a_turn_not_started(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Past the bound nothing is recorded, no turn runs, the ladder re-wakes
+        (leg 7a of the 0.4.0 live-fire: a tool-less turn had recorded the reply)."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"), _card("b"))], answer=_answer(a="reply", b="dismiss")
+        )
+        monkeypatch.setattr(hosted_tools_module, "hosted_tool_names", lambda: [])
+        clock = {"t": 0.0}
+        _fake_stop_wait(monkeypatch, inv, clock)
+        monkeypatch.setattr(hosted_tools_module.time, "monotonic", lambda: clock["t"])
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.hosted_tools"):
+            inv.run_cycle()
+        agent.run_conversation.assert_not_called()
+        assert "build" not in events, "no agent is even built"
+        assert client.recorded == [("b", "dismiss", "msg_b")], "reply NOT recorded"
+        assert inv.turns == 0 and inv.recorded_replies == 0
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert clock["t"] == pytest.approx(hosted_tools_module.HOSTED_TOOLS_WAIT_S)
+        assert any("not started" in r.getMessage() for r in caplog.records)
+
+    def test_stop_during_the_hold_starts_nothing(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        """A stop (leader lease gone) ends the hold at once: no turn starts
+        seconds after the lease, nothing is recorded."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
+        )
+        monkeypatch.setattr(hosted_tools_module, "hosted_tool_names", lambda: [])
+        def wait_then_stop(seconds: float | None = None) -> bool:
+            inv._stopped.set()  # the stop lands during the first poll
+            return True
+
+        monkeypatch.setattr(inv._stopped, "wait", wait_then_stop)
+        with caplog.at_level(logging.INFO, logger="agentchatme_hermes.hosted_tools"):
+            inv.run_cycle()
+        agent.run_conversation.assert_not_called()
+        assert "build" not in events and client.recorded == []
+        assert any("stopping while holding" in r.getMessage() for r in caplog.records)
+
+    def test_outside_hermes_the_hold_is_skipped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _client, _agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
+        )
+        monkeypatch.setattr(hosted_tools_module, "hosted_tool_names", lambda: None)
+        slept = _fake_stop_wait(monkeypatch, inv)
+        inv.run_cycle()
+        assert slept == [] and events[-1] == "record:a:reply"
 
     def test_record_failure_after_start_is_logged_not_raised(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -361,11 +595,37 @@ class TestRunCycle:
             raise RuntimeError("503")
 
         client.decisions = SimpleNamespace(record=failing_record)
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
             inv.run_cycle()
         agent.run_conversation.assert_called_once()
         assert any("not recorded" in r.getMessage() for r in caplog.records)
-        assert inv.turns == 1 and inv.recorded_replies == 0
+        assert inv.turns == 1 and inv.recorded_replies == 0, "the turn ran; the verdict did not land"
+        # The card is still on the tray: the ladder brings the next look, not an unrelated wake.
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv._retry_rung == 1
+
+    def test_reply_record_failure_does_not_leak_into_the_next_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, _agent, _events = _invoker(
+            monkeypatch, trays=[_tray(_card("a")), _tray(_card("a"))], answer=_answer(a="reply")
+        )
+        calls = {"n": 0}
+        real = client._record
+
+        def flaky(conversation_id: str, **kw: Any) -> dict[str, Any]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("503")
+            return real(conversation_id, **kw)
+
+        client.decisions = SimpleNamespace(record=flaky)
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        inv.run_cycle()
+        inv.run_cycle()
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]], "only the failed cycle laddered"
+        assert inv._retry_rung == 0 and client.recorded == [("a", "reply", "msg_a")]
 
     def test_without_texts_no_turn_and_reply_stays_unrecorded(
         self, monkeypatch: pytest.MonkeyPatch
@@ -518,6 +778,221 @@ class TestWorker:
         inv.stop()
         assert time.monotonic() - started < 2.5
         inv.wake()  # ignored after stop
+
+
+def _server_like_inbox(client: _Client, unread: dict[str, str]) -> Any:
+    """The tray as the server builds it: one card per conversation with a
+    message newer than its last ``reply``/``dismiss`` anchor. ``unread`` maps
+    conversation id → newest message id and is mutated by the test as peers
+    write."""
+
+    def tray() -> InboxTray:
+        read_through = {
+            cid: anchor for cid, decision, anchor in client.recorded if decision in ("reply", "dismiss")
+        }
+        cards = []
+        for cid, newest in unread.items():
+            if read_through.get(cid) == newest:
+                continue
+            card = _card(cid)
+            card["preview"]["message_id"] = newest
+            cards.append(card)
+        return _tray(*cards)
+
+    return tray
+
+
+class TestInFlightConversations:
+    """``reply`` is recorded at the end of the turn, so the card is on the
+    tray for the whole turn. Through the worker — the production path — a
+    wake that lands mid-turn re-reads the tray only after the turn has
+    ended and recorded: one turn, one record. A message newer than the
+    anchor, arriving after the turn, earns a new turn."""
+
+    def test_wake_during_a_turn_does_not_gate_the_conversation_again(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        inv, client, agent, events = _invoker(monkeypatch, trays=[], answer=_answer(a="reply"))
+        unread = {"a": "msg_a"}
+        client.live_inbox = _server_like_inbox(client, unread)
+        in_turn = threading.Event()
+        release = threading.Event()
+
+        def long_turn(prompt: str, conversation_history: list[Any]) -> dict[str, Any]:
+            events.append("run")
+            in_turn.set()
+            assert release.wait(5.0)
+            return {"final_response": "sent"}
+
+        agent.run_conversation.side_effect = long_turn
+        # Deterministic: wakes are delivered to the worker the way the
+        # coalescer delivers them (``_on_wake_fired``: mark a cycle due), and
+        # every cycle end releases a semaphore the test acquires — nothing
+        # here waits on a clock.
+        cycles_done = threading.Semaphore(0)
+        real_cycle = inv.run_cycle
+
+        def signalled_cycle() -> Any:
+            try:
+                return real_cycle()
+            finally:
+                cycles_done.release()
+
+        monkeypatch.setattr(inv, "run_cycle", signalled_cycle)
+        inv.start()
+        try:
+            inv._on_wake_fired()  # wake 1
+            assert in_turn.wait(10.0), "turn 1 is running"
+            assert inv.in_flight() == {"a"}
+            inv._on_wake_fired()  # wakes while the turn runs: the card is still on the tray
+            inv._on_wake_fired()
+            assert inv._cycle_due.is_set(), "exactly one follow-up cycle is due"
+            release.set()
+            assert cycles_done.acquire(timeout=10.0), "cycle 1 (the turn) ended"
+            assert cycles_done.acquire(timeout=10.0), "cycle 2 (the follow-up) ended"
+            assert inv.cycles == 2 and not inv._cycle_due.is_set()
+            assert inv.in_flight() == set()
+            assert agent.run_conversation.call_count == 1, "one turn for the conversation"
+            assert client.recorded == [("a", "reply", "msg_a")], "one record"
+            assert events.count("model") == 1, "gated once: the second cycle saw an empty tray"
+
+            # A newer message after the turn: a new card, a new turn, a new record.
+            unread["a"] = "msg_a2"
+            inv._on_wake_fired()
+            assert cycles_done.acquire(timeout=10.0), "cycle 3 (the new turn) ended"
+            assert client.recorded == [("a", "reply", "msg_a"), ("a", "reply", "msg_a2")]
+            assert agent.run_conversation.call_count == 2 and inv.cycles == 3
+        finally:
+            release.set()
+            inv.stop()
+
+    def test_concurrent_cycle_skips_the_in_flight_card_and_rereads_later(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Belt and braces for any caller that is not the worker: a cycle run
+        while a turn is in flight drops that card before the gate, records
+        nothing for it, and asks for one re-read once the turn has ended."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[], answer=_answer(a="reply", b="dismiss")
+        )
+        unread = {"a": "msg_a"}
+        client.live_inbox = _server_like_inbox(client, unread)
+        in_turn = threading.Event()
+        release = threading.Event()
+
+        def long_turn(prompt: str, conversation_history: list[Any]) -> dict[str, Any]:
+            events.append("run")
+            in_turn.set()
+            assert release.wait(5.0)
+            return {"final_response": "sent"}
+
+        agent.run_conversation.side_effect = long_turn
+        rereads: list[int] = []
+        monkeypatch.setattr(inv._coalescer, "wake", lambda: rereads.append(1))
+        first = threading.Thread(target=inv.run_cycle)
+        first.start()
+        try:
+            assert in_turn.wait(2.0)
+            unread["b"] = "msg_b"  # a second peer writes while a's turn runs
+            with caplog.at_level(logging.INFO, logger="agentchatme_hermes.agent_invoker"):
+                result = inv.run_cycle()  # a concurrent caller, mid-turn
+            assert result is not None and result.outcome == "decided"
+            assert client.recorded == [("b", "dismiss", "msg_b")], "a is not gated again, b is"
+            assert rereads == [1], "one re-read asked for, for when the turn ends"
+            assert any("already have a turn in flight (a)" in r.getMessage() for r in caplog.records)
+        finally:
+            release.set()
+            first.join(5.0)
+        assert client.recorded == [("b", "dismiss", "msg_b"), ("a", "reply", "msg_a")]
+        assert inv.in_flight() == set()
+        assert agent.run_conversation.call_count == 1
+
+    def test_in_flight_is_cleared_when_the_turn_crashes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, agent, _events = _invoker(monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply"))
+        agent.run_conversation.side_effect = RuntimeError("boom")
+        inv.run_cycle()
+        assert inv.in_flight() == set() and client.recorded == []
+
+    def test_gate_less_turn_covers_every_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _client, agent, _events = _invoker(
+            monkeypatch,
+            trays=[_tray(_card("a"), _card("b"))],
+            config=SimpleNamespace(wake_debounce_s=0.0, reply_gate_enabled=False),
+        )
+        seen: list[set[str]] = []
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: seen.append(inv.in_flight()) or {"final_response": ""}
+        inv.run_cycle()
+        assert seen == [{"a", "b"}] and inv.in_flight() == set()
+
+
+class TestProfileContext:
+    """Under a multiplexed gateway Hermes keys the tool registry and the home
+    by a context-local HERMES_HOME override. The worker thread enters its
+    profile's override, so the hosted-tools probe reads that profile's
+    overlay and the agent is built for that home."""
+
+    @staticmethod
+    def _fake_hermes(monkeypatch: pytest.MonkeyPatch, home_with_tools: str) -> Any:
+        import contextvars
+        import sys
+        import types
+
+        override: contextvars.ContextVar[str | None] = contextvars.ContextVar("fake_override", default=None)
+        constants = types.ModuleType("hermes_constants")
+        constants.set_hermes_home_override = lambda path: override.set(str(path))  # type: ignore[attr-defined]
+        constants.reset_hermes_home_override = lambda token: override.reset(token)  # type: ignore[attr-defined]
+        constants.get_hermes_home_override = lambda: override.get()  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "hermes_constants", constants)
+
+        class Registry:
+            def get_tool_names_for_toolset(self, name: str) -> list[str]:
+                # the overlay of the profile in context, as Hermes keys it
+                if override.get() == home_with_tools and name == "mcp-agentchat":
+                    return ["mcp__agentchat__agentchat_inbox"]
+                return []
+
+            def get_all_tool_names(self) -> list[str]:
+                return [*self.get_tool_names_for_toolset("mcp-agentchat"), "terminal"]
+
+        tools_pkg = types.ModuleType("tools")
+        tools_pkg.__path__ = []  # type: ignore[attr-defined]
+        module = types.ModuleType("tools.registry")
+        module.registry = Registry()  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "tools", tools_pkg)
+        monkeypatch.setitem(sys.modules, "tools.registry", module)
+        return override
+
+    def test_worker_probes_and_turns_inside_its_profile(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        home_b = tmp_path / "profiles" / "b"
+        override = self._fake_hermes(monkeypatch, str(home_b))
+        inv, client, agent, _events = _invoker(monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply"))
+        # The fixture stubs the probe; put the real one back: it must read profile b's overlay.
+        monkeypatch.setattr(hosted_tools_module, "hosted_tool_names", _REAL_PROBE)
+        inv._runtime.hermes_home = home_b  # the profile this invoker serves
+        seen: list[str | None] = []
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: seen.append(override.get()) or {"final_response": "ok"}
+        slept = _fake_stop_wait(monkeypatch, inv)
+        inv.start()
+        try:
+            inv.wake()
+            assert _wait_for(lambda: inv.turns == 1, timeout=5.0)
+        finally:
+            inv.stop()
+        assert slept == [], "the probe saw profile b's tools at once — no hold"
+        assert seen == [str(home_b)], "the turn ran inside profile b's context"
+        assert client.recorded == [("a", "reply", "msg_a")]
+        assert override.get() is None, "the test thread's context is untouched"
+
+    def test_without_the_profile_context_the_overlay_is_invisible(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """What the fix is for: the same registry read from a bare thread sees nothing."""
+        from agentchatme_hermes.profile_scope import profile_context
+
+        home_b = tmp_path / "profiles" / "b"
+        self._fake_hermes(monkeypatch, str(home_b))
+        assert _REAL_PROBE() == []
+        with profile_context(home_b):
+            assert _REAL_PROBE() == ["mcp__agentchat__agentchat_inbox"]
+        assert _REAL_PROBE() == []
 
 
 class TestInviteRetry:
