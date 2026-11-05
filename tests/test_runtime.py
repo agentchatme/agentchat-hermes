@@ -365,6 +365,36 @@ class TestClientAndTexts:
                 rt.stop()
             texts_cls.return_value.stop.assert_called_once()
 
+    def test_texts_refresh_thread_enters_this_profiles_context(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The texts store's refresh thread runs in this profile's HERMES_HOME
+        override, so the SOUL.md reconcile it triggers reads this profile's file."""
+        import contextvars
+        import sys
+        import types
+
+        from agentchatme_hermes.runtime import Runtime
+
+        override: contextvars.ContextVar[str | None] = contextvars.ContextVar("override", default=None)
+        constants = types.ModuleType("hermes_constants")
+        constants.set_hermes_home_override = lambda path: override.set(str(path))  # type: ignore[attr-defined]
+        constants.reset_hermes_home_override = lambda token: override.reset(token)  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "hermes_constants", constants)
+        home = tmp_path / ".hermes" / "profiles" / "up"
+        with _patched_runtime(lock_winner=False), patch("agentchatme_hermes.runtime.TextsStore") as texts_cls:
+            texts_cls.return_value.get.return_value = None
+            rt = Runtime(_config(hermes_home=home), gateway_mode=False)
+            rt.start()
+            try:
+                thread_scope = texts_cls.call_args.kwargs["thread_scope"]
+                assert override.get() is None
+                with thread_scope():
+                    assert override.get() == str(home)
+                assert override.get() is None
+            finally:
+                rt.stop()
+
     def test_stop_ends_every_thread_the_runtime_started(self, tmp_path: Path) -> None:
         """A real texts store (no network: the fake client's answer is not a
         ``Texts``, so nothing loads) starts its refresh thread with the

@@ -32,6 +32,7 @@ from .leader_lock import lock_path_for, release_leader_lock, try_acquire_ws_lead
 from .profile_scope import (
     account_fingerprint,
     hermes_home_key,
+    profile_context,
     profile_label,
     resolve_hermes_home,
 )
@@ -233,8 +234,13 @@ class Runtime:
                 # The served texts: one synchronous attempt now (server, else
                 # the cache), then a daily refresh. Starting without them is
                 # allowed; the store says so once and keeps trying.
+                home = self._hermes_home
                 self._texts = TextsStore(
-                    client=self._client, cache_path=self._state_dir / TEXTS_FILENAME
+                    client=self._client,
+                    cache_path=self._state_dir / TEXTS_FILENAME,
+                    # The refresh thread's listeners (the SOUL.md reconcile)
+                    # must see this profile's home, not the launch profile's.
+                    thread_scope=lambda: profile_context(home),
                 )
                 self._texts.start()
                 self._invite_ledger = InviteLedger(self._state_dir / INVITES_FILENAME)

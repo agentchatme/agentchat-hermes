@@ -995,6 +995,373 @@ class TestProfileContext:
         assert _REAL_PROBE() == []
 
 
+class _FakeHermesScopes:
+    """Hermes's per-profile scoping, faked faithfully enough to tell profiles apart.
+
+    * ``hermes_constants``: the context-local HERMES_HOME override.
+    * ``agent.secret_scope``: a context-local secret mapping; ``get_secret``
+      reads it and, under multiplex with nothing bound, fails closed as the
+      real module does (``UnscopedSecretError``).
+    * ``gateway.run._profile_runtime_scope(home)``: override + that home's
+      secret mapping; records every entry and exit (with the exception that
+      ended it, if any).
+    * the fallback's three pieces: ``hermes_cli.env_loader.
+      hydrate_profile_secret_sources``, ``tui_gateway.launch_profile_policy.
+      owner_secret_scope`` and ``tools.terminal_scope.
+      install_and_reset_profile_terminal_scope`` — each recorded.
+    * ``gateway.run_turn.GatewayTurnMixin._standalone_launch_scope()``.
+    """
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, secrets: dict[str, dict[str, str]], *,
+                 multiplex: bool = True, with_gateway_helper: bool = True,
+                 helper_raises: Exception | None = None, helper_signature_drift: bool = False,
+                 missing_pieces: tuple[str, ...] = (), standalone_raises: Exception | None = None) -> None:
+        import contextlib
+        import contextvars
+        import sys
+        import types
+
+        self.secrets = secrets
+        self.multiplex = multiplex
+        self.runtime_scope_calls: list[str] = []
+        self.runtime_scope_exits: list[str | None] = []
+        self.standalone_calls = 0
+        self.set_scope_calls: list[tuple[dict[str, str], str | None]] = []
+        self.hydrated: list[str] = []
+        self.terminal_scopes: list[str] = []
+        self.override: contextvars.ContextVar[str | None] = contextvars.ContextVar("fake_override", default=None)
+        self.scope: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar("fake_secret_scope", default=None)
+        fake = self
+
+        def module(name: str, package: bool = False) -> Any:
+            mod = types.ModuleType(name)
+            if package:
+                mod.__path__ = []  # type: ignore[attr-defined]
+            return mod
+
+        constants = module("hermes_constants")
+        constants.set_hermes_home_override = lambda path: fake.override.set(str(path))  # type: ignore[attr-defined]
+        constants.reset_hermes_home_override = lambda token: fake.override.reset(token)  # type: ignore[attr-defined]
+        constants.get_hermes_home_override = lambda: fake.override.get()  # type: ignore[attr-defined]
+
+        secret_scope = module("agent.secret_scope")
+
+        def set_secret_scope(mapping: dict[str, str], *, profile_home: str | None = None) -> Any:
+            fake.set_scope_calls.append((dict(mapping), profile_home))
+            return fake.scope.set(dict(mapping))
+
+        secret_scope.is_multiplex_active = lambda: fake.multiplex  # type: ignore[attr-defined]
+        secret_scope.set_secret_scope = set_secret_scope  # type: ignore[attr-defined]
+        secret_scope.reset_secret_scope = lambda token: fake.scope.reset(token)  # type: ignore[attr-defined]
+        secret_scope.get_secret = fake.get_secret  # type: ignore[attr-defined]
+
+        env_loader = module("hermes_cli.env_loader")
+        env_loader.hydrate_profile_secret_sources = lambda home: fake.hydrated.append(str(home)) or {}  # type: ignore[attr-defined]
+        launch_policy = module("tui_gateway.launch_profile_policy")
+        launch_policy.owner_secret_scope = lambda home: dict(fake.secrets[str(home)])  # type: ignore[attr-defined]
+
+        @contextlib.contextmanager
+        def install_and_reset_profile_terminal_scope(home: Any, **_kw: Any) -> Any:
+            fake.terminal_scopes.append(str(home))
+            yield
+
+        terminal_scope = module("tools.terminal_scope")
+        terminal_scope.install_and_reset_profile_terminal_scope = install_and_reset_profile_terminal_scope  # type: ignore[attr-defined]
+
+        @contextlib.contextmanager
+        def _profile_runtime_scope(profile_home: Any, prepared_secret_scope: Any = None, **_kw: Any) -> Any:
+            fake.runtime_scope_calls.append(str(profile_home))
+            if helper_raises is not None:
+                raise helper_raises
+            home_token = fake.override.set(str(profile_home))
+            secret_token = fake.scope.set(dict(fake.secrets[str(profile_home)]))
+            try:
+                yield
+            except BaseException as exc:
+                fake.runtime_scope_exits.append(type(exc).__name__)
+                raise
+            else:
+                fake.runtime_scope_exits.append(None)
+            finally:
+                fake.scope.reset(secret_token)
+                fake.override.reset(home_token)
+
+        def _drifted(profile_home: Any, *, some_new_required_kw: Any) -> Any:
+            raise AssertionError("never reached: the call itself fails")
+
+        @contextlib.contextmanager
+        def _standalone() -> Any:
+            fake.standalone_calls += 1
+            if standalone_raises is not None:
+                raise standalone_raises
+            yield
+
+        gateway_run = module("gateway.run")
+        gateway_run._profile_runtime_scope = _drifted if helper_signature_drift else _profile_runtime_scope  # type: ignore[attr-defined]
+        run_turn = module("gateway.run_turn")
+        run_turn.GatewayTurnMixin = type("GatewayTurnMixin", (), {"_standalone_launch_scope": staticmethod(_standalone)})  # type: ignore[attr-defined]
+
+        modules = {
+            "hermes_constants": constants,
+            "agent": module("agent", package=True),
+            "agent.secret_scope": secret_scope,
+            "hermes_cli": module("hermes_cli", package=True),
+            "hermes_cli.env_loader": env_loader,
+            "tui_gateway": module("tui_gateway", package=True),
+            "tui_gateway.launch_profile_policy": launch_policy,
+            "tools": module("tools", package=True),
+            "tools.terminal_scope": terminal_scope,
+            "gateway": module("gateway", package=True),
+            "gateway.run": gateway_run if with_gateway_helper else None,
+            "gateway.run_turn": run_turn,
+        }
+        for name in missing_pieces:
+            modules[name] = None
+        for name, mod in modules.items():
+            monkeypatch.setitem(sys.modules, name, mod)
+        # One-time warnings are per process; each test starts fresh.
+        from agentchatme_hermes import profile_scope
+
+        monkeypatch.setattr(profile_scope, "_warned", set())
+
+    def get_secret(self, name: str) -> str | None:
+        bound = self.scope.get()
+        if bound is not None:
+            return bound.get(name)
+        if self.multiplex:
+            raise RuntimeError(f"UnscopedSecretError: get_secret({name!r}) with no profile secret scope while multiplexing")
+        return f"process-env:{name}"
+
+
+class TestProfileTurnScope:
+    """A served profile's cycle — the gate's model call and the turn — must
+    resolve that profile's credentials, in the scope the gateway binds for
+    that profile's own turns (``gateway/run.py`` ``_profile_runtime_scope``)."""
+
+    @staticmethod
+    def _homes(tmp_path: Path) -> tuple[Path, Path]:
+        return tmp_path / "hermes", tmp_path / "hermes" / "profiles" / "up"
+
+    @staticmethod
+    def _secrets(launch: Path, up: Path) -> dict[str, dict[str, str]]:
+        return {str(launch): {"LIVEFIRE_STUB_KEY": "key-launch"}, str(up): {"LIVEFIRE_STUB_KEY": "key-up"}}
+
+    def _worker(self, monkeypatch: pytest.MonkeyPatch, fake: _FakeHermesScopes, home: Path, trays: list[Any]) -> tuple[AgentInvoker, _Client, Any, dict[str, list[Any]]]:
+        inv, client, agent, _events = _invoker(monkeypatch, trays=trays, answer=_answer(a="reply"))
+        inv._runtime.hermes_home = home
+        seen: dict[str, list[Any]] = {"gate": [], "turn": [], "turn_home": [], "between_cycles": []}
+
+        def resolve_model_and_runtime() -> tuple[str, dict[str, Any]]:
+            # What Hermes's provider resolution does: read the key through get_secret.
+            seen["gate"].append(fake.get_secret("LIVEFIRE_STUB_KEY"))
+            return "m", {"provider": "p"}
+
+        def run_conversation(prompt: str, conversation_history: list[Any]) -> dict[str, Any]:
+            seen["turn"].append(fake.get_secret("LIVEFIRE_STUB_KEY"))
+            seen["turn_home"].append(fake.override.get())
+            return {"final_response": "ok"}
+
+        real_requeue = inv._requeue_pending_invites
+
+        def requeue_and_observe() -> None:
+            # Runs on the worker thread at every wake, OUTSIDE any cycle's scope:
+            # what is bound here is what a cycle left behind.
+            seen["between_cycles"].append((fake.scope.get(), fake.override.get()))
+            real_requeue()
+
+        monkeypatch.setattr(inv, "_resolve_model_and_runtime", resolve_model_and_runtime)
+        monkeypatch.setattr(inv, "_requeue_pending_invites", requeue_and_observe)
+        agent.run_conversation.side_effect = run_conversation
+        return inv, client, agent, seen
+
+    def test_served_profile_turn_sees_its_own_secret_and_nothing_leaks(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        launch, up = self._homes(tmp_path)
+        fake = _FakeHermesScopes(monkeypatch, self._secrets(launch, up))
+        inv, client, _agent, seen = self._worker(monkeypatch, fake, up, [_tray(_card("a")), _tray()])
+        inv.start()
+        try:
+            inv.wake()
+            assert _wait_for(lambda: inv.turns == 1, timeout=5.0)
+            inv.wake()  # a second cycle on the same worker thread
+            assert _wait_for(lambda: len(seen["between_cycles"]) == 2 and inv.cycles == 2, timeout=5.0)
+        finally:
+            inv.stop()
+        assert seen["gate"] == ["key-up"], "the gate's model call used profile up's own provider key"
+        assert seen["turn"] == ["key-up"], "the turn used profile up's own provider key"
+        assert seen["turn_home"] == [str(up)]
+        assert fake.runtime_scope_calls == [str(up), str(up)], "Hermes's own scope, entered per cycle"
+        assert fake.runtime_scope_exits == [None, None], "and exited after each successful cycle"
+        # On the worker thread, between cycles: the profile's home override (the
+        # worker's lifetime context) and NO secret scope left over from cycle 1.
+        assert seen["between_cycles"] == [(None, str(up)), (None, str(up))]
+        assert client.recorded == [("a", "reply", "msg_a")]
+
+        inv2, _client2, _agent2, seen2 = self._worker(monkeypatch, fake, launch, [_tray(_card("a"))])
+        inv2.start()
+        try:
+            inv2.wake()
+            assert _wait_for(lambda: inv2.turns == 1, timeout=5.0)
+        finally:
+            inv2.stop()
+        assert seen2["gate"] == ["key-launch"] and seen2["turn"] == ["key-launch"]
+
+    def test_scope_is_exited_when_the_cycle_raises(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        launch, up = self._homes(tmp_path)
+        fake = _FakeHermesScopes(monkeypatch, self._secrets(launch, up))
+        inv, _client, _agent, _seen = self._worker(monkeypatch, fake, up, [_tray(_card("a"))])
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+
+        def exploding_cycle() -> Any:
+            assert fake.scope.get() == {"LIVEFIRE_STUB_KEY": "key-up"}
+            raise RuntimeError("boom inside the scope")
+
+        monkeypatch.setattr(inv, "run_cycle", exploding_cycle)
+        inv._guarded_cycle()
+        assert fake.runtime_scope_exits == ["RuntimeError"], "exited, with the exception"
+        assert fake.scope.get() is None and fake.override.get() is None
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+
+    def test_fallback_enters_exactly_the_gateway_pieces_and_warns_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        launch, up = self._homes(tmp_path)
+        fake = _FakeHermesScopes(monkeypatch, self._secrets(launch, up), with_gateway_helper=False)
+        inv, _client, _agent, seen = self._worker(monkeypatch, fake, up, [_tray(_card("a")), _tray()])
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.profile_scope"):
+            inv._guarded_cycle()
+            inv._guarded_cycle()
+        assert seen["turn"] == ["key-up"] and seen["gate"] == ["key-up"]
+        assert seen["turn_home"] == [str(up)]
+        assert fake.hydrated == [str(up), str(up)], "external secret sources hydrated per cycle"
+        assert fake.set_scope_calls == [({"LIVEFIRE_STUB_KEY": "key-up"}, str(up))] * 2, "owner scope, stamped"
+        assert fake.terminal_scopes == [str(up), str(up)], "the profile's terminal policy installed"
+        assert fake.runtime_scope_calls == []
+        assert len([r for r in caplog.records if "not importable" in r.getMessage()]) == 1, "warned once"
+        assert fake.scope.get() is None and fake.override.get() is None
+
+    @pytest.mark.parametrize(
+        "missing", ["hermes_cli.env_loader", "tui_gateway.launch_profile_policy", "tools.terminal_scope"]
+    )
+    def test_fallback_with_a_missing_piece_runs_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, missing: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        launch, up = self._homes(tmp_path)
+        fake = _FakeHermesScopes(monkeypatch, self._secrets(launch, up), with_gateway_helper=False, missing_pieces=(missing,))
+        inv, client, agent, _seen = self._worker(monkeypatch, fake, up, [_tray(_card("a"))])
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
+            inv._guarded_cycle()
+        assert client.tray_calls == [] and client.recorded == [] and fake.set_scope_calls == []
+        agent.run_conversation.assert_not_called()
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert any("cycle not run" in r.getMessage() and "not importable" in r.getMessage() for r in caplog.records)
+
+    def test_helper_signature_drift_is_one_warning_not_a_traceback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        launch, up = self._homes(tmp_path)
+        fake = _FakeHermesScopes(monkeypatch, self._secrets(launch, up), helper_signature_drift=True)
+        inv, client, _agent, _seen = self._worker(monkeypatch, fake, up, [_tray(_card("a"))])
+        monkeypatch.setattr(inv._coalescer, "wake_after", lambda _s: None)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
+            inv._guarded_cycle()
+        assert client.tray_calls == []
+        lines = [r for r in caplog.records if r.name == "agentchatme_hermes.agent_invoker"]
+        assert [r.levelno for r in lines] == [logging.WARNING, logging.WARNING]  # cycle not run + re-wake
+        assert "cycle not run" in lines[0].getMessage() and "TypeError" in lines[0].getMessage()
+        assert all(r.exc_info is None for r in lines), "no traceback per wake"
+
+    def test_scope_that_cannot_be_entered_runs_nothing_and_rewakes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _launch, up = self._homes(tmp_path)
+        fake = _FakeHermesScopes(monkeypatch, {str(up): {}}, helper_raises=OSError("secret source unreachable"))
+        inv, client, agent, _seen = self._worker(monkeypatch, fake, up, [_tray(_card("a"))])
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
+            inv._guarded_cycle()
+        assert client.tray_calls == [] and client.recorded == []
+        agent.run_conversation.assert_not_called()
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert any("cycle not run" in r.getMessage() and "secret source unreachable" in r.getMessage() for r in caplog.records)
+
+    def test_single_profile_gateway_uses_the_standalone_launch_scope(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        launch, _up = self._homes(tmp_path)
+        fake = _FakeHermesScopes(monkeypatch, {str(launch): {"LIVEFIRE_STUB_KEY": "key-launch"}}, multiplex=False)
+        inv, client, _agent, seen = self._worker(monkeypatch, fake, launch, [_tray(_card("a"))])
+        inv._guarded_cycle()
+        assert fake.standalone_calls == 1 and fake.runtime_scope_calls == []
+        assert seen["turn"] == ["process-env:LIVEFIRE_STUB_KEY"], "single profile: the process env, as before"
+        assert client.recorded == [("a", "reply", "msg_a")]
+
+    def test_single_profile_standalone_failure_still_runs_the_cycle_and_warns_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        launch, _up = self._homes(tmp_path)
+        fake = _FakeHermesScopes(monkeypatch, {str(launch): {}}, multiplex=False,
+                                 standalone_raises=RuntimeError("launch policy drifted"))
+        inv, client, _agent, seen = self._worker(monkeypatch, fake, launch, [_tray(_card("a")), _tray(_card("b"))])
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **_kw: (lambda prompt: _answer(a="reply", b="reply")))
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.profile_scope"):
+            inv._guarded_cycle()
+            inv._guarded_cycle()
+        assert seen["turn"] == ["process-env:LIVEFIRE_STUB_KEY"] * 2, "both cycles ran, unscoped"
+        assert [r[0] for r in client.recorded] == ["a", "b"]
+        assert len([r for r in caplog.records if "standalone launch scope" in r.getMessage()]) == 1
+
+    def test_invite_turn_runs_in_the_profile_scope(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        launch, up = self._homes(tmp_path)
+        fake = _FakeHermesScopes(monkeypatch, self._secrets(launch, up))
+        inv, _client, agent, _seen = self._worker(monkeypatch, fake, up, [])
+        got: list[Any] = []
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: got.append(fake.get_secret("LIVEFIRE_STUB_KEY")) or {"final_response": ""}
+        inv.start()
+        try:
+            inv.handle_group_invite(_invite())
+            assert _wait_for(lambda: inv.invite_turns == 1, timeout=5.0)
+        finally:
+            inv.stop()
+        assert got == ["key-up"] and fake.runtime_scope_calls == [str(up)] and fake.runtime_scope_exits == [None]
+
+    def test_invite_whose_scope_cannot_be_entered_stays_offered_and_rewakes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _launch, up = self._homes(tmp_path)
+        fake = _FakeHermesScopes(monkeypatch, {str(up): {}}, helper_raises=OSError("vault locked"))
+        ledger = InviteLedger(tmp_path / "invites.json")
+        inv, _client, agent, _seen = self._worker(monkeypatch, fake, up, [])
+        inv._ledger = ledger
+        reasons: list[str] = []
+        monkeypatch.setattr(inv, "_schedule_retry", reasons.append)
+        inv._enqueue_invite(_invite())
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
+            inv._drain_invites()
+        agent.run_conversation.assert_not_called()
+        assert reasons == ["profile scope unavailable"], "the dedicated branch, not the outer catch"
+        assert [i.invite_id for i in ledger.pending()] == ["ginv_1"], "offered, not started: retried next wake"
+        assert any("group-invite turn not started" in r.getMessage() and "vault locked" in r.getMessage() for r in caplog.records)
+        assert not any("outer catch" in r.getMessage() for r in caplog.records)
+
+    def test_outside_hermes_the_scope_is_a_no_op(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        import sys
+
+        from agentchatme_hermes.profile_scope import profile_turn_scope
+
+        for name in ("agent.secret_scope", "gateway.run", "gateway.run_turn"):
+            monkeypatch.setitem(sys.modules, name, None)
+        ran: list[int] = []
+        with profile_turn_scope(tmp_path):
+            ran.append(1)
+        assert ran == [1]
+
+
 class TestInviteRetry:
     def test_invite_whose_turn_fails_to_start_is_retried_on_the_next_wake(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
