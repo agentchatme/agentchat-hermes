@@ -1,38 +1,36 @@
-"""Background thread that holds the AgentChat WebSocket — the doorbell's knock.
+"""Background thread that holds the AgentChat WebSocket — where wakes come from.
 
 A single daemon thread runs a private asyncio event loop and hosts the SDK's
-:class:`agentchatme.RealtimeClient`. Lifecycle:
+:class:`agentchatme.RealtimeClient`, unpatched. Lifecycle:
 
 * :meth:`start` spins up the thread, schedules ``connect()`` on the loop,
   returns immediately. Initial WS handshake runs in the background — does
   not block plugin registration.
-* The SDK owns reconnect, HELLO handshake, per-conversation seq ordering and
-  message-id dedup. We don't reimplement any of that.
+* The SDK owns reconnect, HELLO handshake, per-conversation seq ordering,
+  message-id dedup, delivery acks, the offline drain and gap recovery. We
+  don't reimplement any of that.
 * :meth:`stop` schedules a clean disconnect and joins the thread within a
   bounded grace period.
 
-The socket is a knock, not a carrier
-────────────────────────────────────
+The socket is a wake, not a carrier
+───────────────────────────────────
 A ``message.new`` frame means *the tray changed*. The daemon reads only the
 sender (to skip the echo of its own sends) and the ids (for the log line),
-then calls ``on_knock``. What the message says is read by the agent, through
-the hosted tools, inside its turn. Nothing is parsed, queued or acknowledged
-here:
+then calls ``on_wake``. What the message says is read by the agent, through
+the hosted tools, inside its turn. A ``wake`` frame (a reminder the server
+sends for a deferred conversation) is the same wake with no message at all.
 
-* **Never acknowledged.** The SDK negotiates the ``ack`` capability, so the
-  server keeps every envelope ``stored`` until it is acknowledged — and this
-  client never acknowledges (:func:`_knock_realtime_client_class`). A verdict
-  recorded by the gate, or a send by the agent, is what settles delivery;
-  the tray (``GET /v1/inbox``) shows exactly the conversations still
-  undecided. A daemon that acknowledged on receipt would empty the tray
-  before anyone judged it, and a crash between ack and turn would lose the
-  message — the pre-v3 known limitation, fixed by construction.
-* **No REST drain on reconnect.** The SDK's offline drain pulls and acks
-  through ``/v1/messages/sync``; the knock does not want it. Instead every
-  (re)connect knocks once, and the gate reads the tray.
+* **Acknowledged on receipt.** The client runs with ``ack_on_receipt=True``:
+  every ``message.new`` is acknowledged the moment its frame is parsed,
+  before any handler runs. Delivered means *this machine received it*;
+  whether the agent has looked is read state, set by a verdict or a read
+  through the SDK, so an early ack never empties the tray. The pre-Phase-1
+  daemon switched acks off because recording delivery used to settle the
+  conversation; that coupling is gone.
 * **Group invites** arrive on their own frame (``group.invite.received``) and
-  are not on the tray; they are handed to the invoker as a second knock
-  kind, deduplicated by invite id and caught up on connect.
+  are not on the tray; they are handed to the invoker as a second wake
+  kind, deduplicated by invite id per process and caught up on connect.
+  The invoker's ledger decides whether a turn runs.
 
 Pattern mirrors ``plugins/memory/hindsight/__init__.py:_get_loop``: one
 long-lived loop, one daemon thread.
@@ -71,33 +69,6 @@ _SUPERVISOR_BACKOFF_BASE_S = 1.0
 _SUPERVISOR_BACKOFF_MAX_S = 60.0
 _STABLE_CONNECTION_S = 30.0
 
-_knock_client_class: type[Any] | None = None
-
-
-def _knock_realtime_client_class() -> type[Any]:
-    """The SDK's :class:`RealtimeClient` with delivery acks turned off.
-
-    The SDK advertises the ``ack`` capability and, by default, confirms every
-    dispatched envelope so the server marks it ``delivered``
-    (``docs/realtime-delivery-ack.md``). For the doorbell that is the wrong
-    moment: nothing has been judged yet. With the capability negotiated and
-    no ack ever sent, the server keeps the envelope ``stored`` — "the
-    at-least-once contract working as designed" — until the gate's verdict
-    or the agent's send settles it. The override is the one private SDK
-    seam this plugin relies on; ``test_ws_daemon`` pins its presence so an
-    SDK rename fails loudly instead of silently acking again.
-    """
-    global _knock_client_class
-    if _knock_client_class is None:
-        from agentchatme import RealtimeClient
-
-        class _KnockRealtimeClient(RealtimeClient):
-            async def _send_delivery_ack(self, message_id: str) -> None:
-                return None
-
-        _knock_client_class = _KnockRealtimeClient
-    return _knock_client_class
-
 
 class WSDaemon:
     """Owns the long-lived AgentChat WebSocket.
@@ -112,13 +83,13 @@ class WSDaemon:
         *,
         config: Config,
         identity: AgentIdentity,
-        on_knock: Callable[[], None],
+        on_wake: Callable[[], None],
         on_group_invite: Callable[[GroupInviteEvent], None],
         health_path: Path | None = None,
     ) -> None:
         self._config = config
         self._identity = identity
-        self._on_knock = on_knock
+        self._on_wake = on_wake
         self._on_group_invite = on_group_invite
         # Where the liveness record for THIS account is written. ``None``
         # falls back to the legacy per-machine file (test doubles only;
@@ -143,19 +114,20 @@ class WSDaemon:
         self._restart_attempt = 0
 
         # Operational counters for the periodic heartbeat log. Bumped
-        # atomically inside :meth:`_on_message_frame` so the heartbeat
-        # can report what's flowing without coordinating locks.
+        # atomically inside the frame callbacks so the heartbeat can report
+        # what's flowing without coordinating locks.
         self._frames_seen = 0
         self._frames_self_filtered = 0
-        self._knocks = 0
+        self._wake_frames = 0
+        self._wakes = 0
         self._invites_seen = 0
 
-        # Invite-ids already routed to the decision path. Both the live
-        # ``group.invite.received`` frame and the connect-time catch-up funnel
-        # through :meth:`_dispatch_invite` keyed on this set, so an invite is
-        # decided exactly once — whether it arrives live, on a reconnect drain,
-        # or both. Process-lifetime (resets on restart); invite volume is low
-        # so it never grows meaningfully large.
+        # Invite-ids already handed to the invoker by this process. Both the
+        # live ``group.invite.received`` frame and the connect-time catch-up
+        # funnel through :meth:`_dispatch_invite` keyed on this set, so one
+        # process offers an invite once however often it observes it. Whether
+        # a turn runs is the invoker's ledger's call (it persists across
+        # restarts); this set only stops the same process re-offering.
         self._seen_invites: set[str] = set()
 
     # -- lifecycle ----------------------------------------------------------
@@ -269,40 +241,53 @@ class WSDaemon:
 
         self._write_health("stopped")
 
+    def _build_realtime_client(self, **overrides: Any) -> RealtimeClient:
+        """The SDK's socket as shipped: acks on receipt, the HTTP client for
+        the offline drain and gap recovery, Hermes' client identity.
+
+        ``overrides`` is a test seam (``reconnect=False``, a fake
+        ``websocket_connect``); production passes nothing.
+        """
+        from agentchatme import RealtimeClient
+
+        options: dict[str, Any] = {
+            "api_key": self._config.api_key,
+            "base_url": self._config.ws_url,
+            "client": self._http_client,
+            "ack_on_receipt": True,
+            "client_identity": hermes_client_identity(),
+        }
+        options.update(overrides)
+        return RealtimeClient(**options)
+
+    def _subscribe(self, rt_client: RealtimeClient) -> None:
+        rt_client.on("message.new", self._on_message_frame)
+        # A reminder for a deferred conversation: a wake with no message.
+        rt_client.on("wake", self._on_wake_frame)
+        # Group invites arrive on their own frame type — NOT `message.new` — so
+        # without this subscription an invited agent was never notified. This
+        # is the reactive half; invites missed while offline are caught up on
+        # every connect (the invite frame is live-only — it is not part of the
+        # message `/sync` drain).
+        rt_client.on("group.invite.received", self._on_group_invite_frame)
+        rt_client.on_connect(self._on_connect)
+        rt_client.on_disconnect(self._on_disconnect)
+        rt_client.on_error(self._on_error)
+
     async def _main(self) -> None:
         from agentchatme import AsyncAgentChatClient
 
-        # The HTTP client serves the connect-time group-invite catch-up only.
-        # It is deliberately NOT handed to the RealtimeClient: with a client
-        # attached the SDK drains and acknowledges offline envelopes through
-        # /v1/messages/sync on every (re)connect, which would mark them
-        # delivered before anyone judged them (module docstring).
+        # One async HTTP client per cycle: the connect-time invite catch-up,
+        # and — handed to the socket — the SDK's offline drain on (re)connect
+        # and its gap-fill. Both ack what this machine pulled; neither reads.
         self._http_client = AsyncAgentChatClient(
             api_key=self._config.api_key,
             base_url=self._config.api_base,
             client_identity=hermes_client_identity(),
         )
 
-        realtime_class = _knock_realtime_client_class()
-        self._rt_client = realtime_class(
-            api_key=self._config.api_key,
-            base_url=self._config.ws_url,
-            client=None,
-            auto_drain_on_connect=False,
-            client_identity=hermes_client_identity(),
-        )
-        self._rt_client.on("message.new", self._on_message_frame)
-        # Group invites arrive on their own frame type — NOT `message.new` — so
-        # without this subscription an invited agent was never notified (it
-        # could only discover invites by proactively polling
-        # `agentchat_list_group_invites`, which nothing triggered). This is the
-        # reactive half; catching up on invites missed while offline is left to
-        # the agent's own `list_group_invites` tool (the invite frame is
-        # live-only — it is not part of the message `/sync` drain).
-        self._rt_client.on("group.invite.received", self._on_group_invite_frame)
-        self._rt_client.on_connect(self._on_connect)
-        self._rt_client.on_disconnect(self._on_disconnect)
-        self._rt_client.on_error(self._on_error)
+        self._rt_client = self._build_realtime_client()
+        self._subscribe(self._rt_client)
 
         # Stop-event lives on this loop. ``_shutdown`` (scheduled
         # cross-thread) sets it after transport cleanup, which unblocks the wait
@@ -379,12 +364,13 @@ class WSDaemon:
             try:
                 logger.info(
                     "WSDaemon heartbeat: connected=%s handle=@%s "
-                    "frames=%d self_filtered=%d knocks=%d invites=%d",
+                    "frames=%d self_filtered=%d wake_frames=%d wakes=%d invites=%d",
                     connected,
                     self._identity.handle,
                     self._frames_seen,
                     self._frames_self_filtered,
-                    self._knocks,
+                    self._wake_frames,
+                    self._wakes,
                     self._invites_seen,
                 )
             except Exception:
@@ -448,19 +434,18 @@ class WSDaemon:
         self._last_connected_at = time.time()
         self._write_health("connected")
         logger.info("WSDaemon: connected as @%s", self._identity.handle)
-        # Whatever landed while the socket was down is on the tray now; the
-        # server also re-offers stored envelopes to a fresh socket, but the
-        # SDK's dedup swallows the ones this process already saw, so the
-        # connect itself is the knock that covers the gap.
-        self._knock("connect")
+        # Whatever landed while the socket was down is on the tray now. The
+        # SDK drains and acks the offline backlog itself (each drained row is
+        # a message.new to the handler above, deduplicated); the connect is
+        # the one wake that covers the gap whether or not anything drains.
+        self._wake("connect")
         # Catch up on invites that landed while we were offline or before the
         # live subscription existed. Group-invite frames are live-only (unlike
         # messages, they are NOT part of the ``/sync`` drain), so without this
         # an agent invited while disconnected would never find out. Runs on
-        # every (re)connect, deduped so a still-pending invite the agent chose
-        # to leave alone isn't re-decided each reconnect. Fire-and-forget on
-        # this loop so a slow fetch never stalls the connect path — the drain
-        # is fully self-guarded.
+        # every (re)connect, deduped per process here and by the invoker's
+        # ledger across restarts. Fire-and-forget on this loop so a slow fetch
+        # never stalls the connect path — the drain is fully self-guarded.
         try:
             asyncio.get_running_loop().create_task(self._drain_pending_invites())
         except RuntimeError:
@@ -546,19 +531,19 @@ class WSDaemon:
         logger.warning("WSDaemon: error from SDK: %s", exc)
 
     def _on_message_frame(self, frame: dict[str, Any]) -> None:
-        """Inbound ``message.new`` callback: a knock.
+        """Inbound ``message.new`` callback: a wake.
 
         Receives the full envelope ``{type: "message.new", payload: {...}}``.
-        Only two facts are read — the sender, so our own outbound echoed back
-        by server-side fan-out does not wake us, and the ids for the log
-        line. The body is never looked at; the agent reads it through the
-        hosted tools inside its turn.
+        By the time this runs the SDK has already acknowledged the frame
+        (``ack_on_receipt``). Only two facts are read — the sender, so our
+        own outbound echoed back by server-side fan-out does not wake us,
+        and the ids for the log line. The body is never looked at; the agent
+        reads it through the hosted tools inside its turn.
 
         Every frame is logged at INFO so a peer's message reaching this
         process is visible the instant it arrives. Nothing in here may raise
-        into the SDK's dispatch: a handler exception is how the SDK withholds
-        an ack, and this client never acks anyway — but a crashed callback
-        would still take the receive loop down.
+        into the SDK's dispatch: a crashed callback would take the receive
+        loop down.
         """
         self._frames_seen += 1
 
@@ -583,22 +568,42 @@ class WSDaemon:
             return
 
         logger.info(
-            "WSDaemon: knock — message.new conv=%s msg=%s from=@%s",
+            "WSDaemon: wake — message.new conv=%s msg=%s from=@%s",
             conv_id,
             msg_id,
             sender or "?",
         )
-        self._knock("message")
+        self._wake("message")
 
-    def _knock(self, source: str) -> None:
-        """Hand a knock to the invoker; a failing callback never kills the daemon."""
-        self._knocks += 1
+    def _on_wake_frame(self, frame: dict[str, Any]) -> None:
+        """Inbound ``wake`` callback: a reminder for a deferred conversation.
+
+        The SDK has validated the payload (``reason``, ``conversation_id``,
+        ``anchor_message_id``, ``step``, ``at``); a malformed frame goes to
+        ``on_error`` and never reaches here. There is nothing to ack — no
+        message travelled — and nothing to read: the next cycle reads the
+        tray, where the reminded card is back with ``reminder`` set.
+        """
+        self._wake_frames += 1
+        payload = frame.get("payload")
+        data = payload if isinstance(payload, dict) else {}
+        logger.info(
+            "WSDaemon: wake — %s conv=%s step=%s",
+            data.get("reason", "?"),
+            data.get("conversation_id", "<no-conv>"),
+            data.get("step", "?"),
+        )
+        self._wake("wake")
+
+    def _wake(self, source: str) -> None:
+        """Hand a wake to the invoker; a failing callback never kills the daemon."""
+        self._wakes += 1
         try:
-            self._on_knock()
+            self._on_wake()
         except Exception:
             logger.exception(
-                "WSDaemon: on_knock callback raised (source=%s) — daemon survives; "
-                "the next frame knocks again and the tray keeps the cards",
+                "WSDaemon: on_wake callback raised (source=%s) — daemon survives; "
+                "the next frame wakes again and the tray keeps the cards",
                 source,
             )
 
@@ -638,18 +643,18 @@ class WSDaemon:
         self._dispatch_invite(invite, source="live")
 
     def _dispatch_invite(self, invite: GroupInviteEvent, *, source: str) -> bool:
-        """Dedup an invite and hand it to the consent-decision path.
+        """Dedup an invite per process and hand it to the consent-decision path.
 
         Shared by the live frame and the connect-time catch-up, keyed on
-        ``invite_id``, so an invite is decided exactly once no matter how many
-        times it is observed. Returns ``True`` when newly dispatched, ``False``
-        when already handled. On a callback that raises, the invite is left
-        *unseen* so a later catch-up retries — a lost decision must not become
+        ``invite_id``, so one process offers an invite once no matter how many
+        times it observes it. Returns ``True`` when newly dispatched, ``False``
+        when already offered. On a callback that raises, the invite is left
+        *unseen* so a later catch-up retries — a lost offer must not become
         permanent. Never raises: a bad callback cannot take down the daemon.
         """
         if invite.invite_id in self._seen_invites:
             logger.debug(
-                "WSDaemon: group invite %s already handled — skipping (%s)",
+                "WSDaemon: group invite %s already offered — skipping (%s)",
                 invite.invite_id,
                 source,
             )

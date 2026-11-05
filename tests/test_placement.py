@@ -4,13 +4,17 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from agentchatme.types import Texts
 
 from agentchatme_hermes import placement
 from agentchatme_hermes.config import ENV_API_KEY, ENV_API_KEY_LEGACY
 from agentchatme_hermes.soul_anchor import read_anchor_handle
+from agentchatme_hermes.texts import LoadedTexts
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+LINE = "I am @alice on AgentChat (api.agentchat.me). Peers reach me there."
 
 
 class _Env:
@@ -62,15 +66,29 @@ class TestKey:
 
 
 class TestAnchorAndSkill:
-    def test_place_anchor_writes_the_identity_line(self, tmp_path: Path) -> None:
+    def test_place_anchor_writes_the_served_identity_line(self, tmp_path: Path) -> None:
         soul = tmp_path / "SOUL.md"
-        step = placement.place_anchor("@Alice", soul_path=soul)
+        step = placement.place_anchor(handle="@Alice", identity_line=LINE, soul_path=soul)
         assert step.status == "ok" and not step.failed
         assert read_anchor_handle(soul_path=soul) == "alice"
+        assert LINE in soul.read_text(encoding="utf-8")
+
+    def test_place_anchor_without_texts_is_skipped_not_failed(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        step = placement.place_anchor(handle="alice", identity_line=None, soul_path=soul)
+        assert step.status == "skipped" and not step.failed
+        assert "/v1/texts" in step.detail
+        assert not soul.exists()
 
     def test_place_anchor_failure_is_reported_not_raised(self, tmp_path: Path) -> None:
-        step = placement.place_anchor("", soul_path=tmp_path / "SOUL.md")
+        step = placement.place_anchor(handle="", identity_line=LINE, soul_path=tmp_path / "SOUL.md")
         assert step.failed and step.name == "anchor"
+
+    def test_line_naming_another_agent_is_a_failure(self, tmp_path: Path) -> None:
+        step = placement.place_anchor(
+            handle="alice", identity_line="I am @bob on AgentChat.", soul_path=tmp_path / "SOUL.md"
+        )
+        assert step.failed and "@alice" in step.detail
 
     def test_bundled_skill_is_present_and_is_the_published_manual(self) -> None:
         step = placement.check_skill()
@@ -81,6 +99,46 @@ class TestAnchorAndSkill:
 
     def test_missing_skill_is_a_failure(self, tmp_path: Path) -> None:
         assert placement.check_skill(tmp_path / "nope.md").failed
+
+
+class TestResolveIdentityLine:
+    def _texts(self) -> Texts:
+        return Texts.model_validate(
+            {
+                "version": "1",
+                "manual": {"url": "https://agentchat.me/skill.md", "version": "2.1.2"},
+                "wake_instruction": "w",
+                "invite_prompt": "i",
+                "identity_line": "I am @alice on AgentChat. I call agentchat_inbox first.",
+                "identity_line_template": "I am @<handle> on AgentChat.",
+            }
+        )
+
+    def test_served_line_is_spelled_for_hermes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        seen: dict[str, Any] = {}
+
+        def fake_load(client: Any, *, cache_path: Path, **_kw: Any) -> LoadedTexts:
+            seen["cache_path"] = cache_path
+            return LoadedTexts(texts=self._texts(), fetched_at=0.0, source="server")
+
+        monkeypatch.setattr(placement, "load_texts", fake_load)
+        line = placement.resolve_identity_line(
+            api_key="ac_live_k", api_base="https://api.example.test", hermes_home=tmp_path
+        )
+        assert line == "I am @alice on AgentChat. I call mcp__agentchat__agentchat_inbox first."
+        assert seen["cache_path"].parent.parent == tmp_path / "agentchat-state"
+        assert seen["cache_path"].name == "texts.json"
+
+    def test_nothing_available_is_none(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.setattr(placement, "load_texts", lambda client, *, cache_path, **_kw: None)
+        assert (
+            placement.resolve_identity_line(
+                api_key="k", api_base="https://api.example.test", hermes_home=tmp_path
+            )
+            is None
+        )
 
 
 class TestMcpStep:
@@ -108,7 +166,10 @@ class TestMcpStep:
     ) -> None:
         monkeypatch.setattr(placement, "install_entry", lambda *, api_base: "added")
         steps = placement.place_identity_and_tools(
-            handle="alice", api_base="https://api.example.test", soul_path=tmp_path / "SOUL.md"
+            handle="alice",
+            identity_line=LINE,
+            api_base="https://api.example.test",
+            soul_path=tmp_path / "SOUL.md",
         )
         assert [s.name for s in steps] == ["anchor", "skill", "mcp"]
         assert not any(s.failed for s in steps)
@@ -118,6 +179,9 @@ class TestNothingSecretLeaks:
     def test_steps_never_carry_the_key(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setattr(placement, "install_entry", lambda *, api_base: "added")
         steps: list[Any] = placement.place_identity_and_tools(
-            handle="alice", api_base="https://api.example.test", soul_path=tmp_path / "SOUL.md"
+            handle="alice",
+            identity_line=LINE,
+            api_base="https://api.example.test",
+            soul_path=tmp_path / "SOUL.md",
         )
         assert all("ac_live" not in s.detail for s in steps)

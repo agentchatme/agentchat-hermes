@@ -32,8 +32,10 @@ import sys
 
 logger = logging.getLogger(__name__)
 
-# Pinned to match pyproject.toml dependency declaration.
-_SDK_REQUIREMENT = "agentchatme>=1.0.1,<2"
+# Pinned to match pyproject.toml's dependency declaration (a test keeps the
+# two identical): the git-clone path installs the SDK from here, and the
+# plugin needs the SDK's socket, tray, verdicts, texts and gate helper.
+_SDK_REQUIREMENT = "agentchatme>=1.2.0,<2"
 
 
 def _ensure_sdk_installed() -> None:

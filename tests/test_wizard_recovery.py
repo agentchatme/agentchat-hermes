@@ -346,11 +346,15 @@ def _run_flow(
 
     monkeypatch.setattr(wizard, "_recover_start", start)
     monkeypatch.setattr(wizard, "_recover_verify", verify)
-    # Never touch the real SOUL.md / config.yaml from a unit test.
+    # Never touch the real SOUL.md / config.yaml — or the network for the
+    # served identity line — from a unit test.
+    monkeypatch.setattr(
+        wizard, "resolve_identity_line", lambda **_kw: "I am @someone on AgentChat."
+    )
     monkeypatch.setattr(
         wizard,
         "place_identity_and_tools",
-        lambda *, handle, api_base, soul_path=None: anchored.append(handle) or [],
+        lambda *, handle, identity_line, api_base, soul_path=None: anchored.append(handle) or [],
     )
 
     ok = _recover_lost_key_flow(

@@ -3,7 +3,7 @@
 Three modes need to behave correctly:
 
 * **Leader** (gateway_mode=True, lock acquired) — full runtime: WS
-  daemon (the knock) + invoker (gate → turn) + main-line client + identity.
+  daemon (the wake) + invoker (gate → turn) + SDK client + texts + identity.
 * **Follower-gateway** (gateway_mode=True, lock NOT acquired) — light
   runtime, loud warning, no WS, no invoker. This is the path a
   second concurrent gateway hits.
@@ -72,11 +72,15 @@ def _patched_runtime(*, lock_winner: bool = True) -> Any:
     invoker_cls = MagicMock()
     acquire = MagicMock(return_value=99 if lock_winner else None)
     release = MagicMock()
+    texts_cls = MagicMock()
+    texts_cls.return_value.get.return_value = None
 
     with patch(
         "agentchatme_hermes.runtime.WSDaemon", ws_cls
     ), patch(
         "agentchatme_hermes.runtime.AgentInvoker", invoker_cls
+    ), patch(
+        "agentchatme_hermes.runtime.TextsStore", texts_cls
     ), patch(
         "agentchatme_hermes.runtime.try_acquire_ws_leader_lock", acquire
     ), patch(
@@ -224,16 +228,16 @@ class TestPerAccountLockWiring:
             assert rt.lock_path.parent == root / LOCK_DIRNAME
             assert rt.hermes_home == root / "profiles" / "growth"
 
-    def test_invoker_receives_its_runtime_and_daemon_knocks_it(self) -> None:
+    def test_invoker_receives_its_runtime_and_daemon_wakes_it(self) -> None:
         """No singleton lookup inside a turn — the invoker is told who owns it,
-        and the daemon's knock callback is the invoker's."""
+        and the daemon's wake callback is the invoker's."""
         from agentchatme_hermes.runtime import Runtime
 
         with _patched_runtime(lock_winner=True) as (ws_cls, invoker_cls, _client, _acq, _rel):
             rt = Runtime(_config(), gateway_mode=True)
             rt.start()
             assert invoker_cls.call_args.kwargs["runtime"] is rt
-            assert ws_cls.call_args.kwargs["on_knock"] is invoker_cls.return_value.knock
+            assert ws_cls.call_args.kwargs["on_wake"] is invoker_cls.return_value.wake
             assert (
                 ws_cls.call_args.kwargs["on_group_invite"]
                 is invoker_cls.return_value.handle_group_invite
@@ -313,14 +317,14 @@ class TestRuntimeRegistry:
             assert runtime_module.registered_runtimes() == []
 
 
-class TestDoorbellOff:
-    def test_gateway_with_doorbell_off_never_contests_the_lock(self) -> None:
-        """AGENTCHATME_DOORBELL=off: identity resolves, no socket, no invoker, no lock."""
+class TestIntegrationOff:
+    def test_gateway_with_integration_off_never_contests_the_lock(self) -> None:
+        """AGENTCHATME_INTEGRATION=off: identity resolves, no socket, no invoker, no lock."""
         from agentchatme_hermes.runtime import Runtime
 
         with _patched_runtime(lock_winner=True) as (ws_cls, invoker_cls, _client, acquire, _rel):
             cfg = _config()
-            cfg.doorbell_enabled = False
+            cfg.integration_enabled = False
             rt = Runtime(cfg, gateway_mode=True)
             rt.start()
             assert rt.identity.handle == "alice"
@@ -331,16 +335,66 @@ class TestDoorbellOff:
             assert rt._leader_retry_thread is None
 
 
-class TestMainLineClient:
-    def test_runtime_builds_the_main_line_client_for_the_gate(self) -> None:
-        from agentchatme_hermes.main_line import MainLineClient
+class TestClientAndTexts:
+    def test_runtime_hands_the_sdk_client_and_texts_to_the_invoker(self, tmp_path: Path) -> None:
+        """One sync SDK client serves identity, tray, verdicts and texts; the
+        texts store lives in the account's state dir and starts with the runtime."""
         from agentchatme_hermes.runtime import Runtime
 
-        with _patched_runtime(lock_winner=False):
-            rt = Runtime(_config(), gateway_mode=False)
+        with _patched_runtime(lock_winner=True) as (_ws, invoker_cls, fake_client, _acq, _rel), patch(
+            "agentchatme_hermes.runtime.TextsStore"
+        ) as texts_cls:
+            texts_cls.return_value.get.return_value = None
+            rt = Runtime(_config(hermes_home=tmp_path / ".hermes"), gateway_mode=True)
             rt.start()
-            assert isinstance(rt.main_line, MainLineClient)
-            rt.stop()
+            try:
+                assert rt.client is fake_client
+                assert invoker_cls.call_args.kwargs["runtime"] is rt
+                assert invoker_cls.call_args.kwargs["ledger"] is rt.invite_ledger
+                texts_cls.assert_called_once()
+                assert texts_cls.call_args.kwargs["client"] is fake_client
+                assert texts_cls.call_args.kwargs["cache_path"] == rt.state_dir / "texts.json"
+                from agentchatme_hermes.profile_scope import account_fingerprint
+
+                fingerprint = account_fingerprint(rt.config.api_base, rt.config.api_key)
+                assert rt.state_dir == tmp_path / ".hermes" / "agentchat-state" / fingerprint
+                texts_cls.return_value.start.assert_called_once()
+                assert rt.texts is None and rt.identity_line() is None
+            finally:
+                rt.stop()
+            texts_cls.return_value.stop.assert_called_once()
+
+    def test_identity_line_is_the_served_line_spelled_for_hermes(self, tmp_path: Path) -> None:
+        from agentchatme.types import Texts
+
+        from agentchatme_hermes.runtime import Runtime
+
+        served = Texts.model_validate(
+            {
+                "version": "1",
+                "manual": {"url": "u", "version": "v"},
+                "wake_instruction": "w",
+                "invite_prompt": "i",
+                "identity_line": "I am @alice on AgentChat. I call agentchat_inbox first.",
+                "identity_line_template": "I am @<handle> on AgentChat.",
+            }
+        )
+        with _patched_runtime(lock_winner=False), patch(
+            "agentchatme_hermes.runtime.TextsStore"
+        ) as texts_cls:
+            texts_cls.return_value.get.return_value = served
+            rt = Runtime(_config(hermes_home=tmp_path / ".hermes"), gateway_mode=False)
+            rt.start()
+            try:
+                assert rt.texts is served
+                assert rt.identity_line() == (
+                    "I am @alice on AgentChat. I call mcp__agentchat__agentchat_inbox first."
+                )
+                callback = MagicMock()
+                rt.on_texts(callback)
+                texts_cls.return_value.on_texts.assert_called_once_with(callback)
+            finally:
+                rt.stop()
 
 
 class TestFollowerTakeover:

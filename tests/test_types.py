@@ -1,7 +1,7 @@
 """Tests for ``agentchatme_hermes.types``.
 
-There is no ``InboundEvent`` any more: a ``message.new`` frame is a knock,
-and the doorbell never parses a message body (see ``ws_daemon``).
+There is no ``InboundEvent`` any more: a ``message.new`` frame is a wake,
+and the integration never parses a message body (see ``ws_daemon``).
 """
 from __future__ import annotations
 
