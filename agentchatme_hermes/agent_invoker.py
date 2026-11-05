@@ -1,36 +1,47 @@
-"""Knock → gate → turn. The only path from the socket to the agent.
+"""Wake → gate → turn. The only path from the socket to the agent.
 
-What happens on a knock
-───────────────────────
-1. **Coalesce.** Frames inside a short window become one knock
-   (:class:`.knock.KnockCoalescer`). A group waking up is one cycle, not
+What happens on a wake
+──────────────────────
+1. **Coalesce.** Frames inside a short window become one wake
+   (:class:`.wake.WakeCoalescer`). A group waking up is one cycle, not
    twenty.
-2. **Read the tray.** ``GET /v1/inbox?wait_ms=0`` — the server's briefing
-   cards and its gate question, as it built them (:mod:`.main_line`).
-3. **Gate.** The agent's own model answers the question per card
-   (:mod:`.gate`); ``dismiss`` / ``defer`` verdicts are recorded on the
-   server, which settles those conversations. ``reply`` cards stay on the
-   tray.
+2. **Read the tray.** ``client.inbox.tray()`` — the server's briefing cards
+   and its gate question, as it built them.
+3. **Gate.** The SDK's gate helper (:func:`agentchatme.gate.run`) shows the
+   tray to the agent's own model (:mod:`.model_call`, a tool-less
+   completion), parses the verdicts, and records ``dismiss`` / ``defer`` at
+   once. ``reply`` entries come back with a ``record()`` for the host.
 4. **Turn.** If anything was decided ``reply``, start ONE Hermes agent turn
-   with the fixed prompt (:mod:`.turn`). The agent reads and answers through
-   the hosted MCP tools; the send is its verdict. The turn's return value is
-   discarded — nothing is auto-routed anywhere.
+   with the served wake instruction (:mod:`.turn`) naming the ids the gate
+   chose, then call ``record()`` on every ``reply`` entry — right after the
+   turn has started, never before: a turn that fails to start records
+   nothing, the conversation stays unread, and the next wake gates it
+   again. The agent reads and answers through the hosted MCP tools; the
+   turn's return value is discarded — nothing is auto-routed anywhere.
 
-One cycle at a time per account: a knock that lands while a cycle runs is
+"Started", for Hermes: ``AIAgent.run_conversation`` is synchronous, so the
+turn has started once the agent is constructed and the call is being
+entered. Everything that can stop a turn from starting (Hermes runtime not
+importable, texts not loaded, agent construction failed) happens before
+that point and records nothing; an exception out of ``run_conversation``
+itself is a crash after start — the trade-off the gate contract accepts.
+
+One cycle at a time per account: a wake that lands while a cycle runs is
 remembered and runs once the cycle ends (the tray is re-read, so whatever
-the earlier knock announced is covered). A cycle that could not complete —
-model unreachable, server error, verdicts rejected — re-knocks itself on a
-local ladder (1 m, 5 m, 30 m) because a connected socket gets no re-ring
-from the server; the cards wait on the tray meanwhile.
+the earlier wake announced is covered). A cycle that could not complete —
+model unreachable, server error, verdicts rejected, turn not started —
+re-wakes itself on a local ladder (1 m, 5 m, 30 m) because a connected
+socket gets no re-ring from the server; the cards wait on the tray meanwhile.
+A gate that failed closed logs once and starts nothing.
 
-Group invites are a second knock kind: not on the tray, not gated, one turn
-each with the fixed invite prompt, serialized on the same worker.
+Group invites are a second wake kind: not on the tray, not gated, one turn
+each with the served invite prompt, serialized on the same worker. The
+:class:`.invites.InviteLedger` remembers which were offered and which got a
+turn, so an invite whose turn could not start is retried on the next wake
+and a restart does not re-run the ones the agent already looked at.
 
 This mirrors the pattern Hermes' cron scheduler uses: build a transient
-agent, run a turn, ignore the response. What changed from the pre-v3
-invoker: no message bodies, no history rehydration, no prompt of its own,
-no gate wording of its own, no native tools — all of that lives on the main
-line now (``docs/decisions/2026-11-main-line.md``).
+agent, run a turn, ignore the response.
 """
 from __future__ import annotations
 
@@ -39,18 +50,27 @@ import logging
 import threading
 from typing import TYPE_CHECKING, Any, Callable
 
-from . import gate
+from agentchatme import gate
+
 from .config import (
     DEFAULT_GATE_TIMEOUT_S,
-    DEFAULT_KNOCK_DEBOUNCE_S,
     DEFAULT_REPLY_GATE_ENABLED,
-    DEFAULT_REPLY_GATE_FAIL_OPEN,
+    DEFAULT_WAKE_DEBOUNCE_S,
 )
-from .knock import KnockCoalescer
-from .main_line import MainLineError
-from .turn import invite_session_id, invite_turn_prompt, knock_session_id, knock_turn_prompt
+from .invites import InviteLedger
+from .model_call import build_call_model
+from .turn import (
+    MCP_SERVER_NAME,
+    invite_session_id,
+    invite_turn_prompt,
+    wake_session_id,
+    wake_turn_prompt,
+)
+from .wake import WakeCoalescer
 
 if TYPE_CHECKING:
+    from agentchatme.types import InboxTray, Texts
+
     from .config import Config
     from .types import AgentIdentity, GroupInviteEvent
 
@@ -62,15 +82,22 @@ _WORKER_IDLE_WAIT_S = 60.0
 # Fallback model when Hermes' config helpers are unavailable.
 _FALLBACK_MODEL = "claude-sonnet-4-6"
 
-# Local re-knock ladder after a cycle that could not complete. Mirrors the
+# Largest tray the server builds (``INBOX_TRAY_MAX_LIMIT``). The integration
+# always asks for all of it and never parks (``wait_ms=0``).
+TRAY_LIMIT = 50
+
+# Local re-wake ladder after a cycle that could not complete. Mirrors the
 # server's webhook ladder (1m, 5m, 30m) — a connected socket never gets that
-# re-ring, so the doorbell carries it. After the last rung the cycle waits
-# for the next knock; the cards are still on the tray.
+# re-ring, so the integration carries it. After the last rung the cycle
+# waits for the next wake; the cards are still on the tray.
 RETRY_LADDER_S: tuple[float, ...] = (60.0, 300.0, 1800.0)
+
+# A turn ready to run: the agent is built, ``run_conversation`` is next.
+StartedTurn = Callable[[], bool]
 
 
 class AgentInvoker:
-    """Owns the knock worker. Single-use — :meth:`start` once, :meth:`stop` once."""
+    """Owns the wake worker. Single-use — :meth:`start` once, :meth:`stop` once."""
 
     def __init__(
         self,
@@ -78,25 +105,25 @@ class AgentInvoker:
         config: Config,
         identity: AgentIdentity,
         runtime: Any,
+        ledger: InviteLedger | None = None,
     ) -> None:
         self._config = config
         self._identity = identity
         # The runtime this invoker belongs to (one per profile and account).
-        # Supplies the main-line client; never resolved from a registry.
+        # Supplies the SDK client and the served texts; never resolved from
+        # a registry.
         self._runtime = runtime
+        self._ledger = ledger if ledger is not None else InviteLedger(None)
 
         # Gate settings resolved once. getattr-with-default so light
         # config doubles in tests construct cleanly.
         self._gate_enabled = bool(getattr(config, "reply_gate_enabled", DEFAULT_REPLY_GATE_ENABLED))
-        self._gate_fail_open = bool(
-            getattr(config, "reply_gate_fail_open", DEFAULT_REPLY_GATE_FAIL_OPEN)
-        )
         self._gate_timeout_s = float(getattr(config, "gate_timeout_s", DEFAULT_GATE_TIMEOUT_S))
-        debounce_s = float(getattr(config, "knock_debounce_s", DEFAULT_KNOCK_DEBOUNCE_S))
+        debounce_s = float(getattr(config, "wake_debounce_s", DEFAULT_WAKE_DEBOUNCE_S))
 
-        self._coalescer = KnockCoalescer(on_fire=self._on_knock_fired, debounce_s=debounce_s)
-        self._wake = threading.Event()
-        self._knock_due = threading.Event()
+        self._coalescer = WakeCoalescer(on_fire=self._on_wake_fired, debounce_s=debounce_s)
+        self._awake = threading.Event()
+        self._cycle_due = threading.Event()
         self._stopped = threading.Event()
         self._worker: threading.Thread | None = None
         self._invites: collections.deque[GroupInviteEvent] = collections.deque()
@@ -107,6 +134,7 @@ class AgentInvoker:
         self.cycles = 0
         self.turns = 0
         self.invite_turns = 0
+        self.recorded_replies = 0
 
         # Hermes-side handles, resolved lazily on first turn so the plugin
         # registers cleanly where Hermes' runtime isn't importable yet.
@@ -128,7 +156,7 @@ class AgentInvoker:
             return
         self._stopped.set()
         self._coalescer.stop()
-        self._wake.set()
+        self._awake.set()
         worker = self._worker
         if worker is not None and worker.is_alive():
             # A turn in flight finishes on its own; the worker checks
@@ -138,14 +166,20 @@ class AgentInvoker:
             if worker.is_alive():
                 logger.info("AgentInvoker: worker still finishing a turn at stop()")
 
-    # -- knocks -------------------------------------------------------------
+    # -- wakes --------------------------------------------------------------
 
-    def knock(self) -> None:
-        """A knock from the socket (or any other source). Coalesced, then cycled."""
-        self._coalescer.knock()
+    def wake(self) -> None:
+        """A wake from the socket (or any other source). Coalesced, then cycled."""
+        self._coalescer.wake()
 
     def handle_group_invite(self, invite: GroupInviteEvent) -> None:
-        """Queue one invite-decision turn. Runs on the WS thread; never blocks."""
+        """Queue one invite-decision turn. Runs on the socket's event loop;
+        never blocks and never touches the ledger.
+
+        The ledger persists with an fsync under a lock the worker also
+        takes, so the socket thread only appends to the queue; the worker
+        consults the ledger (:meth:`_drain_invites`) before any turn.
+        """
         if self._stopped.is_set():
             logger.warning(
                 "AgentInvoker: group invite dropped at shutdown (group=%s invite=%s) — it stays "
@@ -154,14 +188,20 @@ class AgentInvoker:
                 invite.invite_id,
             )
             return
-        with self._invites_lock:
-            self._invites.append(invite)
-        self._wake.set()
+        self._enqueue_invite(invite)
 
-    def _on_knock_fired(self) -> None:
+    def _enqueue_invite(self, invite: GroupInviteEvent) -> bool:
+        with self._invites_lock:
+            if any(queued.invite_id == invite.invite_id for queued in self._invites):
+                return False
+            self._invites.append(invite)
+        self._awake.set()
+        return True
+
+    def _on_wake_fired(self) -> None:
         """Timer-thread callback from the coalescer: mark a cycle due, wake the worker."""
-        self._knock_due.set()
-        self._wake.set()
+        self._cycle_due.set()
+        self._awake.set()
 
     # -- worker -------------------------------------------------------------
 
@@ -169,16 +209,19 @@ class AgentInvoker:
         logger.info("AgentInvoker: worker started")
         try:
             while not self._stopped.is_set():
-                self._wake.wait(timeout=_WORKER_IDLE_WAIT_S)
+                self._awake.wait(timeout=_WORKER_IDLE_WAIT_S)
                 if self._stopped.is_set():
                     return
-                self._wake.clear()
-                self._drain_invites()
-                if self._knock_due.is_set():
-                    # Clear BEFORE the cycle: a knock landing during the cycle
+                self._awake.clear()
+                if self._cycle_due.is_set():
+                    # Clear BEFORE the cycle: a wake landing during the cycle
                     # sets it again and earns one more cycle afterwards.
-                    self._knock_due.clear()
+                    self._cycle_due.clear()
+                    self._requeue_pending_invites()
+                    self._drain_invites()
                     self._guarded_cycle()
+                else:
+                    self._drain_invites()
         except Exception:
             logger.exception(
                 "AgentInvoker: worker crashed — no further cycles until the gateway restarts"
@@ -186,7 +229,24 @@ class AgentInvoker:
         finally:
             logger.info("AgentInvoker: worker exiting")
 
+    def _requeue_pending_invites(self) -> None:
+        """On a wake, put back every invite the ledger says never got its turn."""
+        for invite in self._ledger.pending():
+            if self._enqueue_invite(invite):
+                logger.info(
+                    "AgentInvoker: retrying group invite %s (group=%s) whose turn did not start",
+                    invite.invite_id,
+                    invite.group_id,
+                )
+
     def _drain_invites(self) -> None:
+        """Run the queued invite turns, on the worker thread.
+
+        The ledger decides here: an invite that already had a turn (this
+        process or an earlier one) is not run again — the agent looked and
+        chose to leave it pending, or acted on it. One that was offered but
+        never got a turn runs now.
+        """
         while True:
             with self._invites_lock:
                 if not self._invites:
@@ -195,97 +255,121 @@ class AgentInvoker:
             if self._stopped.is_set():
                 return
             try:
+                if self._ledger.is_started(invite.invite_id):
+                    logger.info(
+                        "AgentInvoker: group invite %s already had its turn — not running another",
+                        invite.invite_id,
+                    )
+                    continue
+                self._ledger.offer(invite)
                 self._run_invite_turn(invite)
             except Exception:
+                # Whatever escaped must not kill the worker, and the invite
+                # must not wait for an unrelated wake: it stays offered in the
+                # ledger and the ladder brings the next wake.
                 logger.exception(
                     "AgentInvoker: group-invite turn FAILED (outer catch) group=%s invite=%s — "
                     "the invite stays pending server-side",
                     invite.group_id,
                     invite.invite_id,
                 )
+                self._schedule_retry("invite turn failed")
 
     def _guarded_cycle(self) -> None:
         try:
             self.run_cycle()
         except Exception:
             # Outer catch: whatever escaped the cycle must not kill the
-            # worker. Re-knock on the ladder so the tray is read again.
+            # worker. Re-wake on the ladder so the tray is read again.
             logger.exception("AgentInvoker: cycle FAILED with unhandled exception (outer catch)")
             self._schedule_retry("unhandled exception")
 
     # -- one cycle ----------------------------------------------------------
 
-    def run_cycle(self) -> gate.GateResult | None:
+    def run_cycle(self) -> gate.GateResult[gate.GateReply] | None:
         """Read the tray, gate it, start a turn when warranted.
 
         Returns the gate result (``None`` when the tray could not be read).
         Public so tests and ``doctor``-style tooling can drive one cycle.
         """
         self.cycles += 1
+        client = self._runtime.client
         try:
-            tray = self._runtime.main_line.inbox(wait_ms=0)
-        except MainLineError as exc:
+            tray: InboxTray = client.inbox.tray(wait_ms=0, limit=TRAY_LIMIT)
+        except Exception as exc:
             logger.warning("AgentInvoker: tray read failed: %s", exc)
             self._schedule_retry("tray read failed")
             return None
 
         cards = gate.cards_of(tray)
-        truncated = bool(tray.get("truncated"))
+        truncated = bool(tray.truncated)
         if not cards:
             logger.info(
                 "AgentInvoker: tray empty (deferred=%s) — nothing to decide",
-                tray.get("deferred", 0),
+                tray.deferred,
             )
             self._retry_rung = 0
-            return gate.GateResult(source="empty", truncated=truncated)
+            return gate.GateResult(outcome="empty")
 
         if not self._gate_enabled:
-            # Gate off: the agent judges in-turn with the hosted tools.
+            # Gate off: the agent judges in-turn with the hosted tools. No
+            # verdict is recorded by the integration; the turn records its own.
             logger.info(
                 "AgentInvoker: %d card(s) on the tray, gate disabled — starting the turn",
                 len(cards),
             )
-            result = gate.GateResult(
-                source="disabled",
-                cards=len(cards),
-                reply_conversations=tuple(gate.card_ids(cards)),
-                truncated=truncated,
-            )
-        else:
-            result = gate.run_gate(
-                tray,
-                main_line=self._runtime.main_line,
-                main_runtime=self._gate_runtime(),
-                fail_open=self._gate_fail_open,
-                timeout_s=self._gate_timeout_s,
-            )
-            counts = result.counts()
-            logger.info(
-                "AgentInvoker: gate cards=%d reply=%d dismiss=%d defer=%d undecided=%d "
-                "posted=%d post_failures=%d source=%s latency_ms=%d%s",
-                result.cards,
-                counts[gate.REPLY],
-                counts[gate.DISMISS],
-                counts[gate.DEFER],
-                len(result.undecided),
-                result.posted,
-                result.post_failures,
-                result.source,
-                result.latency_ms,
-                f" failure={result.failure!r}" if result.failure else "",
+            if not self._run_wake_turn(reply=[]):
+                self._schedule_retry("turn not started")
+            else:
+                self._retry_rung = 0
+            if truncated:
+                self._coalescer.wake()
+            return gate.GateResult(outcome="decided", undecided=[c["conversation_id"] for c in cards])
+
+        call_model = build_call_model(
+            main_runtime=self._gate_runtime(), timeout_s=self._gate_timeout_s
+        )
+        result = gate.run(
+            tray, call_model, client, tool_namer=gate.mcp_tool_namer(MCP_SERVER_NAME)
+        )
+        counts = {"reply": 0, "dismiss": 0, "defer": 0}
+        for verdict in result.verdicts:
+            counts[verdict.decision] = counts.get(verdict.decision, 0) + 1
+        logger.info(
+            "AgentInvoker: gate cards=%d reply=%d dismiss=%d defer=%d undecided=%d "
+            "recorded=%d record_failures=%d outcome=%s%s",
+            len(cards),
+            counts["reply"],
+            counts["dismiss"],
+            counts["defer"],
+            len(result.undecided),
+            result.recorded,
+            len(result.record_failures),
+            result.outcome,
+            f" failure={result.failure!r}" if result.failure else "",
+        )
+        for failure in result.record_failures:
+            logger.warning(
+                "AgentInvoker: verdict for conv=%s not recorded: %s",
+                failure.conversation_id,
+                failure.error,
             )
 
-        if result.source == "fail_closed":
-            # Nothing posted, no turn. The cards stay on the tray; re-knock
-            # on the ladder so a transient provider outage does not leave
-            # peers unanswered until the next message happens to arrive.
-            self._schedule_retry(result.failure or "gate failed")
+        if result.outcome == "fail_closed":
+            # Logged once above. Nothing recorded, no turn. The cards stay
+            # on the tray; re-wake on the ladder so a transient provider
+            # outage does not leave peers unanswered until the next message
+            # happens to arrive.
+            self._schedule_retry(result.failure or "gate failed closed")
             return result
 
-        if result.start_turn:
-            self._run_knock_turn(result)
+        turn_started = True
+        if result.reply:
+            turn_started = self._run_wake_turn(reply=result.reply)
 
-        if result.post_failures or result.undecided:
+        if not turn_started:
+            self._schedule_retry("turn not started")
+        elif result.record_failures or result.undecided:
             # Some cards were not settled (verdict rejected, or the model
             # skipped them). They are still on the tray; look again later.
             self._schedule_retry("cards left on the tray")
@@ -294,20 +378,20 @@ class AgentInvoker:
 
         if truncated:
             # More conversations are waiting than one tray shows.
-            logger.info("AgentInvoker: tray truncated — knocking again for the rest")
-            self._coalescer.knock()
+            logger.info("AgentInvoker: tray truncated — waking again for the rest")
+            self._coalescer.wake()
         return result
 
     def _schedule_retry(self, reason: str) -> None:
         if self._coalescer.delayed_pending:
-            # A retry is already on its way (a knock landed mid-outage and
+            # A retry is already on its way (a wake landed mid-outage and
             # failed again). One outage climbs the ladder once; climbing per
             # failed cycle would replace the sooner retry with a later one.
-            logger.info("AgentInvoker: %s — a re-knock is already scheduled; not climbing the ladder", reason)
+            logger.info("AgentInvoker: %s — a re-wake is already scheduled; not climbing the ladder", reason)
             return
         if self._retry_rung >= len(RETRY_LADDER_S):
             logger.warning(
-                "AgentInvoker: %s — retry ladder exhausted; waiting for the next knock "
+                "AgentInvoker: %s — retry ladder exhausted; waiting for the next wake "
                 "(the cards stay on the tray)",
                 reason,
             )
@@ -315,38 +399,67 @@ class AgentInvoker:
         delay = RETRY_LADDER_S[self._retry_rung]
         self._retry_rung += 1
         logger.warning(
-            "AgentInvoker: %s — re-knocking in %.0fs (rung %d/%d)",
+            "AgentInvoker: %s — re-waking in %.0fs (rung %d/%d)",
             reason,
             delay,
             self._retry_rung,
             len(RETRY_LADDER_S),
         )
-        self._coalescer.knock_after(delay)
+        self._coalescer.wake_after(delay)
 
     # -- turns --------------------------------------------------------------
 
-    def _run_knock_turn(self, result: gate.GateResult) -> None:
-        session_id = knock_session_id()
+    def _texts(self) -> Texts | None:
+        texts: Texts | None = getattr(self._runtime, "texts", None)
+        if texts is None:
+            logger.warning(
+                "AgentInvoker: no served texts yet (/v1/texts unreachable and nothing cached) "
+                "— the turn cannot start; the cards stay on the tray"
+            )
+        return texts
+
+    def _run_wake_turn(self, *, reply: list[gate.GateReply]) -> bool:
+        """One turn for the cycle; ``True`` when it started.
+
+        Every ``reply`` entry is recorded right after the turn has started
+        (see the module docstring for what "started" means here). An entry
+        whose record fails is logged: the conversation stays unread and the
+        next wake gates it again.
+        """
+        texts = self._texts()
+        if texts is None:
+            return False
+        session_id = wake_session_id()
+        ids = [entry.conversation_id for entry in reply]
         logger.info(
-            "AgentInvoker: turn start session=%s reply_cards=%d source=%s",
+            "AgentInvoker: turn start session=%s reply_cards=%d",
             session_id,
-            len(result.reply_conversations),
-            result.source,
+            len(ids),
         )
-        # Only a verdict the model actually gave is stated to the turn. Under
-        # fail-open or with the gate disabled every card is handed to the turn
-        # undecided, and the agent judges from the tray's own question.
-        decided = result.reply_conversations if result.source == "llm" else ()
-        if self._run_turn(prompt=knock_turn_prompt(decided), session_id=session_id):
+        started = self._start_turn(prompt=wake_turn_prompt(texts, ids), session_id=session_id)
+        if started is None:
+            return False
+        for entry in reply:
+            try:
+                entry.record()
+                self.recorded_replies += 1
+            except Exception as exc:
+                logger.warning(
+                    "AgentInvoker: reply verdict for conv=%s not recorded (%s) — it stays "
+                    "unread and the next wake gates it again",
+                    entry.conversation_id,
+                    exc,
+                )
+        if started():
             self.turns += 1
-        else:
-            # The turn never started (Hermes runtime unavailable, agent build
-            # failed, run_conversation raised): the cards are still stored, so
-            # look again on the ladder instead of waiting for the next peer.
-            self._schedule_retry("turn not started")
+        return True
 
     def _run_invite_turn(self, invite: GroupInviteEvent) -> None:
         if self._stopped.is_set():
+            return
+        texts = self._texts()
+        if texts is None:
+            self._schedule_retry("invite turn not started")
             return
         session_id = invite_session_id(invite.invite_id)
         logger.info(
@@ -356,33 +469,44 @@ class AgentInvoker:
             invite.inviter_handle,
             invite.invite_id,
         )
-        if self._run_turn(prompt=invite_turn_prompt(), session_id=session_id):
+        started = self._start_turn(prompt=invite_turn_prompt(texts), session_id=session_id)
+        if started is None:
+            # Stays "offered" in the ledger; the next wake queues it again.
+            self._schedule_retry("invite turn not started")
+            return
+        self._ledger.mark_started(invite.invite_id)
+        if started():
             self.invite_turns += 1
 
-    def _run_turn(self, *, prompt: str, session_id: str) -> bool:
-        """Build a transient AIAgent and run one turn. ``True`` when it ran.
+    def _start_turn(self, *, prompt: str, session_id: str) -> StartedTurn | None:
+        """Build a transient AIAgent for one turn. ``None`` when it cannot start.
 
-        The return value of ``run_conversation`` is deliberately discarded:
-        the agent's only way to say anything on AgentChat is the hosted
-        ``agentchat_send_message`` tool during the turn.
+        Returns a callable that runs the turn and reports whether it
+        completed. The return value of ``run_conversation`` is deliberately
+        discarded: the agent's only way to say anything on AgentChat is the
+        hosted ``agentchat_send_message`` tool during the turn.
         """
         self._ensure_hermes_resolved()
         agent = self._build_agent(session_id)
         if agent is None:
-            logger.warning("AgentInvoker: agent construction failed for %s — turn dropped", session_id)
-            return False
-        try:
-            result = agent.run_conversation(prompt, conversation_history=[])
-        except Exception:
-            logger.exception("AgentInvoker: run_conversation raised for %s", session_id)
-            return False
-        final = result.get("final_response") if isinstance(result, dict) else None
-        logger.info(
-            "AgentInvoker: turn complete session=%s final_chars=%d",
-            session_id,
-            len(final) if isinstance(final, str) else 0,
-        )
-        return True
+            logger.warning("AgentInvoker: agent construction failed for %s — turn not started", session_id)
+            return None
+
+        def run() -> bool:
+            try:
+                result = agent.run_conversation(prompt, conversation_history=[])
+            except Exception:
+                logger.exception("AgentInvoker: run_conversation raised for %s", session_id)
+                return False
+            final = result.get("final_response") if isinstance(result, dict) else None
+            logger.info(
+                "AgentInvoker: turn complete session=%s final_chars=%d",
+                session_id,
+                len(final) if isinstance(final, str) else 0,
+            )
+            return True
+
+        return run
 
     # -- Hermes integration (lazy imports) ----------------------------------
 
@@ -417,16 +541,25 @@ class AgentInvoker:
             return None
 
         model, runtime_kwargs = self._resolve_model_and_runtime()
-        return AIAgent(
-            model=model,
-            session_id=session_id,
-            session_db=self._session_db,
-            platform="agentchat",
-            quiet_mode=True,
-            load_soul_identity=True,
-            skip_context_files=True,
-            **runtime_kwargs,
-        )
+        try:
+            return AIAgent(
+                model=model,
+                session_id=session_id,
+                session_db=self._session_db,
+                platform="agentchat",
+                quiet_mode=True,
+                load_soul_identity=True,
+                skip_context_files=True,
+                **runtime_kwargs,
+            )
+        except Exception:
+            # A constructor failure (provider config, session DB, a Hermes
+            # change) is a turn that did not start: nothing recorded, the
+            # caller re-wakes on the ladder.
+            logger.exception(
+                "AgentInvoker: AIAgent construction raised for %s — turn not started", session_id
+            )
+            return None
 
     def _gate_runtime(self) -> dict[str, Any]:
         """``main_runtime`` for the gate call: the agent's own model and credentials."""
@@ -494,6 +627,3 @@ def _coerce_model_string(value: Any) -> str:
             if isinstance(candidate, str) and candidate:
                 return candidate
     return _FALLBACK_MODEL
-
-
-GateRunner = Callable[..., gate.GateResult]

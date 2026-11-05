@@ -2,7 +2,7 @@
 
 Kept in their own module so the WS daemon, invoker and runtime don't form a
 circular import graph. Message bodies never appear here: a ``message.new``
-frame is a knock, and the daemon reads only the sender (to skip its own
+frame is a wake, and the daemon reads only the sender (to skip its own
 echo) and the ids (for the log line). What the message says is read by the
 agent, through the hosted tools, inside its turn.
 """

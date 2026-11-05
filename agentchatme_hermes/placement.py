@@ -1,11 +1,14 @@
-"""Placement: the four things the doorbell puts where Hermes loads them.
+"""Placement: the four things the integration puts where Hermes loads them.
 
 1. **The key** — the profile's ``.env`` as ``AGENTCHAT_API_KEY``, the name
    the manual and the MCP declaration use (``Bearer ${AGENTCHAT_API_KEY}``).
    The pre-v3 name ``AGENTCHATME_API_KEY`` is still read, and is kept in
    step while it exists so a downgrade keeps working.
-2. **The identity line** — the published anchor text into ``SOUL.md``
-   (:mod:`.soul_anchor`), the file Hermes loads into every turn.
+2. **The identity line** — the served ``identity_line`` (``GET /v1/texts``,
+   spelled for Hermes by :mod:`.turn`) into ``SOUL.md`` (:mod:`.soul_anchor`),
+   the file Hermes loads into every turn. Nothing is placed when the texts
+   cannot be fetched and nothing is cached; the gateway places the line as
+   soon as a fetch succeeds.
 3. **The manual** — ``https://agentchat.me/skill.md`` verbatim, bundled as
    the ``agentchat:agentchat`` skill. Nothing to write; verified present.
 4. **The tools** — ``mcp_servers.agentchat`` in the profile's
@@ -21,9 +24,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
+from .client_identity import hermes_client_identity
 from .config import ENV_API_KEY, ENV_API_KEY_LEGACY
 from .mcp_registration import McpRegistrationError, install_entry
-from .soul_anchor import AnchorError, write_soul_anchor
+from .profile_scope import resolve_hermes_home
+from .soul_anchor import AnchorError, normalize_handle, write_soul_anchor
+from .state import TEXTS_FILENAME, state_dir_for_account
+from .texts import load_texts
+from .turn import identity_line as render_identity_line
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +39,11 @@ EnvWriter = Callable[[str, str], None]
 EnvReader = Callable[[str], Optional[str]]
 
 BUNDLED_SKILL_PATH = Path(__file__).parent / "skills" / "agentchat" / "SKILL.md"
+
+TEXTS_UNAVAILABLE_DETAIL = (
+    "identity line not placed: /v1/texts is unreachable and nothing is cached — the gateway "
+    "places it once the server answers (or run `hermes agentchat doctor --fix` later)"
+)
 
 
 @dataclass(frozen=True)
@@ -89,15 +102,61 @@ def migrate_legacy_key(save_env_value: EnvWriter, get_env_value: EnvReader) -> b
     return True
 
 
+# ─── the served identity line ──────────────────────────────────────────────
+
+
+def resolve_identity_line(
+    *,
+    api_key: str,
+    api_base: str,
+    hermes_home: Path | None = None,
+    state_dir: Path | None = None,
+) -> str | None:
+    """The served identity line for the account behind ``api_key``, spelled for Hermes.
+
+    One fetch through the SDK (writing the account's texts cache), else the
+    cached copy, else ``None``. For the wizard, the CLI and ``doctor``,
+    which run outside the gateway's :class:`~agentchatme_hermes.texts.TextsStore`.
+    Never raises.
+    """
+    try:
+        from agentchatme import AgentChatClient
+    except ImportError:
+        logger.debug("placement: agentchatme not importable; no identity line")
+        return None
+    home = hermes_home if hermes_home is not None else resolve_hermes_home()
+    cache_path = (
+        state_dir_for_account(
+            hermes_home=home, api_base=api_base, api_key=api_key, state_dir=state_dir
+        )
+        / TEXTS_FILENAME
+    )
+    client = AgentChatClient(
+        api_key=api_key, base_url=api_base, client_identity=hermes_client_identity()
+    )
+    try:
+        loaded = load_texts(client, cache_path=cache_path)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            logger.debug("placement: client close raised", exc_info=True)
+    return render_identity_line(loaded.texts) if loaded is not None else None
+
+
 # ─── identity, manual, tools ───────────────────────────────────────────────
 
 
-def place_anchor(handle: str, *, soul_path: Path | None = None) -> PlacementStep:
+def place_anchor(
+    *, handle: str, identity_line: str | None, soul_path: Path | None = None
+) -> PlacementStep:
+    if identity_line is None:
+        return PlacementStep("anchor", "skipped", TEXTS_UNAVAILABLE_DETAIL)
     try:
-        path = write_soul_anchor(handle, soul_path=soul_path)
+        path = write_soul_anchor(identity_line, handle=handle, soul_path=soul_path)
     except (AnchorError, OSError) as exc:
         return PlacementStep("anchor", "failed", f"could not write the identity line to SOUL.md: {exc}")
-    return PlacementStep("anchor", "ok", f"identity line for @{handle.strip().lstrip('@')} in {path}")
+    return PlacementStep("anchor", "ok", f"identity line for @{normalize_handle(handle)} in {path}")
 
 
 def check_skill(path: Path = BUNDLED_SKILL_PATH) -> PlacementStep:
@@ -130,7 +189,15 @@ def place_mcp(api_base: str) -> PlacementStep:
 
 
 def place_identity_and_tools(
-    *, handle: str, api_base: str, soul_path: Path | None = None
+    *,
+    handle: str,
+    identity_line: str | None,
+    api_base: str,
+    soul_path: Path | None = None,
 ) -> list[PlacementStep]:
     """Anchor, skill, tools — in that order. Never raises."""
-    return [place_anchor(handle, soul_path=soul_path), check_skill(), place_mcp(api_base)]
+    return [
+        place_anchor(handle=handle, identity_line=identity_line, soul_path=soul_path),
+        check_skill(),
+        place_mcp(api_base),
+    ]

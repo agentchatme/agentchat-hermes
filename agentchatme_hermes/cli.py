@@ -21,8 +21,8 @@ Surfaces:
 * **``doctor``** — check every placement (key, identity line, manual,
   hosted tools) plus the lock and the daemon's health; ``--fix`` re-places.
 
-Every successful register / login / recover *places* the doorbell: the key
-in the profile ``.env`` as ``AGENTCHAT_API_KEY``, the published identity
+Every successful register / login / recover *places* the integration: the
+key in the profile ``.env`` as ``AGENTCHAT_API_KEY``, the served identity
 line in SOUL.md, and the hosted MCP server in ``config.yaml`` — see
 :mod:`.placement`.
 
@@ -46,7 +46,13 @@ from typing import TYPE_CHECKING, Any, Callable
 from ._version import __version__
 from .client_identity import hermes_client_identity
 from .config import ENV_API_BASE, ENV_API_KEY, ENV_API_KEY_LEGACY, ENV_HANDLE
-from .placement import PlacementStep, clear_api_key, persist_api_key, place_identity_and_tools
+from .placement import (
+    PlacementStep,
+    clear_api_key,
+    persist_api_key,
+    place_identity_and_tools,
+    resolve_identity_line,
+)
 from .soul_anchor import remove_soul_anchor
 
 if TYPE_CHECKING:
@@ -273,7 +279,7 @@ def _dispatch_register(args: argparse.Namespace) -> int:
         logger.debug("auth_client close raised", exc_info=True)
 
     _persist_credentials(api_key=api_key, handle=handle, api_base=api_base)
-    _install_placement(handle, api_base=api_base)
+    _install_placement(handle, api_base=api_base, api_key=api_key)
     _print_registration_success(handle=handle, api_key=api_key)
     return _EXIT_OK
 
@@ -328,7 +334,7 @@ def _dispatch_login(args: argparse.Namespace) -> int:
         )
 
     _persist_credentials(api_key=api_key, handle=handle, api_base=api_base)
-    _install_placement(handle, api_base=api_base)
+    _install_placement(handle, api_base=api_base, api_key=api_key)
     _printline(f"Saved AgentChat key for @{handle}.")
     return _EXIT_OK
 
@@ -413,7 +419,7 @@ def _dispatch_recover(args: argparse.Namespace) -> int:
         return _exit_with(f"Recovery failed: {exc}")
 
     _persist_credentials(api_key=api_key, handle=resolved_handle, api_base=api_base)
-    _install_placement(resolved_handle, api_base=api_base)
+    _install_placement(resolved_handle, api_base=api_base, api_key=api_key)
     _print_recovery_success(handle=resolved_handle, api_key=api_key)
     return _EXIT_OK
 
@@ -459,7 +465,7 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
 
 
 def _dispatch_doctor(args: argparse.Namespace) -> int:
-    """Health-check the doorbell end-to-end.
+    """Health-check the integration end-to-end.
 
     Surfaces in a single checklist:
 
@@ -501,7 +507,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         _printline(f"  [fail] {line}")
 
     _printline("")
-    _printline(f"AgentChat doorbell doctor — agentchatme-hermes {__version__}")
+    _printline(f"AgentChat integration doctor — agentchatme-hermes {__version__}")
     _printline("")
 
     from .profile_scope import profile_label, resolve_hermes_home, resolve_setting
@@ -509,14 +515,15 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     hermes_home = resolve_hermes_home()
     ok(f"Profile: {profile_label(hermes_home)} ({hermes_home})")
 
-    from .config import DOORBELL_OFF, ENV_DOORBELL
+    from .config import ENV_INTEGRATION, ENV_INTEGRATION_LEGACY, INTEGRATION_OFF
 
-    doorbell = (resolve_setting(ENV_DOORBELL) or "").strip().lower()
-    if doorbell == DOORBELL_OFF:
-        warn(
-            f"{ENV_DOORBELL}=off — this profile holds no socket and is never woken; "
-            "the hosted tools and the manual still work when the agent is run"
-        )
+    for env_name in (ENV_INTEGRATION, ENV_INTEGRATION_LEGACY):
+        if (resolve_setting(env_name) or "").strip().lower() == INTEGRATION_OFF:
+            warn(
+                f"{env_name}=off — this profile holds no socket and is never woken; "
+                "the hosted tools and the manual still work when the agent is run"
+            )
+            break
 
     saved = _read_saved_key_source()
     saved_key = saved[0] if saved else None
@@ -600,6 +607,19 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             fail("Server response missing handle — refusing to trust")
             return _doctor_finalize(failures, warnings_count)
 
+        # The served texts: the identity line the anchor check compares
+        # against, and proof that /v1/texts answers for this key.
+        identity_line, identity_template = _doctor_identity_texts(
+            client, api_key=saved_key, api_base=api_base, hermes_home=hermes_home
+        )
+        if identity_line is not None:
+            ok("served texts available (/v1/texts, or the cached copy)")
+        else:
+            warn(
+                "/v1/texts unreachable and nothing cached — the identity line cannot be "
+                "placed or verified until the server answers"
+            )
+
         status = me.get("status") if isinstance(me, dict) else None
         if status == "active":
             ok(f"Account status: {status}")
@@ -639,7 +659,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         client.close()
 
     if getattr(args, "fix", False) and authenticated_handle is not None:
-        for step in place_identity_and_tools(handle=authenticated_handle, api_base=api_base):
+        for step in place_identity_and_tools(
+            handle=authenticated_handle, identity_line=identity_line, api_base=api_base
+        ):
             (fail if step.failed else ok)(f"fix: {step.name} {step.status} — {step.detail}")
 
     try:
@@ -651,7 +673,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         )
 
         if has_anchor():
-            anchored = read_anchor_handle()
+            anchored = read_anchor_handle(template=identity_template)
             if (
                 anchored is not None
                 and authenticated_handle is not None
@@ -665,19 +687,28 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                     "`hermes agentchat login` here with the right key, or "
                     "re-register."
                 )
-            elif anchored is not None and anchor_is_current() is False:
+            elif anchored is not None and identity_line is None:
                 warn(
-                    "SOUL.md identity line is from an older release — run "
-                    "`hermes agentchat doctor --fix` to place the published text"
+                    f"SOUL.md identity line present (@{anchored}) — cannot verify its text "
+                    "while /v1/texts is unreachable"
+                )
+            elif (
+                anchored is not None
+                and identity_line is not None
+                and anchor_is_current(identity_line, template=identity_template) is False
+            ):
+                warn(
+                    "SOUL.md identity line differs from the served text — run "
+                    "`hermes agentchat doctor --fix` to place the served line"
                 )
             elif anchored is None:
                 warn(
                     "SOUL.md agentchat block was hand-edited and names no handle this plugin "
-                    "recognises — it is yours, left alone; the published identity line is at "
+                    "recognises — it is yours, left alone; the served identity line is at "
                     "https://agentchat.me/skill.md (Be reachable)"
                 )
             else:
-                ok(f"SOUL.md identity line present (@{anchored}, published text)")
+                ok(f"SOUL.md identity line present (@{anchored}, served text)")
         else:
             warn(
                 "SOUL.md identity line missing — run "
@@ -894,21 +925,52 @@ def _dispatch_logout(_args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
-def _install_placement(handle: str, *, api_base: str) -> list[PlacementStep]:
+def _install_placement(handle: str, *, api_base: str, api_key: str) -> list[PlacementStep]:
     """Place the identity line, verify the manual, register the hosted tools.
 
-    Failure is non-fatal: credentials are already persisted and the account
-    is fully operational. Each failed step is printed with its reason so the
-    operator can repair it (``hermes agentchat doctor --fix`` re-runs this).
+    The identity line is fetched from the server for this key (the cached
+    copy when the server is unreachable; skipped when neither exists — the
+    gateway places it later). Failure is non-fatal: credentials are already
+    persisted and the account is fully operational. Each failed step is
+    printed with its reason so the operator can repair it
+    (``hermes agentchat doctor --fix`` re-runs this).
     """
-    steps = place_identity_and_tools(handle=handle, api_base=api_base)
+    identity_line = resolve_identity_line(api_key=api_key, api_base=api_base)
+    steps = place_identity_and_tools(
+        handle=handle, identity_line=identity_line, api_base=api_base
+    )
     for step in steps:
-        if step.failed:
+        if step.failed or step.status == "skipped":
             sys.stderr.write(f"Warning: {step.name}: {step.detail}\n")
             sys.stderr.flush()
         else:
             _printline(f"{step.name}: {step.detail}")
     return steps
+
+
+def _doctor_identity_texts(
+    client: Any, *, api_key: str, api_base: str, hermes_home: Path
+) -> tuple[str | None, str | None]:
+    """``(identity line, template)`` for ``doctor``: one fetch on the open client, else the cache."""
+    try:
+        from .state import TEXTS_FILENAME, state_dir_for_account
+        from .texts import load_texts
+        from .turn import identity_line as render_identity_line
+        from .turn import identity_line_template as render_identity_line_template
+    except ImportError:
+        return None, None
+    cache_path = (
+        state_dir_for_account(hermes_home=hermes_home, api_base=api_base, api_key=api_key)
+        / TEXTS_FILENAME
+    )
+    try:
+        loaded = load_texts(client, cache_path=cache_path)
+    except Exception as exc:
+        logger.debug("doctor: texts load raised: %s", exc)
+        return None, None
+    if loaded is None:
+        return None, None
+    return render_identity_line(loaded.texts), render_identity_line_template(loaded.texts)
 
 
 def _uninstall_mcp_registration() -> None:
@@ -1189,7 +1251,7 @@ def _print_status(me: dict[str, Any]) -> None:
     _printline(f"  Inbox mode:    {inbox_mode}")
     if paused_by_owner != "none":
         _printline(f"  Paused:        {paused_by_owner}  (owner-paused)")
-    _printline(f"  Plugin:        agentchatme-hermes {__version__} (doorbell v3)")
+    _printline(f"  Plugin:        agentchatme-hermes {__version__} (integration)")
     _printline("")
 
 

@@ -14,14 +14,29 @@ The key is ``AGENTCHAT_API_KEY`` — the name the published manual and the
 hosted-MCP declaration use (``Bearer ${AGENTCHAT_API_KEY}``). The pre-v3
 name ``AGENTCHATME_API_KEY`` is still honoured as a fallback and mirrored
 on first activation. Behaviour knobs keep their ``AGENTCHATME_`` prefix.
+
+Two knobs were renamed with the words (integration, wake); the old
+spellings keep working and win nothing — the new name is read first, the
+old one when the new one is unset:
+
+* ``AGENTCHATME_INTEGRATION`` (``on`` | ``off``) ← ``AGENTCHATME_DOORBELL``
+  (``v3`` | ``off``);
+* ``AGENTCHATME_WAKE_DEBOUNCE_S`` ← ``AGENTCHATME_KNOCK_DEBOUNCE_S``.
+
+``AGENTCHATME_REPLY_GATE_FAIL_OPEN`` is retired: the SDK's gate fails
+closed and nothing starts a turn on a failed gate. A value set for it is
+accepted, ignored, and logged once.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
 from .profile_scope import account_fingerprint, resolve_hermes_home, resolve_setting
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_API_BASE = "https://api.agentchat.me"
 
@@ -30,48 +45,46 @@ ENV_API_KEY_LEGACY = "AGENTCHATME_API_KEY"
 ENV_HANDLE = "AGENTCHATME_HANDLE"
 ENV_API_BASE = "AGENTCHATME_API_BASE"
 ENV_WS_URL = "AGENTCHATME_WS_URL"
-ENV_DOORBELL = "AGENTCHATME_DOORBELL"
-ENV_KNOCK_DEBOUNCE_S = "AGENTCHATME_KNOCK_DEBOUNCE_S"
+ENV_INTEGRATION = "AGENTCHATME_INTEGRATION"
+ENV_INTEGRATION_LEGACY = "AGENTCHATME_DOORBELL"
+ENV_WAKE_DEBOUNCE_S = "AGENTCHATME_WAKE_DEBOUNCE_S"
+ENV_WAKE_DEBOUNCE_S_LEGACY = "AGENTCHATME_KNOCK_DEBOUNCE_S"
 ENV_REPLY_GATE_ENABLED = "AGENTCHATME_REPLY_GATE_ENABLED"
-ENV_REPLY_GATE_FAIL_OPEN = "AGENTCHATME_REPLY_GATE_FAIL_OPEN"
+ENV_REPLY_GATE_FAIL_OPEN = "AGENTCHATME_REPLY_GATE_FAIL_OPEN"  # retired, see module docstring
 ENV_GATE_TIMEOUT_S = "AGENTCHATME_GATE_TIMEOUT_S"
 ENV_LOCK_DIR = "AGENTCHATME_LOCK_DIR"
+ENV_STATE_DIR = "AGENTCHATME_STATE_DIR"
 
-# --- the doorbell --------------------------------------------------------------
-# ``v3`` (default): hold the socket, knock, gate on the server's card, start a
+# --- the integration -----------------------------------------------------------
+# ``on`` (default): hold the socket, wake, gate on the server's card, start a
 # turn on the hosted tools. ``off``: hold nothing — the agent still has the
 # hosted tools and the manual, and checks AgentChat only when its human runs
-# it. There is no ``v2`` in this release: the native tool layer and the
-# per-message gate were removed; the version gate is the package version
-# (pin ``agentchatme-hermes==0.2.3111111`` to stay on the old path).
-DOORBELL_V3 = "v3"
-DOORBELL_OFF = "off"
-DEFAULT_DOORBELL = DOORBELL_V3
-_DOORBELL_VALUES = frozenset({DOORBELL_V3, DOORBELL_OFF})
+# it. The pre-rename key took ``v3`` for on; ``v2`` named the removed native
+# tool layer (pin ``agentchatme-hermes==0.2.3111111`` to stay on it).
+INTEGRATION_ON = "on"
+INTEGRATION_OFF = "off"
+DEFAULT_INTEGRATION = INTEGRATION_ON
+_INTEGRATION_VALUES = frozenset({INTEGRATION_ON, INTEGRATION_OFF})
+_INTEGRATION_LEGACY_VALUES = {"v3": INTEGRATION_ON, "off": INTEGRATION_OFF}
 
-# A burst of frames (a group waking up) becomes one knock: the first frame
+# A burst of frames (a group waking up) becomes one wake: the first frame
 # arms a timer, frames inside the window are absorbed, the timer fires once
 # and the cycle reads the whole tray. The server bundles its wakes on the same
 # scale (2 s) for group chatter.
-DEFAULT_KNOCK_DEBOUNCE_S = 2.0
+DEFAULT_WAKE_DEBOUNCE_S = 2.0
 
 # --- reply gate ------------------------------------------------------------
-# On a knock the agent's own model answers the server's gate question for
+# On a wake the agent's own model answers the server's gate question for
 # every card on the tray before any turn starts. On by default; off means
-# every knock starts a turn and the agent judges in-turn with the hosted
+# every wake starts a turn and the agent judges in-turn with the hosted
 # ``agentchat_inbox`` / ``agentchat_decide`` tools.
 DEFAULT_REPLY_GATE_ENABLED = True
-
-# When the decision call fails (provider down, unparseable answer): stay
-# silent and let the doorbell re-knock on its ladder (fail closed), or start
-# the turn anyway and let the agent judge from the tray (fail open). Closed
-# is the default — the main-line decision picked one behaviour for every
-# runtime, and the cards stay on the tray until a verdict or a send.
-DEFAULT_REPLY_GATE_FAIL_OPEN = False
 
 # Timeout (seconds) for the one decision call. It judges a whole tray (up to
 # 50 cards) in one answer, not one message.
 DEFAULT_GATE_TIMEOUT_S = 30.0
+
+_fail_open_warned = False
 
 
 class ConfigError(RuntimeError):
@@ -94,18 +107,19 @@ class Config:
     # Which variable the key came from (``AGENTCHAT_API_KEY`` or the legacy
     # name). Drives the one-time mirror at activation and ``doctor``.
     api_key_source: str = ENV_API_KEY
-    doorbell: str = DEFAULT_DOORBELL
-    knock_debounce_s: float = DEFAULT_KNOCK_DEBOUNCE_S
+    integration: str = DEFAULT_INTEGRATION
+    wake_debounce_s: float = DEFAULT_WAKE_DEBOUNCE_S
     reply_gate_enabled: bool = DEFAULT_REPLY_GATE_ENABLED
-    reply_gate_fail_open: bool = DEFAULT_REPLY_GATE_FAIL_OPEN
     gate_timeout_s: float = DEFAULT_GATE_TIMEOUT_S
     # The Hermes profile this configuration belongs to. Drives where the
     # SOUL.md anchor lives, how the runtime registry keys this profile,
-    # and which root directory holds the leader locks.
+    # and which root directory holds the leader locks and the state.
     hermes_home: Path = field(default_factory=resolve_hermes_home)
-    # Optional override for the leader-lock directory (containers with a
-    # read-only home, shared volumes). ``None`` → ``<hermes root>/agentchat-locks``.
+    # Optional overrides for the leader-lock and state directories
+    # (containers with a read-only home, shared volumes). ``None`` →
+    # ``<hermes root>/agentchat-locks`` and ``<hermes root>/agentchat-state``.
     lock_dir: Path | None = None
+    state_dir: Path | None = None
 
     @property
     def account_fingerprint(self) -> str:
@@ -113,8 +127,8 @@ class Config:
         return account_fingerprint(self.api_base, self.api_key)
 
     @property
-    def doorbell_enabled(self) -> bool:
-        return self.doorbell != DOORBELL_OFF
+    def integration_enabled(self) -> bool:
+        return self.integration != INTEGRATION_OFF
 
 
 def _setting(name: str, default: str = "") -> str:
@@ -122,6 +136,21 @@ def _setting(name: str, default: str = "") -> str:
     if value is None:
         return default
     return value.strip()
+
+
+def _setting_compat(name: str, legacy_name: str) -> tuple[str, str]:
+    """``(value, variable name)``: the new name when set, else the old one.
+
+    Returns ``("", name)`` when neither is set, so callers report the new
+    name in errors and documentation.
+    """
+    value = _setting(name)
+    if value:
+        return value, name
+    legacy = _setting(legacy_name)
+    if legacy:
+        return legacy, legacy_name
+    return "", name
 
 
 def resolve_api_key() -> tuple[str, str] | None:
@@ -174,41 +203,71 @@ def load_config(*, hermes_home: Path | None = None) -> Config | None:
     else:
         ws_url = _derive_ws_url(api_base)
 
-    doorbell = _setting(ENV_DOORBELL, DEFAULT_DOORBELL).lower() or DEFAULT_DOORBELL
-    if doorbell not in _DOORBELL_VALUES:
-        hint = (
-            " The native tool layer and per-message gate were removed in 0.3.0; "
-            "pin agentchatme-hermes==0.2.3111111 to stay on them."
-            if doorbell == "v2"
-            else ""
-        )
-        raise ConfigError(
-            f"{ENV_DOORBELL}={doorbell!r} is not one of: "
-            f"{', '.join(sorted(_DOORBELL_VALUES))}.{hint}"
-        )
-
-    knock_debounce_s = _parse_float_env(
-        ENV_KNOCK_DEBOUNCE_S, DEFAULT_KNOCK_DEBOUNCE_S, minimum=0.0
+    integration = _parse_integration()
+    wake_debounce_s = _parse_float_compat(
+        ENV_WAKE_DEBOUNCE_S, ENV_WAKE_DEBOUNCE_S_LEGACY, DEFAULT_WAKE_DEBOUNCE_S, minimum=0.0
     )
     reply_gate_enabled = _parse_bool_env(ENV_REPLY_GATE_ENABLED, DEFAULT_REPLY_GATE_ENABLED)
-    reply_gate_fail_open = _parse_bool_env(ENV_REPLY_GATE_FAIL_OPEN, DEFAULT_REPLY_GATE_FAIL_OPEN)
+    _warn_retired_fail_open()
     gate_timeout_s = _parse_float_env(ENV_GATE_TIMEOUT_S, DEFAULT_GATE_TIMEOUT_S, minimum=1.0)
 
     lock_dir_raw = _setting(ENV_LOCK_DIR)
     lock_dir = Path(lock_dir_raw).expanduser() if lock_dir_raw else None
+    state_dir_raw = _setting(ENV_STATE_DIR)
+    state_dir = Path(state_dir_raw).expanduser() if state_dir_raw else None
 
     return Config(
         api_key=api_key,
         api_base=api_base,
         ws_url=ws_url,
         api_key_source=api_key_source,
-        doorbell=doorbell,
-        knock_debounce_s=knock_debounce_s,
+        integration=integration,
+        wake_debounce_s=wake_debounce_s,
         reply_gate_enabled=reply_gate_enabled,
-        reply_gate_fail_open=reply_gate_fail_open,
         gate_timeout_s=gate_timeout_s,
         hermes_home=hermes_home if hermes_home is not None else resolve_hermes_home(),
         lock_dir=lock_dir,
+        state_dir=state_dir,
+    )
+
+
+def _parse_integration() -> str:
+    raw, source = _setting_compat(ENV_INTEGRATION, ENV_INTEGRATION_LEGACY)
+    value = raw.lower()
+    if not value:
+        return DEFAULT_INTEGRATION
+    if source == ENV_INTEGRATION_LEGACY:
+        mapped = _INTEGRATION_LEGACY_VALUES.get(value)
+        if mapped is not None:
+            return mapped
+        hint = (
+            " The native tool layer and per-message gate were removed in 0.3.0; "
+            "pin agentchatme-hermes==0.2.3111111 to stay on them."
+            if value == "v2"
+            else ""
+        )
+        raise ConfigError(
+            f"{ENV_INTEGRATION_LEGACY}={value!r} is not one of: "
+            f"{', '.join(sorted(_INTEGRATION_LEGACY_VALUES))} "
+            f"(the current name is {ENV_INTEGRATION}=on|off).{hint}"
+        )
+    if value in _INTEGRATION_VALUES:
+        return value
+    raise ConfigError(
+        f"{ENV_INTEGRATION}={value!r} is not one of: {', '.join(sorted(_INTEGRATION_VALUES))}."
+    )
+
+
+def _warn_retired_fail_open() -> None:
+    global _fail_open_warned
+    if _fail_open_warned or not _setting(ENV_REPLY_GATE_FAIL_OPEN):
+        return
+    _fail_open_warned = True
+    logger.warning(
+        "agentchat: %s is set but no longer does anything — the gate fails closed: when the "
+        "model cannot be reached nothing is recorded, no turn starts, the cards stay on the "
+        "tray and the integration wakes again on its ladder. Remove the setting.",
+        ENV_REPLY_GATE_FAIL_OPEN,
     )
 
 
@@ -236,7 +295,15 @@ def _derive_ws_url(api_base: str) -> str:
 
 
 def _parse_float_env(name: str, default: float, *, minimum: float) -> float:
-    raw = _setting(name)
+    return _parse_float(name, _setting(name), default, minimum=minimum)
+
+
+def _parse_float_compat(name: str, legacy_name: str, default: float, *, minimum: float) -> float:
+    raw, source = _setting_compat(name, legacy_name)
+    return _parse_float(source, raw, default, minimum=minimum)
+
+
+def _parse_float(name: str, raw: str, default: float, *, minimum: float) -> float:
     if not raw:
         return default
     try:

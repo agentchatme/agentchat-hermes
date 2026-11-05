@@ -1,4 +1,4 @@
-"""Plugin registration entry — wires the doorbell into a Hermes process.
+"""Plugin registration entry — wires the integration into a Hermes process.
 
 Called once per Hermes profile by the plugin loader (details at the end
 of this docstring). Two registration modes, chosen based on which Hermes
@@ -6,8 +6,8 @@ process is loading us:
 
 * **Gateway mode** (the long-lived ``hermes gateway run`` process, AND it
   successfully grabbed the per-account WS leader lock): full runtime —
-  identity resolution, the WS daemon that knocks, the invoker that gates
-  and starts turns, the bundled manual as a skill.
+  identity resolution, the served texts, the WS daemon that wakes, the
+  invoker that gates and starts turns, the bundled manual as a skill.
 
 * **CLI mode** (every other Hermes process — TUI/REPL, named subcommands,
   one-shot agents, Hermes-spawned child Python that inherits
@@ -197,7 +197,11 @@ class ActivationWatcher:
         # backfills it for env-var-direct / scripted / container setups and
         # for profiles upgraded from a pre-v3 release — and refuses to stay
         # quiet when the anchor and the key disagree about who this profile is.
-        _reconcile_soul_anchor(runtime)
+        # The identity line is served (GET /v1/texts); the anchor is
+        # reconciled as soon as texts are loaded — now when the server (or
+        # the cache) answered, later when the first fetch succeeds — and
+        # again whenever the served line changes.
+        _reconcile_soul_anchor_when_texts_arrive(runtime)
         _reconcile_key_name(config)
         _reconcile_mcp_registration(runtime)
 
@@ -300,6 +304,20 @@ def _try_start_runtime(config: Any, *, gateway_mode: bool) -> Any:
     return runtime
 
 
+def _reconcile_soul_anchor_when_texts_arrive(runtime: Any) -> None:
+    """Run :func:`_reconcile_soul_anchor` as soon as the served texts exist.
+
+    ``runtime.on_texts`` calls back immediately when texts are already
+    loaded and again on every change; a runtime double without it (tests)
+    is reconciled directly.
+    """
+    on_texts = getattr(runtime, "on_texts", None)
+    if callable(on_texts):
+        on_texts(lambda _texts: _reconcile_soul_anchor(runtime))
+    else:
+        _reconcile_soul_anchor(runtime)
+
+
 def _reconcile_soul_anchor(runtime: Any) -> None:
     """Backfill the SOUL.md identity anchor, and flag an identity mismatch.
 
@@ -308,7 +326,9 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
     directly (env var, hand-edited profile ``.env``, container secrets,
     scripted setup) reaches the plugin's startup with a valid runtime +
     resolved handle but no anchor in SOUL.md. We write it on their
-    behalf.
+    behalf — with the identity line the server serves for this agent
+    (``runtime.identity_line()``); without texts there is nothing to
+    place yet, and the runtime calls again when they arrive.
 
     When an anchor IS present we leave the file alone — a user who
     hand-edited the block made an explicit choice. But if the anchor
@@ -335,9 +355,24 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
         logger.debug("agentchatme_hermes.soul_anchor not importable; skipping backfill")
         return
 
+    identity_line = runtime.identity_line() if callable(getattr(runtime, "identity_line", None)) else None
+    if not isinstance(identity_line, str) or not identity_line.strip():
+        logger.info(
+            "agentchat plugin: identity line not placed yet for profile=%s — /v1/texts "
+            "unreachable and nothing cached; it is placed when the server answers",
+            profile_label(runtime.hermes_home),
+        )
+        return
+    # The served template recognises a block an earlier release wrote
+    # without a handle line, whatever the current wording is.
+    template_fn = getattr(runtime, "identity_line_template", None)
+    template = template_fn() if callable(template_fn) else None
+    if not isinstance(template, str):
+        template = None
+
     try:
         if has_anchor():
-            anchored = read_anchor_handle()
+            anchored = read_anchor_handle(template=template)
             actual = runtime.identity.handle
             if anchored is not None and anchored != actual:
                 logger.error(
@@ -355,20 +390,20 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
                     actual,
                 )
                 return
-            if anchored is not None and anchor_is_current() is False:
-                # Our own block from an older release: same handle, older
-                # text. The published identity line is the one every
-                # doorbell places; refresh it. A hand-edited block
+            if anchored is not None and anchor_is_current(identity_line, template=template) is False:
+                # Our own block from an older release: same handle, other
+                # text. The served identity line is the one every
+                # integration places; refresh it. A hand-edited block
                 # (``anchored is None``) is the user's and is left alone.
-                path = write_soul_anchor(actual)
+                path = write_soul_anchor(identity_line, handle=actual)
                 logger.info(
-                    "agentchat plugin: SOUL.md identity line refreshed to the published "
+                    "agentchat plugin: SOUL.md identity line refreshed to the served "
                     "text (handle=@%s, path=%s)",
                     actual,
                     path,
                 )
             return
-        path = write_soul_anchor(runtime.identity.handle)
+        path = write_soul_anchor(identity_line, handle=runtime.identity.handle)
         logger.info(
             "agentchat plugin: SOUL.md identity anchor backfilled for "
             "non-wizard install path (handle=@%s, path=%s)",
@@ -427,7 +462,7 @@ def _reconcile_mcp_registration(runtime: Any) -> None:
     """Ensure ``mcp_servers.agentchat`` exists in this profile's ``config.yaml``.
 
     The agent's tools live on the hosted MCP server; without this entry a
-    knock starts a turn that has no AgentChat tools. The wizard writes it;
+    wake starts a turn that has no AgentChat tools. The wizard writes it;
     this is the non-wizard path (upgrade from pre-v3, env-var-direct
     install). Adds only when absent — a user-managed entry is never
     touched. The gateway's config watcher connects a new entry within

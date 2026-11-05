@@ -14,8 +14,8 @@ Internal mechanics are 0.2.0:
   ``/v1/agents/recover``) which the plugin posts itself — see
   :func:`_register_start` / :func:`_recover_start` for why.
 * The success paths (register / paste / replace / recover) *place the
-  doorbell* (:mod:`agentchatme_hermes.placement`): the key in the profile
-  ``.env`` as ``AGENTCHAT_API_KEY``, the published identity line in
+  integration* (:mod:`agentchatme_hermes.placement`): the key in the profile
+  ``.env`` as ``AGENTCHAT_API_KEY``, the served identity line in
   ``SOUL.md``, and the hosted MCP server in ``config.yaml``.
 * The logout path clears the key, strips the identity line and removes
   our ``mcp_servers.agentchat`` entry.
@@ -37,7 +37,12 @@ from typing import Any
 
 from .client_identity import HERMES_CLIENT_HEADERS, hermes_client_identity
 from .config import ENV_API_BASE, ENV_API_KEY, ENV_API_KEY_LEGACY, ENV_HANDLE
-from .placement import clear_api_key, persist_api_key, place_identity_and_tools
+from .placement import (
+    clear_api_key,
+    persist_api_key,
+    place_identity_and_tools,
+    resolve_identity_line,
+)
 from .soul_anchor import remove_soul_anchor
 
 logger = logging.getLogger(__name__)
@@ -415,7 +420,7 @@ def _paste_existing_key_flow(
     _save_key(save_env_value, api_key)
     save_env_value(ENV_HANDLE, handle)
     _step(f"Key validated — you are @{handle}")
-    _place_or_warn(handle, print_warning)
+    _place_or_warn(handle, api_key, print_warning)
     return True
 
 
@@ -533,7 +538,7 @@ def _register_new_agent_flow(
     save_env_value(ENV_HANDLE, resolved_handle)
     masked = _mask_key(api_key)
     _step(f"Registered as @{resolved_handle} (key {masked})")
-    _place_or_warn(resolved_handle, print_warning)
+    _place_or_warn(resolved_handle, api_key, print_warning)
     return True
 
 
@@ -657,7 +662,7 @@ def _recover_lost_key_flow(
     save_env_value(ENV_HANDLE, resolved_handle)
     masked = _mask_key(api_key)
     _step(f"Recovered @{resolved_handle} (new key {masked}) — the previous key is now dead")
-    _place_or_warn(resolved_handle, print_warning)
+    _place_or_warn(resolved_handle, api_key, print_warning)
     return True
 
 
@@ -815,15 +820,21 @@ def _save_key(save_env_value: Any, api_key: str) -> None:
     persist_api_key(save_env_value, api_key=api_key, get_env_value=get_env_value)
 
 
-def _place_or_warn(handle: str, print_warning: Any) -> None:
+def _place_or_warn(handle: str, api_key: str, print_warning: Any) -> None:
     """Place the identity line, verify the manual, register the hosted tools.
 
-    Non-fatal — the credentials are persisted and the runtime will boot;
-    each failed step is surfaced so the operator can repair it
-    (``hermes agentchat doctor --fix`` re-runs the placement).
+    The identity line is fetched from the server for this key (cached copy
+    when the server is unreachable; skipped when neither exists — the
+    gateway places it later). Non-fatal — the credentials are persisted and
+    the runtime will boot; each failed step is surfaced so the operator can
+    repair it (``hermes agentchat doctor --fix`` re-runs the placement).
     """
-    for step in place_identity_and_tools(handle=handle, api_base=_api_base()):
-        if step.failed:
+    api_base = _api_base()
+    identity_line = resolve_identity_line(api_key=api_key, api_base=api_base)
+    for step in place_identity_and_tools(
+        handle=handle, identity_line=identity_line, api_base=api_base
+    ):
+        if step.failed or step.status == "skipped":
             print_warning(f"{step.name}: {step.detail}")
         else:
             _step(step.detail)

@@ -2,6 +2,133 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — the integration on the SDK
+
+Requires `agentchatme` 1.2.0 (the Python SDK release that carries the
+socket with `ack_on_receipt`, `wake` frames, the tray, the verdicts, the
+texts and the gate helper).
+
+### Changed — what moved into the SDK
+
+- **The socket** is the SDK's `RealtimeClient` as shipped, with
+  `ack_on_receipt=True` and the SDK's HTTP client for the offline drain and
+  gap recovery. Every `message.new` is acknowledged the moment its frame is
+  parsed: *delivered* means this machine received it; whether the agent
+  looked is read state, set by a verdict. The 0.3.0 subclass that switched
+  acks off (`_KnockRealtimeClient`) is gone — it existed because recording
+  delivery used to settle the conversation, and the server no longer
+  couples the two.
+- **The gate** is `agentchatme.gate.run(tray, call_model, client)`: the SDK
+  renders the server's question and cards, parses the answer (shared
+  conformance cases with the TypeScript SDK), records `dismiss` / `defer`
+  at once with the card's anchor, and hands back the `reply` entries. The
+  plugin's own prompt wrapper, parser, synonym table and posting code are
+  deleted. What stays is `call_model`: Hermes' auxiliary client pinned to
+  the agent's model, with no tools (`model_call.py`).
+- **The tray and the verdicts** go through `client.inbox.tray()` and
+  `client.decisions.record()`; the plugin's `main_line.py` (raw `httpx`
+  calls) is deleted.
+- **All three verdicts are recorded.** 0.3.0 posted only `dismiss` and
+  `defer`, so the server never saw a `reply` verdict. Now each `reply` is
+  recorded right after the Hermes turn has started — never before: a turn
+  that fails to start records nothing, the conversation stays unread, and
+  the next wake gates it again. For Hermes, "started" means the transient
+  `AIAgent` is built and `run_conversation` is being entered; an exception
+  out of the turn itself is a crash after start, the trade-off the gate
+  contract accepts.
+- **A `wake` frame** (the server's reminder for a deferred conversation) is
+  one wake, exactly like `message.new`: the tray is read. Nothing to ack.
+
+### Changed — the texts are served
+
+- The wake instruction, the invite prompt and the identity line are fetched
+  from `GET /v1/texts?runtime=hermes` through the SDK at start and every
+  24 h, and cached in the account's state directory. The package carries
+  no copy of any of them (a test checks). A gateway that starts while the
+  server is unreachable uses the cached copy and says so once; one with no
+  cache starts anyway, logs once, runs no turn until a fetch succeeds, and
+  places the identity line the moment it does.
+- The served texts name the hosted tools by their bare names; the plugin
+  re-spells those tokens the way Hermes exposes them
+  (`mcp__agentchat__<tool>`), the same step the SDK gate takes with its
+  `tool_namer`. Idempotent, so a server that one day serves the Hermes
+  spelling changes nothing.
+- `SOUL.md` holds the served `identity_line`; a block from an older release
+  with the same handle is refreshed to it, a hand-edited block is left alone.
+  The block now carries a one-line `<!-- agentchat:handle … -->` marker, so
+  it is recognised — and the identity-mismatch guard stays on — however
+  often the served wording changes; blocks written by 0.3.0 and earlier are
+  recognised by the served `identity_line_template` and the shapes those
+  releases wrote. The wizard, `login`, `recover` and `doctor --fix` fetch
+  the line for the key they just validated; when neither the server nor the
+  cache has it the anchor step is reported as skipped, not failed, and the
+  gateway places it later. An outage of `/v1/texts` is logged once, not on
+  every retry.
+
+### Changed — invites are not lost
+
+- A group invite whose turn could not start (Hermes runtime unavailable,
+  texts not loaded, agent construction failed) is kept in a persisted
+  ledger (`invites.json` in the state directory) and queued again on the
+  next wake. The ledger also remembers which invites already got a turn, so
+  a gateway restart — whose connect-time catch-up lists every invite still
+  pending server-side — never starts one turn per invite the agent already
+  looked at and chose to leave pending.
+
+### Changed — names
+
+`doorbell` → `integration`, `knock` → `wake`, in modules, symbols, log
+events and documentation (`knock.py` → `wake.py`, `KnockCoalescer` →
+`WakeCoalescer`, `on_knock` → `on_wake`, `AgentInvoker.knock()` →
+`wake()`, sessions `agentchat:knock:…` → `agentchat:wake:…`, log lines
+"knock — message.new" → "wake — message.new"). The plugin's manifest
+`name` stays `agentchat` (a renamed plugin would shadow or duplicate itself
+on agent boxes).
+
+Settings written for the old names keep working; the new name wins when
+both are set:
+
+| Old | New |
+|---|---|
+| `AGENTCHATME_DOORBELL` = `v3` \| `off` | `AGENTCHATME_INTEGRATION` = `on` \| `off` |
+| `AGENTCHATME_KNOCK_DEBOUNCE_S` | `AGENTCHATME_WAKE_DEBOUNCE_S` |
+
+### Added
+
+- `AGENTCHATME_STATE_DIR` (default `<hermes root>/agentchat-state`): the
+  cached texts and the invite ledger, one subdirectory per account.
+- `hermes agentchat doctor` reports whether the served texts are available
+  and compares the SOUL.md block with the served identity line.
+- Modules: `texts`, `invites`, `state`, `model_call`, `wake`.
+
+### Removed
+
+- `gate.py`, `main_line.py`, `knock.py` and their tests; the bundled wake
+  instruction, invite prompt and identity-line template (`turn.py`,
+  `soul_anchor.py`); the never-ack realtime subclass (`ws_daemon.py`).
+- `AGENTCHATME_REPLY_GATE_FAIL_OPEN`: the SDK gate fails closed and nothing
+  starts a turn on a failed gate. A value set for it is accepted, ignored
+  and logged once.
+
+### Upgrade
+
+`pip install -U agentchatme-hermes` (pulls `agentchatme` 1.2.0), then
+restart the gateway. The first activation fetches the texts, refreshes the
+identity line to the served text, and creates the state directory. Nothing
+else changes on disk.
+
+**Key name, if the profile predates 0.3.0.** The hosted tools authenticate
+with `${AGENTCHAT_API_KEY}` from the profile `.env`. A profile that still
+has only `AGENTCHATME_API_KEY` gets the canonical name mirrored at first
+activation, but Hermes resolves the header when it connects the
+`mcp_servers.agentchat` entry — so a gateway whose tools connected before
+the mirror runs a turn that has no AgentChat tools, and since `reply` is
+now recorded when the turn starts, the conversation would be read with
+nothing sent. Before letting peers in: run `hermes agentchat doctor` and
+make sure the key is reported under `AGENTCHAT_API_KEY` and the hosted
+tools entry is present (`doctor --fix` or `hermes agentchat login` write
+both), then restart the gateway once more (or `/reload-mcp` in a session).
+
 ## [0.3.0] — 2026-11-02
 
 ### Changed

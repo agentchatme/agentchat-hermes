@@ -1,28 +1,14 @@
-"""The bundled manual IS the published manual, and the identity line IS its anchor text.
+"""The bundled manual IS the published manual.
 
-Four texts carry the product; all four are written in the main line and only
-placed here (``docs/decisions/2026-11-main-line.md``, *Texts*). These tests
-keep the two placed copies — the skill file and the SOUL.md anchor template
-— in lockstep with each other, so a release that refreshes one cannot forget
-the other.
+The texts an agent reads are served (``GET /v1/texts``) and never bundled;
+the one placed copy left in this package is the manual itself, registered
+as the ``agentchat:agentchat`` skill. These tests keep that copy where
+Hermes expects it and recognisably the published document.
 """
 from __future__ import annotations
 
-import re
-
 from agentchatme_hermes.placement import BUNDLED_SKILL_PATH
 from agentchatme_hermes.skills import SKILL_NAME, SKILL_PATH, SKILL_SOURCE_URL
-from agentchatme_hermes.soul_anchor import ANCHOR_LINE_TEMPLATE, ANCHOR_TEXT_SOURCE
-
-_ANCHOR_SECTION = "### 1. The anchor line (identity)"
-
-
-def _published_anchor_text() -> str:
-    text = SKILL_PATH.read_text(encoding="utf-8")
-    start = text.index(_ANCHOR_SECTION)
-    match = re.search(r"```text\n(.*?)\n```", text[start:], re.DOTALL)
-    assert match, "the manual's anchor section must carry a ```text block"
-    return match.group(1)
 
 
 class TestBundle:
@@ -49,10 +35,13 @@ class TestBundle:
             assert needle in text
 
 
-class TestAnchorLockstep:
-    def test_identity_line_is_the_manuals_anchor_text_verbatim(self) -> None:
-        assert _published_anchor_text() == ANCHOR_LINE_TEMPLATE
-
-    def test_source_is_recorded(self) -> None:
-        assert "agentchat.me/skill.md" in ANCHOR_TEXT_SOURCE
-        assert "Be reachable" in ANCHOR_TEXT_SOURCE
+class TestNoCopiedTexts:
+    def test_package_carries_no_wake_instruction_or_identity_template(self) -> None:
+        """Rule 3: every text an agent sees is served. The package may name
+        the hosted tools and the manual; it may not carry the sentences."""
+        package_dir = BUNDLED_SKILL_PATH.parents[2]
+        for path in package_dir.glob("*.py"):
+            source = path.read_text(encoding="utf-8")
+            assert "You were woken by AgentChat" not in source, path.name
+            assert "I am @<handle> on AgentChat" not in source, path.name
+            assert "Being invited is not a reason to join" not in source, path.name

@@ -11,13 +11,13 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
 
+from agentchatme_hermes import config as config_module
 from agentchatme_hermes.config import (
     DEFAULT_API_BASE,
-    DEFAULT_DOORBELL,
     DEFAULT_GATE_TIMEOUT_S,
-    DEFAULT_KNOCK_DEBOUNCE_S,
+    DEFAULT_INTEGRATION,
     DEFAULT_REPLY_GATE_ENABLED,
-    DEFAULT_REPLY_GATE_FAIL_OPEN,
+    DEFAULT_WAKE_DEBOUNCE_S,
     ENV_API_KEY,
     ENV_API_KEY_LEGACY,
     ConfigError,
@@ -52,12 +52,15 @@ def _isolated(monkeypatch: pytest.MonkeyPatch, **values: str | None) -> None:
         "AGENTCHATME_API_KEY",
         "AGENTCHATME_API_BASE",
         "AGENTCHATME_WS_URL",
+        "AGENTCHATME_INTEGRATION",
         "AGENTCHATME_DOORBELL",
+        "AGENTCHATME_WAKE_DEBOUNCE_S",
         "AGENTCHATME_KNOCK_DEBOUNCE_S",
         "AGENTCHATME_REPLY_GATE_ENABLED",
         "AGENTCHATME_REPLY_GATE_FAIL_OPEN",
         "AGENTCHATME_GATE_TIMEOUT_S",
         "AGENTCHATME_LOCK_DIR",
+        "AGENTCHATME_STATE_DIR",
     ):
         monkeypatch.delenv(k, raising=False)
     for k, v in values.items():
@@ -169,8 +172,8 @@ class TestGateConfig:
         cfg = load_config()
         assert cfg is not None
         assert cfg.reply_gate_enabled is DEFAULT_REPLY_GATE_ENABLED
-        assert cfg.reply_gate_fail_open is DEFAULT_REPLY_GATE_FAIL_OPEN
         assert cfg.gate_timeout_s == DEFAULT_GATE_TIMEOUT_S
+        assert not hasattr(cfg, "reply_gate_fail_open"), "retired: the gate fails closed"
 
     def test_enabled_kill_switch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _isolated(
@@ -182,15 +185,24 @@ class TestGateConfig:
         assert cfg is not None
         assert cfg.reply_gate_enabled is False
 
-    def test_fail_open_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_retired_fail_open_is_accepted_ignored_and_warned_once(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
         _isolated(
             monkeypatch,
             AGENTCHATME_API_KEY="k",
-            AGENTCHATME_REPLY_GATE_FAIL_OPEN="false",
+            AGENTCHATME_REPLY_GATE_FAIL_OPEN="true",
         )
-        cfg = load_config()
+        monkeypatch.setattr(config_module, "_fail_open_warned", False)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.config"):
+            cfg = load_config()
+            load_config()
         assert cfg is not None
-        assert cfg.reply_gate_fail_open is False
+        warnings = [r for r in caplog.records if "REPLY_GATE_FAIL_OPEN" in r.getMessage()]
+        assert len(warnings) == 1, "logged once, not on every load"
+        assert "fails closed" in warnings[0].getMessage()
 
     @pytest.mark.parametrize("truthy", ["1", "true", "TRUE", "yes", "on", "On"])
     def test_bool_truthy_tokens(
@@ -328,53 +340,101 @@ class TestKeyNames:
         assert resolve_api_key() == ("old", ENV_API_KEY_LEGACY)
 
 
-# ───────────────────────── doorbell ─────────────────────────
+# ───────────────────────── the integration ─────────────────────────
 
 
-class TestDoorbellConfig:
+class TestIntegrationConfig:
     def test_defaults(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _isolated(monkeypatch, AGENTCHAT_API_KEY="k")
         cfg = load_config()
         assert cfg is not None
-        assert cfg.doorbell == DEFAULT_DOORBELL == "v3"
-        assert cfg.doorbell_enabled is True
-        assert cfg.knock_debounce_s == DEFAULT_KNOCK_DEBOUNCE_S == 2.0
+        assert cfg.integration == DEFAULT_INTEGRATION == "on"
+        assert cfg.integration_enabled is True
+        assert cfg.wake_debounce_s == DEFAULT_WAKE_DEBOUNCE_S == 2.0
+        assert cfg.state_dir is None
 
     def test_off_switch(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_DOORBELL="OFF")
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_INTEGRATION="OFF")
         cfg = load_config()
         assert cfg is not None
-        assert cfg.doorbell == "off"
-        assert cfg.doorbell_enabled is False
+        assert cfg.integration == "off"
+        assert cfg.integration_enabled is False
 
-    def test_v2_is_rejected_with_the_pin_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_unknown_value_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_INTEGRATION="v3")
+        with pytest.raises(ConfigError, match="AGENTCHATME_INTEGRATION"):
+            load_config()
+
+    def test_debounce_override_and_floor(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_WAKE_DEBOUNCE_S="0.5")
+        cfg = load_config()
+        assert cfg is not None and cfg.wake_debounce_s == 0.5
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_WAKE_DEBOUNCE_S="-1")
+        with pytest.raises(ConfigError, match="below the minimum"):
+            load_config()
+
+    def test_state_dir_override(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_STATE_DIR=str(tmp_path / "st"))
+        cfg = load_config()
+        assert cfg is not None and cfg.state_dir == tmp_path / "st"
+
+
+class TestRenamedKeysKeepWorking:
+    """``doorbell`` → ``integration``, ``knock`` → ``wake``: a config.yaml or
+    .env written for the old names keeps working; the new name wins when both
+    are set."""
+
+    def test_legacy_doorbell_v3_is_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_DOORBELL="v3")
+        cfg = load_config()
+        assert cfg is not None and cfg.integration == "on" and cfg.integration_enabled
+
+    def test_legacy_doorbell_off_is_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_DOORBELL="OFF")
+        cfg = load_config()
+        assert cfg is not None and cfg.integration == "off" and not cfg.integration_enabled
+
+    def test_new_name_wins_over_legacy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(
+            monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_INTEGRATION="on", AGENTCHATME_DOORBELL="off"
+        )
+        cfg = load_config()
+        assert cfg is not None and cfg.integration_enabled is True
+
+    def test_legacy_v2_is_rejected_with_the_pin_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_DOORBELL="v2")
         with pytest.raises(ConfigError, match=r"0\.2\.3111111"):
             load_config()
 
-    def test_unknown_value_is_rejected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_legacy_unknown_value_names_the_new_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_DOORBELL="loud")
-        with pytest.raises(ConfigError, match="AGENTCHATME_DOORBELL"):
+        with pytest.raises(ConfigError, match=r"AGENTCHATME_INTEGRATION=on\|off"):
             load_config()
 
-    def test_debounce_override_and_floor(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_KNOCK_DEBOUNCE_S="0.5")
+    def test_legacy_knock_debounce_is_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_KNOCK_DEBOUNCE_S="0.25")
         cfg = load_config()
-        assert cfg is not None and cfg.knock_debounce_s == 0.5
-        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_KNOCK_DEBOUNCE_S="-1")
-        with pytest.raises(ConfigError, match="below the minimum"):
+        assert cfg is not None and cfg.wake_debounce_s == 0.25
+
+    def test_new_debounce_wins_over_legacy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(
+            monkeypatch,
+            AGENTCHAT_API_KEY="k",
+            AGENTCHATME_WAKE_DEBOUNCE_S="1.5",
+            AGENTCHATME_KNOCK_DEBOUNCE_S="0.25",
+        )
+        cfg = load_config()
+        assert cfg is not None and cfg.wake_debounce_s == 1.5
+
+    def test_legacy_debounce_errors_name_the_legacy_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_KNOCK_DEBOUNCE_S="soon")
+        with pytest.raises(ConfigError, match="AGENTCHATME_KNOCK_DEBOUNCE_S"):
             load_config()
 
 
-class TestGateDefaultsAreTheMainLines:
-    def test_fail_closed_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The main-line decision picked one failure behaviour for every runtime."""
-        assert DEFAULT_REPLY_GATE_FAIL_OPEN is False
-        _isolated(monkeypatch, AGENTCHAT_API_KEY="k")
-        cfg = load_config()
-        assert cfg is not None and cfg.reply_gate_fail_open is False
-
-    def test_fail_open_opt_in(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _isolated(monkeypatch, AGENTCHAT_API_KEY="k", AGENTCHATME_REPLY_GATE_FAIL_OPEN="true")
-        cfg = load_config()
-        assert cfg is not None and cfg.reply_gate_fail_open is True
+class TestGateFailsClosed:
+    def test_there_is_no_fail_open_switch(self) -> None:
+        """The SDK gate fails closed and the host starts nothing on a failed
+        gate; the old opt-in no longer exists as a setting."""
+        assert not hasattr(config_module, "DEFAULT_REPLY_GATE_FAIL_OPEN")
+        assert "reply_gate_fail_open" not in config_module.Config.__dataclass_fields__

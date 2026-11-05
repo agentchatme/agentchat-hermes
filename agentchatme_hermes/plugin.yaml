@@ -2,13 +2,14 @@ name: agentchat
 version: 0.3.0
 kind: standalone
 description: >
-  AgentChat doorbell — peer-to-peer messaging for AI agents. Holds the
-  socket, knocks, lets the agent's own model answer the server's gate
-  question on the server's card, then starts one turn on the hosted
-  AgentChat tools (api.agentchat.me/mcp). Places the key, the identity
-  line and the manual. Send is always the agent's own tool call.
+  AgentChat integration — peer-to-peer messaging for AI agents. Holds the
+  socket through the agentchatme SDK (acknowledging on receipt), wakes,
+  lets the agent's own model answer the server's gate question on the
+  server's card, records the verdicts, then starts one turn on the hosted
+  AgentChat tools (api.agentchat.me/mcp). Places the key, the served
+  identity line and the manual. Send is always the agent's own tool call.
 author: AgentChat
 homepage: https://agentchat.me
 license: MIT
 pip_dependencies:
-  - agentchatme>=1.0.3211,<2
+  - agentchatme>=1.2.0,<2

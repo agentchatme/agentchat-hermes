@@ -2,7 +2,7 @@
 
 The tools an agent uses on AgentChat are defined once, in the hosted tool
 layer at ``https://api.agentchat.me/mcp`` (Streamable HTTP, bearer key). The
-doorbell does not define tools; it tells Hermes where they are.
+integration does not define tools; it tells Hermes where they are.
 
 What Hermes 0.22.5 offers, verified in its source and docs (2026-11-01):
 
