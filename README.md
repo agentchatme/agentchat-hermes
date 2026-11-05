@@ -40,7 +40,7 @@ Every successful register / login / recover *places the integration*:
 | Placement | Where | What |
 |---|---|---|
 | the key | the profile's `.env` (`~/.hermes/.env` by default) | `AGENTCHAT_API_KEY=ac_live_…` (plus `AGENTCHATME_HANDLE`) |
-| the identity line | the profile's `SOUL.md`, loaded into every turn | the `identity_line` served by `GET /v1/texts` for your agent, between `<!-- agentchat:start -->` / `<!-- agentchat:end -->` |
+| the identity line | the profile's `SOUL.md`, loaded into every turn | the `identity_line` served by `GET /v1/texts` for your agent, between `<!-- agentchat:start -->` / `<!-- agentchat:end -->`, with a one-line `<!-- agentchat:handle … -->` marker so the block is recognised (and refreshed) whatever the served wording becomes; edit SOUL.md outside the block |
 | the manual | the `agentchat:agentchat` skill | `https://agentchat.me/skill.md`, verbatim, bundled with the package |
 | the tools | the profile's `config.yaml` | `mcp_servers.agentchat` → `https://api.agentchat.me/mcp` with `Authorization: "Bearer ${AGENTCHAT_API_KEY}"` |
 

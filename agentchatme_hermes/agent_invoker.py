@@ -173,12 +173,12 @@ class AgentInvoker:
         self._coalescer.wake()
 
     def handle_group_invite(self, invite: GroupInviteEvent) -> None:
-        """Queue one invite-decision turn. Runs on the WS thread; never blocks.
+        """Queue one invite-decision turn. Runs on the socket's event loop;
+        never blocks and never touches the ledger.
 
-        The ledger decides: an invite that already had a turn (this process
-        or an earlier one) is not run again — the agent looked and chose to
-        leave it pending, or acted on it. One that was offered but never got
-        a turn is queued again.
+        The ledger persists with an fsync under a lock the worker also
+        takes, so the socket thread only appends to the queue; the worker
+        consults the ledger (:meth:`_drain_invites`) before any turn.
         """
         if self._stopped.is_set():
             logger.warning(
@@ -188,13 +188,6 @@ class AgentInvoker:
                 invite.invite_id,
             )
             return
-        if self._ledger.is_started(invite.invite_id):
-            logger.info(
-                "AgentInvoker: group invite %s already had its turn — not running another",
-                invite.invite_id,
-            )
-            return
-        self._ledger.offer(invite)
         self._enqueue_invite(invite)
 
     def _enqueue_invite(self, invite: GroupInviteEvent) -> bool:
@@ -247,6 +240,13 @@ class AgentInvoker:
                 )
 
     def _drain_invites(self) -> None:
+        """Run the queued invite turns, on the worker thread.
+
+        The ledger decides here: an invite that already had a turn (this
+        process or an earlier one) is not run again — the agent looked and
+        chose to leave it pending, or acted on it. One that was offered but
+        never got a turn runs now.
+        """
         while True:
             with self._invites_lock:
                 if not self._invites:
@@ -255,14 +255,25 @@ class AgentInvoker:
             if self._stopped.is_set():
                 return
             try:
+                if self._ledger.is_started(invite.invite_id):
+                    logger.info(
+                        "AgentInvoker: group invite %s already had its turn — not running another",
+                        invite.invite_id,
+                    )
+                    continue
+                self._ledger.offer(invite)
                 self._run_invite_turn(invite)
             except Exception:
+                # Whatever escaped must not kill the worker, and the invite
+                # must not wait for an unrelated wake: it stays offered in the
+                # ledger and the ladder brings the next wake.
                 logger.exception(
                     "AgentInvoker: group-invite turn FAILED (outer catch) group=%s invite=%s — "
                     "the invite stays pending server-side",
                     invite.group_id,
                     invite.invite_id,
                 )
+                self._schedule_retry("invite turn failed")
 
     def _guarded_cycle(self) -> None:
         try:
@@ -530,16 +541,25 @@ class AgentInvoker:
             return None
 
         model, runtime_kwargs = self._resolve_model_and_runtime()
-        return AIAgent(
-            model=model,
-            session_id=session_id,
-            session_db=self._session_db,
-            platform="agentchat",
-            quiet_mode=True,
-            load_soul_identity=True,
-            skip_context_files=True,
-            **runtime_kwargs,
-        )
+        try:
+            return AIAgent(
+                model=model,
+                session_id=session_id,
+                session_db=self._session_db,
+                platform="agentchat",
+                quiet_mode=True,
+                load_soul_identity=True,
+                skip_context_files=True,
+                **runtime_kwargs,
+            )
+        except Exception:
+            # A constructor failure (provider config, session DB, a Hermes
+            # change) is a turn that did not start: nothing recorded, the
+            # caller re-wakes on the ladder.
+            logger.exception(
+                "AgentInvoker: AIAgent construction raised for %s — turn not started", session_id
+            )
+            return None
 
     def _gate_runtime(self) -> dict[str, Any]:
         """``main_runtime`` for the gate call: the agent's own model and credentials."""

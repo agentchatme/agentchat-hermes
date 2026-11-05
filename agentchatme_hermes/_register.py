@@ -363,10 +363,16 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
             profile_label(runtime.hermes_home),
         )
         return
+    # The served template recognises a block an earlier release wrote
+    # without a handle line, whatever the current wording is.
+    template_fn = getattr(runtime, "identity_line_template", None)
+    template = template_fn() if callable(template_fn) else None
+    if not isinstance(template, str):
+        template = None
 
     try:
         if has_anchor():
-            anchored = read_anchor_handle()
+            anchored = read_anchor_handle(template=template)
             actual = runtime.identity.handle
             if anchored is not None and anchored != actual:
                 logger.error(
@@ -384,7 +390,7 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
                     actual,
                 )
                 return
-            if anchored is not None and anchor_is_current(identity_line) is False:
+            if anchored is not None and anchor_is_current(identity_line, template=template) is False:
                 # Our own block from an older release: same handle, other
                 # text. The served identity line is the one every
                 # integration places; refresh it. A hand-edited block

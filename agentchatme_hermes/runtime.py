@@ -38,6 +38,7 @@ from .profile_scope import (
 from .state import INVITES_FILENAME, TEXTS_FILENAME, state_dir_for
 from .texts import TextsCallback, TextsStore
 from .turn import identity_line as render_identity_line
+from .turn import identity_line_template as render_identity_line_template
 from .types import AgentIdentity
 from .ws_daemon import WSDaemon
 from .ws_health import health_path_for
@@ -164,6 +165,11 @@ class Runtime:
         """The served identity line for this agent, spelled for Hermes; ``None`` without texts."""
         texts = self.texts
         return render_identity_line(texts) if texts is not None else None
+
+    def identity_line_template(self) -> str | None:
+        """The served template (``<handle>`` unfilled), spelled for Hermes; ``None`` without texts."""
+        texts = self.texts
+        return render_identity_line_template(texts) if texts is not None else None
 
     def on_texts(self, callback: TextsCallback) -> None:
         """Run ``callback(texts)`` now if texts are loaded, and whenever they change."""

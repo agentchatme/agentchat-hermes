@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
@@ -364,6 +365,30 @@ class TestClientAndTexts:
                 rt.stop()
             texts_cls.return_value.stop.assert_called_once()
 
+    def test_stop_ends_every_thread_the_runtime_started(self, tmp_path: Path) -> None:
+        """A real texts store (no network: the fake client's answer is not a
+        ``Texts``, so nothing loads) starts its refresh thread with the
+        runtime; ``stop()`` must end it, leaving no ``agentchat-*`` thread."""
+        from agentchatme_hermes.runtime import Runtime
+
+        fake_client = MagicMock()
+        fake_client.get_me.return_value = {"handle": "alice"}
+        before = {t.name for t in threading.enumerate()}
+        with patch.object(Runtime, "_build_sync_client", return_value=fake_client):
+            rt = Runtime(_config(hermes_home=tmp_path / ".hermes"), gateway_mode=False)
+            rt.start()
+            thread = rt.texts_store._thread
+            assert thread is not None and thread.is_alive()
+            assert rt.texts is None
+            rt.stop()
+        thread.join(timeout=2.0)
+        assert not thread.is_alive()
+        leaked = [
+            t.name for t in threading.enumerate() if t.name.startswith("agentchat-") and t.name not in before
+        ]
+        assert leaked == []
+        fake_client.close.assert_called_once()
+
     def test_identity_line_is_the_served_line_spelled_for_hermes(self, tmp_path: Path) -> None:
         from agentchatme.types import Texts
 
@@ -390,6 +415,7 @@ class TestClientAndTexts:
                 assert rt.identity_line() == (
                     "I am @alice on AgentChat. I call mcp__agentchat__agentchat_inbox first."
                 )
+                assert rt.identity_line_template() == "I am @<handle> on AgentChat."
                 callback = MagicMock()
                 rt.on_texts(callback)
                 texts_cls.return_value.on_texts.assert_called_once_with(callback)

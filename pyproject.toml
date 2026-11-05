@@ -109,7 +109,9 @@ ignore = [
 "tests/*" = ["B", "PLR"]
 
 [tool.mypy]
-python_version = "3.9"
+# No python_version: each CI job checks with its own interpreter (3.9 through
+# 3.13), so 3.9 semantics are checked on the 3.9 job, and mypy 2.x — which no
+# longer accepts 3.9 as a target — prints no note on the newer hosts.
 strict = true
 warn_unused_ignores = true
 warn_redundant_casts = true

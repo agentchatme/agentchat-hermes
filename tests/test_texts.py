@@ -204,6 +204,51 @@ class TestStore:
         store._thread.join(timeout=2.0)
         assert not store._thread.is_alive()
 
+    def test_store_warns_once_per_outage_with_a_cache(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The store re-enters ``load_texts`` every 5→60 min while offline;
+        the operator gets one line per outage, not one per retry."""
+        cache = tmp_path / "texts.json"
+        write_cache(cache, _texts("Cached."), fetched_at=0.0)
+        client = _Client(ConnectionError("down"))
+        store = TextsStore(client=client, cache_path=cache)  # type: ignore[arg-type]
+
+        def warnings() -> list[str]:
+            return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+        try:
+            with caplog.at_level(logging.DEBUG, logger="agentchatme_hermes.texts"):
+                store.start()
+                for _ in range(4):
+                    store.refresh()
+                assert len(warnings()) == 1, warnings()
+                assert sum("unreachable" in r.getMessage() for r in caplog.records) == 5, "still logged, at DEBUG"
+                # The server comes back, then goes away again: one new warning.
+                client.result = _texts("Served.")
+                store.refresh()
+                assert len(warnings()) == 1
+                client.result = ConnectionError("down again")
+                store.refresh()
+                store.refresh()
+                assert len(warnings()) == 2, warnings()
+        finally:
+            store.stop()
+
+    def test_store_warns_once_per_outage_without_a_cache(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        store = TextsStore(client=_Client(ConnectionError("down")), cache_path=tmp_path / "t.json")  # type: ignore[arg-type]
+        try:
+            with caplog.at_level(logging.DEBUG, logger="agentchatme_hermes.texts"):
+                store.start()
+                store.refresh()
+                store.refresh()
+            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+            assert len(warnings) == 1 and "nothing is cached" in warnings[0].getMessage()
+        finally:
+            store.stop()
+
     def test_second_start_uses_the_cache_written_by_the_first(self, tmp_path: Path) -> None:
         cache = tmp_path / "t.json"
         first = TextsStore(client=_Client(_texts("From server.")), cache_path=cache)  # type: ignore[arg-type]

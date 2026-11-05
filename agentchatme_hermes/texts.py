@@ -113,25 +113,31 @@ def load_texts(
     cache_path: Path | None,
     runtime: str = TEXTS_RUNTIME,
     now: Callable[[], float] = time.time,
+    quiet: bool = False,
 ) -> LoadedTexts | None:
     """Fetch the texts; on success rewrite the cache, on failure fall back to it.
 
     Never raises. ``None`` means neither the server nor the cache had
-    anything. The wizard, ``doctor`` and the runtime's first attempt all go
-    through here so the policy is written once.
+    anything. The wizard, ``doctor`` and the runtime's attempts all go
+    through here so the policy is written once. ``quiet`` logs a failure at
+    DEBUG instead of WARNING: the store sets it once an outage has been
+    reported, so a retry every few minutes does not repeat the line.
     """
     try:
         texts = fetch_texts(client, runtime=runtime)
     except Exception as exc:
+        level = logging.DEBUG if quiet else logging.WARNING
         cached = read_cache(cache_path) if cache_path is not None else None
         if cached is not None:
-            logger.warning(
+            logger.log(
+                level,
                 "texts: /v1/texts unreachable (%s) — using the cached copy from %.0f h ago",
                 exc,
                 cached.age_s(now()) / 3600.0,
             )
             return cached
-        logger.warning(
+        logger.log(
+            level,
             "texts: /v1/texts unreachable (%s) and nothing is cached%s — no wake instruction, "
             "invite prompt or identity line until the server answers",
             exc,
@@ -237,8 +243,14 @@ class TextsStore:
         if previous is not None and previous.source == "server":
             loaded, served = self._fetch_or_keep(previous)
         else:
+            # One warning per outage: ``_failures`` is 0 until the first
+            # failed attempt and resets only when the server answers.
             loaded = load_texts(
-                self._client, cache_path=self._cache_path, runtime=self._runtime, now=self._now
+                self._client,
+                cache_path=self._cache_path,
+                runtime=self._runtime,
+                now=self._now,
+                quiet=self._failures > 0,
             )
             served = loaded is not None and loaded.source == "server"
             if loaded is None:

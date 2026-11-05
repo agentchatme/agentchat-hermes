@@ -572,6 +572,85 @@ class TestInviteRetry:
         finally:
             inv.stop()
 
+    def test_socket_thread_never_waits_on_the_ledger_write(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``handle_group_invite`` runs on the socket's event loop: it must
+        return at once even while the worker is inside a slow fsync'd write
+        holding the ledger lock. A connect-time catch-up of N invites must
+        not stall frames and pongs."""
+        from agentchatme_hermes import invites as invites_module
+
+        ledger = InviteLedger(tmp_path / "invites.json")
+        inv, _client, _agent, _events = _invoker(monkeypatch, trays=[], answer=_answer(), ledger=ledger)
+        entered = threading.Event()
+        real_write = invites_module.write_json_atomic
+
+        def slow_write(path: Any, record: Any) -> None:
+            entered.set()
+            time.sleep(0.4)
+            real_write(path, record)
+
+        monkeypatch.setattr(invites_module, "write_json_atomic", slow_write)
+        inv.start()
+        try:
+            started = time.monotonic()
+            inv.handle_group_invite(_invite("ginv_a"))
+            first = time.monotonic() - started
+            assert entered.wait(2.0), "the worker is now inside the slow write"
+            started = time.monotonic()
+            inv.handle_group_invite(_invite("ginv_b"))
+            second = time.monotonic() - started
+            assert first < 0.1 and second < 0.1, (first, second)
+            assert _wait_for(lambda: inv.invite_turns == 2, timeout=5.0)
+        finally:
+            inv.stop()
+
+    def test_agent_constructor_raising_is_a_turn_not_started(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``AIAgent(...)`` raising (anything but ImportError) must not wait
+        for an unrelated wake: nothing recorded, the invite stays offered, the
+        ladder brings the next wake."""
+        ledger = InviteLedger(tmp_path / "invites.json")
+        inv, _client, agent, _events = _invoker(monkeypatch, trays=[], answer=_answer(), ledger=ledger)
+
+        def raising(_session_id: str) -> Any:
+            raise RuntimeError("provider config exploded")
+
+        monkeypatch.setattr(inv, "_build_agent", raising)
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        inv.start()
+        try:
+            inv.handle_group_invite(_invite())
+            assert _wait_for(lambda: scheduled == [invoker_module.RETRY_LADDER_S[0]])
+            agent.run_conversation.assert_not_called()
+            assert [i.invite_id for i in ledger.pending()] == ["ginv_1"]
+            assert inv.invite_turns == 0
+        finally:
+            inv.stop()
+
+    def test_build_agent_swallows_constructor_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import sys
+        import types
+
+        class ExplodingAgent:
+            def __init__(self, **_kwargs: Any) -> None:
+                raise RuntimeError("no session db")
+
+        module = types.ModuleType("run_agent")
+        module.AIAgent = ExplodingAgent  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "run_agent", module)
+        inv = AgentInvoker(
+            config=SimpleNamespace(wake_debounce_s=0.0),
+            identity=AgentIdentity(handle="me"),
+            runtime=SimpleNamespace(client=None, texts=TEXTS),
+        )
+        monkeypatch.setattr(inv, "_resolve_model_and_runtime", lambda: ("m", {}))
+        assert inv._build_agent("agentchat:wake:test") is None
+        assert inv._start_turn(prompt="p", session_id="s") is None
+
     def test_invite_without_texts_stays_pending(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         ledger = InviteLedger(tmp_path / "invites.json")
         inv, _client, agent, _events = _invoker(

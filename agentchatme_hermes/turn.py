@@ -104,6 +104,12 @@ def identity_line(texts: Texts) -> str:
     return spell_hosted_tools(texts.identity_line).strip()
 
 
+def identity_line_template(texts: Texts) -> str:
+    """The served template (``<handle>`` unfilled), spelled for Hermes: what
+    :func:`.soul_anchor.read_anchor_handle` recognises an unmarked block by."""
+    return spell_hosted_tools(texts.identity_line_template).strip()
+
+
 def wake_session_id(now: float | None = None) -> str:
     """A fresh Hermes session per wake turn.
 

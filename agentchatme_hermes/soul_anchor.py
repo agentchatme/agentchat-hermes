@@ -22,6 +22,18 @@ with markers that scope what we own — the pattern nvm, conda and pyenv use
 for their blocks in ``~/.bashrc``: scoped, idempotent, removable,
 user-content-preserving.
 
+Recognising our own block
+─────────────────────────
+The served wording may change at any time, and the refresh must keep
+working across any number of rewords — including rewords that happened
+while the gateway was down. So the block carries its own identity: a
+one-line HTML comment naming the handle (``<!-- agentchat:handle ops -->``)
+right after the opening marker. :func:`read_anchor_handle` reads that
+first. Blocks written by earlier releases have no such line; for those the
+served ``identity_line_template`` and the two shapes earlier releases wrote
+are recognised. A block in none of these shapes was hand-edited and is the
+user's: left alone, and ``doctor`` says so.
+
 Lifecycle
 ─────────
 write   — the wizard and ``cli`` after the API key has been validated
@@ -38,6 +50,10 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +63,14 @@ logger = logging.getLogger(__name__)
 # one canonical block, not two competing copies of the same identity.
 ANCHOR_START = "<!-- agentchat:start -->"
 ANCHOR_END = "<!-- agentchat:end -->"
+
+# The handle line inside our block: shape-independent recognition.
+HANDLE_MARKER_PREFIX = "<!-- agentchat:handle "
+HANDLE_MARKER_SUFFIX = " -->"
+_HANDLE_MARKER_RE = re.compile(r"<!-- agentchat:handle @?([a-z0-9][a-z0-9-]*) -->")
+
+_HANDLE_PLACEHOLDER = "<handle>"
+_HANDLE_RE = r"@?([a-z0-9][a-z0-9-]*)"
 
 
 class AnchorError(RuntimeError):
@@ -65,16 +89,23 @@ def normalize_handle(handle: str) -> str:
     return handle.strip().lstrip("@").lower()
 
 
-def render_anchor_block(identity_line: str) -> str:
-    """The fenced block to inject into SOUL.md: markers around the served line.
+def render_handle_marker(handle: str) -> str:
+    return f"{HANDLE_MARKER_PREFIX}{normalize_handle(handle)}{HANDLE_MARKER_SUFFIX}"
+
+
+def render_anchor_block(identity_line: str, *, handle: str) -> str:
+    """The fenced block to inject into SOUL.md: markers, the handle line, the served line.
 
     Raises:
-        AnchorError: if the line is empty.
+        AnchorError: if the line or the handle is empty.
     """
     line = identity_line.strip()
     if not line:
         raise AnchorError("render_anchor_block: identity line is empty")
-    return "\n".join([ANCHOR_START, line, ANCHOR_END])
+    trimmed = normalize_handle(handle)
+    if not trimmed:
+        raise AnchorError("render_anchor_block: handle is empty")
+    return "\n".join([ANCHOR_START, render_handle_marker(trimmed), line, ANCHOR_END])
 
 
 def resolve_soul_path() -> Path:
@@ -121,7 +152,7 @@ def write_soul_anchor(identity_line: str, *, handle: str, soul_path: Path | None
     if not trimmed:
         raise AnchorError("write_soul_anchor: handle is empty")
 
-    block = render_anchor_block(identity_line)
+    block = render_anchor_block(identity_line, handle=trimmed)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     existing = target.read_text(encoding="utf-8") if target.exists() else ""
@@ -130,9 +161,12 @@ def write_soul_anchor(identity_line: str, *, handle: str, soul_path: Path | None
 
     # Post-write verify — the identity defense. The served line carries
     # the handle the key authenticates as; a line that names nobody (or
-    # somebody else) must not sit in the system prompt forever.
+    # somebody else) must not sit in the system prompt forever. The handle
+    # marker alone does not satisfy this: the check is on the text the
+    # model reads.
     verify = target.read_text(encoding="utf-8")
-    if f"@{trimmed}" not in verify:
+    body = _split_marker(_anchor_inner(verify) or "")[1]
+    if f"@{trimmed}" not in body:
         raise AnchorError(
             f"write_soul_anchor: handle @{trimmed} did not land in "
             f"{target} — the identity line does not name this agent; remove the "
@@ -167,83 +201,112 @@ def has_anchor(*, soul_path: Path | None = None) -> bool:
     return ANCHOR_START in content and ANCHOR_END in content
 
 
-# The shapes of blocks this plugin has written, so an anchor from any
-# earlier release is still recognised (and refreshed, see
-# :func:`anchor_is_current`): the served line ("I am @handle on AgentChat"),
-# then the pre-v3 block ("You are **@handle** on AgentChat"). A block in
-# neither shape was hand-edited and is the user's.
+# The shapes of blocks earlier releases wrote without a handle line, so an
+# anchor from any of them is still recognised (and refreshed, see
+# :func:`anchor_is_current`): 0.3.0's "I am @handle on AgentChat", then
+# the pre-v3 "You are **@handle** on AgentChat". A block in none of the
+# recognised shapes was hand-edited and is the user's.
 _ANCHOR_HANDLE_RES = (
     re.compile(r"I am @([a-z0-9][a-z0-9-]*) on AgentChat"),
     re.compile(r"You are \*\*@([a-z0-9][a-z0-9-]*)\*\* on AgentChat"),
 )
-_HANDLE_PLACEHOLDER = "<handle>"
 
 
 def _template_pattern(template: str | None) -> re.Pattern[str] | None:
-    """A recogniser built from the served ``identity_line_template``, when given."""
+    """A recogniser built from a served ``identity_line_template``.
+
+    Anchored on the words before ``<handle>`` (whitespace normalised so a
+    reflowed block still matches); when the handle opens the template, on
+    the first words after it instead.
+    """
     if not template or _HANDLE_PLACEHOLDER not in template:
         return None
-    head, _sep, _tail = template.partition(_HANDLE_PLACEHOLDER)
-    # The first line up to the placeholder is enough to recognise the shape;
-    # whitespace is normalised so a reflowed block still matches.
+    head, _sep, tail = template.partition(_HANDLE_PLACEHOLDER)
     prefix = " ".join(head.split())
-    if not prefix:
+    if prefix:
+        return re.compile(re.escape(prefix) + r"\s*" + _HANDLE_RE)
+    suffix = " ".join(tail.split()[:3])
+    if not suffix:
         return None
-    return re.compile(re.escape(prefix) + r"\s*@?([a-z0-9][a-z0-9-]*)")
+    return re.compile(_HANDLE_RE + r"\s*" + re.escape(suffix))
+
+
+def _anchor_inner(content: str) -> str | None:
+    """The text between the markers, or ``None`` when there is no block."""
+    start_idx = content.find(ANCHOR_START)
+    end_idx = content.find(ANCHOR_END)
+    if start_idx < 0 or end_idx < 0 or end_idx < start_idx:
+        return None
+    return content[start_idx + len(ANCHOR_START) : end_idx]
+
+
+def _split_marker(inner: str) -> tuple[str | None, str]:
+    """``(handle from the marker line, the rest)`` of a block's inner text."""
+    match = _HANDLE_MARKER_RE.search(inner)
+    if match is None:
+        return None, inner
+    return match.group(1), inner[: match.start()] + inner[match.end() :]
 
 
 def read_anchor_handle(
-    *, soul_path: Path | None = None, template: str | None = None
+    *,
+    soul_path: Path | None = None,
+    template: str | None = None,
+    templates: Iterable[str] = (),
 ) -> str | None:
     """Return the handle named inside the fenced block, or ``None``.
 
+    The block's own handle line wins. Without one (a block written by an
+    earlier release), the served ``template`` (and any further
+    ``templates``) and the shapes earlier releases wrote are tried.
     ``None`` when the file or the markers are absent, or when the block
-    was hand-edited into a shape we do not recognise (the served template
-    when ``template`` is given, the current and pre-v3 shapes always). Used
-    at plugin start to detect a profile whose SOUL.md says one identity
-    while its API key authenticates as another — the mix-up behind the
-    September 2026 fleet incident, where a profile labelled *Growth* was
-    sending as *Operations*.
+    was hand-edited into a shape we do not recognise. Used at plugin start
+    to detect a profile whose SOUL.md says one identity while its API key
+    authenticates as another — the mix-up behind the September 2026 fleet
+    incident, where a profile labelled *Growth* was sending as *Operations*.
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
     try:
         content = target.read_text(encoding="utf-8")
     except OSError:
         return None
-    start_idx = content.find(ANCHOR_START)
-    end_idx = content.find(ANCHOR_END)
-    if start_idx < 0 or end_idx < 0 or end_idx < start_idx:
+    inner = _anchor_inner(content)
+    if inner is None:
         return None
-    block = content[start_idx:end_idx]
+    marked, body = _split_marker(inner)
+    if marked is not None:
+        return marked
     patterns: list[re.Pattern[str]] = []
-    from_template = _template_pattern(template)
-    if from_template is not None:
-        patterns.append(from_template)
+    for candidate in (template, *templates):
+        pattern = _template_pattern(candidate)
+        if pattern is not None:
+            patterns.append(pattern)
     patterns.extend(_ANCHOR_HANDLE_RES)
-    normalised = " ".join(block.split())
+    normalised = " ".join(body.split())
     for pattern in patterns:
-        match = pattern.search(normalised) or pattern.search(block)
+        match = pattern.search(normalised) or pattern.search(body)
         if match:
             return match.group(1)
     return None
 
 
-def anchor_is_current(identity_line: str, *, soul_path: Path | None = None) -> bool | None:
-    """``True`` when the block holds exactly ``identity_line``.
+def anchor_is_current(
+    identity_line: str, *, soul_path: Path | None = None, template: str | None = None
+) -> bool | None:
+    """``True`` when the block's text is exactly ``identity_line``.
 
     ``False`` for a recognised block with other text (safe to refresh);
     ``None`` when there is no block, or the block names no handle we
     recognise (a hand-edited block is the user's, and is left alone).
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
-    handle = read_anchor_handle(soul_path=target)
-    if handle is None:
+    if read_anchor_handle(soul_path=target, template=template) is None:
         return None
-    content = target.read_text(encoding="utf-8")
-    start_idx = content.find(ANCHOR_START)
-    end_idx = content.find(ANCHOR_END)
-    block = content[start_idx + len(ANCHOR_START) : end_idx].strip()
-    return block == identity_line.strip()
+    inner = _anchor_inner(target.read_text(encoding="utf-8"))
+    if inner is None:
+        return None
+    _marked, body = _split_marker(inner)
+    return body.strip() == identity_line.strip()
 
 
 def remove_soul_anchor(*, soul_path: Path | None = None) -> bool:

@@ -609,7 +609,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
 
         # The served texts: the identity line the anchor check compares
         # against, and proof that /v1/texts answers for this key.
-        identity_line = _doctor_identity_line(client, api_key=saved_key, api_base=api_base, hermes_home=hermes_home)
+        identity_line, identity_template = _doctor_identity_texts(
+            client, api_key=saved_key, api_base=api_base, hermes_home=hermes_home
+        )
         if identity_line is not None:
             ok("served texts available (/v1/texts, or the cached copy)")
         else:
@@ -671,7 +673,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         )
 
         if has_anchor():
-            anchored = read_anchor_handle()
+            anchored = read_anchor_handle(template=identity_template)
             if (
                 anchored is not None
                 and authenticated_handle is not None
@@ -693,7 +695,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             elif (
                 anchored is not None
                 and identity_line is not None
-                and anchor_is_current(identity_line) is False
+                and anchor_is_current(identity_line, template=identity_template) is False
             ):
                 warn(
                     "SOUL.md identity line differs from the served text — run "
@@ -946,16 +948,17 @@ def _install_placement(handle: str, *, api_base: str, api_key: str) -> list[Plac
     return steps
 
 
-def _doctor_identity_line(
+def _doctor_identity_texts(
     client: Any, *, api_key: str, api_base: str, hermes_home: Path
-) -> str | None:
-    """The served identity line for ``doctor``: one fetch on the open client, else the cache."""
+) -> tuple[str | None, str | None]:
+    """``(identity line, template)`` for ``doctor``: one fetch on the open client, else the cache."""
     try:
         from .state import TEXTS_FILENAME, state_dir_for_account
         from .texts import load_texts
         from .turn import identity_line as render_identity_line
+        from .turn import identity_line_template as render_identity_line_template
     except ImportError:
-        return None
+        return None, None
     cache_path = (
         state_dir_for_account(hermes_home=hermes_home, api_base=api_base, api_key=api_key)
         / TEXTS_FILENAME
@@ -964,8 +967,10 @@ def _doctor_identity_line(
         loaded = load_texts(client, cache_path=cache_path)
     except Exception as exc:
         logger.debug("doctor: texts load raised: %s", exc)
-        return None
-    return render_identity_line(loaded.texts) if loaded is not None else None
+        return None, None
+    if loaded is None:
+        return None, None
+    return render_identity_line(loaded.texts), render_identity_line_template(loaded.texts)
 
 
 def _uninstall_mcp_registration() -> None:

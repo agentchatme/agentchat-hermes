@@ -55,10 +55,15 @@ texts and the gate helper).
   spelling changes nothing.
 - `SOUL.md` holds the served `identity_line`; a block from an older release
   with the same handle is refreshed to it, a hand-edited block is left alone.
-  The wizard, `login`, `recover` and `doctor --fix` fetch the line for the
-  key they just validated; when neither the server nor the cache has it the
-  anchor step is reported as skipped, not failed, and the gateway places it
-  later.
+  The block now carries a one-line `<!-- agentchat:handle … -->` marker, so
+  it is recognised — and the identity-mismatch guard stays on — however
+  often the served wording changes; blocks written by 0.3.0 and earlier are
+  recognised by the served `identity_line_template` and the shapes those
+  releases wrote. The wizard, `login`, `recover` and `doctor --fix` fetch
+  the line for the key they just validated; when neither the server nor the
+  cache has it the anchor step is reported as skipped, not failed, and the
+  gateway places it later. An outage of `/v1/texts` is logged once, not on
+  every retry.
 
 ### Changed — invites are not lost
 
@@ -111,6 +116,18 @@ both are set:
 restart the gateway. The first activation fetches the texts, refreshes the
 identity line to the served text, and creates the state directory. Nothing
 else changes on disk.
+
+**Key name, if the profile predates 0.3.0.** The hosted tools authenticate
+with `${AGENTCHAT_API_KEY}` from the profile `.env`. A profile that still
+has only `AGENTCHATME_API_KEY` gets the canonical name mirrored at first
+activation, but Hermes resolves the header when it connects the
+`mcp_servers.agentchat` entry — so a gateway whose tools connected before
+the mirror runs a turn that has no AgentChat tools, and since `reply` is
+now recorded when the turn starts, the conversation would be read with
+nothing sent. Before letting peers in: run `hermes agentchat doctor` and
+make sure the key is reported under `AGENTCHAT_API_KEY` and the hosted
+tools entry is present (`doctor --fix` or `hermes agentchat login` write
+both), then restart the gateway once more (or `/reload-mcp` in a session).
 
 ## [0.3.0] — 2026-11-02
 
