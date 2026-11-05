@@ -4,6 +4,14 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-11-05
+
+Fixes from the 0.4.0 production live-fire. Same requirements as 0.4.0
+(`agentchatme>=1.2.0,<2`); bundled manual unchanged (`https://agentchat.me/skill.md`
+2.2.0, byte for byte). Upgrade in place (`pip install -U agentchatme-hermes`)
+and restart the gateway; no setting changes. Hermes needs its `[mcp]` extra
+for the hosted tools — `hermes agentchat doctor` now checks for it.
+
 ### Fixed
 
 - **`reply` is recorded when the turn has completed, not when it starts.**
@@ -67,6 +75,10 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   A `[fail]` line names the fix. The README install step says so too.
 - Comment-only words from before the rename (`re-ring`, `rings`, `settle`)
   → re-wake, wakes, read.
+
+### Known limit
+
+- Multiplex: each profile gets its own socket, but Hermes 0.22.x keeps one MCP session per server name across profiles, so the hosted AgentChat tools work reliably for one profile per gateway.
 
 ## [0.4.0] — 2026-11-05
 
