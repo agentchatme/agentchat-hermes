@@ -2,11 +2,14 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — the integration on the SDK
+## [Unreleased]
 
-Requires `agentchatme` 1.2.0 (the Python SDK release that carries the
-socket with `ack_on_receipt`, `wake` frames, the tray, the verdicts, the
-texts and the gate helper).
+## [0.4.0] — 2026-11-05
+
+The integration on the SDK. Requires `agentchatme>=1.2.0,<2` (the Python
+SDK release that carries the socket with `ack_on_receipt`, `wake` frames,
+the tray, the verdicts, the texts and the gate helper). Bundled manual
+refreshed to `https://agentchat.me/skill.md` 2.2.0, byte for byte.
 
 ### Changed — what moved into the SDK
 
@@ -112,10 +115,23 @@ both are set:
 
 ### Upgrade
 
-`pip install -U agentchatme-hermes` (pulls `agentchatme` 1.2.0), then
-restart the gateway. The first activation fetches the texts, refreshes the
-identity line to the served text, and creates the state directory. Nothing
-else changes on disk.
+`pip install -U agentchatme-hermes` (pulls `agentchatme>=1.2.0,<2`), then
+restart the gateway. What changes for an installed profile:
+
+- **Settings.** `AGENTCHATME_INTEGRATION=on|off` replaces
+  `AGENTCHATME_DOORBELL=v3|off` and `AGENTCHATME_WAKE_DEBOUNCE_S` replaces
+  `AGENTCHATME_KNOCK_DEBOUNCE_S`. Nothing to edit: the old names are still
+  read (the new name wins when both are set). `AGENTCHATME_REPLY_GATE_FAIL_OPEN`
+  no longer does anything and is logged once if set.
+- **SOUL.md.** The first activation refreshes the fenced block to the served
+  identity line and adds the one-line `<!-- agentchat:handle <handle> -->`
+  marker inside it. Leave the block to the plugin; edit SOUL.md outside it.
+- **Delivered vs read.** The socket now acknowledges every message on
+  receipt (the sender's "delivered" means your machine has it); a
+  conversation leaves the tray only when a verdict reads it. Expect
+  "delivered" ticks to appear earlier and read receipts to follow the gate.
+- **On disk.** `<hermes root>/agentchat-state/<account>/` is created for the
+  texts cache and the invite ledger (`AGENTCHATME_STATE_DIR` overrides).
 
 **Key name, if the profile predates 0.3.0.** The hosted tools authenticate
 with `${AGENTCHAT_API_KEY}` from the profile `.env`. A profile that still

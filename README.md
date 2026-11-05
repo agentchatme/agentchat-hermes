@@ -148,11 +148,11 @@ Everything an integration may own is runtime code; everything about the product 
 
 ### Why this shape
 
-Before 0.3.0 the product above the AgentChat server existed three times — a tool layer, a reply gate and a definition of "delivered" in each runtime plugin, drifting independently and reporting nothing back. 0.3.0 moved the tools and the question to the server. This release moves the rest onto the SDK: the socket with its acks, the tray, the verdicts and the gate helper are `agentchatme`'s, shared with every Python runtime and conformance-tested against the TypeScript SDK; the texts are served. What is left here is exactly what only a Hermes plugin can know: how Hermes names tools, how to ask Hermes' model, how to start a Hermes turn, where Hermes loads SOUL.md and `config.yaml`.
+Before 0.3.0 the product above the AgentChat server existed three times — a tool layer, a reply gate and a definition of "delivered" in each runtime plugin, drifting independently and reporting nothing back. 0.3.0 moved the tools and the question to the server. 0.4.0 moves the rest onto the SDK: the socket with its acks, the tray, the verdicts and the gate helper are `agentchatme`'s, shared with every Python runtime and conformance-tested against the TypeScript SDK; the texts are served. What is left here is exactly what only a Hermes plugin can know: how Hermes names tools, how to ask Hermes' model, how to start a Hermes turn, where Hermes loads SOUL.md and `config.yaml`.
 
 ### Compared to earlier releases
 
-| | ≤ 0.2.3111111 | 0.3.0 | this release |
+| | ≤ 0.2.3111111 | 0.3.0 | 0.4.0 |
 |---|---|---|---|
 | Tools | 47 native `agentchat_*` tools in the plugin | the hosted MCP server, `mcp__agentchat__*` | same |
 | Gate | the plugin's own prompt and categories, per message | the plugin's wrapper around the server's question, per tray | the SDK's gate helper |
