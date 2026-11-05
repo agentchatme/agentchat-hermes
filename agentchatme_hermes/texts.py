@@ -34,6 +34,7 @@ from agentchatme.types import Texts
 from .state import read_json, write_json_atomic
 
 if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
     from pathlib import Path
 
     from agentchatme import AgentChatClient
@@ -177,8 +178,15 @@ class TextsStore:
         retry_interval_s: float = RETRY_INTERVAL_S,
         retry_max_s: float = RETRY_MAX_S,
         now: Callable[[], float] = time.time,
+        thread_scope: Callable[[], AbstractContextManager[object]] | None = None,
     ) -> None:
         self._client = client
+        # Entered by the refresh thread for its lifetime. A served-texts change
+        # fires listeners there, and the SOUL.md reconcile they run resolves its
+        # file through Hermes's context-local HERMES_HOME override: without the
+        # profile's context a multiplexed gateway's refresh would read and write
+        # the LAUNCH profile's SOUL.md. The runtime passes ``profile_context``.
+        self._thread_scope = thread_scope
         self._cache_path = cache_path
         self._runtime = runtime
         self._refresh_interval_s = refresh_interval_s
@@ -302,6 +310,13 @@ class TextsStore:
         return min(self._retry_max_s, backoff)
 
     def _loop(self) -> None:
+        if self._thread_scope is None:
+            self._refresh_until_stopped()
+            return
+        with self._thread_scope():
+            self._refresh_until_stopped()
+
+    def _refresh_until_stopped(self) -> None:
         while not self._stop.wait(self.next_delay()):
             try:
                 self.refresh()

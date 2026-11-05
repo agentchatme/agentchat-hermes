@@ -191,6 +191,58 @@ class TestStore:
         finally:
             store.stop()
 
+    def test_refresh_thread_runs_inside_the_thread_scope(self, tmp_path: Path) -> None:
+        """A served-texts change fires listeners on the refresh thread; they
+        must run in the profile's context (the runtime passes
+        ``profile_context``), or a multiplexed gateway's SOUL.md reconcile
+        would read and write the launch profile's file."""
+        import contextlib
+        import contextvars
+        import threading
+
+        marker: contextvars.ContextVar[str | None] = contextvars.ContextVar("profile", default=None)
+
+        @contextlib.contextmanager
+        def thread_scope() -> Any:
+            token = marker.set("profile-up")
+            try:
+                yield
+            finally:
+                marker.reset(token)
+
+        class Changing:
+            def __init__(self) -> None:
+                self.n = 0
+                self.texts = SimpleNamespace(get=self._get)
+
+            def _get(self, *, runtime: str) -> Texts:
+                self.n += 1
+                return _texts(wake=f"Wake {self.n}.")
+
+        calls: list[tuple[str, str | None]] = []
+        changed = threading.Event()
+        store = TextsStore(
+            client=Changing(),  # type: ignore[arg-type]
+            cache_path=tmp_path / "t.json",
+            refresh_interval_s=0.01,
+            thread_scope=thread_scope,
+        )
+
+        def listener(_texts: Texts) -> None:
+            calls.append((threading.current_thread().name, marker.get()))
+            if threading.current_thread().name == "agentchat-texts-refresh":
+                changed.set()
+
+        store.on_texts(listener)
+        store.start()
+        try:
+            assert changed.wait(5.0), "a refresh brought new texts and fired the listener"
+        finally:
+            store.stop()
+        refresh_calls = [scope for name, scope in calls if name == "agentchat-texts-refresh"]
+        assert refresh_calls and set(refresh_calls) == {"profile-up"}
+        assert marker.get() is None, "the caller's context is untouched"
+
     def test_refresh_thread_runs_and_stops(self, tmp_path: Path) -> None:
         store = TextsStore(
             client=_Client(_texts()),  # type: ignore[arg-type]

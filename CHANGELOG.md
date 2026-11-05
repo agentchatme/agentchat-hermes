@@ -10,16 +10,26 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   worker set the profile's `HERMES_HOME` override but not Hermes's
   per-profile *secret scope*, which the gateway binds around every served
   profile's own turns (`gateway/run.py` `_profile_runtime_scope`). Under a
-  multiplexed gateway `get_secret` then had no scope for our cycle: a
-  served profile's provider key (`key_env`), and any other secret its gate
-  call or turn read, resolved to the launch profile's value or failed
-  closed. Each cycle — tray read, gate call, hosted-tools hold, turn — and
-  each invite turn now runs in Hermes's own `_profile_runtime_scope(home)`
-  (the same override + secret scope built from the profile's `.env`, when
-  that helper is not importable); a single-profile gateway enters
-  `GatewayTurnMixin._standalone_launch_scope()`, as its own turns do. A
-  scope that cannot be entered runs nothing: the cards stay on the tray and
-  the ladder re-wakes.
+  multiplexed gateway every `get_secret` in our cycle therefore failed
+  closed (`UnscopedSecretError`): a provider key in the profile's `.env`
+  (`key_env`) could not be read, the gate failed closed and no turn ran —
+  for every profile, the launch profile included. Each cycle — tray read,
+  gate call, hosted-tools hold, turn — and each invite turn now runs in
+  Hermes's own `_profile_runtime_scope(home)`. When that helper is not
+  importable, the same three pieces are entered from Hermes's modules (the
+  HERMES_HOME override; the secret scope from `owner_secret_scope` after
+  `hydrate_profile_secret_sources`; the profile's terminal policy via
+  `install_and_reset_profile_terminal_scope`), with one warning; if any
+  piece is missing the cycle is skipped. A multiplexed scope that cannot be
+  entered runs nothing: the cards stay on the tray and the ladder re-wakes.
+  A single-profile gateway enters `GatewayTurnMixin._standalone_launch_scope()`,
+  as its own turns do, and runs the cycle as before (warned once) if that
+  cannot be entered.
+- **The texts refresh thread runs in its profile's context.** A served-texts
+  change fires the SOUL.md reconcile on that thread; without the profile's
+  HERMES_HOME override a multiplexed gateway reconciled the launch
+  profile's SOUL.md (a false `IDENTITY MISMATCH`, or the wrong handle in a
+  SOUL.md without a block).
 
 ### Corrected
 
@@ -28,7 +38,8 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   with their own keys get two connections, and multiplex works. The
   live-fire failures behind that line came from an MCP-client recovery bug
   upstream — one dropped request ends the whole session, and a stale
-  reconnect flag then tears down the next healthy one — being reported upstream.
+  reconnect flag then tears down the next healthy one — tracked as
+  NousResearch/hermes-agent#103211 and modelcontextprotocol/python-sdk#3522.
 
 ## [0.4.1] — 2026-11-05
 
@@ -104,7 +115,7 @@ for the hosted tools — `hermes agentchat doctor` now checks for it.
 
 ### Known limit
 
-- ~~Multiplex: each profile gets its own socket, but Hermes 0.22.x keeps one MCP session per server name across profiles, so the hosted AgentChat tools work reliably for one profile per gateway.~~ Wrong — see 0.4.2 (Corrected).
+- ~~Multiplex: each profile gets its own socket, but Hermes 0.22.x keeps one MCP session per server name across profiles, so the hosted AgentChat tools work reliably for one profile per gateway.~~ Wrong — see [Unreleased] → Corrected.
 
 ## [0.4.0] — 2026-11-05
 
