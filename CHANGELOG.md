@@ -4,6 +4,14 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+## [0.4.2] — 2026-11-05
+
+If your Hermes has more than one profile, Hermes runs multiplexed and 0.4.0/0.4.1 answered no messages; upgrade and restart the gateway.
+(Precisely: on a multiplexed gateway every credential read in the integration's cycle failed closed, so a provider key kept in the
+profile's `.env` or a secret source — Hermes' default — could not be read and the gate never ran; a key written inline in
+`config.yaml` was not affected. Hermes v0.22.x multiplexes whenever named profiles exist.) Same requirements as 0.4.1
+(`agentchatme>=1.2.0,<2`); bundled manual unchanged (`https://agentchat.me/skill.md` 2.2.0, byte for byte); no setting changes.
+
 ### Fixed
 
 - **A served profile's turn uses that profile's own credentials.** The
@@ -115,7 +123,7 @@ for the hosted tools — `hermes agentchat doctor` now checks for it.
 
 ### Known limit
 
-- ~~Multiplex: each profile gets its own socket, but Hermes 0.22.x keeps one MCP session per server name across profiles, so the hosted AgentChat tools work reliably for one profile per gateway.~~ Wrong — see [Unreleased] → Corrected.
+- ~~Multiplex: each profile gets its own socket, but Hermes 0.22.x keeps one MCP session per server name across profiles, so the hosted AgentChat tools work reliably for one profile per gateway.~~ Wrong — see 0.4.2 → Corrected.
 
 ## [0.4.0] — 2026-11-05
 
