@@ -13,10 +13,9 @@ from agentchatme_hermes.turn import (
     SKILL_REF,
     identity_line,
     invite_session_id,
-    invite_turn_prompt,
     mcp_tool_name,
     wake_session_id,
-    wake_turn_prompt,
+    with_manual,
 )
 
 # Shapes like the server's, as ``?runtime=hermes`` serves them: hosted tool
@@ -72,56 +71,23 @@ class TestToolNames:
 
 
 class TestAsServed:
-    def test_texts_are_used_verbatim(self) -> None:
+    def test_the_identity_line_is_used_verbatim(self) -> None:
         """No re-spelling, no text of our own inside the served words."""
-        assert wake_turn_prompt(TEXTS).startswith(TEXTS.wake_instruction.strip())
-        assert invite_turn_prompt(TEXTS).startswith(TEXTS.invite_prompt.strip())
         assert identity_line(TEXTS) == TEXTS.identity_line.strip()
 
 
-class TestWakePrompt:
-    def test_is_the_served_instruction_with_hermes_tool_names(self) -> None:
-        prompt = wake_turn_prompt(TEXTS)
-        assert prompt.startswith("You were woken by AgentChat.")
-        for tool in (
-            "mcp__agentchat__agentchat_inbox",
-            "mcp__agentchat__agentchat_decide",
-            "mcp__agentchat__agentchat_get_conversation",
-            "mcp__agentchat__agentchat_send_message",
-        ):
-            assert tool in prompt
-        assert " agentchat_inbox" not in prompt, "bare hosted name — Hermes would not find it"
+class TestTurnPrompt:
+    """The kit builds a turn's prompt from the served texts (the wake
+    instruction and the conversation id, or the invite prompt and the
+    invite id); this runtime adds only where its manual is."""
 
-    def test_states_the_gates_reply_ids_and_nothing_else(self) -> None:
-        prompt = wake_turn_prompt(TEXTS, ("conv_a", "conv_b"))
-        assert "decided to answer: conv_a, conv_b." in prompt
-        assert prompt.startswith(TEXTS.wake_instruction.strip())
-        assert prompt.endswith(MANUAL_POINTER)
-        assert "preview" not in prompt
-        assert wake_turn_prompt(TEXTS, ()) == wake_turn_prompt(TEXTS)
-        assert wake_turn_prompt(TEXTS, ("", "conv_c")) == wake_turn_prompt(TEXTS, ("conv_c",))
+    def test_adds_only_the_manual_pointer(self) -> None:
+        prompt = f"{TEXTS.wake_instruction}\n\nconversation_id: conv_a"
+        assert with_manual(prompt) == f"{prompt}\n\n{MANUAL_POINTER}"
+        assert f"skill_view {SKILL_REF}" in with_manual(prompt)
 
-    def test_points_at_the_bundled_manual(self) -> None:
-        assert f"skill_view {SKILL_REF}" in wake_turn_prompt(TEXTS)
-
-    def test_no_text_of_our_own_beyond_the_two_facts(self) -> None:
-        prompt = wake_turn_prompt(TEXTS, ("conv_a",))
-        ours = prompt.replace(TEXTS.wake_instruction.strip(), "", 1)
-        ours = ours.replace(MANUAL_POINTER, "", 1)
-        assert ours.strip() == (
-            "The gate step before this turn decided to answer: conv_a. Any other card on the "
-            "tray was left undecided; decide it with the tray's question."
-        )
-
-
-class TestInvitePrompt:
-    def test_is_the_served_invite_prompt_with_hermes_tool_names(self) -> None:
-        prompt = invite_turn_prompt(TEXTS)
-        assert prompt.startswith("A group invitation is pending.")
-        assert "mcp__agentchat__agentchat_list_group_invites" in prompt
-        assert "mcp__agentchat__agentchat_accept_group_invite" in prompt
-        assert "mcp__agentchat__agentchat_reject_group_invite" in prompt
-        assert prompt.endswith(MANUAL_POINTER)
+    def test_strips_the_kits_prompt_once(self) -> None:
+        assert with_manual("  hi \n") == f"hi\n\n{MANUAL_POINTER}"
 
 
 class TestIdentityLine:

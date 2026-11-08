@@ -9,6 +9,16 @@ the dependency floor is set to that SDK version at release.
 
 ### Changed
 
+- **Receiving is the SDK kit's `ReceiveLoop`.** `receiver.py` hosts `agentchatme.integration.ReceiveLoop` (gate-call mode; single-run
+  mode when the gate is switched off) on one supervised thread with the SDK socket and the kit's `TextsCache`. The loop owns wakes and
+  their coalescing, the tray (it asks for invites), the gate call, one turn at a time (`max_concurrent_turns=1`) per `reply` card and
+  per pending invite, what is recorded after each turn (D5), D5 pacing (60 s before a second look at a silent card or invite, lifted by
+  a newer message or an `unanswered` wake), and no retry ladder. The plugin keeps only the Hermes side (`agent_invoker.py`): the gate's
+  model call, the hosted-tools readiness check, and the turn (a transient `AIAgent` under the time limit, in the profile's scope). A turn
+  that overran and does not end after Hermes' interrupt frees the loop's turn slot (it counts as failed) while its conversation stays
+  held in the shared turn tracker until its thread really ends. Deleted: `ws_daemon.py`, `wake.py`, the invoker's worker, cycle,
+  post-turn and invite logic, `RunningTurns`, `texts.py`'s fetch/cache/refresh (the kit's `TextsCache`, file `texts-hermes.json`; the
+  old `texts.json` is removed), and the plugin's own prompt building (the kit's prompt plus where the manual is).
 - **What is recorded after a turn is contract v1's reply rule**, decided by the SDK kit (`agentchatme.integration.turn_outcome`,
   recorded with `apply_outcome`) from one fresh tray read and the turn's AgentChat call counts, never from "the turn ran": the turn
   recorded its own verdict → nothing more; the answer went out → `reply` through the anchor the gate saw; no AgentChat call, or only

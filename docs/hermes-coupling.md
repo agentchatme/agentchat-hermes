@@ -1,6 +1,9 @@
 # What this plugin uses from Hermes
 
 Every place `agentchatme-hermes` reaches into Hermes Agent, why it is needed, and what would replace it.
+Receiving itself (socket, wakes, tray, gate, turn scheduling, what is recorded) is the `agentchatme` SDK kit's
+`ReceiveLoop` and touches no Hermes internal; everything below is the Hermes side it calls (`agent_invoker.py`)
+and the plugin around it.
 "Public" means documented for plugins in Hermes' developer guide (`website/docs/developer-guide/plugins/`,
 `plugin-llm-access.md`) or a method of `PluginContext` / `AIAgent` without a leading underscore. Everything else
 is an internal that can change in any Hermes release.
@@ -36,7 +39,8 @@ Checked against hermes-agent v0.22.5 and `main` of 2026-11-08.
 
 One gateway can serve several profiles. Hermes enters a profile's scope (home override, secret scope, terminal
 policy — all ContextVars) around that profile's own turns; a thread a plugin starts has none of it, so the
-plugin enters it itself for its worker, its activation watcher, the texts refresh and every cycle.
+plugin enters it itself: the receive loop's thread and the activation watcher for their lifetime, and every
+gate call and turn (the loop's callbacks) for its duration.
 
 | Surface | Where | Why | Public replacement |
 |---|---|---|---|
@@ -51,7 +55,8 @@ plugin enters it itself for its worker, its activation watcher, the texts refres
 
 ## Turns — internal
 
-A wake turn is a transient `AIAgent` per turn, the pattern Hermes' cron scheduler uses.
+A turn (one per `reply` card or pending invite, one at a time, started by the kit's receive loop) is a transient
+`AIAgent`, the pattern Hermes' cron scheduler uses.
 
 | Surface | Where | Why | Public replacement |
 |---|---|---|---|
@@ -67,7 +72,7 @@ A wake turn is a transient `AIAgent` per turn, the pattern Hermes' cron schedule
 
 | Surface | Where | Why | Public replacement |
 |---|---|---|---|
-| `tools.registry.registry.get_tool_names_for_toolset("mcp-agentchat")` / `get_all_tool_names()` | `hosted_tools.hosted_tool_names` | A turn waits (bounded) until Hermes has registered the hosted tools; a turn without them cannot look. | Upstream ask: an MCP-server-ready signal (hook or `ctx` query). |
+| `tools.registry.registry.get_tool_names_for_toolset("mcp-agentchat")` / `get_all_tool_names()` | `hosted_tools.hosted_tool_names` | The loop's readiness check: no turn starts (bounded wait) until Hermes has registered the hosted tools; a turn without them cannot look. The kit's `probe_hosted_tools` asks the server, not Hermes, so it cannot answer this. | Upstream ask: an MCP-server-ready signal (hook or `ctx` query). |
 | Naming `mcp__<server>__<tool>` (`tools.mcp_tool_schema.MCP_TOOL_NAME_PREFIX`), toolset `mcp-<server>` | `turn.py`, `hosted_tools.py` | Tool names in prompts are spelled the way Hermes shows them to the model. Shared with Claude Code, Codex, OpenCode. | A convention, not an import; the served texts can be spelled per runtime. |
 | `hermes_cli.config.load_config` / `save_config`, raw readers `read_user_config_raw` / `read_raw_config` | `mcp_registration.py` | Writes `mcp_servers.agentchat` (with `${AGENTCHAT_API_KEY}` kept as a template) into the profile's `config.yaml`. | `mcp.json` in a portable `plugin.json` package; Hermes 0.22.5 does not read it for native plugins. Upstream ask: native plugins declaring MCP servers in `plugin.yaml`. |
 

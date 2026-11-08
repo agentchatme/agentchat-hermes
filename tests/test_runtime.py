@@ -70,19 +70,17 @@ def _patched_runtime(*, lock_winner: bool = True) -> Any:
     fake_client = MagicMock()
     fake_client.get_me.return_value = {"handle": "alice"}
 
-    ws_cls = MagicMock()
+    ws_cls = MagicMock()  # the receiver (socket + receive loop)
     invoker_cls = MagicMock()
     acquire = MagicMock(return_value=99 if lock_winner else None)
     release = MagicMock()
-    texts_cls = MagicMock()
-    texts_cls.return_value.get.return_value = None
 
     with patch(
-        "agentchatme_hermes.runtime.WSDaemon", ws_cls
+        "agentchatme_hermes.runtime.Receiver", ws_cls
     ), patch(
         "agentchatme_hermes.runtime.AgentInvoker", invoker_cls
     ), patch(
-        "agentchatme_hermes.runtime.TextsStore", texts_cls
+        "agentchatme_hermes.runtime.load_texts", MagicMock(return_value=None)
     ), patch(
         "agentchatme_hermes.runtime.try_acquire_ws_leader_lock", acquire
     ), patch(
@@ -109,7 +107,7 @@ class TestRuntimeStartLeaderMode:
             assert ws_cls.called
             assert invoker_cls.called
             ws_cls.return_value.start.assert_called_once()
-            invoker_cls.return_value.start.assert_called_once()
+            invoker_cls.return_value.start.assert_not_called()  # the receiver runs it; it has no thread
 
             assert rt.identity.handle == "alice"
             assert rt.client is fake_client
@@ -239,8 +237,9 @@ class TestPerAccountLockWiring:
             rt = Runtime(_config(), gateway_mode=True)
             rt.start()
             assert invoker_cls.call_args.kwargs["runtime"] is rt
-            assert ws_cls.call_args.kwargs["on_wake"] is invoker_cls.return_value.wake
+            assert ws_cls.call_args.kwargs["invoker"] is invoker_cls.return_value
             assert "on_group_invite" not in ws_cls.call_args.kwargs, "invites are on the tray"
+            assert ws_cls.call_args.kwargs["hermes_home"] == rt.hermes_home
 
 
 class TestRuntimeRegistry:
@@ -334,70 +333,75 @@ class TestIntegrationOff:
             assert rt._leader_retry_thread is None
 
 
+_SERVED = {
+    "version": "1",
+    "manual": {"url": "u", "version": "v"},
+    "wake_instruction": "w",
+    "invite_prompt": "i",
+    "identity_line": "I am @alice on AgentChat. I call mcp__agentchat__agentchat_inbox first.",
+    "identity_line_template": "I am @<handle> on AgentChat.",
+}
+
+
 class TestClientAndTexts:
-    def test_runtime_hands_the_sdk_client_and_texts_to_the_invoker(self, tmp_path: Path) -> None:
-        """One sync SDK client serves identity, tray, verdicts and texts; the
-        texts store lives in the account's state dir and starts with the runtime."""
+    def test_runtime_hands_the_sdk_client_and_the_texts_cache_to_the_receiver(self, tmp_path: Path) -> None:
+        """One sync SDK client serves identity and the start-time texts load;
+        the receiver gets a texts cache in the account's state dir and the
+        runtime's hub for changes; the old state files are removed."""
         from agentchatme_hermes.runtime import Runtime
 
-        with _patched_runtime(lock_winner=True) as (_ws, invoker_cls, fake_client, _acq, _rel), patch(
-            "agentchatme_hermes.runtime.TextsStore"
-        ) as texts_cls:
-            texts_cls.return_value.get.return_value = None
-            rt = Runtime(_config(hermes_home=tmp_path / ".hermes"), gateway_mode=True)
+        home = tmp_path / ".hermes"
+        with _patched_runtime(lock_winner=True) as (ws_cls, invoker_cls, fake_client, _acq, _rel):
+            rt = Runtime(_config(hermes_home=home), gateway_mode=True)
+            rt.state_dir.mkdir(parents=True)
+            (rt.state_dir / "texts.json").write_text("{}", encoding="utf-8")
+            (rt.state_dir / "invites.json").write_text("{}", encoding="utf-8")
             rt.start()
             try:
                 assert rt.client is fake_client
                 assert invoker_cls.call_args.kwargs["runtime"] is rt
                 assert "ledger" not in invoker_cls.call_args.kwargs
-                texts_cls.assert_called_once()
                 assert not (rt.state_dir / "invites.json").exists()
-                assert texts_cls.call_args.kwargs["client"] is fake_client
-                assert texts_cls.call_args.kwargs["cache_path"] == rt.state_dir / "texts.json"
+                assert not (rt.state_dir / "texts.json").exists()
+                cache = ws_cls.call_args.kwargs["texts_factory"](fake_client)
+                assert cache.runtime == "hermes" and cache.file_path == rt.state_dir / "texts-hermes.json"
+                assert ws_cls.call_args.kwargs["on_texts"] == rt._set_texts
                 from agentchatme_hermes.profile_scope import account_fingerprint
 
                 fingerprint = account_fingerprint(rt.config.api_base, rt.config.api_key)
-                assert rt.state_dir == tmp_path / ".hermes" / "agentchat-state" / fingerprint
-                texts_cls.return_value.start.assert_called_once()
+                assert rt.state_dir == home / "agentchat-state" / fingerprint
                 assert rt.texts is None and rt.identity_line() is None
             finally:
                 rt.stop()
-            texts_cls.return_value.stop.assert_called_once()
+            ws_cls.return_value.stop.assert_called_once()
 
-    def test_texts_refresh_thread_enters_this_profiles_context(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """The texts store's refresh thread runs in this profile's HERMES_HOME
-        override, so the SOUL.md reconcile it triggers reads this profile's file."""
-        import contextvars
-        import sys
-        import types
+    def test_texts_hub_tells_listeners_of_real_changes(self, tmp_path: Path) -> None:
+        from agentchatme.types import Texts
 
         from agentchatme_hermes.runtime import Runtime
 
-        override: contextvars.ContextVar[str | None] = contextvars.ContextVar("override", default=None)
-        constants = types.ModuleType("hermes_constants")
-        constants.set_hermes_home_override = lambda path: override.set(str(path))  # type: ignore[attr-defined]
-        constants.reset_hermes_home_override = lambda token: override.reset(token)  # type: ignore[attr-defined]
-        monkeypatch.setitem(sys.modules, "hermes_constants", constants)
-        home = tmp_path / ".hermes" / "profiles" / "up"
-        with _patched_runtime(lock_winner=False), patch("agentchatme_hermes.runtime.TextsStore") as texts_cls:
-            texts_cls.return_value.get.return_value = None
-            rt = Runtime(_config(hermes_home=home), gateway_mode=False)
+        with _patched_runtime(lock_winner=False):
+            rt = Runtime(_config(hermes_home=tmp_path / ".hermes"), gateway_mode=False)
             rt.start()
             try:
-                thread_scope = texts_cls.call_args.kwargs["thread_scope"]
-                assert override.get() is None
-                with thread_scope():
-                    assert override.get() == str(home)
-                assert override.get() is None
+                seen: list[str] = []
+                rt.on_texts(lambda texts: seen.append(texts.identity_line))
+                assert seen == [], "nothing loaded yet"
+                served = Texts.model_validate(_SERVED)
+                rt._set_texts(served)
+                rt._set_texts(Texts.model_validate(_SERVED))  # the same again: no news
+                rt._set_texts(None)  # a failed refresh changes nothing
+                assert seen == [_SERVED["identity_line"]]
+                late: list[str] = []
+                rt.on_texts(lambda texts: late.append(texts.identity_line))
+                assert late == [_SERVED["identity_line"]], "a late listener hears the current texts at once"
+                rt._set_texts(Texts.model_validate({**_SERVED, "identity_line": "I am @alice, reworded."}))
+                assert seen[-1] == late[-1] == "I am @alice, reworded."
             finally:
                 rt.stop()
 
     def test_stop_ends_every_thread_the_runtime_started(self, tmp_path: Path) -> None:
-        """A real texts store (no network: the fake client's answer is not a
-        ``Texts``, so nothing loads) starts its refresh thread with the
-        runtime; ``stop()`` must end it, leaving no ``agentchat-*`` thread."""
+        """A follower starts no thread of its own; ``stop()`` closes the client."""
         from agentchatme_hermes.runtime import Runtime
 
         fake_client = MagicMock()
@@ -406,12 +410,8 @@ class TestClientAndTexts:
         with patch.object(Runtime, "_build_sync_client", return_value=fake_client):
             rt = Runtime(_config(hermes_home=tmp_path / ".hermes"), gateway_mode=False)
             rt.start()
-            thread = rt.texts_store._thread
-            assert thread is not None and thread.is_alive()
-            assert rt.texts is None
+            assert rt.texts is None, "the fake client serves no Texts"
             rt.stop()
-        thread.join(timeout=2.0)
-        assert not thread.is_alive()
         leaked = [
             t.name for t in threading.enumerate() if t.name.startswith("agentchat-") and t.name not in before
         ]
@@ -423,31 +423,16 @@ class TestClientAndTexts:
 
         from agentchatme_hermes.runtime import Runtime
 
-        served = Texts.model_validate(
-            {
-                "version": "1",
-                "manual": {"url": "u", "version": "v"},
-                "wake_instruction": "w",
-                "invite_prompt": "i",
-                "identity_line": "I am @alice on AgentChat. I call mcp__agentchat__agentchat_inbox first.",
-                "identity_line_template": "I am @<handle> on AgentChat.",
-            }
-        )
+        served = Texts.model_validate(_SERVED)
         with _patched_runtime(lock_winner=False), patch(
-            "agentchatme_hermes.runtime.TextsStore"
-        ) as texts_cls:
-            texts_cls.return_value.get.return_value = served
+            "agentchatme_hermes.runtime.load_texts", MagicMock(return_value=served)
+        ):
             rt = Runtime(_config(hermes_home=tmp_path / ".hermes"), gateway_mode=False)
             rt.start()
             try:
                 assert rt.texts is served
-                assert rt.identity_line() == (
-                    "I am @alice on AgentChat. I call mcp__agentchat__agentchat_inbox first."
-                )
+                assert rt.identity_line() == _SERVED["identity_line"]
                 assert rt.identity_line_template() == "I am @<handle> on AgentChat."
-                callback = MagicMock()
-                rt.on_texts(callback)
-                texts_cls.return_value.on_texts.assert_called_once_with(callback)
             finally:
                 rt.stop()
 
@@ -477,7 +462,7 @@ class TestFollowerTakeover:
 
             assert rt.is_leader is True
             ws_cls.return_value.start.assert_called_once()
-            invoker_cls.return_value.start.assert_called_once()
+            invoker_cls.return_value.start.assert_not_called()  # the receiver runs it; it has no thread
             assert acquire.call_count == 3
             rt.stop()
 

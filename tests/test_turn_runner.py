@@ -10,8 +10,9 @@ The agent is a small double with the parts of ``AIAgent`` the runner uses:
   is interrupted the way Hermes' own watchdogs do it (``hard_interrupt``
   with a fixed ``tool_reason``) and reported ``timeout``;
 * a turn the interrupt does not stop is reported ``timeout`` with
-  ``ended=False`` and stays held in :class:`RunningTurns` until its thread
-  really ends — then the release callback fires once;
+  ``ended=False``; its ``finished`` event and end callback come only when
+  its thread really ends (the invoker keeps its conversation held until
+  then);
 * the caller's ContextVars (the profile scope) reach the turn thread;
 * ``stopped`` interrupts a running turn.
 """
@@ -26,7 +27,6 @@ from unittest.mock import MagicMock
 from agentchatme_hermes.turn_runner import (
     INTERRUPT_STOP_REASON,
     INTERRUPT_TOOL_REASON,
-    RunningTurns,
     TurnLimits,
     interrupt_agent,
     run_turn,
@@ -129,36 +129,29 @@ def test_activity_keeps_the_turn_alive_until_the_ceiling() -> None:
     assert time.monotonic() - started >= 0.4, "not cut by the idle limit while busy"
 
 
-def test_turn_that_ignores_the_interrupt_stays_held_until_it_really_ends() -> None:
+def test_turn_that_ignores_the_interrupt_ends_later() -> None:
     agent = _Agent(block=True, obey=False)
-    released: list[str] = []
-    running = RunningTurns(on_released=lambda: released.append("wake"))
-    token = running.hold(frozenset({"conv_a"}))
+    ended: list[str] = []
     report = run_turn(
         agent,
         "go",
         session_id="s",
         limits=TurnLimits(idle_s=0.05, max_s=5.0, grace_s=0.05, poll_s=0.01),
-        on_finished=lambda: running.release(token),
+        on_finished=lambda: ended.append("end"),
     )
     assert report.status == "timeout" and not report.ended
     assert report.turn_end().status == "still_running", "it keeps its conversation"
-    running.abandon(token)
-    assert running.busy() == {"conv_a"} and running.hung == 1
-    assert released == []
+    assert ended == []
 
     agent.release.set()  # the stuck call finally returns
     assert report.finished.wait(2.0)
-    assert running.busy() == set() and running.hung == 0
-    assert released == ["wake"], "the tray is read again once the overrun turn ended"
+    assert ended == ["end"], "the end callback comes with the real end, once"
 
 
-def test_a_normal_turn_releases_without_a_wake() -> None:
-    released: list[str] = []
-    running = RunningTurns(on_released=lambda: released.append("wake"))
-    token = running.hold(frozenset({"conv_a"}))
-    report = run_turn(_Agent(), "go", session_id="s", limits=FAST, on_finished=lambda: running.release(token))
-    assert report.ended and running.busy() == set() and released == []
+def test_a_normal_turn_calls_the_end_callback_before_returning() -> None:
+    ended: list[str] = []
+    report = run_turn(_Agent(), "go", session_id="s", limits=FAST, on_finished=lambda: ended.append("end"))
+    assert report.ended and ended == ["end"]
 
 
 def test_profile_context_reaches_the_turn_thread() -> None:
@@ -229,16 +222,3 @@ def test_interrupt_agent_shapes() -> None:
 
     raises = _Raises()
     assert interrupt_agent(raises, "why") is True and raises.used, "falls back to interrupt()"
-
-
-def test_running_turns_keys() -> None:
-    running = RunningTurns()
-    a = running.hold(frozenset({"c1", "c2"}))
-    running.hold(frozenset({"invite:i1"}))
-    assert running.busy() == {"c1", "c2", "invite:i1"}
-    assert running.is_busy("c2") and not running.is_busy("c3")
-    running.release(a)
-    running.release(a)  # idempotent
-    assert running.busy() == {"invite:i1"}
-    running.abandon(999)  # unknown token: nothing
-    assert running.hung == 0

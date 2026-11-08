@@ -1,11 +1,10 @@
 """How a Hermes turn is addressed: the served texts, as served for Hermes.
 
-A wake turn starts with the server's wake instruction and an invite turn
-with the server's invite prompt, both fetched from ``GET /v1/texts``
-(:mod:`.texts`) — this module carries no text of its own beyond two facts
-it is the only one to know: which conversation ids the gate decided to
-answer, and where this runtime keeps the manual (the ``agentchat:agentchat``
-skill). The agent then reads, decides and sends through the hosted MCP
+A turn's prompt is built by the SDK kit's receive loop from the served
+texts (``GET /v1/texts``, :mod:`.texts`): the wake instruction and the
+conversation id, or the invite prompt and the invite id. This module adds
+the one fact only this runtime knows — where it keeps the manual (the
+``agentchat:agentchat`` skill) — and the session ids. The agent then reads, decides and sends through the hosted MCP
 tools (``https://api.agentchat.me/mcp``), declared as the ``agentchat`` MCP
 server in the profile's ``config.yaml`` (see :mod:`.mcp_registration`).
 
@@ -27,8 +26,6 @@ import uuid
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
-
     from agentchatme.types import Texts
 
 # Name of the MCP server entry this plugin registers. Changing it changes
@@ -59,37 +56,11 @@ INBOX_TOOL = mcp_tool_name("agentchat_inbox")
 MANUAL_POINTER = f"(The AgentChat manual is the skill {SKILL_REF}: skill_view {SKILL_REF}.)"
 
 
-def wake_turn_prompt(texts: Texts, reply_conversations: Sequence[str] = ()) -> str:
-    """The prompt a wake turn starts with.
-
-    The served wake instruction, then — when the gate decided ``reply`` for
-    some cards — the conversation ids it chose. The turn is a fresh session
-    with no memory of the gate call, so the ids are stated; every other card
-    on the tray was left undecided and the turn judges it with the tray's
-    own question. Ids are metadata, never content. Ends with where the
-    manual is in this runtime.
-    """
-    sections = [texts.wake_instruction.strip()]
-    ids = [cid for cid in reply_conversations if isinstance(cid, str) and cid]
-    if ids:
-        sections.append(
-            "The gate step before this turn decided to answer: "
-            + ", ".join(ids)
-            + ". Any other card on the tray was left undecided; decide it with the tray's question."
-        )
-    sections.append(MANUAL_POINTER)
-    return "\n\n".join(sections)
-
-
-def invite_turn_prompt(texts: Texts, invite_id: str | None = None) -> str:
-    """The prompt a group-invite turn starts with: the served invite prompt,
-    the invite this turn is for (its id: metadata, never the group's name or
-    anything else a peer wrote), and where the manual is."""
-    sections = [texts.invite_prompt.strip()]
-    if isinstance(invite_id, str) and invite_id:
-        sections.append(f"This turn is for the invite {invite_id}.")
-    sections.append(MANUAL_POINTER)
-    return "\n\n".join(sections)
+def with_manual(prompt: str) -> str:
+    """A turn's prompt as the kit built it (the served wake instruction and
+    the conversation id, or the served invite prompt and the invite id),
+    then where this runtime keeps the manual."""
+    return f"{prompt.strip()}\n\n{MANUAL_POINTER}"
 
 
 def identity_line(texts: Texts) -> str:

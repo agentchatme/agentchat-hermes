@@ -10,7 +10,6 @@ from fake_keys import PREFIX, api_key
 from agentchatme_hermes import placement
 from agentchatme_hermes.config import ENV_API_KEY, ENV_API_KEY_LEGACY
 from agentchatme_hermes.soul_anchor import read_anchor_handle
-from agentchatme_hermes.texts import LoadedTexts
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -120,20 +119,19 @@ class TestResolveIdentityLine:
     ) -> None:
         seen: dict[str, Any] = {}
 
-        def fake_load(client: Any, *, cache_path: Path, **_kw: Any) -> LoadedTexts:
-            seen["cache_path"] = cache_path
-            return LoadedTexts(texts=self._texts(), fetched_at=0.0, source="server")
+        def fake_load(client: Any, *, state_dir: Path, **_kw: Any) -> Texts:
+            seen["state_dir"] = state_dir
+            return self._texts()
 
         monkeypatch.setattr(placement, "load_texts", fake_load)
         line = placement.resolve_identity_line(
             api_key=api_key("k"), api_base="https://api.example.test", hermes_home=tmp_path
         )
         assert line == "I am @alice on AgentChat. I call mcp__agentchat__agentchat_inbox first."
-        assert seen["cache_path"].parent.parent == tmp_path / "agentchat-state"
-        assert seen["cache_path"].name == "texts.json"
+        assert seen["state_dir"].parent == tmp_path / "agentchat-state"
 
     def test_nothing_available_is_none(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setattr(placement, "load_texts", lambda client, *, cache_path, **_kw: None)
+        monkeypatch.setattr(placement, "load_texts", lambda client, *, state_dir, **_kw: None)
         assert (
             placement.resolve_identity_line(
                 api_key="k", api_base="https://api.example.test", hermes_home=tmp_path

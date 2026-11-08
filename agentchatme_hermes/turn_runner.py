@@ -33,9 +33,9 @@ How it works
   ``timeout`` — a failed turn: nothing is recorded for it.
 * A thread that does not end within the grace keeps running in the
   background; :attr:`TurnReport.finished` is set only when it really ends.
-  The caller keeps that turn's conversations marked as running until then
-  (:class:`RunningTurns`), so no second turn starts for them while the
-  first one may still send.
+  The caller keeps that turn's conversation held until then (in the kit's
+  shared turn tracker, :mod:`.agent_invoker`), so no second turn starts for
+  it while the first one may still send.
 
 What the turn did on AgentChat (the reply rule's inputs)
 ────────────────────────────────────────────────────────
@@ -452,62 +452,3 @@ def turn_failure(result: Any) -> str | None:
     )
     detail = str(error).strip()[:300] if error else "no error text"
     return f"{what}{f', {reason}' if reason else ''}: {detail}"
-
-
-# ─── turns that are running ─────────────────────────────────────────────────
-
-
-class RunningTurns:
-    """Which conversations (and invites) have a turn running right now.
-
-    A key is held from the moment a turn starts until its thread has really
-    ended — not until the host stopped waiting for it. Cards whose key is
-    held are not gated and get no second turn. Thread-safe.
-    """
-
-    def __init__(self, *, on_released: Callable[[], None] | None = None) -> None:
-        self._lock = threading.Lock()
-        self._held: dict[int, frozenset[str]] = {}
-        self._abandoned: set[int] = set()
-        self._next = 0
-        self._on_released = on_released
-
-    def hold(self, keys: set[str] | frozenset[str]) -> int:
-        with self._lock:
-            self._next += 1
-            token = self._next
-            self._held[token] = frozenset(keys)
-        return token
-
-    def release(self, token: int) -> None:
-        with self._lock:
-            keys = self._held.pop(token, None)
-            was_abandoned = token in self._abandoned
-            self._abandoned.discard(token)
-        if keys is not None and was_abandoned and self._on_released is not None:
-            # A turn the host had stopped waiting for has ended: whatever its
-            # cards hold now was not looked at by anyone; read the tray again.
-            try:
-                self._on_released()
-            except Exception:
-                logger.exception("AgentInvoker: running-turn release callback raised")
-
-    def abandon(self, token: int) -> None:
-        """The host stopped waiting for this turn; keep it held until it ends."""
-        with self._lock:
-            if token in self._held:
-                self._abandoned.add(token)
-
-    def busy(self) -> set[str]:
-        with self._lock:
-            return set().union(*self._held.values()) if self._held else set()
-
-    def is_busy(self, key: str) -> bool:
-        with self._lock:
-            return any(key in keys for keys in self._held.values())
-
-    @property
-    def hung(self) -> int:
-        """Turns that overran and have not ended yet."""
-        with self._lock:
-            return len(self._abandoned)

@@ -667,7 +667,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         # doctor. The gateway drains sync on every (re)connect, and a
         # doctor invocation while the gateway is up would race the
         # drain — the SDK has no peek/count variant, only "pull and
-        # ack." We instead rely on the WSDaemon heartbeat in the
+        # ack." We instead rely on the receiver heartbeat in the
         # gateway log for queue-depth visibility.
     finally:
         client.close()
@@ -1024,24 +1024,21 @@ def _doctor_identity_texts(
 ) -> tuple[str | None, str | None]:
     """``(identity line, template)`` for ``doctor``: one fetch on the open client, else the cache."""
     try:
-        from .state import TEXTS_FILENAME, state_dir_for_account
+        from .state import state_dir_for_account
         from .texts import load_texts
         from .turn import identity_line as render_identity_line
         from .turn import identity_line_template as render_identity_line_template
     except ImportError:
         return None, None
-    cache_path = (
-        state_dir_for_account(hermes_home=hermes_home, api_base=api_base, api_key=api_key)
-        / TEXTS_FILENAME
-    )
+    state_dir = state_dir_for_account(hermes_home=hermes_home, api_base=api_base, api_key=api_key)
     try:
-        loaded = load_texts(client, cache_path=cache_path)
+        texts = load_texts(client, state_dir=state_dir)
     except Exception as exc:
         logger.debug("doctor: texts load raised: %s", exc)
         return None, None
-    if loaded is None:
+    if texts is None:
         return None, None
-    return render_identity_line(loaded.texts), render_identity_line_template(loaded.texts)
+    return render_identity_line(texts), render_identity_line_template(texts)
 
 
 def _uninstall_mcp_registration() -> None:

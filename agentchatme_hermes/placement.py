@@ -29,7 +29,7 @@ from .config import ENV_API_KEY, ENV_API_KEY_LEGACY
 from .mcp_registration import McpRegistrationError, install_entry
 from .profile_scope import resolve_hermes_home
 from .soul_anchor import AnchorError, normalize_handle, write_soul_anchor
-from .state import TEXTS_FILENAME, state_dir_for_account
+from .state import state_dir_for_account
 from .texts import load_texts
 from .turn import identity_line as render_identity_line
 
@@ -116,7 +116,7 @@ def resolve_identity_line(
 
     One fetch through the SDK (writing the account's texts cache), else the
     cached copy, else ``None``. For the wizard, the CLI and ``doctor``,
-    which run outside the gateway's :class:`~agentchatme_hermes.texts.TextsStore`.
+    which run outside the gateway's receive loop.
     Never raises.
     """
     try:
@@ -125,23 +125,20 @@ def resolve_identity_line(
         logger.debug("placement: agentchatme not importable; no identity line")
         return None
     home = hermes_home if hermes_home is not None else resolve_hermes_home()
-    cache_path = (
-        state_dir_for_account(
-            hermes_home=home, api_base=api_base, api_key=api_key, state_dir=state_dir
-        )
-        / TEXTS_FILENAME
+    account_dir = state_dir_for_account(
+        hermes_home=home, api_base=api_base, api_key=api_key, state_dir=state_dir
     )
     client = AgentChatClient(
         api_key=api_key, base_url=api_base, client_identity=hermes_client_identity()
     )
     try:
-        loaded = load_texts(client, cache_path=cache_path)
+        texts = load_texts(client, state_dir=account_dir)
     finally:
         try:
             client.close()
         except Exception:
             logger.debug("placement: client close raised", exc_info=True)
-    return render_identity_line(loaded.texts) if loaded is not None else None
+    return render_identity_line(texts) if texts is not None else None
 
 
 # ─── identity, manual, tools ───────────────────────────────────────────────
