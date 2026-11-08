@@ -768,7 +768,7 @@ def _gate_answer(server: _Server) -> Any:
     return call_model
 
 
-def _loop(inv: AgentInvoker, server: _Server) -> ReceiveLoop:
+def _loop(inv: AgentInvoker, server: _Server, **overrides: Any) -> ReceiveLoop:
     return ReceiveLoop(
         server,
         TEXTS,
@@ -782,6 +782,7 @@ def _loop(inv: AgentInvoker, server: _Server) -> ReceiveLoop:
         turn_tracker=inv.tracker,
         quiet_ms=1,
         max_ms=5,
+        **overrides,
     )
 
 
@@ -813,6 +814,39 @@ class TestThroughTheReceiveLoop:
         assert await _until(lambda: bool(agent.prompts) and inv.tracker.size == 0)
         await loop.stop()
         assert "invite_id: ginv_1" in agent.prompts[0] and server.dismissed == []
+
+    @pytest.mark.parametrize(
+        ("content", "dismissed"),
+        [
+            ('{"result": "{\\"invites\\": []}"}', True),
+            ("Error executing tool: connection reset", False),
+        ],
+    )
+    async def test_an_invite_left_pending_twice_is_dismissed_only_on_counts_that_all_succeeded(
+        self, monkeypatch: pytest.MonkeyPatch, content: str, dismissed: bool
+    ) -> None:
+        """The second silent invite turn dismisses the invite only when its
+        AgentChat calls are known and all succeeded (the transcript count);
+        a call that may have failed leaves it on the tray (``silent_unconfirmed``)."""
+        server = _Server()
+        server.invites = ["ginv_1"]
+        agent = _Agent(result={"final_response": "", "messages": [
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "mcp__agentchat__agentchat_list_group_invites", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "name": "mcp__agentchat__agentchat_list_group_invites", "content": content},
+        ]})
+        inv = _invoker(monkeypatch, agent)
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: _gate_answer(server))
+        loop = _loop(inv, server, pace_ms=0)
+        await loop.start()
+        for turns in (1, 2, 3):
+            loop.wake()
+            assert await _until(lambda turns=turns: len(agent.prompts) >= turns and inv.tracker.size == 0)
+            await loop.idle()
+            if server.dismissed:
+                break
+        await loop.stop()
+        assert server.dismissed == (["ginv_1"] if dismissed else [])
+        assert len(agent.prompts) == (2 if dismissed else 3)
 
     async def test_a_stuck_turn_does_not_stop_the_next_conversation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """One turn at a time (max_concurrent_turns=1): the stuck turn for

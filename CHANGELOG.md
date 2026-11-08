@@ -45,7 +45,8 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 - **Group invites come from the tray; the invite ledger is gone.** Pending invites are on the tray (contract v1). After the cards,
   each invite gets one turn of its own (three per cycle, the rest on the next) whose prompt names the invite id; what is recorded after
   it is the kit's rule (`invite_outcome`): answered in the turn → nothing; looked and left it pending → nothing the first time, then
-  `dismiss` (seen, left pending, not shown again); failed or could not look → nothing, and the server re-wakes while the invite is
+  `dismiss` (seen, left pending, not shown again) when that turn's AgentChat calls are known and all succeeded, else nothing
+  (`silent_unconfirmed`); failed or could not look → nothing, and the server re-wakes while the invite is
   pending. The socket's `group.invite.received` frame is one more wake. Deleted: `invites.py` and its `invites.json` ledger (removed
   from the state directory on start), the socket's per-process invite dedupe and its connect-time `list_group_invites` catch-up.
 - **The socket watchdog honours the server's delay.** Over the connect budget the server answers 429 / close 1013 with a delay (up
