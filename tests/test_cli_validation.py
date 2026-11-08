@@ -213,6 +213,12 @@ class TestDoctor:
         monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)  # type: ignore[attr-defined]
         # Hermes' MCP client is present on a clean install (the [mcp] extra).
         monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)  # type: ignore[attr-defined]
+        # A clean install has the hosted-tools entry. Stated, not read from
+        # Hermes: with Hermes installed (the hermes-main workflow) the real
+        # check would read this test machine's config.yaml.
+        from agentchatme_hermes import mcp_registration
+
+        monkeypatch.setattr(mcp_registration, "inspect_entry", lambda **_kw: "ours")  # type: ignore[attr-defined]
 
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         captured = capsys.readouterr()  # type: ignore[attr-defined]

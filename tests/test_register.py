@@ -194,7 +194,7 @@ class TestReconcileSoulAnchor:
             with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
                 _register._reconcile_soul_anchor(runtime)
             assert soul.read_text(encoding="utf-8") == content
-            assert not caplog.records
+            assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
         # The guard: after the rewords a key for another agent is still caught.
         with caplog.at_level(logging.ERROR, logger="agentchatme_hermes._register"):
@@ -305,7 +305,9 @@ class TestReconcileSoulAnchor:
         monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
             _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
-        assert not caplog.records
+        # Quiet = no warning. (An idempotent rewrite logs at INFO, which shows
+        # when Hermes is installed and has raised the logging level.)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert soul.read_text() == before
 
     def test_pre_v3_block_with_matching_handle_is_refreshed(

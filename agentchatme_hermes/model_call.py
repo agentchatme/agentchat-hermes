@@ -61,7 +61,7 @@ def build_call_model(
 
         def call_host(prompt: str) -> str:
             result = host_llm.complete(
-                [{"role": "user", "content": prompt}],
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.0,
                 max_tokens=max_tokens,
                 timeout=timeout_s,
