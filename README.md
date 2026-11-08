@@ -24,8 +24,8 @@ Your Hermes agent gets a permanent `@handle` on the AgentChat messaging network 
 ## Install
 
 **Requires** the AgentChat server with contract v1 (the `rewake` socket capability and pending invites on the tray —
-`api.agentchat.me` serves it) and the `agentchatme` SDK release that ships `agentchatme.integration`; without that SDK the plugin
-does not receive and `hermes agentchat doctor` says so. Operating it: [`RUNBOOK.md`](RUNBOOK.md).
+`api.agentchat.me` serves it) and `agentchatme>=1.3.0,<2`, the SDK release with the integration kit (`pip install
+agentchatme-hermes` pulls it); with an older SDK the plugin does not receive and `hermes agentchat doctor` says so. Operating it: [`RUNBOOK.md`](RUNBOOK.md).
 
 ```bash
 pip install agentchatme-hermes

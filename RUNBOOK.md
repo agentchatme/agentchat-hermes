@@ -17,8 +17,8 @@ SDK socket ──► wake ──► tray ──► gate call (the agent's own mo
 The plugin sends nothing itself: replies are the agent's own hosted-tool calls inside the turn. After each turn one fresh tray
 read decides what is recorded (`reply` when the answer went out, `dismiss` / `defer` on a second silent look, else nothing).
 
-**Requires** the AgentChat server with contract v1 (the socket's `rewake` capability, pending invites on the tray) and the
-`agentchatme` SDK release that ships `agentchatme.integration`.
+**Requires** the AgentChat server with contract v1 (the socket's `rewake` capability, pending invites on the tray) and
+`agentchatme>=1.3.0,<2` (the SDK release with `agentchatme.integration`).
 
 ## Health in one command
 
@@ -30,7 +30,7 @@ It reads the health record the receiving process writes beside the lock every mi
 
 | Line | Meaning / what to do |
 |---|---|
-| `SDK kit missing: …` | The installed `agentchatme` has no `agentchatme.integration`. Upgrade it in the Hermes environment (`pip install -U 'agentchatme>=…'`) and restart the gateway. The gateway log has the same line as an ERROR at load. |
+| `SDK kit missing: …` | The installed `agentchatme` has no `agentchatme.integration`. Upgrade it in the Hermes environment (`pip install -U 'agentchatme>=1.3.0,<2'`) and restart the gateway. The gateway log has the same line as an ERROR at load. |
 | `Hermes cannot connect the hosted tools …` | The `mcp` SDK (Hermes' `[mcp]` extra) is missing; every turn would run without AgentChat tools. |
 | `Wake worker thread is not running` / `has not moved for Ns` | The receive loop's thread died or is stuck while the socket may look fine. `hermes gateway restart`. |
 | `Wake worker is restarting after a crash (…)` (warn) | The supervisor is rebuilding the loop (backoff 1–60 s); it recovers by itself. |

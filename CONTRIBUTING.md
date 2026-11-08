@@ -90,24 +90,6 @@ git worktree add .worktrees/<branch> -b <branch> origin/main
 `mypy agentchatme_hermes` and `pytest -q` on Python 3.9–3.13 (Linux) plus a
 macOS and a Windows smoke run; run all three locally before pushing.
 
-## Developing against an unreleased SDK
-
-The integration is built on the `agentchatme` SDK's kit
-(`agentchatme.integration`). When a change here needs SDK work that is not
-on PyPI yet, install the SDK from its branch into your environment, after
-this package:
-
-```bash
-python -m pip install -e '.[dev]'
-python -m pip install --force-reinstall --no-deps \
-  "agentchatme @ git+https://github.com/agentchatme/agentchat-python@<branch>"
-```
-
-(or `pip install -e ../agentchat-python` from a local clone). CI installs the
-SDK from PyPI, so such a branch is red on GitHub until that SDK release is
-published; the `agentchatme` floor in `pyproject.toml` moves to that release
-in the same PR.
-
 ## Hermes coupling
 
 `docs/hermes-coupling.md` lists every Hermes internal this plugin touches and

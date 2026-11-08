@@ -10,9 +10,10 @@ and loads THIS file as ``hermes_plugins.agentchat`` via
 ``hermes plugins install`` does NOT pip-install our dependencies,
 only clones the repo. So this module owns two jobs:
 
-1. Lazy-install ``agentchatme`` if the import fails (mirrors the
-   self-bootstrap pattern in ``hermes_cli/setup.py`` for optional
-   adapters like ``modal`` and ``daytona``).
+1. Lazy-install ``agentchatme`` if the import fails, or upgrade one older
+   than the release with the integration kit (mirrors the self-bootstrap
+   pattern in ``hermes_cli/setup.py`` for optional adapters like
+   ``modal`` and ``daytona``).
 2. Re-export :func:`register` from :mod:`agentchatme_hermes` — the
    canonical package living as a sibling subdirectory in the cloned
    repo. The relative import resolves through Hermes's
@@ -34,8 +35,44 @@ logger = logging.getLogger(__name__)
 
 # Pinned to match pyproject.toml's dependency declaration (a test keeps the
 # two identical): the git-clone path installs the SDK from here, and the
-# plugin needs the SDK's socket, tray, verdicts, texts and gate helper.
-_SDK_REQUIREMENT = "agentchatme>=1.2.0,<2"
+# plugin needs the SDK's integration kit (agentchatme.integration, 1.3.0).
+_SDK_REQUIREMENT = "agentchatme>=1.3.0,<2"
+_SDK_FLOOR = (1, 3, 0)
+
+
+def _installed_sdk_version() -> tuple[int, ...] | None:
+    """The installed ``agentchatme`` release, read from its metadata (the
+    SDK is not imported: a later upgrade must be what this process loads);
+    ``None`` when it is not installed."""
+    from importlib import metadata
+
+    try:
+        raw = metadata.version("agentchatme")
+    except metadata.PackageNotFoundError:
+        return None
+    parts: list[int] = []
+    for piece in raw.split(".")[:3]:
+        digits = ""
+        for char in piece:
+            if not char.isdigit():
+                break
+            digits += char
+        parts.append(int(digits or 0))
+    return tuple(parts)
+
+
+def _ensure_sdk_current() -> None:
+    """Upgrade an ``agentchatme`` older than the kit's release. A failed
+    upgrade is not fatal: the plugin then loads, says once that it cannot
+    receive, and ``hermes agentchat doctor`` reports it."""
+    installed = _installed_sdk_version()
+    if installed is None or installed >= _SDK_FLOOR:
+        return
+    logger.info("agentchatme SDK is older than the integration kit's release; installing %s", _SDK_REQUIREMENT)
+    try:
+        _install_sdk()
+    except Exception as exc:
+        logger.warning("could not upgrade the agentchatme SDK (%s)", exc)
 
 
 def _ensure_sdk_installed() -> None:
@@ -56,7 +93,12 @@ def _ensure_sdk_installed() -> None:
         pass
 
     logger.info("agentchatme SDK not installed; installing %s", _SDK_REQUIREMENT)
+    _install_sdk()
 
+
+def _install_sdk() -> None:
+    """``pip install`` (else ``uv pip install``) the requirement into the
+    environment ``sys.executable`` points at; raises when neither works."""
     # Path 1: pip via the current interpreter. Works on any venv that
     # has pip available (most do; the uv-built ones do not).
     try:
@@ -104,6 +146,7 @@ def _existing_path(path: str) -> str | None:
     return path if os.path.isfile(path) and os.access(path, os.X_OK) else None
 
 
+_ensure_sdk_current()
 _ensure_sdk_installed()
 
 # Re-export from the canonical package. The relative import only

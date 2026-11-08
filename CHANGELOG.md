@@ -9,10 +9,10 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 - **The AgentChat server with contract v1**: the `rewake` socket capability (the server re-wakes unanswered cards; there is no
   local retry ladder any more), pending group invites on the tray (`invites=1`; there is no local invite ledger any more), and the
   served gate-call texts. Against an older server, unanswered cards are not re-woken and invites are not seen.
-- **The `agentchatme` SDK release that ships `agentchatme.integration`** (the kit). `KIT_MIN_VERSION` (`kit.py`) and the
-  dependency floor in `pyproject.toml` are set to that SDK release's number at release time — the founder sets it; 1.3.0 is the
-  expected value per `VERSIONING.md`. Without the kit the plugin does not receive and says so: one ERROR at load naming the
-  required SDK version, and `hermes agentchat doctor` fails on it (the CLI and the manual stay registered).
+- **`agentchatme>=1.3.0,<2`**, the SDK release that ships `agentchatme.integration` (the kit): the dependency floor in
+  `pyproject.toml` and `plugin.yaml`, and `KIT_MIN_VERSION` in `kit.py`. The git-clone install's shim upgrades an older SDK it
+  finds. Without the kit the plugin does not receive and says so: one ERROR at load naming the required SDK version, and
+  `hermes agentchat doctor` fails on it (the CLI and the manual stay registered).
 
 ### Changed
 
