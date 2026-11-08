@@ -521,13 +521,26 @@ class TestStartTurn:
         assert inv.tracker.size == 0 and inv.hung_turns == 0
 
     async def test_a_stuck_turn_frees_the_slot_and_keeps_its_conversation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The handoff under the kit's release semantics: ``release`` lets go
+        of the loop's entry (its wait ends with ``None``: nothing recorded;
+        its slot is freed by the loop's release listener) and, in the same
+        step, the invoker begins its own entry for the conversation."""
         agent = _Agent(block=True, obey=False)
         inv = _invoker(monkeypatch, agent)
         woken: list[str] = []
+        released: list[str] = []
+        inv.tracker.on_release(lambda handle: released.append(handle.key))
         inv.set_wake(lambda: woken.append("wake"))
-        end = await _run(inv, _reply_request("conv_a"))
-        assert end.status == "failed" and "still running" in (end.detail or ""), "the loop records nothing and frees its slot"
+        loop_handle = inv.tracker.begin(TrackedTurn.reply("conv_a", "msg_a"))
+        assert loop_handle is not None
+        admission = await inv.start_turn(_reply_request("conv_a"))
+        end = await inv.tracker.confirmed_end(loop_handle, admission.done)
+        assert end is None, "released: the loop records nothing for it"
+        assert not inv.tracker.holds(loop_handle), "the loop's entry is gone"
+        assert released == ["conversation:conv_a"], "the release listeners heard it (the loop frees its slot)"
+        inv.tracker.end(loop_handle)  # what the loop does next: a no-op, the entry is the invoker's now
         assert inv.tracker.conversation_running("conv_a"), "held by the invoker until the thread ends"
+        assert inv.tracker.begin(TrackedTurn.reply("conv_a", "msg_a2")) is None, "no second turn for it"
         assert inv.hung_turns == 1 and inv.status()["hung_turns"] == 1
 
         agent.release.set()  # the stuck call finally returns
@@ -582,7 +595,7 @@ class TestStartTurn:
         inv.detach_turns()  # the loop is going away
         end = await inv.tracker.confirmed_end(handle, admission.done)
         inv.tracker.end(handle)
-        assert end is not None and end.status == "failed"
+        assert end is None and not inv.tracker.holds(handle), "released to the invoker: nothing recorded"
         assert inv.tracker.conversation_running("conv_a"), "still held: its thread runs"
         inv.stop()
         agent.release.set()
@@ -804,6 +817,13 @@ class TestThroughTheReceiveLoop:
         loop.wake()
         assert await _until(lambda: ("conv_b", "reply", "msg_b") in server.recorded, timeout=10.0)
         assert inv.tracker.conversation_running("conv_a") and inv.hung_turns == 1
+        status = loop.status()
+        assert status.counters["turns_active"] == 0 and status.counters["turns_waiting"] == 0, "the slot was freed"
+        assert [t.turn.conversation_id for t in status.turns] == ["conv_a"], "conv_a: held by the invoker"
+        # More wakes while conv_a is held: it is never gated again.
+        for _ in range(3):
+            loop.wake()
+            await loop.idle()
         assert len(stuck.prompts) == 1, "no second turn for conv_a while the first may still send"
         assert all(r[0] != "conv_a" for r in server.recorded)
         stuck.release.set()

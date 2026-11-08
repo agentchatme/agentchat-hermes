@@ -23,12 +23,13 @@ hosts it. This module is what only Hermes can say, as the loop's callbacks:
 
 A turn that overran and does not end after Hermes' own interrupt
 ─────────────────────────────────────────────────────────────────
-It counts as failed (nothing is recorded) and frees the loop's turn slot,
-but its conversation (or invite) stays held until its thread really ends:
-in one step on the loop's thread, with no await in between, the hold in the
-shared :class:`~agentchatme.integration.TurnTracker` passes from the loop's
-entry to one of this module's, which is ended — and the loop woken — when
-the thread ends. So no second turn starts for a conversation while the
+Its conversation (or invite) stays held until its thread really ends, while
+the loop moves on: in one step on the loop's thread, with no await in
+between, the shared :class:`~agentchatme.integration.TurnTracker` releases
+the loop's entry — the loop's wait on it ends with nothing recorded and its
+turn slot is freed at once (the next waiting turn starts) — and begins one
+of this module's for the same conversation, which is ended (and the loop
+woken) when the thread ends. So no second turn starts for a conversation while the
 first may still send, and one stuck turn does not stop the others. With
 :data:`MAX_HUNG_TURNS` such turns still running, no new turn is admitted
 (the cards stay on the tray; the server re-wakes).
@@ -316,7 +317,8 @@ class AgentInvoker:
             elif report.status == "timeout" and not turn.thread_done:
                 # Overran and still running: from the loop's entry to ours, in
                 # one step with no await in between, so no cycle sees the
-                # conversation free.
+                # conversation free. The release ends the loop's wait (nothing
+                # recorded) and frees its slot; ``done`` below is for the record.
                 self.tracker.release(turn.key)
                 turn.host_handle = self.tracker.begin(turn.tracked)
                 self.hung_total += 1
