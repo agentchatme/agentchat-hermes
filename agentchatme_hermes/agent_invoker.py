@@ -532,7 +532,7 @@ class AgentInvoker:
             host_llm=host_llm,
         )
         # The gate prompt's own words are served (``gate_call_preamble``,
-        # ``gate_call_answer_format``); without texts the gate fails closed.
+        # ``gate_call_answer_format``); the SDK uses them when passed.
         # The tray's question names the hosted tools bare: the namer spells
         # them the way Hermes shows them (served texts already are).
         result = gate.run(

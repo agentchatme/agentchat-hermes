@@ -34,7 +34,7 @@ the dependency floor is set to that SDK version at release.
   file. New: a legacy `agentchat-skill` block is replaced instead of left beside ours, and a line that does not name the agent is
   refused before anything is written (it was written, then reported).
 - **The gate prompt's own words are served.** The SDK gate builds its prompt from `gate_call_preamble` / `gate_call_answer_format` in
-  `GET /v1/texts?runtime=hermes`; without them it fails closed (nothing recorded, no turn).
+  `GET /v1/texts?runtime=hermes` (without them, the SDK's previous wording).
 
 ### Fixed
 

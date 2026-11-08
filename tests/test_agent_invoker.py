@@ -767,18 +767,17 @@ class TestRunCycle:
         assert inv.left_on_tray == 1, "only the failed cycle left a card"
         assert client.recorded == [("a", "reply", "msg_a")]
 
-    def test_without_texts_the_gate_fails_closed(
+    def test_without_texts_no_turn_and_reply_stays_unrecorded(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The gate prompt's words are served: without texts the SDK gate
-        # judges nothing (no model call), records nothing, starts nothing.
-        inv, client, agent, events = _invoker(
+        # Without served texts the SDK gate judges with its legacy wording;
+        # the turn cannot start (no wake instruction), so reply records nothing.
+        inv, client, agent, _events = _invoker(
             monkeypatch, trays=[_tray(_card("a"), _card("b"))], answer=_answer(a="reply", b="defer"), texts=None
         )
-        result = inv.run_cycle()
-        assert result is not None and result.outcome == "fail_closed"
+        inv.run_cycle()
         agent.run_conversation.assert_not_called()
-        assert client.recorded == [] and "model" not in events
+        assert client.recorded == [("b", "defer", "msg_b")]
         assert inv.left_on_tray == 1
 
     def test_gate_disabled_starts_the_turn_from_the_tray(self, monkeypatch: pytest.MonkeyPatch) -> None:
