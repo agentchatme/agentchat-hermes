@@ -24,7 +24,7 @@ Checked against hermes-agent v0.22.5 and `main` of 2026-11-08.
 | Entry point group `hermes_agent.plugins`, `register(ctx)` | `pyproject.toml`, `_register.py` | How Hermes finds and loads the plugin, once per profile. |
 | `ctx.register_cli_command` | `cli.py` | `hermes agentchat …` (register, login, doctor, recover). |
 | `ctx.register_skill` | `skills/__init__.py` | The bundled manual as the `agentchat:agentchat` skill. |
-| `ctx.llm.complete(...)` | `model_call.py` | The gate call: one tool-less completion on the profile's main model (or a fallback the user declared). Where it exists, it replaces the rows marked *gate fallback* below. |
+| `ctx.llm.complete(...)` | `model_call.py` | The gate call: one tool-less completion on the profile's main model (or a fallback the user declared). Where it exists, it replaces the rows marked *gate fallback* below. It resolves the profile from the calling thread's context, so the plugin still enters the profile's scope around it; **upstream ask:** bind `ctx.llm` to the profile whose manager created the `ctx`. |
 | `ctx.on_unload(callback)` | `_register.py` | A plugin reload, disable or remove in a running process: the runtime is stopped (socket, wake worker, timers, leader lock) and dropped from the registry, so the reloaded code takes the socket and the lock. |
 | `agent.secret_scope.get_secret` | `profile_scope.py` | Reading `AGENTCHAT_API_KEY` and the `AGENTCHATME_*` settings for the right profile. The plugin guide names this as the way plugins read secrets. |
 | Top-level `__init__.py` shim | repo root | Hermes' directory (git clone) install path. |
