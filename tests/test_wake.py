@@ -80,45 +80,11 @@ class TestDebounce:
         coalescer.stop()
 
 
-class TestRetryWake:
-    def test_wake_after_delays_then_wakes(self) -> None:
-        fired = threading.Event()
-        coalescer = WakeCoalescer(on_fire=fired.set, debounce_s=0.0)
-        started = time.monotonic()
-        coalescer.wake_after(0.05)
-        assert fired.wait(1.0)
-        assert time.monotonic() - started >= 0.04
-        coalescer.stop()
-
-    def test_sooner_wake_after_replaces_a_later_one(self) -> None:
-        fires: list[int] = []
-        coalescer = WakeCoalescer(on_fire=lambda: fires.append(1), debounce_s=0.0)
-        coalescer.wake_after(5.0)
-        coalescer.wake_after(0.02)
-        assert _wait_for(lambda: len(fires) == 1)
-        time.sleep(0.1)
-        assert len(fires) == 1, "the replaced delayed wake must not fire too"
-        coalescer.stop()
-
-    def test_later_wake_after_never_pushes_a_sooner_one_back(self) -> None:
-        # Two fail-closed cycles inside one outage: the 60 s retry must not be
-        # replaced by the 300 s one, or recovery waits five minutes for nothing.
-        fires: list[int] = []
-        coalescer = WakeCoalescer(on_fire=lambda: fires.append(1), debounce_s=0.0)
-        coalescer.wake_after(0.03)
-        assert coalescer.delayed_pending
-        coalescer.wake_after(5.0)
-        assert _wait_for(lambda: len(fires) == 1, timeout=1.0)
-        assert not coalescer.delayed_pending
-        coalescer.stop()
-
-
 class TestStop:
     def test_stop_cancels_pending_and_ignores_later_wakes(self) -> None:
         fires: list[int] = []
         coalescer = WakeCoalescer(on_fire=lambda: fires.append(1), debounce_s=0.05)
         coalescer.wake()
-        coalescer.wake_after(0.05)
         coalescer.stop()
         coalescer.wake()
         time.sleep(0.15)

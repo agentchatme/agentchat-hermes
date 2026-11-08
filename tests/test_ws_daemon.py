@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -203,6 +204,26 @@ class TestSdkClientAsShipped:
         assert rt._opts.auto_drain_on_connect is True
         assert rt._opts.client_identity.name == "hermes"
         assert rt._opts.base_url == "wss://api.example.test"
+        # Contract v1: the server's unanswered re-wake comes to this socket
+        # (no local retry ladder), and its heartbeat frames feed the watchdog.
+        assert rt._advertised_capabilities() == ["ack", "heartbeat", "rewake"]
+
+    async def test_unanswered_rewake_frame_is_one_wake(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """D3: a ``wake`` frame with reason ``unanswered`` (the server's
+        re-wake for cards still on the tray) starts a cycle like any wake."""
+        daemon, on_wake, _inv = _make_daemon()
+        monkeypatch.setattr(daemon, "_write_health", MagicMock())
+        ws = _FakeWS(
+            [
+                {"type": "hello.ok", "capabilities": ["ack", "heartbeat", "rewake"]},
+                {"type": "wake", "payload": {"reason": "unanswered", "conversation_ids": ["conv_1"], "step": 1, "at": "2026-11-08T10:00:00.000Z"}},
+            ]
+        )
+        rt = daemon._build_realtime_client(reconnect=False)
+        daemon._subscribe(rt)
+        rt._ws = ws
+        await rt._recv_loop()
+        assert daemon._wake_frames == 1 and on_wake.call_count == 2, "connect wake + the re-wake"
 
     async def test_frame_is_acked_before_the_wake_runs(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Delivered = the machine received it: the ack goes out before the
@@ -308,6 +329,51 @@ class TestSupervisor:
             await daemon._heartbeat_loop()
 
         daemon._write_health.assert_called_with("reconnecting")  # type: ignore[attr-defined]
+
+    async def test_watchdog_waits_out_a_server_requested_delay(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """D8: over the connect budget the SDK waits the delay the server
+        asked for. The wedge watchdog must not replace the client meanwhile
+        (a fresh client would reconnect at once, against the server)."""
+        from agentchatme_hermes.ws_daemon import _DISCONNECTED_RESTART_AFTER_S, _restart_after_s
+
+        assert _restart_after_s(SimpleNamespace(state="backoff", rate_limited_ms=None)) == _DISCONNECTED_RESTART_AFTER_S
+        waited = _restart_after_s(SimpleNamespace(state="backoff", rate_limited_ms=600_000))
+        assert waited >= 600 * 1.1 + _DISCONNECTED_RESTART_AFTER_S
+        assert _restart_after_s(SimpleNamespace(state="blocked", rate_limited_ms=None)) == float("inf")
+        assert _restart_after_s(SimpleNamespace(state="backoff", rate_limited_ms=True)) == _DISCONNECTED_RESTART_AFTER_S
+
+        daemon, _on_wake, _inv = _make_daemon()
+        daemon._rt_client = SimpleNamespace(is_connected=False, state="backoff", rate_limited_ms=600_000)  # type: ignore[assignment]
+        daemon._disconnected_since = 0.0
+        ticks = {"n": 0}
+
+        async def sleep(_s: float) -> None:
+            ticks["n"] += 1
+            if ticks["n"] > 2:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr("agentchatme_hermes.ws_daemon.asyncio.sleep", sleep)
+        monkeypatch.setattr("agentchatme_hermes.ws_daemon.time.monotonic", lambda: 400.0)
+        monkeypatch.setattr(daemon, "_write_health", MagicMock())
+        await daemon._heartbeat_loop()  # returns on cancel: no RuntimeError at 400 s
+
+    def test_missing_rewake_is_said_once(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        daemon, _on_wake, _inv = _make_daemon()
+        monkeypatch.setattr(daemon, "_write_health", MagicMock())
+        daemon._rt_client = SimpleNamespace(capabilities=frozenset({"ack"}))  # type: ignore[assignment]
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.ws_daemon"):
+            daemon._on_connect()
+            daemon._on_connect()
+        assert sum("rewake" in r.getMessage() for r in caplog.records) == 1
+        caplog.clear()
+        quiet, _w, _i = _make_daemon()
+        monkeypatch.setattr(quiet, "_write_health", MagicMock())
+        quiet._rt_client = SimpleNamespace(capabilities=frozenset({"ack", "rewake"}))  # type: ignore[assignment]
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.ws_daemon"):
+            quiet._on_connect()
+        assert not [r for r in caplog.records if "rewake" in r.getMessage()]
 
     def test_disconnect_publishes_recovering_health(self, monkeypatch: pytest.MonkeyPatch) -> None:
         daemon, _on_wake, _inv = _make_daemon()

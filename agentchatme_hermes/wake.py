@@ -9,11 +9,9 @@ the window is absorbed, and the timer fires exactly once. Whoever fires then
 reads the whole tray, so nothing a later frame announced is missed — the
 tray is the truth, the wake is not.
 
-Also offers :meth:`wake_after` for the local retry ladder: when a gate cycle
-could not complete (model unreachable, server error, turn not started) the
-integration schedules another wake later instead of dropping the tray. The
-server's own ladder wakes webhooks; a connected socket gets no re-wake, so
-the integration carries that duty itself.
+There is no delayed wake: a cycle that could not complete leaves the cards
+on the tray, and the server re-wakes this socket while they stay unanswered
+(contract v1 D3, the ``rewake`` capability).
 
 Thread-safe; callbacks run on a timer thread and must return quickly (the
 invoker's callback sets an event and returns).
@@ -22,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 from typing import Callable
 
 logger = logging.getLogger(__name__)
@@ -34,10 +31,6 @@ class WakeCoalescer:
     """Debounce wakes into single fires.
 
     * :meth:`wake` — arm the timer if none is armed; otherwise absorb.
-    * :meth:`wake_after` — a delayed wake (retry ladder). When one is
-      already pending the SOONER deadline wins (a later retry never pushes
-      an earlier one back); an immediate wake in between still fires on
-      its own schedule.
     * :meth:`stop` — cancel everything; later wakes are ignored.
     """
 
@@ -53,8 +46,6 @@ class WakeCoalescer:
         self._debounce_s = debounce_s
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
-        self._delayed: threading.Timer | None = None
-        self._delayed_deadline: float | None = None
         self._stopped = False
         self.wakes = 0
         self.absorbed = 0
@@ -64,12 +55,6 @@ class WakeCoalescer:
     def armed(self) -> bool:
         with self._lock:
             return self._timer is not None
-
-    @property
-    def delayed_pending(self) -> bool:
-        """True while a retry wake is scheduled and has not fired."""
-        with self._lock:
-            return self._delayed is not None
 
     def wake(self) -> None:
         with self._lock:
@@ -85,39 +70,15 @@ class WakeCoalescer:
             self._timer = timer
         timer.start()
 
-    def wake_after(self, delay_s: float) -> None:
-        deadline = time.monotonic() + max(0.0, delay_s)
-        with self._lock:
-            if self._stopped:
-                return
-            if self._delayed is not None:
-                if self._delayed_deadline is not None and self._delayed_deadline <= deadline:
-                    return  # an earlier retry is already on its way; keep it
-                self._delayed.cancel()
-            timer = threading.Timer(max(0.0, delay_s), self._delayed_wake)
-            timer.name = "agentchat-wake-retry"
-            timer.daemon = True
-            self._delayed = timer
-            self._delayed_deadline = deadline
-        timer.start()
-
     def stop(self) -> None:
         with self._lock:
             self._stopped = True
-            timers = [t for t in (self._timer, self._delayed) if t is not None]
+            timer = self._timer
             self._timer = None
-            self._delayed = None
-            self._delayed_deadline = None
-        for timer in timers:
+        if timer is not None:
             timer.cancel()
 
     # -- timer callbacks ----------------------------------------------------
-
-    def _delayed_wake(self) -> None:
-        with self._lock:
-            self._delayed = None
-            self._delayed_deadline = None
-        self.wake()
 
     def _fire(self) -> None:
         with self._lock:

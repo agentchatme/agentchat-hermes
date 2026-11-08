@@ -71,6 +71,27 @@ _SUPERVISOR_BACKOFF_MAX_S = 60.0
 _STABLE_CONNECTION_S = 30.0
 
 
+def _restart_after_s(rt_client: Any) -> float:
+    """How long a disconnected socket may stay down before the daemon
+    replaces the SDK client (the guard against a wedged client).
+
+    Never while the SDK is honouring a delay the server asked for (the
+    connect budget, HTTP 429 or close 1013 with a retry hint: contract v1
+    D8 — a fresh client would reconnect at once, against the server's
+    word) or retrying slowly after an auth rejection (``blocked``: a fresh
+    client would retry at once). The SDK reconnects by itself in both.
+    """
+    limit = _DISCONNECTED_RESTART_AFTER_S
+    state = getattr(rt_client, "state", None)
+    if state == "blocked":
+        return float("inf")
+    budget_ms = getattr(rt_client, "rate_limited_ms", None)
+    if isinstance(budget_ms, (int, float)) and not isinstance(budget_ms, bool) and budget_ms > 0:
+        # The SDK waits up to 10 % past the server's delay; then one attempt.
+        limit = max(limit, budget_ms / 1000.0 * 1.1 + _DISCONNECTED_RESTART_AFTER_S)
+    return limit
+
+
 class WSDaemon:
     """Owns the long-lived AgentChat WebSocket.
 
@@ -134,6 +155,7 @@ class WSDaemon:
         # a turn runs is the invoker's ledger's call (it persists across
         # restarts); this set only stops the same process re-offering.
         self._seen_invites: set[str] = set()
+        self._rewake_warned = False
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -247,8 +269,9 @@ class WSDaemon:
         self._write_health("stopped")
 
     def _build_realtime_client(self, **overrides: Any) -> RealtimeClient:
-        """The SDK's socket as shipped: acks on receipt, the HTTP client for
-        the offline drain and gap recovery, Hermes' client identity.
+        """The SDK's socket as shipped: acks on receipt, the ``rewake`` and
+        ``heartbeat`` capabilities, the HTTP client for the offline drain and
+        gap recovery, Hermes' client identity.
 
         ``overrides`` is a test seam (``reconnect=False``, a fake
         ``websocket_connect``); production passes nothing.
@@ -260,6 +283,10 @@ class WSDaemon:
             "base_url": self._config.ws_url,
             "client": self._http_client,
             "ack_on_receipt": True,
+            # ``rewake``: the server's unanswered re-wake (contract v1 D3)
+            # comes to this socket, so the integration keeps no retry ladder.
+            # ``heartbeat``: the server's 45 s frame feeds the SDK's watchdog.
+            "capabilities": {"rewake": True, "heartbeat": True},
             "client_identity": hermes_client_identity(),
         }
         options.update(overrides)
@@ -357,7 +384,7 @@ class WSDaemon:
                     self._disconnected_since = time.monotonic()
                 disconnected_for = time.monotonic() - self._disconnected_since
                 self._write_health("reconnecting")
-                if disconnected_for >= _DISCONNECTED_RESTART_AFTER_S:
+                if disconnected_for >= _restart_after_s(rt_client):
                     # Deliberately outside the heartbeat-log guard below: this
                     # exception is the liveness signal the outer supervisor
                     # must see in order to replace a wedged SDK client.
@@ -447,6 +474,7 @@ class WSDaemon:
         self._last_connected_at = time.time()
         self._write_health("connected")
         logger.info("WSDaemon: connected as @%s", self._identity.handle)
+        self._check_rewake()
         # Whatever landed while the socket was down is on the tray now. The
         # SDK drains and acks the offline backlog itself (each drained row is
         # a message.new to the handler above, deduplicated); the connect is
@@ -467,6 +495,26 @@ class WSDaemon:
             logger.debug(
                 "WSDaemon: no running loop for invite catch-up — skipping"
             )
+
+    def _check_rewake(self) -> None:
+        """Say once if the server did not take the ``rewake`` capability.
+
+        Without it a cycle that could not finish leaves its cards waiting for
+        the next message: this integration keeps no retry ladder of its own.
+        """
+        rt = self._rt_client
+        negotiated = getattr(rt, "capabilities", None) if rt is not None else None
+        if not isinstance(negotiated, (set, frozenset)) or "rewake" in negotiated:
+            return
+        if self._rewake_warned:
+            return
+        self._rewake_warned = True
+        logger.warning(
+            "WSDaemon: the server did not take the rewake capability (negotiated: %s) — "
+            "cards a cycle could not finish wait for the next message instead of the "
+            "server's re-wake",
+            ", ".join(sorted(negotiated)) or "none",
+        )
 
     async def _drain_pending_invites(self) -> None:
         """Fetch pending group invites and surface any not yet handled.

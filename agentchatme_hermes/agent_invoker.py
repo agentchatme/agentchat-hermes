@@ -58,9 +58,10 @@ never recorded twice), the set is cleared when the turn ends — completed
 or crashed — and a cycle that skipped a card re-reads the tray once the
 turn is over, so a message newer than the anchor is not missed. A cycle that could not complete —
 model unreachable, server error, verdicts rejected, turn not started or
-crashed — re-wakes itself on a local ladder (1 m, 5 m, 30 m) because a
-connected socket gets no re-wake from the server; the cards wait on the
-tray meanwhile. A gate that failed closed logs once and starts nothing.
+crashed — leaves the cards on the tray, and the server re-wakes this socket
+while they stay unanswered (contract v1 D3, the ``rewake`` capability); the
+integration keeps no retry ladder. A gate that failed closed logs once and
+starts nothing.
 
 Group invites are a second wake kind: not on the tray, not gated, one turn
 each with the served invite prompt, serialized on the same worker. The
@@ -140,12 +141,6 @@ _FALLBACK_MODEL = "claude-sonnet-4-6"
 # always asks for all of it and never parks (``wait_ms=0``).
 TRAY_LIMIT = 50
 
-# Local re-wake ladder after a cycle that could not complete. Mirrors the
-# server's webhook ladder (1m, 5m, 30m) — a connected socket never gets that
-# re-wake, so the integration carries it. After the last rung the cycle
-# waits for the next wake; the cards are still on the tray.
-RETRY_LADDER_S: tuple[float, ...] = (60.0, 300.0, 1800.0)
-
 # A turn ready to run: the hosted tools are registered, the agent is built,
 # ``run_conversation`` is next. Calling it runs the turn under the time
 # limit (:mod:`.turn_runner`) and reports what became of it.
@@ -213,7 +208,10 @@ class AgentInvoker:
         self._worker: threading.Thread | None = None
         self._invites: collections.deque[GroupInviteEvent] = collections.deque()
         self._invites_lock = threading.Lock()
-        self._retry_rung = 0
+        # Cycles that ended with cards still on the tray (diagnostics, tests).
+        # Nothing here re-wakes for them: the server does (contract v1 D3).
+        self.left_on_tray = 0
+        self.last_left_reason: str | None = None
         # Conversations (and invites, ``invite:<id>``) whose turn is running.
         # The record happens when the turn ends, so until then the card is
         # still on the tray and must not be gated again. A turn that overran
@@ -232,7 +230,7 @@ class AgentInvoker:
         self._last_turn: dict[str, Any] | None = None
         self.worker_restarts = 0
         # ``reply`` cards the last cycle's turn left on the tray (the reply
-        # rule recorded nothing, or its record failed): the ladder re-wakes.
+        # rule recorded nothing, or its record failed): the server re-wakes.
         self._cards_left_after_turn = 0
         self._silent_turns: collections.OrderedDict[tuple[str, str], int] = collections.OrderedDict()
 
@@ -524,7 +522,7 @@ class AgentInvoker:
             except Exception:
                 # Whatever escaped must not kill the worker, and the invite
                 # must not wait for an unrelated wake: it stays offered in the
-                # ledger and the ladder brings the next wake.
+                # ledger and the server's re-wake brings the next wake.
                 logger.exception(
                     "AgentInvoker: group-invite turn FAILED (outer catch) group=%s invite=%s — "
                     "the invite stays pending server-side",
@@ -543,12 +541,12 @@ class AgentInvoker:
                 self.run_cycle()
         except ProfileScopeError as exc:
             # Never run a cycle with another profile's credentials: nothing is
-            # read or recorded, the cards stay on the tray, the ladder re-wakes.
+            # read or recorded, the cards stay on the tray, the server re-wakes.
             logger.warning("AgentInvoker: cycle not run — %s", exc)
             self._schedule_retry("profile scope unavailable")
         except Exception:
             # Outer catch: whatever escaped the cycle must not kill the
-            # worker. Re-wake on the ladder so the tray is read again.
+            # worker. The cards stay on the tray; the server re-wakes.
             logger.exception("AgentInvoker: cycle FAILED with unhandled exception (outer catch)")
             self._schedule_retry("unhandled exception")
 
@@ -589,8 +587,6 @@ class AgentInvoker:
                 "AgentInvoker: tray empty (deferred=%s) — nothing to decide",
                 tray.deferred,
             )
-            if not skipped:
-                self._retry_rung = 0
             return gate.GateResult(outcome="empty")
 
         if not self._gate_enabled:
@@ -605,8 +601,6 @@ class AgentInvoker:
             )
             if turn != "completed":
                 self._schedule_retry(f"turn {turn.replace('_', ' ')}")
-            else:
-                self._retry_rung = 0
             if truncated:
                 self._coalescer.wake()
             return gate.GateResult(outcome="decided", undecided=[c["conversation_id"] for c in cards])
@@ -653,9 +647,9 @@ class AgentInvoker:
 
         if result.outcome == "fail_closed":
             # Logged once above. Nothing recorded, no turn. The cards stay
-            # on the tray; re-wake on the ladder so a transient provider
-            # outage does not leave peers unanswered until the next message
-            # happens to arrive.
+            # on the tray; the server re-wakes while they are unanswered, so a
+            # transient provider outage does not leave peers waiting for the
+            # next message to arrive.
             self._schedule_retry(result.failure or "gate failed closed")
             return result
 
@@ -672,8 +666,6 @@ class AgentInvoker:
             # left (it could not look, or looked once and did nothing — the
             # second look dismisses it). Look again later.
             self._schedule_retry("cards left on the tray")
-        else:
-            self._retry_rung = 0
 
         if truncated:
             # More conversations are waiting than one tray shows.
@@ -682,29 +674,21 @@ class AgentInvoker:
         return result
 
     def _schedule_retry(self, reason: str) -> None:
-        if self._coalescer.delayed_pending:
-            # A retry is already on its way (a wake landed mid-outage and
-            # failed again). One outage climbs the ladder once; climbing per
-            # failed cycle would replace the sooner retry with a later one.
-            logger.info("AgentInvoker: %s — a re-wake is already scheduled; not climbing the ladder", reason)
-            return
-        if self._retry_rung >= len(RETRY_LADDER_S):
-            logger.warning(
-                "AgentInvoker: %s — retry ladder exhausted; waiting for the next wake "
-                "(the cards stay on the tray)",
-                reason,
-            )
-            return
-        delay = RETRY_LADDER_S[self._retry_rung]
-        self._retry_rung += 1
+        """A cycle ended with cards still on the tray. Nothing is scheduled.
+
+        The server re-wakes an agent whose tray holds unanswered cards (or a
+        pending invite) on its own ladder — +1 m, +5 m, +30 m, +3 h after the
+        newest message, restarting on a newer one — and sends that wake to
+        this socket because it negotiated ``rewake`` (contract v1 D3; see
+        :mod:`.ws_daemon`). The integration keeps no ladder of its own.
+        """
+        self.left_on_tray += 1
+        self.last_left_reason = reason
         logger.warning(
-            "AgentInvoker: %s — re-waking in %.0fs (rung %d/%d)",
+            "AgentInvoker: %s — the cards stay on the tray; the server re-wakes while they are "
+            "unanswered",
             reason,
-            delay,
-            self._retry_rung,
-            len(RETRY_LADDER_S),
         )
-        self._coalescer.wake_after(delay)
 
     # -- turns --------------------------------------------------------------
 
@@ -727,7 +711,7 @@ class AgentInvoker:
         it **could look**: a turn whose transcript shows no AgentChat call,
         or only failed ones, records nothing. A turn that could not start,
         raised, failed, or overran its time limit records nothing either;
-        the cards stay on the tray and the ladder brings the next wake. An
+        the cards stay on the tray and the server re-wakes. An
         entry whose record fails is logged: it stays unread and the next
         wake gates it again.
 
@@ -1022,7 +1006,7 @@ class AgentInvoker:
         except Exception:
             # A constructor failure (provider config, session DB, a Hermes
             # change) is a turn that did not start: nothing recorded, the
-            # caller re-wakes on the ladder.
+            # cards stay on the tray and the server re-wakes.
             logger.exception(
                 "AgentInvoker: AIAgent construction raised for %s — turn not started", session_id
             )

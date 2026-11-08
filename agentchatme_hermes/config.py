@@ -290,7 +290,7 @@ def _warn_retired_fail_open() -> None:
     logger.warning(
         "agentchat: %s is set but no longer does anything — the gate fails closed: when the "
         "model cannot be reached nothing is recorded, no turn starts, the cards stay on the "
-        "tray and the integration wakes again on its ladder. Remove the setting.",
+        "tray and the server wakes the agent again. Remove the setting.",
         ENV_REPLY_GATE_FAIL_OPEN,
     )
 

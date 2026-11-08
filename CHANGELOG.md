@@ -15,6 +15,14 @@ the dependency floor is set to that SDK version at release.
   failed ones → nothing; it looked and did nothing → nothing the first time, `dismiss` (`no_action_needed`) the second time for the
   same anchor. A failed tray read after the turn now records nothing (it recorded `reply` before); the card stays and the next wake
   looks again. The local post-turn comparison it replaces is deleted.
+- **No local retry ladder; the server re-wakes.** The socket offers the `rewake` and `heartbeat` capabilities. A cycle that could not
+  finish (model unreachable, server error, turn failed, card left after a silent turn) leaves the cards on the tray and arms nothing;
+  the server re-wakes this socket while they stay unanswered (+1 m, +5 m, +30 m, +3 h after the newest message, restarting on a
+  newer one). The 1 m / 5 m / 30 m ladder and the coalescer's delayed wake are deleted. A server that does not take `rewake` is
+  logged once.
+- **The socket watchdog honours the server's delay.** Over the connect budget the server answers 429 / close 1013 with a delay (up
+  to an hour); the daemon's wedged-client watchdog no longer replaces the client while the SDK waits it out (or while it retries
+  slowly after an auth rejection), so it does not reconnect against the server's word.
 - **The SOUL.md identity block is the kit's.** Rendering, finding (handle line, served template, earlier wordings), replacing and
   removing the block are `agentchatme.integration.anchor`, shared with every integration; this package only picks and writes the
   file. New: a legacy `agentchat-skill` block is replaced instead of left beside ours, and a line that does not name the agent is

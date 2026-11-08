@@ -356,14 +356,12 @@ class TestRunCycle:
         inv, client, agent, _events = _invoker(
             monkeypatch, trays=[_tray(_card("a"))], answer=RuntimeError("provider down")
         )
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
             result = inv.run_cycle()
         assert result is not None and result.outcome == "fail_closed"
         agent.run_conversation.assert_not_called()
         assert client.recorded == []
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(warnings) == 1, "logged once"
         assert "provider down" in warnings[0].getMessage()
@@ -372,50 +370,23 @@ class TestRunCycle:
         inv, client, agent, _events = _invoker(
             monkeypatch, trays=[_tray(_card("a"))], answer="I would rather not say."
         )
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         result = inv.run_cycle()
         assert result is not None and result.outcome == "fail_closed"
         agent.run_conversation.assert_not_called()
-        assert client.recorded == [] and scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert client.recorded == [] and inv.left_on_tray == 1
 
-    def test_retry_ladder_climbs_then_stops(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_failed_cycles_schedule_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Contract v1 (D3): the server re-wakes an agent with unanswered
+        cards, on the socket that negotiated ``rewake``. No local ladder: a
+        failed cycle arms no timer of its own."""
         inv, _client, _agent, _events = _invoker(
-            monkeypatch, trays=[_tray(_card("a"))] * 10, answer=RuntimeError("down")
+            monkeypatch, trays=[_tray(_card("a"))] * 5, answer=RuntimeError("down")
         )
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         for _ in range(5):
             inv.run_cycle()
-        assert scheduled == list(invoker_module.RETRY_LADDER_S)
-
-    def test_failure_while_a_retry_is_pending_does_not_climb(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        inv, _client, _agent, _events = _invoker(
-            monkeypatch, trays=[_tray(_card("a"))] * 3, answer=RuntimeError("down")
-        )
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
-        inv.run_cycle()
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
-        # A wake lands mid-outage and its cycle fails too, with the 60 s retry still pending.
-        monkeypatch.setattr(type(inv._coalescer), "delayed_pending", property(lambda self: True))
-        inv.run_cycle()
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]], "one outage, one rung"
-        assert inv._retry_rung == 1
-
-    def test_success_resets_the_ladder(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        inv, _client, _agent, _events = _invoker(
-            monkeypatch, trays=[_tray(_card("a"))] * 3, answer=RuntimeError("down")
-        )
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
-        inv.run_cycle()
-        assert inv._retry_rung == 1
-        monkeypatch.setattr(
-            invoker_module, "build_call_model", lambda **_kw: (lambda prompt: _answer(a="dismiss"))
-        )
-        inv.run_cycle()
-        assert inv._retry_rung == 0
+        assert inv.left_on_tray == 5 and inv.last_left_reason is not None
+        assert not inv._coalescer.armed, "nothing scheduled"
+        assert not hasattr(invoker_module, "RETRY_LADDER_S")
 
     def test_turn_that_fails_to_start_records_nothing_and_rewakes(
         self, monkeypatch: pytest.MonkeyPatch
@@ -424,14 +395,12 @@ class TestRunCycle:
             monkeypatch, trays=[_tray(_card("a"), _card("b"))], answer=_answer(a="reply", b="dismiss")
         )
         monkeypatch.setattr(inv, "_build_agent", lambda _session_id: None)
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         inv.run_cycle()
         agent.run_conversation.assert_not_called()
         assert client.recorded == [("b", "dismiss", "msg_b")], "reply NOT recorded: it stays unread"
         assert "record:a:reply" not in events
         assert inv.turns == 0 and inv.recorded_replies == 0
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
 
     def test_crashed_turn_records_nothing_and_rewakes(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -443,14 +412,12 @@ class TestRunCycle:
             monkeypatch, trays=[_tray(_card("a"), _card("b"))], answer=_answer(a="reply", b="dismiss")
         )
         agent.run_conversation.side_effect = RuntimeError("provider exploded")
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
             inv.run_cycle()  # must not raise
         assert client.recorded == [("b", "dismiss", "msg_b")], "reply NOT recorded"
         assert "record:a:reply" not in events
         assert inv.turns == 0 and inv.recorded_replies == 0
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
         assert any("nothing recorded" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.parametrize(
@@ -472,14 +439,12 @@ class TestRunCycle:
             monkeypatch, trays=[_tray(_card("a"), _card("b"))], answer=_answer(a="reply", b="dismiss")
         )
         agent.run_conversation.side_effect = lambda prompt, conversation_history: result
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
             inv.run_cycle()
         assert client.recorded == [("b", "dismiss", "msg_b")], "reply NOT recorded"
         assert "record:a:reply" not in events
         assert inv.turns == 0 and inv.recorded_replies == 0
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
         messages = [r.getMessage() for r in caplog.records]
         assert any("did not complete" in m for m in messages)
         if result.get("error"):
@@ -503,12 +468,10 @@ class TestRunCycle:
         ]
         agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": "Could not reach AgentChat.", "messages": transcript, "completed": True}
         client.turn_sends = False
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         with caplog.at_level(logging.INFO, logger="agentchatme_hermes.agent_invoker"):
             inv.run_cycle()
         assert client.recorded == [] and "record:a:reply" not in events
-        assert inv.outcomes["could_not_look"] == 1 and scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.outcomes["could_not_look"] == 1 and inv.left_on_tray == 1
         assert any("could_not_look" in r.getMessage() and "1 AgentChat call(s), 1 failed" in r.getMessage() for r in caplog.records)
 
     def test_turn_with_no_agentchat_call_records_nothing(
@@ -527,11 +490,9 @@ class TestRunCycle:
         ]
         agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": "Nothing to do.", "messages": transcript, "completed": True}
         client.turn_sends = False
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         inv.run_cycle()
         assert client.recorded == [] and "record:a:reply" not in events
-        assert inv.outcomes["could_not_look"] == 1 and scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.outcomes["could_not_look"] == 1 and inv.left_on_tray == 1
         assert inv.status()["last_turn"]["agentchat_calls"] == {"made": 0, "failed": 0}
 
     def test_count_agentchat_calls_helper(self) -> None:
@@ -620,11 +581,9 @@ class TestRunCycle:
         # pre-kit integration recorded reply here).
         inv, client, _agent, _events = _invoker(monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply"))
         client.turn_view = RuntimeError("inbox down")
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         inv.run_cycle()
         assert client.recorded == [] and inv.outcomes["card_unknown"] == 1
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
 
     def test_a_card_missing_from_a_truncated_tray_records_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Past a truncated page the card may still be unread: claim nothing.
@@ -716,15 +675,13 @@ class TestRunCycle:
         clock = {"t": 0.0}
         _fake_stop_wait(monkeypatch, inv, clock)
         monkeypatch.setattr(hosted_tools_module.time, "monotonic", lambda: clock["t"])
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.hosted_tools"):
             inv.run_cycle()
         agent.run_conversation.assert_not_called()
         assert "build" not in events, "no agent is even built"
         assert client.recorded == [("b", "dismiss", "msg_b")], "reply NOT recorded"
         assert inv.turns == 0 and inv.recorded_replies == 0
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
         assert clock["t"] == pytest.approx(hosted_tools_module.HOSTED_TOOLS_WAIT_S)
         assert any("not started" in r.getMessage() for r in caplog.records)
 
@@ -766,16 +723,13 @@ class TestRunCycle:
             raise RuntimeError("503")
 
         client.decisions = SimpleNamespace(record=failing_record)
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
             inv.run_cycle()
         agent.run_conversation.assert_called_once()
         assert any("not recorded" in r.getMessage() for r in caplog.records)
         assert inv.turns == 1 and inv.recorded_replies == 0, "the turn ran; the verdict did not land"
-        # The card is still on the tray: the ladder brings the next look, not an unrelated wake.
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
-        assert inv._retry_rung == 1
+        # The card is still on the tray: the server's re-wake brings the next look.
+        assert inv.left_on_tray == 1
 
     def test_reply_record_failure_does_not_leak_into_the_next_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, client, _agent, _events = _invoker(
@@ -791,12 +745,10 @@ class TestRunCycle:
             return real(conversation_id, **kw)
 
         client.decisions = SimpleNamespace(record=flaky)
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         inv.run_cycle()
         inv.run_cycle()
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]], "only the failed cycle laddered"
-        assert inv._retry_rung == 0 and client.recorded == [("a", "reply", "msg_a")]
+        assert inv.left_on_tray == 1, "only the failed cycle left a card"
+        assert client.recorded == [("a", "reply", "msg_a")]
 
     def test_without_texts_the_gate_fails_closed(
         self, monkeypatch: pytest.MonkeyPatch
@@ -806,13 +758,11 @@ class TestRunCycle:
         inv, client, agent, events = _invoker(
             monkeypatch, trays=[_tray(_card("a"), _card("b"))], answer=_answer(a="reply", b="defer"), texts=None
         )
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         result = inv.run_cycle()
         assert result is not None and result.outcome == "fail_closed"
         agent.run_conversation.assert_not_called()
         assert client.recorded == [] and "model" not in events
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
 
     def test_gate_disabled_starts_the_turn_from_the_tray(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, client, agent, events = _invoker(
@@ -831,11 +781,9 @@ class TestRunCycle:
         inv, _client, agent, _events = _invoker(
             monkeypatch, trays=[ConnectionError("503")], answer=_answer(a="reply")
         )
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         assert inv.run_cycle() is None
         agent.run_conversation.assert_not_called()
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
 
     def test_truncated_tray_wakes_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, _client, _agent, _events = _invoker(
@@ -850,11 +798,9 @@ class TestRunCycle:
         inv, _client, _agent, _events = _invoker(
             monkeypatch, trays=[_tray(_card("a"), _card("b"))], answer=_answer(a="dismiss")
         )
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         result = inv.run_cycle()
         assert result is not None and result.undecided == ["b"]
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
 
     def test_gate_prompt_spells_tools_for_hermes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         prompts: list[str] = []
@@ -1392,8 +1338,6 @@ class TestProfileTurnScope:
         launch, up = self._homes(tmp_path)
         fake = _FakeHermesScopes(monkeypatch, self._secrets(launch, up))
         inv, _client, _agent, _seen = self._worker(monkeypatch, fake, up, [_tray(_card("a"))])
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
 
         def exploding_cycle() -> Any:
             assert fake.scope.get() == {"LIVEFIRE_STUB_KEY": "key-up"}
@@ -1403,7 +1347,7 @@ class TestProfileTurnScope:
         inv._guarded_cycle()
         assert fake.runtime_scope_exits == ["RuntimeError"], "exited, with the exception"
         assert fake.scope.get() is None and fake.override.get() is None
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
 
     def test_fallback_enters_exactly_the_gateway_pieces_and_warns_once(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -1432,13 +1376,11 @@ class TestProfileTurnScope:
         launch, up = self._homes(tmp_path)
         fake = _FakeHermesScopes(monkeypatch, self._secrets(launch, up), with_gateway_helper=False, missing_pieces=(missing,))
         inv, client, agent, _seen = self._worker(monkeypatch, fake, up, [_tray(_card("a"))])
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
             inv._guarded_cycle()
         assert client.tray_calls == [] and client.recorded == [] and fake.set_scope_calls == []
         agent.run_conversation.assert_not_called()
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
         assert any("cycle not run" in r.getMessage() and "not importable" in r.getMessage() for r in caplog.records)
 
     def test_helper_signature_drift_is_one_warning_not_a_traceback(
@@ -1447,7 +1389,6 @@ class TestProfileTurnScope:
         launch, up = self._homes(tmp_path)
         fake = _FakeHermesScopes(monkeypatch, self._secrets(launch, up), helper_signature_drift=True)
         inv, client, _agent, _seen = self._worker(monkeypatch, fake, up, [_tray(_card("a"))])
-        monkeypatch.setattr(inv._coalescer, "wake_after", lambda _s: None)
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
             inv._guarded_cycle()
         assert client.tray_calls == []
@@ -1462,13 +1403,11 @@ class TestProfileTurnScope:
         _launch, up = self._homes(tmp_path)
         fake = _FakeHermesScopes(monkeypatch, {str(up): {}}, helper_raises=OSError("secret source unreachable"))
         inv, client, agent, _seen = self._worker(monkeypatch, fake, up, [_tray(_card("a"))])
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
             inv._guarded_cycle()
         assert client.tray_calls == [] and client.recorded == []
         agent.run_conversation.assert_not_called()
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
         assert any("cycle not run" in r.getMessage() and "secret source unreachable" in r.getMessage() for r in caplog.records)
 
     def test_single_profile_gateway_uses_the_standalone_launch_scope(
@@ -1556,13 +1495,11 @@ class TestInviteRetry:
         monkeypatch.setattr(
             inv, "_build_agent", lambda sid: real_build(sid) if build_ok["value"] else None
         )
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
 
         inv.start()
         try:
             inv.handle_group_invite(_invite())
-            assert _wait_for(lambda: scheduled == [invoker_module.RETRY_LADDER_S[0]])
+            assert _wait_for(lambda: inv.left_on_tray == 1)
             assert inv.invite_turns == 0
             assert [i.invite_id for i in ledger.pending()] == ["ginv_1"], "offered, not started"
 
@@ -1642,12 +1579,10 @@ class TestInviteRetry:
             raise RuntimeError("provider config exploded")
 
         monkeypatch.setattr(inv, "_build_agent", raising)
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         inv.start()
         try:
             inv.handle_group_invite(_invite())
-            assert _wait_for(lambda: scheduled == [invoker_module.RETRY_LADDER_S[0]])
+            assert _wait_for(lambda: inv.left_on_tray == 1)
             agent.run_conversation.assert_not_called()
             assert [i.invite_id for i in ledger.pending()] == ["ginv_1"]
             assert inv.invite_turns == 0
@@ -1679,12 +1614,10 @@ class TestInviteRetry:
         inv, _client, agent, _events = _invoker(
             monkeypatch, trays=[], answer=_answer(), texts=None, ledger=ledger
         )
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         inv.start()
         try:
             inv.handle_group_invite(_invite())
-            assert _wait_for(lambda: scheduled == [invoker_module.RETRY_LADDER_S[0]])
+            assert _wait_for(lambda: inv.left_on_tray == 1)
             agent.run_conversation.assert_not_called()
             assert [i.invite_id for i in ledger.pending()] == ["ginv_1"]
         finally:
@@ -1748,14 +1681,12 @@ class TestTurnTimeLimit:
         stuck = _BlockingAgent(obey=False)
         monkeypatch.setattr(inv, "_build_agent", lambda _sid: stuck)
         _fast_limits(inv)
-        scheduled: list[float] = []
         wakes: list[str] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         monkeypatch.setattr(inv._coalescer, "wake", lambda: wakes.append("wake"))
 
         inv.run_cycle()
         assert client.recorded == [] and "record:a:reply" not in events
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
         assert stuck.interrupts == [turn_runner_module.INTERRUPT_TOOL_REASON]
         assert inv.in_flight() == {"a"}, "held: the stuck turn may still send"
         status = inv.status()
@@ -1776,24 +1707,20 @@ class TestTurnTimeLimit:
         obeying = _BlockingAgent(obey=True)
         monkeypatch.setattr(inv, "_build_agent", lambda _sid: obeying)
         _fast_limits(inv, grace_s=2.0)
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         inv.run_cycle()
         assert client.recorded == [] and inv.turns == 0
         assert inv.in_flight() == set() and inv.status()["hung_turns"] == 0
         assert inv.status()["last_turn"]["ended"] is True
-        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.left_on_tray == 1
 
     def test_no_new_turn_while_too_many_turns_are_hung(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
         inv, client, agent, _events = _invoker(monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply"))
         for cid in ("x", "y")[: invoker_module.MAX_HUNG_TURNS]:
             inv._running.abandon(inv._running.hold(frozenset({cid})))
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         with caplog.at_level(logging.ERROR, logger="agentchatme_hermes.agent_invoker"):
             inv.run_cycle()
         agent.run_conversation.assert_not_called()
-        assert client.recorded == [] and scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert client.recorded == [] and inv.left_on_tray == 1
         assert any("have not ended" in r.getMessage() for r in caplog.records)
 
     def test_stop_interrupts_the_running_turn(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1813,14 +1740,12 @@ class TestTurnTimeLimit:
         ledger = InviteLedger(None)
         inv, _client, agent, _events = _invoker(monkeypatch, trays=[], answer=_answer(), ledger=ledger)
         agent.run_conversation.side_effect = RuntimeError("provider exploded")
-        scheduled: list[float] = []
-        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         invite = _invite()
         ledger.offer(invite)
         inv._run_invite_turn(invite)
         assert not ledger.is_started(invite.invite_id)
         assert [i.invite_id for i in ledger.pending()] == [invite.invite_id], "retried on the next wake"
-        assert inv.invite_turns == 0 and scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.invite_turns == 0 and inv.left_on_tray == 1
 
         agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": ""}
         inv._run_invite_turn(invite)
