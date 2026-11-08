@@ -8,6 +8,7 @@ for low signal — the validators below are the load-bearing logic.
 from __future__ import annotations
 
 import pytest
+from fake_keys import api_key
 
 from agentchatme_hermes.cli import _validate_email, _validate_handle
 
@@ -110,9 +111,9 @@ class TestArgparseWiring:
         parser = argparse.ArgumentParser(prog="hermes-agentchat")
         setup_argparse(parser)
 
-        args = parser.parse_args(["login", "--api-key", "ac_live_xxx"])
+        args = parser.parse_args(["login", "--api-key", api_key("xxx")])
         assert args.action == "login"
-        assert args.api_key == "ac_live_xxx"
+        assert args.api_key == api_key("xxx")
 
     def test_setup_argparse_wires_status_and_logout(self) -> None:
         import argparse
@@ -185,7 +186,7 @@ class TestDoctor:
         from agentchatme_hermes import cli
 
         monkeypatch.setattr(  # type: ignore[attr-defined]
-            cli, "_read_saved_key_source", lambda: ("ac_live_xyz", cli._ENV_API_KEY)
+            cli, "_read_saved_key_source", lambda: (api_key("xyz"), cli._ENV_API_KEY)
         )
 
         fake_client = MagicMock()
@@ -240,7 +241,7 @@ class TestDoctor:
         from agentchatme_hermes import cli
 
         monkeypatch.setattr(  # type: ignore[attr-defined]
-            cli, "_read_saved_key_source", lambda: ("ac_live_xyz", cli._ENV_API_KEY_LEGACY)
+            cli, "_read_saved_key_source", lambda: (api_key("xyz"), cli._ENV_API_KEY_LEGACY)
         )
         monkeypatch.setattr(cli, "_sdk_importable", lambda: False)  # type: ignore[attr-defined]
         import sys

@@ -20,6 +20,7 @@ import sys
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from fake_keys import api_key
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -306,7 +307,7 @@ class TestLockPathFor:
     def test_same_account_two_profiles_share_one_lock(self, tmp_path: Path) -> None:
         """Cloned credentials must still yield exactly one live socket."""
         root = tmp_path / ".hermes"
-        fp = account_fingerprint("https://api.agentchat.me", "ac_live_shared")
+        fp = account_fingerprint("https://api.agentchat.me", api_key("shared"))
         a = lock_path_for(hermes_home=root / "profiles" / "a", account_fingerprint=fp)
         b = lock_path_for(hermes_home=root / "profiles" / "b", account_fingerprint=fp)
         assert a == b
@@ -358,11 +359,11 @@ class TestTwoProfilesOneMachine:
         base = "https://api.agentchat.me"
         growth = lock_path_for(
             hermes_home=root / "profiles" / "growth",
-            account_fingerprint=account_fingerprint(base, "ac_live_growth"),
+            account_fingerprint=account_fingerprint(base, api_key("growth")),
         )
         ops = lock_path_for(
             hermes_home=root / "profiles" / "ops",
-            account_fingerprint=account_fingerprint(base, "ac_live_ops"),
+            account_fingerprint=account_fingerprint(base, api_key("ops")),
         )
         fd_growth = try_acquire_ws_leader_lock(growth)
         fd_ops = try_acquire_ws_leader_lock(ops)
@@ -378,7 +379,7 @@ class TestTwoProfilesOneMachine:
         self, tmp_path: Path
     ) -> None:
         root = tmp_path / ".hermes"
-        fp = account_fingerprint("https://api.agentchat.me", "ac_live_shared")
+        fp = account_fingerprint("https://api.agentchat.me", api_key("shared"))
         a = lock_path_for(hermes_home=root / "profiles" / "a", account_fingerprint=fp)
         b = lock_path_for(hermes_home=root / "profiles" / "b", account_fingerprint=fp)
         fd_a = try_acquire_ws_leader_lock(a)

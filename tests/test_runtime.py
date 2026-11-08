@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fake_keys import api_key
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -42,7 +43,7 @@ def _reset_runtime_singleton() -> Any:
 
 def _config(
     *,
-    api_key: str = "ac_live_test",
+    api_key: str = api_key("test"),
     hermes_home: Path | None = None,
     lock_dir: Path | None = None,
 ) -> Any:
@@ -251,11 +252,11 @@ class TestRuntimeRegistry:
         home = tmp_path / ".hermes"
         with _patched_runtime():
             growth = get_runtime(
-                _config(api_key="ac_live_growth", hermes_home=home / "profiles" / "growth"),
+                _config(api_key=api_key("growth"), hermes_home=home / "profiles" / "growth"),
                 gateway_mode=True,
             )
             ops = get_runtime(
-                _config(api_key="ac_live_ops", hermes_home=home / "profiles" / "ops"),
+                _config(api_key=api_key("ops"), hermes_home=home / "profiles" / "ops"),
                 gateway_mode=True,
             )
             assert growth is not ops

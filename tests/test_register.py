@@ -19,6 +19,8 @@ import sys
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
+from fake_keys import api_key
+
 from agentchatme_hermes._register import _is_gateway_context
 from agentchatme_hermes.leader_lock import GATEWAY_ENV_MARKER
 
@@ -352,7 +354,7 @@ class TestReconcileKeyName:
         from agentchatme_hermes import _register
         from agentchatme_hermes.config import ENV_API_KEY, ENV_API_KEY_LEGACY
 
-        env = {ENV_API_KEY_LEGACY: "ac_live_old"}
+        env = {ENV_API_KEY_LEGACY: api_key("old")}
         module = types.ModuleType("hermes_cli.config")
         module.get_env_value = env.get  # type: ignore[attr-defined]
         module.save_env_value = env.__setitem__  # type: ignore[attr-defined]
@@ -360,7 +362,7 @@ class TestReconcileKeyName:
         monkeypatch.setitem(sys.modules, "hermes_cli.config", module)
 
         _register._reconcile_key_name(SimpleNamespace(api_key_source=ENV_API_KEY_LEGACY))
-        assert env[ENV_API_KEY] == "ac_live_old"
+        assert env[ENV_API_KEY] == api_key("old")
 
     def test_canonical_profile_is_untouched(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from types import SimpleNamespace

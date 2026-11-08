@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from fake_keys import PREFIX
 
 from agentchatme_hermes import mcp_registration as reg
 
@@ -26,7 +27,7 @@ class TestEntry:
             "url": "https://api.agentchat.me/mcp",
             "headers": {"Authorization": "Bearer ${AGENTCHAT_API_KEY}"},
         }
-        assert "ac_live" not in json.dumps(entry)
+        assert PREFIX not in json.dumps(entry)
 
     def test_hosted_url_follows_api_base(self) -> None:
         assert reg.hosted_mcp_url("http://localhost:3000/") == "http://localhost:3000/mcp"

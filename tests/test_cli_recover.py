@@ -19,6 +19,7 @@ import argparse
 from typing import Any
 
 import pytest
+from fake_keys import api_key
 
 from agentchatme_hermes import cli, wizard
 from agentchatme_hermes.cli import (
@@ -176,7 +177,7 @@ class _Harness:
         self.verifies: list[tuple[str, str]] = []
         self.persisted: list[dict[str, str]] = []
         self.anchored: list[str] = []
-        self.verify_result: tuple[str, str] = ("ac_live_newkey_000000000000", "alice")
+        self.verify_result: tuple[str, str] = (api_key("newkey_000000000000"), "alice")
         self.verify_error: _RecoverError | None = None
         self.start_error: _RecoverError | None = None
         self.code = "123456"
@@ -222,7 +223,7 @@ class TestDispatchRecover:
         assert h.verifies == [("pnd_1", "123456")]
         assert h.persisted == [
             {
-                "api_key": "ac_live_newkey_000000000000",
+                "api_key": api_key("newkey_000000000000"),
                 "handle": "alice",
                 "api_base": "https://api.agentchat.me",
             }
@@ -230,13 +231,13 @@ class TestDispatchRecover:
         assert h.anchored == ["alice"]
         assert "Recovered @alice" in captured.out
         assert "previous key is now dead" in captured.out
-        assert "ac_live_newkey_000000000000" not in captured.out  # masked
+        assert api_key("newkey_000000000000") not in captured.out  # masked
 
     def test_persists_handle_the_server_returned(
         self, clean_env: None, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         h = _Harness(monkeypatch)
-        h.verify_result = ("ac_live_newkey_000000000000", "alice")
+        h.verify_result = (api_key("newkey_000000000000"), "alice")
         rc = cli._dispatch_recover(_ns(email="a@b.co", handle="alice"))
         assert rc == _EXIT_OK
         assert h.persisted[0]["handle"] == "alice"
