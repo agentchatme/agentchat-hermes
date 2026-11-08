@@ -94,9 +94,15 @@ def wake_turn_prompt(texts: Texts, reply_conversations: Sequence[str] = ()) -> s
     return "\n\n".join(sections)
 
 
-def invite_turn_prompt(texts: Texts) -> str:
-    """The prompt a group-invite turn starts with: the served invite prompt."""
-    return spell_hosted_tools(texts.invite_prompt) + "\n\n" + MANUAL_POINTER
+def invite_turn_prompt(texts: Texts, invite_id: str | None = None) -> str:
+    """The prompt a group-invite turn starts with: the served invite prompt,
+    the invite this turn is for (its id: metadata, never the group's name or
+    anything else a peer wrote), and where the manual is."""
+    sections = [spell_hosted_tools(texts.invite_prompt)]
+    if isinstance(invite_id, str) and invite_id:
+        sections.append(f"This turn is for the invite {invite_id}.")
+    sections.append(MANUAL_POINTER)
+    return "\n\n".join(sections)
 
 
 def identity_line(texts: Texts) -> str:

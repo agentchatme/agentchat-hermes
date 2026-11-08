@@ -10,8 +10,8 @@ bound to that profile's own key, home, SOUL.md and leader lock. Owns:
   at start.
 * The sync SDK :class:`AgentChatClient`: identity, the tray, the verdicts
   and the texts all go through it.
-* The :class:`TextsStore` (the served texts, cached, refreshed daily) and
-  the :class:`InviteLedger`, both in the account's state directory.
+* The :class:`TextsStore` (the served texts, cached, refreshed daily) in
+  the account's state directory.
 * The :class:`WSDaemon` background thread (where wakes come from), leader only.
 * The :class:`AgentInvoker` worker (wake → gate → turn), leader only.
 
@@ -27,7 +27,6 @@ from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
 from .agent_invoker import AgentInvoker
 from .client_identity import hermes_client_identity
-from .invites import InviteLedger
 from .leader_lock import lock_path_for, release_leader_lock, try_acquire_ws_leader_lock
 from .profile_scope import (
     account_fingerprint,
@@ -36,7 +35,7 @@ from .profile_scope import (
     profile_label,
     resolve_hermes_home,
 )
-from .state import INVITES_FILENAME, TEXTS_FILENAME, state_dir_for
+from .state import LEGACY_INVITES_FILENAME, TEXTS_FILENAME, state_dir_for
 from .texts import TextsCallback, TextsStore
 from .turn import identity_line as render_identity_line
 from .turn import identity_line_template as render_identity_line_template
@@ -126,7 +125,6 @@ class Runtime:
         self._identity: AgentIdentity | None = None
         self._client: AgentChatClient | None = None
         self._texts: TextsStore | None = None
-        self._invite_ledger: InviteLedger | None = None
         self._ws_daemon: WSDaemon | None = None
         self._invoker: AgentInvoker | None = None
 
@@ -186,12 +184,6 @@ class Runtime:
         self.texts_store.on_texts(callback)
 
     @property
-    def invite_ledger(self) -> InviteLedger:
-        if self._invite_ledger is None:
-            raise RuntimeError("Runtime.start() has not completed")
-        return self._invite_ledger
-
-    @property
     def integration_enabled(self) -> bool:
         return bool(getattr(self._config, "integration_enabled", True))
 
@@ -207,7 +199,7 @@ class Runtime:
 
     @property
     def state_dir(self) -> Path:
-        """Where this account's texts cache and invite ledger live."""
+        """Where this account's texts cache lives."""
         return self._state_dir
 
     @property
@@ -252,7 +244,9 @@ class Runtime:
                     thread_scope=lambda: profile_context(home),
                 )
                 self._texts.start()
-                self._invite_ledger = InviteLedger(self._state_dir / INVITES_FILENAME)
+                # Invites are on the tray (contract v1); the ledger file a
+                # release before kept is not read by anything any more.
+                _remove_quietly(self._state_dir / LEGACY_INVITES_FILENAME)
 
                 # Leader election. Only attempt when the caller asked for
                 # gateway mode (a real ``hermes gateway run``) and the
@@ -342,7 +336,6 @@ class Runtime:
             config=self._config,
             identity=self._identity,
             runtime=self,
-            ledger=self._invite_ledger,
             health=health,
             host_llm=self._host_llm,
         )
@@ -351,7 +344,6 @@ class Runtime:
             config=self._config,
             identity=self._identity,
             on_wake=self._invoker.wake,
-            on_group_invite=self._invoker.handle_group_invite,
             health_path=health_path_for(self._lock_path),
             health=health,
         )
@@ -531,10 +523,20 @@ class Runtime:
         self._identity = None
         self._client = None
         self._texts = None
-        self._invite_ledger = None
         self._ws_daemon = None
         self._invoker = None
         self._is_leader = False
+
+
+def _remove_quietly(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.debug("agentchat runtime: could not remove %s: %s", path, exc)
+        return
+    logger.info("agentchat runtime: removed the old invite ledger %s (invites are on the tray)", path)
 
 
 # ─── registry ──────────────────────────────────────────────────────────────

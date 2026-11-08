@@ -63,12 +63,15 @@ while they stay unanswered (contract v1 D3, the ``rewake`` capability); the
 integration keeps no retry ladder. A gate that failed closed logs once and
 starts nothing.
 
-Group invites are a second wake kind: not on the tray, not gated, one turn
-each with the served invite prompt, serialized on the same worker. The
-:class:`.invites.InviteLedger` remembers which were offered and which had a
-turn that looked, so an invite whose turn could not start, crashed or
-overran is retried on the next wake and a restart does not re-run the ones
-the agent already looked at.
+Group invites come on the same tray (contract v1 D4: ``tray.invites``,
+pending and not dismissed by this agent). After the cards, each invite gets
+one turn of its own with the served invite prompt (a few per cycle; the
+rest on the next). What the host records after it is the kit's rule
+(``agentchatme.integration.invite_outcome``): answered in the turn →
+nothing; looked and left it pending → nothing the first time, ``dismiss``
+(seen, left pending, not shown again) the second time; a turn that failed
+or could not look → nothing, and the server re-wakes while the invite is
+pending. Nothing is remembered on disk: the tray is the truth.
 
 The worker is supervised: a worker loop that dies is restarted with backoff
 (1 s doubling to 60 s) and reads the tray again; its state — alive, idle /
@@ -92,7 +95,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from agentchatme import gate
-from agentchatme.integration import apply_outcome, turn_outcome
+from agentchatme.integration import (
+    apply_invite_outcome,
+    apply_outcome,
+    invite_outcome,
+    turn_outcome,
+)
 
 from .config import (
     DEFAULT_GATE_TIMEOUT_S,
@@ -102,7 +110,6 @@ from .config import (
     DEFAULT_WAKE_DEBOUNCE_S,
 )
 from .hosted_tools import wait_for_hosted_tools
-from .invites import InviteLedger
 from .model_call import build_call_model
 from .profile_scope import (
     ProfileScopeError,
@@ -124,9 +131,10 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from agentchatme.types import InboxTray, Texts
+    from agentchatme.types.inbox import TrayInvite
 
     from .config import Config
-    from .types import AgentIdentity, GroupInviteEvent
+    from .types import AgentIdentity
     from .ws_health import HealthBoard
 
 logger = logging.getLogger(__name__)
@@ -169,6 +177,10 @@ MAX_HUNG_TURNS = 2
 
 WorkerState = Literal["starting", "idle", "cycle", "turn", "restart_wait", "stopped"]
 
+# Invite turns per cycle; the rest on the next cycle, so a burst of invites
+# never holds the account's messages back for long.
+MAX_INVITE_TURNS_PER_CYCLE = 3
+
 
 class AgentInvoker:
     """Owns the wake worker. Single-use — :meth:`start` once, :meth:`stop` once."""
@@ -179,7 +191,6 @@ class AgentInvoker:
         config: Config,
         identity: AgentIdentity,
         runtime: Any,
-        ledger: InviteLedger | None = None,
         health: HealthBoard | None = None,
         host_llm: Callable[[], Any] | None = None,
     ) -> None:
@@ -189,7 +200,6 @@ class AgentInvoker:
         # Supplies the SDK client and the served texts; never resolved from
         # a registry.
         self._runtime = runtime
-        self._ledger = ledger if ledger is not None else InviteLedger(None)
 
         # Gate settings resolved once. getattr-with-default so light
         # config doubles in tests construct cleanly.
@@ -206,8 +216,6 @@ class AgentInvoker:
         self._cycle_due = threading.Event()
         self._stopped = threading.Event()
         self._worker: threading.Thread | None = None
-        self._invites: collections.deque[GroupInviteEvent] = collections.deque()
-        self._invites_lock = threading.Lock()
         # Cycles that ended with cards still on the tray (diagnostics, tests).
         # Nothing here re-wakes for them: the server does (contract v1 D3).
         self.left_on_tray = 0
@@ -353,32 +361,6 @@ class AgentInvoker:
         """A wake from the socket (or any other source). Coalesced, then cycled."""
         self._coalescer.wake()
 
-    def handle_group_invite(self, invite: GroupInviteEvent) -> None:
-        """Queue one invite-decision turn. Runs on the socket's event loop;
-        never blocks and never touches the ledger.
-
-        The ledger persists with an fsync under a lock the worker also
-        takes, so the socket thread only appends to the queue; the worker
-        consults the ledger (:meth:`_drain_invites`) before any turn.
-        """
-        if self._stopped.is_set():
-            logger.warning(
-                "AgentInvoker: group invite dropped at shutdown (group=%s invite=%s) — it stays "
-                "pending server-side and is reachable through the hosted tools",
-                invite.group_id,
-                invite.invite_id,
-            )
-            return
-        self._enqueue_invite(invite)
-
-    def _enqueue_invite(self, invite: GroupInviteEvent) -> bool:
-        with self._invites_lock:
-            if any(queued.invite_id == invite.invite_id for queued in self._invites):
-                return False
-            self._invites.append(invite)
-        self._awake.set()
-        return True
-
     def _on_wake_fired(self) -> None:
         """Timer-thread callback from the coalescer: mark a cycle due, wake the worker."""
         self._cycle_due.set()
@@ -459,77 +441,8 @@ class AgentInvoker:
                 # sets it again and earns one more cycle afterwards.
                 self._cycle_due.clear()
                 self._set_state("cycle")
-                self._requeue_pending_invites()
-                self._drain_invites()
                 self._guarded_cycle()
-            elif self._has_queued_invites():
-                self._set_state("cycle")
-                self._drain_invites()
             self._set_state("idle")
-
-    def _has_queued_invites(self) -> bool:
-        with self._invites_lock:
-            return bool(self._invites)
-
-    def _requeue_pending_invites(self) -> None:
-        """On a wake, put back every invite the ledger says never got its turn."""
-        for invite in self._ledger.pending():
-            if self._enqueue_invite(invite):
-                logger.info(
-                    "AgentInvoker: retrying group invite %s (group=%s) whose turn did not start",
-                    invite.invite_id,
-                    invite.group_id,
-                )
-
-    def _drain_invites(self) -> None:
-        """Run the queued invite turns, on the worker thread.
-
-        The ledger decides here: an invite that already had a turn (this
-        process or an earlier one) is not run again — the agent looked and
-        chose to leave it pending, or acted on it. One that was offered but
-        never got a turn runs now.
-        """
-        while True:
-            with self._invites_lock:
-                if not self._invites:
-                    return
-                invite = self._invites.popleft()
-            if self._stopped.is_set():
-                return
-            try:
-                if self._ledger.is_started(invite.invite_id):
-                    logger.info(
-                        "AgentInvoker: group invite %s already had its turn — not running another",
-                        invite.invite_id,
-                    )
-                    continue
-                if self._running.is_busy(_INVITE_KEY + invite.invite_id):
-                    # Its earlier turn overran and has not ended: no second
-                    # turn while the first may still act. It stays offered.
-                    logger.info(
-                        "AgentInvoker: group invite %s still has a turn running — not starting "
-                        "another",
-                        invite.invite_id,
-                    )
-                    continue
-                self._ledger.offer(invite)
-                with profile_turn_scope(self._profile_home()):
-                    self._run_invite_turn(invite)
-            except ProfileScopeError as exc:
-                # Offered, not started: the next wake retries it in scope.
-                logger.warning("AgentInvoker: group-invite turn not started — %s", exc)
-                self._schedule_retry("profile scope unavailable")
-            except Exception:
-                # Whatever escaped must not kill the worker, and the invite
-                # must not wait for an unrelated wake: it stays offered in the
-                # ledger and the server's re-wake brings the next wake.
-                logger.exception(
-                    "AgentInvoker: group-invite turn FAILED (outer catch) group=%s invite=%s — "
-                    "the invite stays pending server-side",
-                    invite.group_id,
-                    invite.invite_id,
-                )
-                self._schedule_retry("invite turn failed")
 
     def _guarded_cycle(self) -> None:
         try:
@@ -553,7 +466,8 @@ class AgentInvoker:
     # -- one cycle ----------------------------------------------------------
 
     def run_cycle(self) -> gate.GateResult[gate.GateReply] | None:
-        """Read the tray, gate it, start a turn when warranted.
+        """Read the tray, gate its cards, start a turn when warranted, then
+        one turn per pending invite.
 
         Returns the gate result (``None`` when the tray could not be read).
         Public so tests and ``doctor``-style tooling can drive one cycle.
@@ -566,7 +480,13 @@ class AgentInvoker:
             logger.warning("AgentInvoker: tray read failed: %s", exc)
             self._schedule_retry("tray read failed")
             return None
+        result = self._decide_cards(tray)
+        self._run_invite_turns(tray)
+        return result
 
+    def _decide_cards(self, tray: InboxTray) -> gate.GateResult[gate.GateReply]:
+        """Gate the tray's cards and run the reply turn (steps 3 to 5 of the module docstring)."""
+        client = self._runtime.client
         tray, skipped = self._skip_in_flight(tray)
         if skipped:
             # A turn is running for these conversations (a concurrent caller
@@ -819,51 +739,100 @@ class AgentInvoker:
             self._silent_turns.move_to_end(key)
             while len(self._silent_turns) > _SILENT_MEMORY:
                 self._silent_turns.popitem(last=False)
-        elif reason not in ("turn_failed", "turn_running", "card_unknown", "could_not_look"):
+        elif reason not in (
+            "turn_failed",
+            "turn_running",
+            "card_unknown",
+            "invite_unknown",
+            "could_not_look",
+        ):
             # Recorded, answered, decided by the turn, or gone: start over.
             self._silent_turns.pop(key, None)
 
-    def _run_invite_turn(self, invite: GroupInviteEvent) -> None:
-        if self._stopped.is_set():
-            return
+    def _run_invite_turns(self, tray: InboxTray) -> None:
+        """One turn per pending invite on the tray, a few per cycle.
+
+        An invite whose earlier turn overran and has not ended gets no second
+        turn. Past the per-cycle cap, or a truncated invite list, the tray is
+        read again in a new cycle, so messages are gated in between.
+        """
+        invites: list[TrayInvite] = list(getattr(tray, "invites", None) or [])
+        started = 0
+        for invite in invites:
+            if self._stopped.is_set():
+                return
+            if self._running.is_busy(_INVITE_KEY + invite.invite_id):
+                logger.info(
+                    "AgentInvoker: group invite %s still has a turn running — not starting another",
+                    invite.invite_id,
+                )
+                continue
+            if started >= MAX_INVITE_TURNS_PER_CYCLE:
+                logger.info(
+                    "AgentInvoker: %d invite turn(s) this cycle — the rest on the next", started
+                )
+                self._coalescer.wake()
+                return
+            started += 1
+            self._run_invite_turn(invite)
+        if getattr(tray, "invites_truncated", False):
+            self._coalescer.wake()
+
+    def _run_invite_turn(self, invite: TrayInvite) -> None:
         texts = self._texts()
         if texts is None:
             self._schedule_retry("invite turn not started")
             return
         session_id = invite_session_id(invite.invite_id)
         logger.info(
-            "AgentInvoker: group-invite turn start group=%s (%s) from=@%s invite=%s",
-            invite.group_name,
-            invite.group_id,
-            invite.inviter_handle,
+            "AgentInvoker: group-invite turn start invite=%s group=%s from=%s",
             invite.invite_id,
+            invite.group.id,
+            invite.invited_by,
         )
         started = self._start_turn(
-            prompt=invite_turn_prompt(texts),
+            prompt=invite_turn_prompt(texts, invite.invite_id),
             session_id=session_id,
             holds=frozenset({_INVITE_KEY + invite.invite_id}),
         )
         if started is None:
-            # Stays "offered" in the ledger; the next wake queues it again.
             self._schedule_retry("invite turn not started")
             return
         report = started()
-        calls = report.calls
-        could_not_look = calls is not None and (calls.made <= 0 or calls.failed >= calls.made)
-        if report.status != "completed" or could_not_look:
-            # Never marked started: a turn that crashed, overran or could not
-            # look did not decide the invite. It stays offered and the next
-            # wake runs it again (not while this one is still running).
-            logger.warning(
-                "AgentInvoker: group-invite turn for %s did not decide it (%s) — it stays "
-                "offered and the next wake tries again",
-                invite.invite_id,
-                report.detail or report.calls_text(),
-            )
-            self._schedule_retry("invite turn did not complete")
+        if report.status == "completed":
+            self.invite_turns += 1
+        client = self._runtime.client
+        try:
+            fresh: Any = client.inbox.tray(wait_ms=0, limit=TRAY_LIMIT)
+        except Exception as exc:
+            logger.info("AgentInvoker: tray re-read after the invite turn failed (%s)", exc)
+            fresh = None
+        key = ("invite", invite.invite_id)
+        outcome = invite_outcome(
+            turn=report.turn_end(),
+            invite=invite,
+            fresh_tray=fresh,
+            silent_before=self._silent_turns.get(key, 0),
+        )
+        self._remember_silence(key, outcome.reason)
+        self.outcomes[f"invite_{outcome.reason}"] += 1
+        logger.info(
+            "AgentInvoker: invite=%s after turn %s: %s → %s (%s)",
+            invite.invite_id,
+            session_id,
+            outcome.reason,
+            outcome.action,
+            report.calls_text(),
+        )
+        if outcome.action == "dismiss_invite":
+            try:
+                apply_invite_outcome(client, outcome)
+            except Exception as exc:
+                logger.warning("AgentInvoker: invite %s not dismissed (%s)", invite.invite_id, exc)
+                self._schedule_retry("invite dismiss failed")
             return
-        self._ledger.mark_started(invite.invite_id)
-        self.invite_turns += 1
+        if outcome.reason != "invite_answered":
+            self._schedule_retry(f"invite {outcome.reason.replace('_', ' ')}")
 
     def _start_turn(
         self, *, prompt: str, session_id: str, holds: frozenset[str] = frozenset()

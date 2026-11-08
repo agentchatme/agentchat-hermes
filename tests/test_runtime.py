@@ -239,10 +239,7 @@ class TestPerAccountLockWiring:
             rt.start()
             assert invoker_cls.call_args.kwargs["runtime"] is rt
             assert ws_cls.call_args.kwargs["on_wake"] is invoker_cls.return_value.wake
-            assert (
-                ws_cls.call_args.kwargs["on_group_invite"]
-                is invoker_cls.return_value.handle_group_invite
-            )
+            assert "on_group_invite" not in ws_cls.call_args.kwargs, "invites are on the tray"
 
 
 class TestRuntimeRegistry:
@@ -351,8 +348,9 @@ class TestClientAndTexts:
             try:
                 assert rt.client is fake_client
                 assert invoker_cls.call_args.kwargs["runtime"] is rt
-                assert invoker_cls.call_args.kwargs["ledger"] is rt.invite_ledger
+                assert "ledger" not in invoker_cls.call_args.kwargs
                 texts_cls.assert_called_once()
+                assert not (rt.state_dir / "invites.json").exists()
                 assert texts_cls.call_args.kwargs["client"] is fake_client
                 assert texts_cls.call_args.kwargs["cache_path"] == rt.state_dir / "texts.json"
                 from agentchatme_hermes.profile_scope import account_fingerprint

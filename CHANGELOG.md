@@ -20,6 +20,12 @@ the dependency floor is set to that SDK version at release.
   the server re-wakes this socket while they stay unanswered (+1 m, +5 m, +30 m, +3 h after the newest message, restarting on a
   newer one). The 1 m / 5 m / 30 m ladder and the coalescer's delayed wake are deleted. A server that does not take `rewake` is
   logged once.
+- **Group invites come from the tray; the invite ledger is gone.** Pending invites are on the tray (contract v1). After the cards,
+  each invite gets one turn of its own (three per cycle, the rest on the next) whose prompt names the invite id; what is recorded after
+  it is the kit's rule (`invite_outcome`): answered in the turn → nothing; looked and left it pending → nothing the first time, then
+  `dismiss` (seen, left pending, not shown again); failed or could not look → nothing, and the server re-wakes while the invite is
+  pending. The socket's `group.invite.received` frame is one more wake. Deleted: `invites.py` and its `invites.json` ledger (removed
+  from the state directory on start), the socket's per-process invite dedupe and its connect-time `list_group_invites` catch-up.
 - **The socket watchdog honours the server's delay.** Over the connect budget the server answers 429 / close 1013 with a delay (up
   to an hour); the daemon's wedged-client watchdog no longer replaces the client while the SDK waits it out (or while it retries
   slowly after an auth rejection), so it does not reconnect against the server's word.

@@ -27,10 +27,9 @@ sends for a deferred conversation) is the same wake with no message at all.
   through the SDK, so an early ack never empties the tray. The pre-Phase-1
   daemon switched acks off because recording delivery used to mark the
   conversation read; that coupling is gone.
-* **Group invites** arrive on their own frame (``group.invite.received``) and
-  are not on the tray; they are handed to the invoker as a second wake
-  kind, deduplicated by invite id per process and caught up on connect.
-  The invoker's ledger decides whether a turn runs.
+* **Group invites** are on the tray (contract v1): their own frame
+  (``group.invite.received``) is one more wake, like ``message.new``. The
+  cycle reads the invites from the tray; nothing about them is kept here.
 
 Pattern mirrors ``plugins/memory/hindsight/__init__.py:_get_loop``: one
 long-lived loop, one daemon thread.
@@ -54,7 +53,7 @@ if TYPE_CHECKING:
     from agentchatme import AsyncAgentChatClient, RealtimeClient
 
     from .config import Config
-    from .types import AgentIdentity, GroupInviteEvent
+    from .types import AgentIdentity
     from .ws_health import HealthBoard
 
 logger = logging.getLogger(__name__)
@@ -106,14 +105,12 @@ class WSDaemon:
         config: Config,
         identity: AgentIdentity,
         on_wake: Callable[[], None],
-        on_group_invite: Callable[[GroupInviteEvent], None],
         health_path: Path | None = None,
         health: HealthBoard | None = None,
     ) -> None:
         self._config = config
         self._identity = identity
         self._on_wake = on_wake
-        self._on_group_invite = on_group_invite
         # Where the liveness record for THIS account is written. ``None``
         # falls back to the legacy per-machine file (test doubles only;
         # the runtime always passes the per-account path). With ``health``
@@ -148,13 +145,6 @@ class WSDaemon:
         self._wakes = 0
         self._invites_seen = 0
 
-        # Invite-ids already handed to the invoker by this process. Both the
-        # live ``group.invite.received`` frame and the connect-time catch-up
-        # funnel through :meth:`_dispatch_invite` keyed on this set, so one
-        # process offers an invite once however often it observes it. Whether
-        # a turn runs is the invoker's ledger's call (it persists across
-        # restarts); this set only stops the same process re-offering.
-        self._seen_invites: set[str] = set()
         self._rewake_warned = False
 
     # -- lifecycle ----------------------------------------------------------
@@ -296,11 +286,9 @@ class WSDaemon:
         rt_client.on("message.new", self._on_message_frame)
         # A reminder for a deferred conversation: a wake with no message.
         rt_client.on("wake", self._on_wake_frame)
-        # Group invites arrive on their own frame type — NOT `message.new` — so
-        # without this subscription an invited agent was never notified. This
-        # is the reactive half; invites missed while offline are caught up on
-        # every connect (the invite frame is live-only — it is not part of the
-        # message `/sync` drain).
+        # A new group invite: one more wake. The invite itself is read from
+        # the tray (contract v1), which also covers invites that arrived while
+        # this socket was down.
         rt_client.on("group.invite.received", self._on_group_invite_frame)
         rt_client.on_connect(self._on_connect)
         rt_client.on_disconnect(self._on_disconnect)
@@ -309,9 +297,9 @@ class WSDaemon:
     async def _main(self) -> None:
         from agentchatme import AsyncAgentChatClient
 
-        # One async HTTP client per cycle: the connect-time invite catch-up,
-        # and — handed to the socket — the SDK's offline drain on (re)connect
-        # and its gap-fill. Both ack what this machine pulled; neither reads.
+        # One async HTTP client per cycle, handed to the socket for the SDK's
+        # offline drain on (re)connect and its gap-fill. Both ack what this
+        # machine pulled; neither reads.
         self._http_client = AsyncAgentChatClient(
             api_key=self._config.api_key,
             base_url=self._config.api_base,
@@ -474,27 +462,13 @@ class WSDaemon:
         self._last_connected_at = time.time()
         self._write_health("connected")
         logger.info("WSDaemon: connected as @%s", self._identity.handle)
-        self._check_rewake()
-        # Whatever landed while the socket was down is on the tray now. The
-        # SDK drains and acks the offline backlog itself (each drained row is
-        # a message.new to the handler above, deduplicated); the connect is
-        # the one wake that covers the gap whether or not anything drains.
+        # Whatever landed while the socket was down — messages and invites —
+        # is on the tray now. The SDK drains and acks the offline backlog
+        # itself (each drained row is a message.new to the handler above,
+        # deduplicated); the connect is the one wake that covers the gap
+        # whether or not anything drains.
         self._wake("connect")
-        # Catch up on invites that landed while we were offline or before the
-        # live subscription existed. Group-invite frames are live-only (unlike
-        # messages, they are NOT part of the ``/sync`` drain), so without this
-        # an agent invited while disconnected would never find out. Runs on
-        # every (re)connect, deduped per process here and by the invoker's
-        # ledger across restarts. Fire-and-forget on this loop so a slow fetch
-        # never stalls the connect path — the drain is fully self-guarded.
-        try:
-            asyncio.get_running_loop().create_task(self._drain_pending_invites())
-        except RuntimeError:
-            # No running loop — defensive; _on_connect is always fired from the
-            # daemon loop in practice. Live invite frames still work.
-            logger.debug(
-                "WSDaemon: no running loop for invite catch-up — skipping"
-            )
+        self._check_rewake()
 
     def _check_rewake(self) -> None:
         """Say once if the server did not take the ``rewake`` capability.
@@ -515,54 +489,6 @@ class WSDaemon:
             "server's re-wake",
             ", ".join(sorted(negotiated)) or "none",
         )
-
-    async def _drain_pending_invites(self) -> None:
-        """Fetch pending group invites and surface any not yet handled.
-
-        The reactive companion to the live ``group.invite.received``
-        subscription: it closes the offline gap the live path cannot (invite
-        frames are not replayed on reconnect). Every invite is routed through
-        :meth:`_dispatch_invite`, so anything already seen live — or on a prior
-        reconnect drain — is skipped. Fully guarded: a failed fetch degrades to
-        "live frames only", never crashes the loop.
-        """
-        http = self._http_client
-        if http is None:
-            return
-        try:
-            # Typed loosely: this is untrusted wire data. The SDK annotates it
-            # as list[dict], but the defensive shape checks below must stay
-            # reachable — a malformed server response cannot be allowed to
-            # crash the daemon loop.
-            invites: Any = await http.list_group_invites()
-        except Exception:
-            logger.warning(
-                "WSDaemon: pending-invite catch-up failed (@%s) — live invite "
-                "frames are unaffected and the agent can still call "
-                "agentchat_list_group_invites",
-                self._identity.handle,
-                exc_info=True,
-            )
-            return
-
-        if not isinstance(invites, list):
-            return
-
-        from .types import GroupInviteEvent
-
-        surfaced = 0
-        for item in invites:
-            if not isinstance(item, dict):
-                continue
-            invite = GroupInviteEvent.from_ws_frame(item)
-            if invite is not None and self._dispatch_invite(invite, source="catch-up"):
-                surfaced += 1
-        if surfaced:
-            logger.info(
-                "WSDaemon: surfaced %d pending group invite(s) on connect (@%s)",
-                surfaced,
-                self._identity.handle,
-            )
 
     def _on_disconnect(self, info: dict[str, Any]) -> None:
         if self._disconnected_since is None:
@@ -669,78 +595,16 @@ class WSDaemon:
             )
 
     def _on_group_invite_frame(self, frame: dict[str, Any]) -> None:
-        """Inbound ``group.invite.received`` callback.
-
-        Receives ``{type: "group.invite.received", payload: {...}}``. Parses the
-        payload into a :class:`GroupInviteEvent` and hands it to the invoker's
-        consent-decision path via ``on_group_invite``. An invite is not on the
-        tray and does not go through the gate — it is a one-shot decision
-        (accept / reject / ignore) the agent makes for itself in a turn.
-
-        Same defensive contract as :meth:`_on_message_frame`: a single bad
-        frame — or a callback that raises — must NEVER take down the daemon.
-        """
-        from .types import GroupInviteEvent
-
+        """Inbound ``group.invite.received``: a wake. The invite is on the tray
+        (contract v1); the cycle reads it there, so a frame and a connect-time
+        backlog are the same thing. Ids are logged, the group name (peer
+        text) is not."""
         self._invites_seen += 1
-
         payload = frame.get("payload")
-        if not isinstance(payload, dict):
-            logger.warning(
-                "WSDaemon: group.invite.received without dict payload "
-                "(type=%s) — dropping",
-                type(payload).__name__,
-            )
-            return
-
-        invite = GroupInviteEvent.from_ws_frame(payload)
-        if invite is None:
-            logger.warning(
-                "WSDaemon: dropping malformed group-invite payload keys=%s",
-                sorted(payload.keys()),
-            )
-            return
-
-        self._dispatch_invite(invite, source="live")
-
-    def _dispatch_invite(self, invite: GroupInviteEvent, *, source: str) -> bool:
-        """Dedup an invite per process and hand it to the consent-decision path.
-
-        Shared by the live frame and the connect-time catch-up, keyed on
-        ``invite_id``, so one process offers an invite once no matter how many
-        times it observes it. Returns ``True`` when newly dispatched, ``False``
-        when already offered. On a callback that raises, the invite is left
-        *unseen* so a later catch-up retries — a lost offer must not become
-        permanent. Never raises: a bad callback cannot take down the daemon.
-        """
-        if invite.invite_id in self._seen_invites:
-            logger.debug(
-                "WSDaemon: group invite %s already offered — skipping (%s)",
-                invite.invite_id,
-                source,
-            )
-            return False
-
+        data = payload if isinstance(payload, dict) else {}
         logger.info(
-            "WSDaemon: dispatching group invite group=%s (%s) from=@%s "
-            "invite=%s source=%s",
-            invite.group_name,
-            invite.group_id,
-            invite.inviter_handle,
-            invite.invite_id,
-            source,
+            "WSDaemon: wake — group invite invite=%s group=%s",
+            data.get("id") or data.get("invite_id") or "<no-id>",
+            data.get("group_id", "<no-group>"),
         )
-        try:
-            self._on_group_invite(invite)
-        except Exception:
-            logger.exception(
-                "WSDaemon: on_group_invite callback raised for group=%s "
-                "invite=%s — daemon survives; the invite stays pending and is "
-                "reachable via agentchat_list_group_invites.",
-                invite.group_id,
-                invite.invite_id,
-            )
-            return False
-
-        self._seen_invites.add(invite.invite_id)
-        return True
+        self._wake("invite")

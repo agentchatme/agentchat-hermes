@@ -27,7 +27,6 @@ import json
 import logging
 import threading
 import time
-from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
@@ -40,9 +39,8 @@ from agentchatme_hermes import agent_invoker as invoker_module
 from agentchatme_hermes import hosted_tools as hosted_tools_module
 from agentchatme_hermes import turn_runner as turn_runner_module
 from agentchatme_hermes.agent_invoker import _FALLBACK_MODEL, AgentInvoker, _coerce_model_string
-from agentchatme_hermes.invites import InviteLedger
 from agentchatme_hermes.turn import invite_turn_prompt, wake_turn_prompt
-from agentchatme_hermes.types import AgentIdentity, GroupInviteEvent
+from agentchatme_hermes.types import AgentIdentity
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -84,17 +82,35 @@ def _card(cid: str) -> dict[str, Any]:
     }
 
 
-def _tray(*cards: dict[str, Any], truncated: bool = False) -> InboxTray:
+def _tray(
+    *cards: dict[str, Any],
+    truncated: bool = False,
+    invites: list[dict[str, Any]] | None = None,
+    invites_truncated: bool = False,
+) -> InboxTray:
     return InboxTray.model_validate(
         {
+            "version": 1,
             "you": "@me",
             "question": "Decide per card with agentchat_decide.",
             "categories": ["open_request", "no_action_needed"],
             "conversations": list(cards),
             "deferred": 0,
             "truncated": truncated,
+            "invites": invites or [],
+            "invites_truncated": invites_truncated,
         }
     )
+
+
+def _tray_invite(invite_id: str = "ginv_1") -> dict[str, Any]:
+    """A pending group invite as the tray carries it (contract v1)."""
+    return {
+        "invite_id": invite_id,
+        "group": {"id": "grp_1", "name": "Council", "member_count": 3},
+        "invited_by": "@carol",
+        "at": "2026-11-08T10:00:00.000Z",
+    }
 
 
 def _answer(**decisions: str) -> str:
@@ -127,6 +143,8 @@ class _Client:
         self.last_served: InboxTray | None = None
         self.inbox = SimpleNamespace(tray=self._tray)
         self.decisions = SimpleNamespace(record=self._record)
+        self.dismissed_invites: list[str] = []
+        self.groups = SimpleNamespace(dismiss_invite=self.dismissed_invites.append)
 
     def _tray(self, *, wait_ms: int = 0, limit: int | None = None) -> InboxTray:
         self.tray_calls.append({"wait_ms": wait_ms, "limit": limit})
@@ -201,7 +219,6 @@ def _invoker(
     answer: str | Exception | None = None,
     config: Any = None,
     texts: Texts | None = TEXTS,
-    ledger: InviteLedger | None = None,
 ) -> tuple[AgentInvoker, _Client, MagicMock, list[str]]:
     """An invoker with a stubbed runtime, agent and model answer.
 
@@ -211,7 +228,7 @@ def _invoker(
     client = _Client(trays)
     runtime = SimpleNamespace(client=client, texts=texts)
     cfg = config or SimpleNamespace(wake_debounce_s=0.0)
-    inv = AgentInvoker(config=cfg, identity=AgentIdentity(handle="me"), runtime=runtime, ledger=ledger)
+    inv = AgentInvoker(config=cfg, identity=AgentIdentity(handle="me"), runtime=runtime)
 
     events: list[str] = []
     agent = MagicMock()
@@ -833,16 +850,6 @@ def _wait_for(predicate: Any, timeout: float = 2.0) -> bool:
     return False
 
 
-def _invite(invite_id: str = "ginv_1") -> GroupInviteEvent:
-    return GroupInviteEvent(
-        invite_id=invite_id,
-        group_id="grp_1",
-        group_name="Council",
-        inviter_handle="carol",
-        received_at=datetime.now(timezone.utc),
-    )
-
-
 class TestWorker:
     def test_wake_runs_one_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv, client, _agent, _events = _invoker(monkeypatch, trays=[_tray()], answer=_answer())
@@ -876,17 +883,6 @@ class TestWorker:
             assert _wait_for(lambda: inv.cycles == 2)
             time.sleep(0.05)
             assert inv.cycles == 2, "two wakes during one cycle collapse into one follow-up"
-        finally:
-            inv.stop()
-
-    def test_invite_runs_its_own_turn_with_the_served_prompt(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        inv, _client, agent, _events = _invoker(monkeypatch, trays=[], answer=_answer())
-        inv.start()
-        try:
-            inv.handle_group_invite(_invite())
-            assert _wait_for(lambda: inv.invite_turns == 1)
-            agent.run_conversation.assert_called_once_with(invite_turn_prompt(TEXTS), conversation_history=[])
-            assert inv.cycles == 0, "an invite is not a tray wake"
         finally:
             inv.stop()
 
@@ -1288,16 +1284,17 @@ class TestProfileTurnScope:
             seen["turn_home"].append(fake.override.get())
             return {"final_response": "ok"}
 
-        real_requeue = inv._requeue_pending_invites
+        real_guarded = inv._guarded_cycle
 
-        def requeue_and_observe() -> None:
-            # Runs on the worker thread at every wake, OUTSIDE any cycle's scope:
-            # what is bound here is what a cycle left behind.
+        def observe_then_cycle() -> None:
+            # Runs on the worker thread at every wake, OUTSIDE any cycle's scope
+            # (the cycle enters it inside): what is bound here is what an
+            # earlier cycle left behind.
             seen["between_cycles"].append((fake.scope.get(), fake.override.get()))
-            real_requeue()
+            real_guarded()
 
         monkeypatch.setattr(inv, "_resolve_model_and_runtime", resolve_model_and_runtime)
-        monkeypatch.setattr(inv, "_requeue_pending_invites", requeue_and_observe)
+        monkeypatch.setattr(inv, "_guarded_cycle", observe_then_cycle)
         agent.run_conversation.side_effect = run_conversation
         return inv, client, agent, seen
 
@@ -1439,35 +1436,14 @@ class TestProfileTurnScope:
     def test_invite_turn_runs_in_the_profile_scope(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         launch, up = self._homes(tmp_path)
         fake = _FakeHermesScopes(monkeypatch, self._secrets(launch, up))
-        inv, _client, agent, _seen = self._worker(monkeypatch, fake, up, [])
+        inv, _client, agent, _seen = self._worker(
+            monkeypatch, fake, up, [_tray(invites=[_tray_invite()]), _tray()]
+        )
         got: list[Any] = []
         agent.run_conversation.side_effect = lambda prompt, conversation_history: got.append(fake.get_secret("LIVEFIRE_STUB_KEY")) or {"final_response": ""}
-        inv.start()
-        try:
-            inv.handle_group_invite(_invite())
-            assert _wait_for(lambda: inv.invite_turns == 1, timeout=5.0)
-        finally:
-            inv.stop()
+        inv._guarded_cycle()
+        assert inv.invite_turns == 1
         assert got == ["key-up"] and fake.runtime_scope_calls == [str(up)] and fake.runtime_scope_exits == [None]
-
-    def test_invite_whose_scope_cannot_be_entered_stays_offered_and_rewakes(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        _launch, up = self._homes(tmp_path)
-        fake = _FakeHermesScopes(monkeypatch, {str(up): {}}, helper_raises=OSError("vault locked"))
-        ledger = InviteLedger(tmp_path / "invites.json")
-        inv, _client, agent, _seen = self._worker(monkeypatch, fake, up, [])
-        inv._ledger = ledger
-        reasons: list[str] = []
-        monkeypatch.setattr(inv, "_schedule_retry", reasons.append)
-        inv._enqueue_invite(_invite())
-        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
-            inv._drain_invites()
-        agent.run_conversation.assert_not_called()
-        assert reasons == ["profile scope unavailable"], "the dedicated branch, not the outer catch"
-        assert [i.invite_id for i in ledger.pending()] == ["ginv_1"], "offered, not started: retried next wake"
-        assert any("group-invite turn not started" in r.getMessage() and "vault locked" in r.getMessage() for r in caplog.records)
-        assert not any("outer catch" in r.getMessage() for r in caplog.records)
 
     def test_outside_hermes_the_scope_is_a_no_op(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         import sys
@@ -1482,112 +1458,31 @@ class TestProfileTurnScope:
         assert ran == [1]
 
 
-class TestInviteRetry:
-    def test_invite_whose_turn_fails_to_start_is_retried_on_the_next_wake(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        ledger = InviteLedger(tmp_path / "invites.json")
-        inv, _client, agent, _events = _invoker(
-            monkeypatch, trays=[_tray()] * 3, answer=_answer(), ledger=ledger
-        )
-        build_ok = {"value": False}
-        real_build = inv._build_agent
-        monkeypatch.setattr(
-            inv, "_build_agent", lambda sid: real_build(sid) if build_ok["value"] else None
-        )
-
-        inv.start()
-        try:
-            inv.handle_group_invite(_invite())
-            assert _wait_for(lambda: inv.left_on_tray == 1)
-            assert inv.invite_turns == 0
-            assert [i.invite_id for i in ledger.pending()] == ["ginv_1"], "offered, not started"
-
-            build_ok["value"] = True
-            inv.wake()  # the next wake re-queues the pending invite
-            assert _wait_for(lambda: inv.invite_turns == 1)
-            agent.run_conversation.assert_called_once_with(invite_turn_prompt(TEXTS), conversation_history=[])
-            assert ledger.is_started("ginv_1") and ledger.pending() == []
-        finally:
-            inv.stop()
-
-    def test_invite_that_ran_is_not_run_again_after_a_restart(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        path = tmp_path / "invites.json"
-        first = InviteLedger(path)
-        first.offer(_invite())
-        first.mark_started("ginv_1")
-
-        # A new process: the connect-time catch-up offers the still-pending invite again.
-        inv, _client, agent, _events = _invoker(
-            monkeypatch, trays=[], answer=_answer(), ledger=InviteLedger(path)
-        )
-        inv.start()
-        try:
-            inv.handle_group_invite(_invite())
-            time.sleep(0.1)
-            agent.run_conversation.assert_not_called()
-            assert inv.invite_turns == 0
-        finally:
-            inv.stop()
-
-    def test_socket_thread_never_waits_on_the_ledger_write(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
-        """``handle_group_invite`` runs on the socket's event loop: it must
-        return at once even while the worker is inside a slow fsync'd write
-        holding the ledger lock. A connect-time catch-up of N invites must
-        not stall frames and pongs."""
-        from agentchatme_hermes import invites as invites_module
-
-        ledger = InviteLedger(tmp_path / "invites.json")
-        inv, _client, _agent, _events = _invoker(monkeypatch, trays=[], answer=_answer(), ledger=ledger)
-        entered = threading.Event()
-        real_write = invites_module.write_json_atomic
-
-        def slow_write(path: Any, record: Any) -> None:
-            entered.set()
-            time.sleep(0.4)
-            real_write(path, record)
-
-        monkeypatch.setattr(invites_module, "write_json_atomic", slow_write)
-        inv.start()
-        try:
-            started = time.monotonic()
-            inv.handle_group_invite(_invite("ginv_a"))
-            first = time.monotonic() - started
-            assert entered.wait(2.0), "the worker is now inside the slow write"
-            started = time.monotonic()
-            inv.handle_group_invite(_invite("ginv_b"))
-            second = time.monotonic() - started
-            assert first < 0.1 and second < 0.1, (first, second)
-            assert _wait_for(lambda: inv.invite_turns == 2, timeout=5.0)
-        finally:
-            inv.stop()
-
+class TestTurnNotStarted:
     def test_agent_constructor_raising_is_a_turn_not_started(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``AIAgent(...)`` raising (anything but ImportError) must not wait
-        for an unrelated wake: nothing recorded, the invite stays offered, the
-        ladder brings the next wake."""
-        ledger = InviteLedger(tmp_path / "invites.json")
-        inv, _client, agent, _events = _invoker(monkeypatch, trays=[], answer=_answer(), ledger=ledger)
+        """``AIAgent(...)`` raising (anything but ImportError): nothing
+        recorded, the invite stays on the tray, the server re-wakes."""
+        inv, client, agent, _events = _invoker(
+            monkeypatch, trays=[_tray(invites=[_tray_invite()])], answer=_answer()
+        )
 
-        def raising(_session_id: str) -> Any:
-            raise RuntimeError("provider config exploded")
+        import sys
+        import types
 
-        monkeypatch.setattr(inv, "_build_agent", raising)
-        inv.start()
-        try:
-            inv.handle_group_invite(_invite())
-            assert _wait_for(lambda: inv.left_on_tray == 1)
-            agent.run_conversation.assert_not_called()
-            assert [i.invite_id for i in ledger.pending()] == ["ginv_1"]
-            assert inv.invite_turns == 0
-        finally:
-            inv.stop()
+        class ExplodingAgent:
+            def __init__(self, **_kwargs: Any) -> None:
+                raise RuntimeError("provider config exploded")
+
+        module = types.ModuleType("run_agent")
+        module.AIAgent = ExplodingAgent  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "run_agent", module)
+        monkeypatch.setattr(inv, "_build_agent", AgentInvoker._build_agent.__get__(inv))
+        inv.run_cycle()
+        agent.run_conversation.assert_not_called()
+        assert inv.left_on_tray == 1 and inv.invite_turns == 0
+        assert client.dismissed_invites == []
 
     def test_build_agent_swallows_constructor_errors(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import sys
@@ -1609,19 +1504,13 @@ class TestInviteRetry:
         assert inv._build_agent("agentchat:wake:test") is None
         assert inv._start_turn(prompt="p", session_id="s") is None
 
-    def test_invite_without_texts_stays_pending(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        ledger = InviteLedger(tmp_path / "invites.json")
-        inv, _client, agent, _events = _invoker(
-            monkeypatch, trays=[], answer=_answer(), texts=None, ledger=ledger
+    def test_invite_without_texts_stays_pending(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, agent, _events = _invoker(
+            monkeypatch, trays=[_tray(invites=[_tray_invite()])], answer=_answer(), texts=None
         )
-        inv.start()
-        try:
-            inv.handle_group_invite(_invite())
-            assert _wait_for(lambda: inv.left_on_tray == 1)
-            agent.run_conversation.assert_not_called()
-            assert [i.invite_id for i in ledger.pending()] == ["ginv_1"]
-        finally:
-            inv.stop()
+        inv.run_cycle()
+        agent.run_conversation.assert_not_called()
+        assert inv.left_on_tray >= 1 and client.dismissed_invites == []
 
 
 class TestSessionPerTurn:
@@ -1736,20 +1625,78 @@ class TestTurnTimeLimit:
         assert _wait_for(lambda: inv.status()["state"] == "stopped")
         assert client.recorded == [], "a turn stopped mid-way records nothing"
 
-    def test_crashed_invite_turn_is_not_marked_started(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        ledger = InviteLedger(None)
-        inv, _client, agent, _events = _invoker(monkeypatch, trays=[], answer=_answer(), ledger=ledger)
-        agent.run_conversation.side_effect = RuntimeError("provider exploded")
-        invite = _invite()
-        ledger.offer(invite)
-        inv._run_invite_turn(invite)
-        assert not ledger.is_started(invite.invite_id)
-        assert [i.invite_id for i in ledger.pending()] == [invite.invite_id], "retried on the next wake"
-        assert inv.invite_turns == 0 and inv.left_on_tray == 1
 
+
+class TestInvitesOnTheTray:
+    """Contract v1 (D4): pending invites are on the tray. Each gets a turn of
+    its own after the cards; what is recorded after it is the kit's
+    ``invite_outcome``. Nothing is remembered on disk."""
+
+    def _pending(self, client: _Client, pending: list[str]) -> None:
+        """The server's view: the invites still pending (mutated by a turn)."""
+        client.live_inbox = lambda: _tray(invites=[_tray_invite(i) for i in pending])
+
+    def test_an_invite_gets_its_own_turn_naming_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, agent, _events = _invoker(monkeypatch, trays=[], answer=_answer())
+        pending = ["ginv_1"]
+        self._pending(client, pending)
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: pending.clear() or {"final_response": "accepted"}
+        inv.run_cycle()
+        agent.run_conversation.assert_called_once_with(invite_turn_prompt(TEXTS, "ginv_1"), conversation_history=[])
+        assert "This turn is for the invite ginv_1." in invite_turn_prompt(TEXTS, "ginv_1")
+        assert inv.invite_turns == 1 and inv.outcomes["invite_invite_answered"] == 1
+        assert client.dismissed_invites == [] and inv.left_on_tray == 0
+
+    def test_left_pending_twice_is_dismissed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, agent, _events = _invoker(monkeypatch, trays=[], answer=_answer())
+        self._pending(client, ["ginv_1"])
         agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": ""}
-        inv._run_invite_turn(invite)
-        assert ledger.is_started(invite.invite_id) and inv.invite_turns == 1
+        inv.run_cycle()
+        assert client.dismissed_invites == [] and inv.outcomes["invite_silent_first"] == 1
+        inv.run_cycle()
+        assert client.dismissed_invites == ["ginv_1"] and inv.outcomes["invite_silent_again"] == 1
+
+    def test_a_failed_invite_turn_records_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, agent, _events = _invoker(monkeypatch, trays=[], answer=_answer())
+        self._pending(client, ["ginv_1"])
+        agent.run_conversation.side_effect = RuntimeError("provider exploded")
+        inv.run_cycle()
+        inv.run_cycle()
+        assert client.dismissed_invites == [], "a failed turn never counts as a look"
+        assert inv.outcomes["invite_turn_failed"] == 2 and inv.left_on_tray == 2
+
+    def test_invites_run_after_the_cards_even_on_an_empty_card_tray(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, _agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"), invites=[_tray_invite()])], answer=_answer(a="dismiss")
+        )
+        inv.run_cycle()
+        assert client.recorded == [("a", "dismiss", "msg_a")] and inv.invite_turns == 1
+        assert events.index("model") < events.index("run"), "cards are gated first"
+
+    def test_a_few_invite_turns_per_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        many = [f"ginv_{i}" for i in range(invoker_module.MAX_INVITE_TURNS_PER_CYCLE + 2)]
+        inv, client, agent, _events = _invoker(monkeypatch, trays=[], answer=_answer())
+        self._pending(client, many)
+        wakes: list[str] = []
+        monkeypatch.setattr(inv._coalescer, "wake", lambda: wakes.append("wake"))
+        inv.run_cycle()
+        assert agent.run_conversation.call_count == invoker_module.MAX_INVITE_TURNS_PER_CYCLE
+        assert wakes == ["wake"], "the rest on the next cycle"
+
+    def test_no_second_turn_while_an_invite_turn_is_running(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, agent, _events = _invoker(monkeypatch, trays=[], answer=_answer())
+        self._pending(client, ["ginv_1"])
+        inv._running.abandon(inv._running.hold(frozenset({"invite:ginv_1"})))
+        inv.run_cycle()
+        agent.run_conversation.assert_not_called()
+
+    def test_a_server_without_invites_on_the_tray(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, agent, _events = _invoker(monkeypatch, trays=[], answer=_answer())
+        client.live_inbox = lambda: InboxTray.model_validate(
+            {"you": "@me", "question": "q", "categories": [], "conversations": [], "deferred": 0, "truncated": False}
+        )
+        inv.run_cycle()
+        agent.run_conversation.assert_not_called()
 
 
 class TestWorkerSupervision:
@@ -1760,22 +1707,22 @@ class TestWorkerSupervision:
         inv, _client, _agent, _events = _invoker(monkeypatch, trays=[_tray(), _tray()], answer=_answer())
         monkeypatch.setattr(invoker_module, "WORKER_BACKOFF_BASE_S", 0.01)
         calls = {"n": 0}
-        real = inv._requeue_pending_invites
+        real = inv._guarded_cycle
 
         def flaky() -> None:
             calls["n"] += 1
             if calls["n"] == 1:
-                raise RuntimeError("ledger exploded")
+                raise RuntimeError("cycle exploded")
             real()
 
-        monkeypatch.setattr(inv, "_requeue_pending_invites", flaky)
+        monkeypatch.setattr(inv, "_guarded_cycle", flaky)
         inv.start()
         try:
             inv._on_wake_fired()
             assert _wait_for(lambda: inv.worker_restarts == 1 and inv.cycles >= 1, timeout=5.0)
             status = inv.status()
             assert status["alive"] is True and status["restarts"] == 1
-            assert "ledger exploded" in (status["last_error"] or "")
+            assert "cycle exploded" in (status["last_error"] or "")
             assert _wait_for(lambda: inv.status()["state"] == "idle")
         finally:
             inv.stop()

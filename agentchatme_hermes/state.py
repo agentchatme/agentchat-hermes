@@ -1,13 +1,11 @@
 """Per-account state on disk: what the integration must remember across restarts.
 
-Two things live here today, both small JSON files:
-
-* the last served texts (``texts.json``), so a gateway that starts while
-  ``GET /v1/texts`` is unreachable still has the wake instruction, the
-  invite prompt and the identity line it used last time;
-* the invite ledger (``invites.json``), so a group invite whose turn could
-  not start is retried on the next wake instead of being lost, and a
-  restart does not start one turn per invite the agent already looked at.
+One small JSON file lives here today: the last served texts
+(``texts.json``), so a gateway that starts while ``GET /v1/texts`` is
+unreachable still has the wake instruction, the invite prompt and the
+identity line it used last time. (Releases before contract v1 also kept an
+invite ledger, ``invites.json``; invites are on the tray now and the runtime
+removes that file.)
 
 The directory is per (Hermes root, account): ``<hermes root>/agentchat-state/
 <fingerprint>/``, beside ``agentchat-locks/`` and for the same reason — two
@@ -32,7 +30,8 @@ from .profile_scope import account_fingerprint, hermes_root_of
 
 STATE_DIRNAME = "agentchat-state"
 TEXTS_FILENAME = "texts.json"
-INVITES_FILENAME = "invites.json"
+# Written by releases before contract v1 (the invite ledger); removed on start.
+LEGACY_INVITES_FILENAME = "invites.json"
 
 
 def state_dir_for(
