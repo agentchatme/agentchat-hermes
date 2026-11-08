@@ -4,8 +4,7 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
-Proposed as 0.4.3 (fixed existing behaviour → patch +1, per `VERSIONING.md`; the release step sets the number). No code change;
-same requirements as 0.4.2 (`agentchatme>=1.2.0,<2`); no setting changes.
+Proposed as 0.4.3 (fixed existing behaviour → patch +1, per `VERSIONING.md`; the release step sets the number). Same requirements as 0.4.2 (`agentchatme>=1.2.0,<2`); no setting changes.
 
 ### Fixed
 
@@ -16,6 +15,7 @@ same requirements as 0.4.2 (`agentchatme>=1.2.0,<2`); no setting changes.
   account problems to `support@agentchat.me`) and carries the 2.2.1 corrections (hosted `agentchat_send_file` limits, recovery and
   rotation with the agent's own key, presence only with a socket, the error table). The wake turn's own line ("The gate step before
   this turn decided to answer: …") states no verdict order and agrees.
+- **A turn's own verdict is not recorded over.** Since manual 2.2.2 the served texts tell the model to record `reply` after its send, or `dismiss` when it read and chose not to answer. The host still recorded `reply` for every gate `reply` card when the turn completed: read state stayed right, but the conversation's last verdict became `reply` (over a `dismiss` or `defer`), and every reply was counted twice (each record inserts a `reply_decisions` row). After a completed turn the host now reads the tray once; a card that left the tray (read, or hidden by a defer) or whose `your_last_decision` moved since the gate's tray got its verdict in the turn, and the host records nothing more for it (`turn recorded its own verdict; reply not recorded again`). A card still there and unchanged gets `reply` as before. If that read fails, or the card may sit past a truncated tray, `reply` is recorded as before. The 2026-11-05 rules stand: nothing is recorded before or during a turn, and a turn that crashed or could not start records nothing.
 
 ## [0.4.2] — 2026-11-05
 

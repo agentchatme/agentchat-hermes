@@ -17,7 +17,16 @@ What happens on a wake
    turn's return value is discarded — nothing is auto-routed anywhere.
 5. **Record.** When that turn has **completed**, call ``record()`` on every
    ``reply`` entry: a completed turn looked, so the conversation counts as
-   read — whether or not it chose to send. Never earlier: recording marks
+   read — whether or not it chose to send. Except where the turn recorded
+   a verdict for that conversation itself: the served texts tell the model
+   to record ``reply`` after its send, or ``dismiss`` when it read and chose
+   not to answer (or ``defer``). One fresh tray read after the turn shows
+   it — the card has left the tray (read, or hidden by a defer), or its
+   ``your_last_decision`` moved since the gate's tray — and the host then
+   records nothing more, so the agent's own last verdict stands and a reply
+   is counted once. If that read fails, or the card may sit past a
+   truncated tray, ``reply`` is recorded as before (reading is
+   forward-only, so a repeat never un-reads anything). Never earlier: recording marks
    the conversation read and takes the card off the tray, so a turn that
    records first finds an empty tray (the 0.4.0 live-fire: 25 s parked in
    ``agentchat_inbox`` for nothing). A turn that could not start (Hermes
@@ -63,6 +72,7 @@ import collections
 import json
 import logging
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
@@ -174,6 +184,9 @@ class AgentInvoker:
         self.turns = 0
         self.invite_turns = 0
         self.recorded_replies = 0
+        # ``reply`` entries the host left alone because the turn recorded a
+        # verdict for that conversation itself (see the module docstring).
+        self.turn_recorded_verdicts = 0
 
         # Hermes-side handles, resolved lazily on first turn so the plugin
         # registers cleanly where Hermes' runtime isn't importable yet.
@@ -568,7 +581,16 @@ class AgentInvoker:
             )
             return "crashed"
         self.turns += 1
+        decided_in_turn = self._decided_in_turn(reply)
         for entry in reply:
+            if entry.conversation_id in decided_in_turn:
+                self.turn_recorded_verdicts += 1
+                logger.info(
+                    "AgentInvoker: conv=%s — the turn recorded its own verdict; reply not "
+                    "recorded again",
+                    entry.conversation_id,
+                )
+                continue
             try:
                 entry.record()
                 self.recorded_replies += 1
@@ -581,6 +603,43 @@ class AgentInvoker:
                     exc,
                 )
         return "completed"
+
+    def _decided_in_turn(self, reply: Sequence[gate.GateReply]) -> set[str]:
+        """The ``reply`` conversations the completed turn recorded a verdict
+        for itself, seen on one fresh tray read.
+
+        A card that left the tray was read (a verdict or a mark-read) or
+        hidden by a ``defer`` — either way by the turn, since the host had
+        recorded nothing for it. A card still there whose
+        ``your_last_decision`` differs from the gate's copy got a verdict in
+        the turn (a newer message keeps it on the tray). A card still there,
+        unchanged, got nothing: the host records ``reply``. When the read
+        fails, or a missing card may sit past a truncated tray, nothing is
+        claimed and ``reply`` is recorded as before.
+        """
+        if not reply:
+            return set()
+        try:
+            tray = self._runtime.client.inbox.tray(wait_ms=0, limit=TRAY_LIMIT)
+        except Exception as exc:
+            logger.info(
+                "AgentInvoker: tray re-read after the turn failed (%s) — recording reply "
+                "for every card the gate chose",
+                exc,
+            )
+            return set()
+        cards = {card["conversation_id"]: card for card in gate.cards_of(tray)}
+        truncated = _tray_truncated(tray)
+        decided: set[str] = set()
+        for entry in reply:
+            card = cards.get(entry.conversation_id)
+            if card is None:
+                if not truncated:
+                    decided.add(entry.conversation_id)
+                continue
+            if _last_decision_at(card) != _last_decision_at(entry.card):
+                decided.add(entry.conversation_id)
+        return decided
 
     def _run_invite_turn(self, invite: GroupInviteEvent) -> None:
         if self._stopped.is_set():
@@ -764,6 +823,35 @@ class AgentInvoker:
 
 _HOSTED_TOOL_MARK = f"{MCP_TOOL_PREFIX}{MCP_SERVER_NAME}__"
 _UNTRUSTED_SOURCE_MARK = f'source="{_HOSTED_TOOL_MARK}'
+
+
+def _card_data(card: Any) -> Mapping[str, Any]:
+    if isinstance(card, Mapping):
+        return card
+    dump = getattr(card, "model_dump", None)
+    if callable(dump):
+        data = dump(mode="json")
+        if isinstance(data, Mapping):
+            return data
+    return {}
+
+
+def _last_decision_at(card: Any) -> str | None:
+    """When the card's ``your_last_decision`` was recorded (server time), or
+    ``None`` when the agent never recorded one. Compared only with another
+    value from the same server field, so no clock is involved."""
+    last = _card_data(card).get("your_last_decision")
+    if isinstance(last, Mapping):
+        at = last.get("at")
+        if isinstance(at, str) and at:
+            return at
+    return None
+
+
+def _tray_truncated(tray: Any) -> bool:
+    if isinstance(tray, Mapping):
+        return bool(tray.get("truncated"))
+    return bool(getattr(tray, "truncated", False))
 
 
 def turn_looked(result: Any) -> bool | None:

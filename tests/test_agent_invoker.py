@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
 import pytest
+from agentchatme import gate
 from agentchatme.types import InboxTray, Texts
 
 from agentchatme_hermes import agent_invoker as invoker_module
@@ -108,6 +109,14 @@ class _Client:
         # A live fake inbox: a callable that builds the tray from the state
         # the server would hold (what is unread given what was recorded).
         self.live_inbox: Any = None
+        # What the server shows after a turn: by default the last served
+        # tray minus what was recorded (a card stays unread until something
+        # reads it). A test sets ``turn_view`` (a tray, or an exception) to
+        # say what the turn left; ``after_turn`` is that view, armed when the
+        # turn ends and consumed by the host's one post-turn read.
+        self.turn_view: Any = None
+        self.after_turn: Any = None
+        self.last_served: InboxTray | None = None
         self.inbox = SimpleNamespace(tray=self._tray)
         self.decisions = SimpleNamespace(record=self._record)
 
@@ -115,10 +124,19 @@ class _Client:
         self.tray_calls.append({"wait_ms": wait_ms, "limit": limit})
         if self.live_inbox is not None:
             return self.live_inbox()
+        if self.after_turn is not None:
+            # The host's one read after a completed turn (``_decided_in_turn``).
+            view = self.after_turn
+            self.after_turn = None
+            if isinstance(view, Exception):
+                raise view
+            assert isinstance(view, InboxTray)
+            return view
         nxt = self.trays.pop(0) if self.trays else _tray()
         if isinstance(nxt, Exception):
             raise nxt
         assert isinstance(nxt, InboxTray)
+        self.last_served = nxt
         return nxt
 
     def _record(
@@ -133,6 +151,21 @@ class _Client:
             raise self.record_error
         self.recorded.append((conversation_id, decision, through_message_id))
         return {"decision": decision}
+
+
+def _leave_unread_on_the_tray(client: _Client) -> None:
+    """A turn that recorded nothing: after it, the server still shows every
+    card of the last served tray that nobody recorded (unread stays on the
+    tray). The host's post-turn read sees that, unless the test set its own."""
+    if client.turn_view is not None:
+        client.after_turn = client.turn_view
+        return
+    served = client.last_served
+    if served is None:
+        return
+    recorded = {cid for cid, _decision, _anchor in client.recorded}
+    cards = [c for c in gate.cards_of(served) if c["conversation_id"] not in recorded]
+    client.after_turn = _tray(*cards, truncated=bool(served.truncated))
 
 
 def _fake_stop_wait(monkeypatch: pytest.MonkeyPatch, inv: AgentInvoker, clock: dict[str, float] | None = None) -> list[float]:
@@ -191,6 +224,26 @@ def _invoker(
         events.append("build")
         return agent
 
+    # When a turn ends, the server still shows what nobody recorded; the
+    # host's post-turn read (``_decided_in_turn``) sees that view.
+    real_start_turn = inv._start_turn
+
+    def start_turn(**kw: Any) -> Any:
+        started = real_start_turn(**kw)
+        if started is None or "decided to answer" not in str(kw.get("prompt", "")):
+            # Not started, or a turn with no gate ``reply`` (invite, gate
+            # off): the host makes no post-turn read.
+            return started
+
+        def run() -> bool:
+            try:
+                return bool(started())
+            finally:
+                _leave_unread_on_the_tray(client)
+
+        return run
+
+    monkeypatch.setattr(inv, "_start_turn", start_turn)
     monkeypatch.setattr(inv, "_ensure_hermes_resolved", lambda: None)
     monkeypatch.setattr(inv, "_build_agent", build_agent)
     monkeypatch.setattr(inv, "_resolve_model_and_runtime", lambda: ("m", {"provider": "p"}))
@@ -245,7 +298,9 @@ class TestRunCycle:
         )
         result = inv.run_cycle()
         assert result is not None and result.outcome == "decided"
-        assert client.tray_calls == [{"wait_ms": 0, "limit": 50}]
+        # The gate's tray, then one read after the completed turn to see
+        # whether the turn recorded its own verdict.
+        assert client.tray_calls == [{"wait_ms": 0, "limit": 50}, {"wait_ms": 0, "limit": 50}]
         # dismiss recorded by the SDK gate at once, with the card's anchor;
         # reply recorded by the host only after the turn has completed.
         assert events == ["model", "record:b:dismiss", "build", "run", "record:a:reply"]
@@ -479,6 +534,56 @@ class TestRunCycle:
         assert invoker_module.turn_failure({"failed": True, "error": "boom", "failure_reason": "provider_error"}) == "failed, provider_error: boom"
         assert invoker_module.turn_failure({"partial": True, "error": "cut"}) == "partial: cut"
         assert invoker_module.turn_failure({"completed": False}) == "not completed: no error text"
+
+    def test_turn_that_recorded_its_own_verdict_is_not_recorded_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The served texts tell the model to record reply after its send (or
+        # dismiss when it read and chose not to answer). The card then left
+        # the tray: the host records nothing more, so the agent's own last
+        # verdict stands and the reply is counted once.
+        inv, client, _agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
+        )
+        client.turn_view = _tray()
+        inv.run_cycle()
+        assert events == ["model", "build", "run"]
+        assert client.recorded == []
+        assert inv.turn_recorded_verdicts == 1 and inv.recorded_replies == 0
+        assert inv.turns == 1
+
+    def test_a_verdict_in_the_turn_seen_on_a_card_kept_by_a_newer_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The turn answered and recorded reply; a newer peer message keeps the
+        # card on the tray. Its your_last_decision moved: no second reply.
+        before = _card("a")
+        after = {**_card("a"), "your_last_decision": {"decision": "reply", "category": None, "at": "2026-11-07T10:00:05.000Z"}}
+        inv, client, _agent, _events = _invoker(monkeypatch, trays=[_tray(before)], answer=_answer(a="reply"))
+        client.turn_view = _tray(after)
+        inv.run_cycle()
+        assert client.recorded == []
+        assert inv.turn_recorded_verdicts == 1
+
+    def test_an_older_verdict_on_the_card_is_not_the_turns(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The card carried a verdict from an earlier cycle; the turn recorded
+        # nothing (same your_last_decision after it): the host records reply.
+        old = {"decision": "defer", "category": None, "at": "2026-11-06T09:00:00.000Z"}
+        card = {**_card("a"), "your_last_decision": old}
+        inv, client, _agent, _events = _invoker(monkeypatch, trays=[_tray(card)], answer=_answer(a="reply"))
+        client.turn_view = _tray(card)
+        inv.run_cycle()
+        assert client.recorded == [("a", "reply", "msg_a")]
+        assert inv.turn_recorded_verdicts == 0 and inv.recorded_replies == 1
+
+    def test_a_failed_re_read_records_reply_as_before(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, _agent, _events = _invoker(monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply"))
+        client.turn_view = RuntimeError("inbox down")
+        inv.run_cycle()
+        assert client.recorded == [("a", "reply", "msg_a")]
+
+    def test_a_card_missing_from_a_truncated_tray_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Past a truncated page the card may still be unread: claim nothing.
+        inv, client, _agent, _events = _invoker(monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply"))
+        client.turn_view = _tray(_card("x"), truncated=True)
+        inv.run_cycle()
+        assert client.recorded == [("a", "reply", "msg_a")]
 
     def test_turn_reads_the_card_before_reply_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """What the ordering is for: the turn's first ``agentchat_inbox`` must
