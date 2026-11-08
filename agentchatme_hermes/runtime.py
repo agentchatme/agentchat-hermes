@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
 from .agent_invoker import AgentInvoker
 from .client_identity import hermes_client_identity
@@ -82,9 +82,18 @@ class Runtime:
     while letting sibling profiles with their own accounts receive.
     """
 
-    def __init__(self, config: Config, *, gateway_mode: bool) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        gateway_mode: bool,
+        host_llm: Callable[[], Any] | None = None,
+    ) -> None:
         self._config = config
         self._gateway_mode_requested = gateway_mode
+        # Accessor for Hermes' public plugin LLM (``ctx.llm``) of the profile
+        # that registered this runtime; the invoker's gate call uses it.
+        self._host_llm = host_llm
 
         # Profile binding. Read defensively: production passes a
         # :class:`Config`, tests pass light doubles without these fields.
@@ -335,6 +344,7 @@ class Runtime:
             runtime=self,
             ledger=self._invite_ledger,
             health=health,
+            host_llm=self._host_llm,
         )
         health.set_worker_status(self._invoker.status)
         self._ws_daemon = WSDaemon(
@@ -560,7 +570,9 @@ _runtimes: dict[_RuntimeKey, Runtime] = {}
 _registry_lock = threading.Lock()
 
 
-def get_runtime(config: Config, *, gateway_mode: bool) -> Runtime:
+def get_runtime(
+    config: Config, *, gateway_mode: bool, host_llm: Callable[[], Any] | None = None
+) -> Runtime:
     """Return the runtime for ``config``'s profile and account, constructing if needed.
 
     Idempotent per key: the same profile + account resolves to the same
@@ -577,7 +589,7 @@ def get_runtime(config: Config, *, gateway_mode: bool) -> Runtime:
     with _registry_lock:
         existing = _runtimes.get(key)
         if existing is None:
-            existing = Runtime(config, gateway_mode=gateway_mode)
+            existing = Runtime(config, gateway_mode=gateway_mode, host_llm=host_llm)
             _runtimes[key] = existing
         elif existing.gateway_mode_requested != gateway_mode:
             logger.warning(

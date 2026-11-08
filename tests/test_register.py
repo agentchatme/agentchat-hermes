@@ -455,7 +455,7 @@ class TestActivationWatcher:
         configs: list[Any] = [None, SimpleNamespace(api_base="https://api.example.test")]
         monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: configs.pop(0))
         runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path)
-        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode: runtime)
+        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
         monkeypatch.setattr(_register, "_reconcile_key_name", lambda cfg: None)
         monkeypatch.setattr(_register, "_reconcile_mcp_registration", lambda rt: None)
@@ -482,7 +482,7 @@ class TestActivationWatcher:
         runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path)
         outcomes: list[Any] = [None, None, runtime]
         monkeypatch.setattr(
-            _register, "_try_start_runtime", lambda cfg, *, gateway_mode: outcomes.pop(0)
+            _register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: outcomes.pop(0)
         )
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
         monkeypatch.setattr(_register, "_reconcile_key_name", lambda cfg: None)

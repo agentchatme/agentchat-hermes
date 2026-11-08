@@ -106,3 +106,52 @@ class TestContentOf:
     )
     def test_odd_shapes_are_empty(self, response: Any) -> None:
         assert content_of(response) == ""
+
+
+class TestHostLlm:
+    """Hermes' public plugin LLM (``ctx.llm``) makes the gate call when the
+    host has it: no override (the profile's own model), no tools."""
+
+    def test_complete_on_the_hosts_llm(self) -> None:
+        seen: dict[str, Any] = {}
+
+        class _PluginLlm:
+            def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                seen["messages"] = messages
+                seen.update(kwargs)
+                return SimpleNamespace(text='{"decisions": []}')
+
+        def never(**_kw: Any) -> Any:
+            raise AssertionError("the auxiliary client is not used when ctx.llm is there")
+
+        call_model = build_call_model(main_runtime={"model": "ignored"}, timeout_s=9.0, call_llm=never, host_llm=_PluginLlm())
+        assert call_model("THE PROMPT") == '{"decisions": []}'
+        assert seen["messages"] == [{"role": "user", "content": "THE PROMPT"}]
+        assert seen["temperature"] == 0.0 and seen["timeout"] == 9.0
+        assert seen["max_tokens"] == DEFAULT_MAX_TOKENS and seen["purpose"] == "agentchat gate call"
+        assert not ({"provider", "model", "agent_id", "profile"} & set(seen)), "no override: the profile's own model"
+        assert not (_TOOL_KWARGS & set(seen))
+
+    def test_empty_text_is_empty(self) -> None:
+        class _PluginLlm:
+            def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                return SimpleNamespace(text=None)
+
+        assert build_call_model(main_runtime={}, timeout_s=1.0, host_llm=_PluginLlm())("p") == ""
+
+
+def test_host_llm_accessor_is_static_and_lazy() -> None:
+    from agentchatme_hermes._register import host_llm_accessor
+
+    reads: list[str] = []
+
+    class _Ctx:
+        @property
+        def llm(self) -> Any:
+            reads.append("llm")
+            return "facade"
+
+    accessor = host_llm_accessor(_Ctx())
+    assert accessor is not None and reads == [], "the property is not read at register time"
+    assert accessor() == "facade" and reads == ["llm"]
+    assert host_llm_accessor(SimpleNamespace()) is None, "an older Hermes: no ctx.llm"

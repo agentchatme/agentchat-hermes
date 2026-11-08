@@ -1883,3 +1883,41 @@ class TestRunBudget:
 
         built = self._build(monkeypatch, OldAgent, SimpleNamespace(wake_debounce_s=0.0))
         assert built is not None and built.platform == "agentchat"
+
+
+class TestGateOnHostLlm:
+    def test_gate_uses_ctx_llm_and_resolves_no_credentials(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        client = _Client([_tray(_card("a"))])
+        calls: list[dict[str, Any]] = []
+
+        class _PluginLlm:
+            def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                calls.append(kwargs)
+                return SimpleNamespace(text=_answer(a="dismiss"))
+
+        inv = AgentInvoker(
+            config=SimpleNamespace(wake_debounce_s=0.0),
+            identity=AgentIdentity(handle="me"),
+            runtime=SimpleNamespace(client=client, texts=TEXTS),
+            host_llm=_PluginLlm,
+        )
+
+        def no_resolve() -> Any:
+            raise AssertionError("no config or credential read when ctx.llm is there")
+
+        monkeypatch.setattr(inv, "_resolve_model_and_runtime", no_resolve)
+        inv.run_cycle()
+        assert len(calls) == 1 and client.recorded == [("a", "dismiss", "msg_a")]
+
+    def test_a_failing_accessor_falls_back_once_with_a_warning(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        inv, _client, _agent, events = _invoker(monkeypatch, trays=[_tray(_card("a")), _tray(_card("b"))], answer=_answer(a="dismiss", b="dismiss"))
+
+        def broken() -> Any:
+            raise ImportError("agent.plugin_llm")
+
+        inv._host_llm = broken
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
+            inv.run_cycle()
+            inv.run_cycle()
+        assert events.count("model") == 2, "the fallback path made the gate call"
+        assert sum("ctx.llm" in r.getMessage() for r in caplog.records) == 1

@@ -46,9 +46,10 @@ and account — see :mod:`.profile_scope`.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from ._version import __version__
 from .config import ENV_API_KEY, ENV_API_KEY_LEGACY, ConfigError, load_config
@@ -97,6 +98,7 @@ def register(ctx: Any) -> None:
         hermes_home=hermes_home,
         profile=profile,
         gateway_mode=gateway_mode,
+        host_llm=host_llm_accessor(ctx),
     )
     outcome = watcher.try_activate()
 
@@ -154,8 +156,10 @@ class ActivationWatcher:
         hermes_home: Path,
         profile: str,
         gateway_mode: bool,
+        host_llm: Callable[[], Any] | None = None,
     ) -> None:
         self._runtime: Runtime | None = None
+        self._host_llm = host_llm
         self._hermes_home = hermes_home
         self._profile = profile
         self._gateway_mode = gateway_mode
@@ -184,7 +188,9 @@ class ActivationWatcher:
         if config is None:
             return "unconfigured"
 
-        runtime = _try_start_runtime(config, gateway_mode=self._gateway_mode)
+        runtime = _try_start_runtime(
+            config, gateway_mode=self._gateway_mode, host_llm=self._host_llm
+        )
         if runtime is None:
             self._failures += 1
             return "failed"
@@ -276,7 +282,23 @@ def _is_gateway_context(ctx: Any) -> bool:
     return is_hermes_gateway_process()
 
 
-def _try_start_runtime(config: Any, *, gateway_mode: bool) -> Any:
+def host_llm_accessor(ctx: Any) -> Callable[[], Any] | None:
+    """A zero-argument accessor for Hermes' public plugin LLM (``ctx.llm``).
+
+    ``None`` when this Hermes' plugin context has no ``llm`` (older Hermes,
+    test doubles). Looked up statically, so the property — which imports
+    Hermes' LLM layer — runs only when the gate first needs it.
+    """
+    try:
+        inspect.getattr_static(ctx, "llm")
+    except AttributeError:
+        return None
+    return lambda: ctx.llm
+
+
+def _try_start_runtime(
+    config: Any, *, gateway_mode: bool, host_llm: Callable[[], Any] | None = None
+) -> Any:
     """Construct + start the runtime. Returns the runtime or ``None`` on failure.
 
     Reasons start can fail:
@@ -293,7 +315,7 @@ def _try_start_runtime(config: Any, *, gateway_mode: bool) -> Any:
     from .runtime import get_runtime
 
     try:
-        runtime = get_runtime(config, gateway_mode=gateway_mode)
+        runtime = get_runtime(config, gateway_mode=gateway_mode, host_llm=host_llm)
         runtime.start()
     except Exception as exc:
         logger.error(

@@ -183,6 +183,7 @@ class AgentInvoker:
         runtime: Any,
         ledger: InviteLedger | None = None,
         health: HealthBoard | None = None,
+        host_llm: Callable[[], Any] | None = None,
     ) -> None:
         self._config = config
         self._identity = identity
@@ -239,6 +240,12 @@ class AgentInvoker:
         # ``reply`` entries the host left alone because the turn recorded a
         # verdict for that conversation itself (see the module docstring).
         self.turn_recorded_verdicts = 0
+
+        # Hermes' public plugin LLM (``ctx.llm``), read when the gate needs it;
+        # ``None`` on a Hermes without it (the gate then resolves the model
+        # and credentials itself, :meth:`_gate_runtime`).
+        self._host_llm = host_llm
+        self._host_llm_warned = False
 
         # Hermes-side handles, resolved lazily on first turn so the plugin
         # registers cleanly where Hermes' runtime isn't importable yet.
@@ -599,8 +606,11 @@ class AgentInvoker:
                 self._coalescer.wake()
             return gate.GateResult(outcome="decided", undecided=[c["conversation_id"] for c in cards])
 
+        host_llm = self._host_llm_facade()
         call_model = build_call_model(
-            main_runtime=self._gate_runtime(), timeout_s=self._gate_timeout_s
+            main_runtime=self._gate_runtime() if host_llm is None else {},
+            timeout_s=self._gate_timeout_s,
+            host_llm=host_llm,
         )
         result = gate.run(
             tray, call_model, client, tool_namer=gate.mcp_tool_namer(MCP_SERVER_NAME)
@@ -988,6 +998,22 @@ class AgentInvoker:
             logger.exception(
                 "AgentInvoker: AIAgent construction raised for %s — turn not started", session_id
             )
+            return None
+
+    def _host_llm_facade(self) -> Any:
+        """Hermes' ``ctx.llm`` for the gate call, or ``None`` to use the fallback path."""
+        if self._host_llm is None:
+            return None
+        try:
+            return self._host_llm()
+        except Exception as exc:
+            if not self._host_llm_warned:
+                self._host_llm_warned = True
+                logger.warning(
+                    "AgentInvoker: Hermes' plugin LLM (ctx.llm) is unavailable (%r) — the gate "
+                    "calls the agent's model through the auxiliary client instead",
+                    exc,
+                )
             return None
 
     def _gate_runtime(self) -> dict[str, Any]:

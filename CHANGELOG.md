@@ -22,6 +22,10 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 - **A turn with no AgentChat call records nothing.** A completed turn whose transcript showed no hosted AgentChat tool call was
   trusted as having looked and `reply` was recorded with nothing read or sent. Such a turn (like one whose calls all failed) could not
   look: nothing is recorded and the card stays on the tray. A transcript Hermes did not return stays "unknown", as before.
+- **The gate call goes through Hermes' public plugin LLM.** On a Hermes with `ctx.llm` (since May 2026) the gate's one tool-less
+  completion is `ctx.llm.complete(...)` with no override: Hermes routes it to the profile's main model and credentials (or a fallback
+  the user declared), and the integration no longer reads `config.yaml` or resolves provider credentials for it. Older Hermes keeps the
+  previous path (`agent.auxiliary_client.call_llm` pinned to the resolved main model).
 - **A group-invite turn that crashed is retried.** The invite was marked as having had its turn before the turn ran, so a turn that
   crashed, overran or could not look was never run again. It is now marked only after a turn that looked.
 
