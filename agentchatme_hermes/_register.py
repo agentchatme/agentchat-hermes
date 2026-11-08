@@ -35,8 +35,14 @@ and cards come from the server — see ``docs/decisions/2026-11-main-line.md``.
 There is NO ``on_session_end`` hook. Hermes fires that on every individual
 session ending (TUI sessions, cron jobs, adapter chats — not just process
 shutdown), which would spuriously stop the runtime mid-flight. Daemon
-threads (``daemon=True``) die with the process on real shutdown; no explicit
-cleanup hook is needed or wanted.
+threads (``daemon=True``) die with the process on real shutdown.
+
+The plugin's own unload is different: ``ctx.on_unload`` runs when Hermes
+unloads this plugin (reload, disable, remove) in a process that keeps
+running. Then the runtime is stopped — socket closed, wake worker and timers
+stopped, leader lock released — and dropped from the registry, so the next
+``register(ctx)`` (the reloaded code) can take the lock and the socket
+instead of finding them held by the old one.
 
 Called once per Hermes **profile**: once per process in a classic gateway,
 once per served profile in a multiplexed gateway (Hermes keeps one plugin
@@ -100,6 +106,7 @@ def register(ctx: Any) -> None:
         gateway_mode=gateway_mode,
         host_llm=host_llm_accessor(ctx),
     )
+    _close_on_unload(ctx, watcher)
     outcome = watcher.try_activate()
 
     if outcome == "active":
@@ -160,6 +167,10 @@ class ActivationWatcher:
     ) -> None:
         self._runtime: Runtime | None = None
         self._host_llm = host_llm
+        # Guards ``_runtime`` and ``_closed`` between the activation thread
+        # and :meth:`close` (the plugin's unload).
+        self._state_lock = threading.Lock()
+        self._closed = False
         self._hermes_home = hermes_home
         self._profile = profile
         self._gateway_mode = gateway_mode
@@ -172,9 +183,13 @@ class ActivationWatcher:
         return self._runtime
 
     def try_activate(self) -> str:
-        """One attempt. Returns ``"active"``, ``"unconfigured"`` or ``"failed"``."""
-        if self._runtime is not None:
-            return "active"
+        """One attempt. Returns ``"active"``, ``"unconfigured"``, ``"failed"``
+        or ``"closed"`` (the plugin was unloaded)."""
+        with self._state_lock:
+            if self._closed:
+                return "closed"
+            if self._runtime is not None:
+                return "active"
         try:
             config = load_config(hermes_home=self._hermes_home)
         except ConfigError as exc:
@@ -195,7 +210,11 @@ class ActivationWatcher:
             self._failures += 1
             return "failed"
 
-        self._runtime = runtime
+        if not self._adopt(runtime):
+            # Unloaded while this attempt was starting the runtime: it must
+            # not keep the socket or the lock for code that is gone.
+            _shutdown_runtime(runtime, profile=self._profile)
+            return "closed"
         self._failures = 0
 
         # Placement reconciliation. Wizard users (`hermes agentchat
@@ -240,6 +259,32 @@ class ActivationWatcher:
     def stop(self) -> None:
         self._stop.set()
 
+    def _adopt(self, runtime: Runtime) -> bool:
+        """Keep ``runtime`` unless the plugin was unloaded meanwhile."""
+        with self._state_lock:
+            if self._closed:
+                return False
+            self._runtime = runtime
+            return True
+
+    @property
+    def closed(self) -> bool:
+        with self._state_lock:
+            return self._closed
+
+    def close(self) -> None:
+        """The plugin is being unloaded: stop retrying and stop the runtime
+        (socket, wake worker, timers, leader lock). Idempotent."""
+        with self._state_lock:
+            if self._closed:
+                return
+            self._closed = True
+            runtime = self._runtime
+            self._runtime = None
+        self._stop.set()
+        if runtime is not None:
+            _shutdown_runtime(runtime, profile=self._profile)
+
     def _loop(self) -> None:
         # A late activation builds the runtime from this thread: do it in the
         # profile's own context, as register() did (multiplex: the launch
@@ -247,12 +292,58 @@ class ActivationWatcher:
         with profile_context(self._hermes_home):
             while not self._stop.wait(self.next_delay()):
                 try:
-                    if self.try_activate() == "active":
+                    if self.try_activate() in ("active", "closed"):
                         return
                 except Exception:
                     # The watcher must outlive any surprise; log and keep going.
                     logger.exception("agentchat plugin: activation attempt raised")
                     self._failures += 1
+
+
+def _close_on_unload(ctx: Any, watcher: ActivationWatcher) -> None:
+    """Have Hermes close ``watcher`` (and its runtime) when it unloads the plugin.
+
+    ``ctx.on_unload`` is Hermes' public cleanup hook for a plugin's unload
+    (reload, disable, remove); a Hermes without it unloads plugins only by
+    exiting, and the daemon threads go with the process.
+    """
+    try:
+        inspect.getattr_static(ctx, "on_unload")
+    except AttributeError:
+        logger.debug("agentchat plugin: this Hermes has no ctx.on_unload")
+        return
+    on_unload = getattr(ctx, "on_unload", None)
+    if not callable(on_unload):
+        return
+
+    def agentchat_runtime_stop() -> None:
+        watcher.close()
+
+    try:
+        on_unload(agentchat_runtime_stop)
+    except Exception:
+        logger.warning(
+            "agentchat plugin: could not register the unload hook — a plugin reload keeps the "
+            "old runtime until the process exits",
+            exc_info=True,
+        )
+
+
+def _shutdown_runtime(runtime: Any, *, profile: str) -> None:
+    """Stop a runtime and drop it from the registry (the plugin's unload)."""
+    from .runtime import forget_runtime
+
+    try:
+        runtime.stop()
+    except Exception:
+        logger.exception("agentchat plugin: runtime stop raised during unload")
+    finally:
+        forget_runtime(runtime)
+    logger.info(
+        "agentchat plugin unloaded for profile=%s: socket closed, wake worker stopped, leader "
+        "lock released",
+        profile,
+    )
 
 
 def _is_gateway_context(ctx: Any) -> bool:

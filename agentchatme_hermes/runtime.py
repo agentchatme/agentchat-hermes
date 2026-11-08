@@ -629,6 +629,18 @@ def get_existing_runtime(config: Config | None = None) -> Runtime | None:
         return None
 
 
+def forget_runtime(runtime: Runtime) -> bool:
+    """Drop ``runtime`` from the registry (after it was stopped for the
+    plugin's unload), so the next ``get_runtime`` for its profile builds a
+    fresh one instead of returning a stopped one. ``True`` when it was there."""
+    with _registry_lock:
+        for key, value in list(_runtimes.items()):
+            if value is runtime:
+                del _runtimes[key]
+                return True
+    return False
+
+
 def registered_runtimes() -> list[Runtime]:
     """Snapshot of every runtime in this process (diagnostics)."""
     with _registry_lock:

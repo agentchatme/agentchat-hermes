@@ -499,3 +499,28 @@ class TestFollowerTakeover:
             health_path = ws_cls.call_args.kwargs["health_path"]
             assert health_path.parent == rt.lock_path.parent
             assert health_path.name == rt.lock_path.stem + ".health.json"
+
+
+class TestUnloadedRuntime:
+    def test_a_stopped_leader_releases_everything_and_is_forgotten(self) -> None:
+        """What the plugin's unload does to a real leader runtime: the socket
+        and the worker are stopped, the leader lock is released, and the
+        registry builds a fresh runtime for the reloaded code."""
+        from agentchatme_hermes import runtime as runtime_module
+
+        with _patched_runtime(lock_winner=True) as (ws_cls, invoker_cls, fake_client, _acquire, release):
+            rt = runtime_module.get_runtime(_config(), gateway_mode=True)
+            rt.start()
+            assert rt.is_leader
+            from agentchatme_hermes._register import _shutdown_runtime
+
+            _shutdown_runtime(rt, profile="default")
+            ws_cls.return_value.stop.assert_called_once()
+            invoker_cls.return_value.stop.assert_called_once()
+            fake_client.close.assert_called_once()
+            release.assert_called_once_with(99)
+            assert not rt.is_leader
+            assert runtime_module.forget_runtime(rt) is False, "already forgotten"
+            fresh = runtime_module.get_runtime(_config(), gateway_mode=True)
+            assert fresh is not rt
+            runtime_module.forget_runtime(fresh)

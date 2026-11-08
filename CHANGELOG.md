@@ -61,6 +61,10 @@ the dependency floor is set to that SDK version at release.
   completion is `ctx.llm.complete(...)` with no override: Hermes routes it to the profile's main model and credentials (or a fallback
   the user declared), and the integration no longer reads `config.yaml` or resolves provider credentials for it. Older Hermes keeps the
   previous path (`agent.auxiliary_client.call_llm` pinned to the resolved main model).
+- **A plugin reload no longer leaves the old runtime holding the socket.** The plugin registers Hermes' `ctx.on_unload`: when
+  Hermes unloads it (reload, disable, remove) in a running process, the runtime is stopped — socket closed, wake worker and timers
+  stopped, leader lock released — and forgotten, so the reloaded code takes over at once. A runtime an activation attempt was still
+  starting when the unload came is stopped too.
 - **A group-invite turn that crashed is retried.** The invite was marked as having had its turn before the turn ran, so a turn that
   crashed, overran or could not look was never run again. It is now marked only after a turn that looked.
 

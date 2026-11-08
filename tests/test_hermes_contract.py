@@ -215,6 +215,28 @@ def test_plugin_context_surface() -> None:
     assert isinstance(inspect.getattr_static(context, "llm"), property)
 
 
+def test_hermes_unload_stops_our_runtime(tmp_path: Path) -> None:
+    """A plugin reload/disable runs ``ctx.on_unload``: our hook stops the
+    runtime (socket, worker, lock) and forgets it."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from agentchatme_hermes._register import ActivationWatcher, _close_on_unload
+
+    plugins = _import("hermes_cli.plugins")
+    manifest = _import("hermes_cli.plugins_manifest").PluginManifest(name="agentchat", source="entrypoint")
+    manager = plugins.PluginManager()
+    ctx = plugins.PluginContext(manifest, manager)
+    watcher = ActivationWatcher(hermes_home=tmp_path, profile="default", gateway_mode=True)
+    runtime = SimpleNamespace(stop=MagicMock())
+    assert watcher._adopt(runtime)  # type: ignore[arg-type]
+    _close_on_unload(ctx, watcher)
+    runtime.stop.assert_not_called()
+    assert manager.unload("agentchat") is True
+    runtime.stop.assert_called_once()
+    assert watcher.closed
+
+
 def test_plugin_llm_reaches_the_profiles_main_model(answering_model: _Stub, _hermes_home: Path) -> None:
     from agentchatme_hermes.model_call import build_call_model
 
