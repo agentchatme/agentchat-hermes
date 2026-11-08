@@ -109,3 +109,27 @@ def test_doctor_line_for_the_worker() -> None:
     assert hung is not None and hung[0] == "warn" and "overran" in hung[1]
     long_turn = _describe_worker({"state": "turn", "alive": True, "heartbeat_at": now - 1, "since": now - 1000}, now=now)
     assert long_turn is not None and long_turn[0] == "warn" and "1000s" in long_turn[1]
+
+
+def test_doctor_line_for_a_stuck_cap_and_the_loop() -> None:
+    from agentchatme_hermes.cli import _describe_worker
+    from agentchatme_hermes.ws_health import bad_cycle_run
+
+    now = 10_000.0
+    base: dict[str, object] = {"state": "idle", "alive": True, "heartbeat_at": now - 1, "max_hung_turns": 2}
+    capped = _describe_worker({**base, "hung_turns": 2}, now=now)
+    assert capped is not None and capped[0] == "fail" and "no new turn" in capped[1], "no turn can start: an error"
+
+    def cycles(*outcomes: str) -> dict[str, object]:
+        recent = [{"at": "t", "outcome": o, "failure": "why" if o != "decided" else None} for o in outcomes]
+        return {**base, "hung_turns": 0, "loop": {"recent_cycles": recent}}
+
+    for bad in ("fail_closed", "tools_unavailable", "texts_missing", "abandoned", "tray_failed"):
+        line = _describe_worker(cycles("decided", bad, bad, bad), now=now)
+        assert line is not None and line[0] == "fail" and bad in line[1], bad
+    one = _describe_worker(cycles("decided", "fail_closed"), now=now)
+    assert one is not None and one[0] == "warn"
+    healed = _describe_worker(cycles("fail_closed", "fail_closed", "fail_closed", "empty"), now=now)
+    assert healed is not None and healed[0] == "ok", "a good cycle ends the run"
+    assert bad_cycle_run([{"outcome": "abandoned"}, {"outcome": "turns_started"}]) == (0, None)
+    assert bad_cycle_run(None) == (0, None)

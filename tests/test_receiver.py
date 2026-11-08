@@ -36,21 +36,23 @@ from agentchatme_hermes.types import AgentIdentity
 from agentchatme_hermes.ws_health import HealthBoard, read_ws_health
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
-def _config() -> Any:
+def _config(**extra: Any) -> Any:
     return SimpleNamespace(
         api_key=api_key("receiver"),
         api_base="https://api.example.test",
         ws_url="wss://api.example.test",
+        **extra,
     )
 
 
-def _receiver(tmp_path: Path, invoker: Any = None, **kwargs: Any) -> Receiver:
+def _receiver(tmp_path: Path, invoker: Any = None, *, config: Any = None, **kwargs: Any) -> Receiver:
     inv = invoker or AgentInvoker(config=SimpleNamespace(), identity=AgentIdentity(handle="me"), runtime=SimpleNamespace())
     return Receiver(
-        config=_config(),
+        config=config or _config(),
         identity=AgentIdentity(handle="me"),
         invoker=inv,
         texts_factory=lambda client: texts_cache(client, tmp_path),
@@ -250,7 +252,7 @@ class TestWiredEndToEnd:
         monkeypatch.setattr(inv, "_resolve_model_and_runtime", lambda: ("m", {}))
         monkeypatch.setattr(
             "agentchatme_hermes.agent_invoker.build_call_model",
-            lambda **kw: (lambda prompt: json.dumps({"decisions": [{"conversation_id": "conv_a", "decision": "reply"}]})),
+            lambda **kw: (lambda prompt, **_: json.dumps({"decisions": [{"conversation_id": "conv_a", "decision": "reply"}]})),
         )
         placed: list[str] = []
         receiver = _receiver(tmp_path, inv, on_texts=lambda texts: placed.append(texts.identity_line))
@@ -286,3 +288,213 @@ def test_stop_before_start_is_harmless(tmp_path: Path) -> None:
     receiver.stop()
     receiver.stop()
     assert MagicMock is not None and not receiver.alive
+
+
+
+class TestSupervisionEdges:
+    def test_a_cancelled_main_is_rebuilt_not_fatal(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        receiver = _receiver(tmp_path)
+        monkeypatch.setattr(receiver_module, "_SUPERVISOR_BACKOFF_BASE_S", 0.01)
+        calls = {"n": 0}
+        second = threading.Event()
+
+        async def main() -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise asyncio.CancelledError
+            second.set()
+            receiver._stop_event = asyncio.Event()
+            await receiver._stop_event.wait()
+
+        monkeypatch.setattr(receiver, "_main", main)
+        receiver.start()
+        try:
+            assert second.wait(5.0), "a BaseException from the loop rebuilds it"
+            assert receiver.alive and receiver.restarts == 1
+        finally:
+            receiver.stop()
+
+    def test_system_exit_stops_cleanly_and_hands_the_account_back(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        exited = threading.Event()
+        receiver = _receiver(tmp_path, on_exit=exited.set)
+
+        async def main() -> None:
+            raise SystemExit(3)
+
+        monkeypatch.setattr(receiver, "_main", main)
+        receiver.start()
+        assert exited.wait(5.0), "the runtime is told (it releases the leader lock once turns end)"
+        receiver._thread.join(5.0)  # type: ignore[union-attr]
+        assert not receiver.alive and receiver.restarts == 0
+        assert receiver.worker_status()["state"] == "stopped"
+        assert "SystemExit" in (receiver._last_error or "")
+
+    def test_the_thread_runs_in_the_profiles_context(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import contextvars
+        import sys
+        import types
+
+        override: contextvars.ContextVar[str | None] = contextvars.ContextVar("override", default=None)
+        constants = types.ModuleType("hermes_constants")
+        constants.set_hermes_home_override = lambda path: override.set(str(path))  # type: ignore[attr-defined]
+        constants.reset_hermes_home_override = lambda token: override.reset(token)  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "hermes_constants", constants)
+        home = tmp_path / ".hermes" / "profiles" / "b"
+        receiver = _receiver(tmp_path, hermes_home=home)
+        seen: list[str | None] = []
+        monkeypatch.setattr(receiver, "_supervise", lambda: seen.append(override.get()))
+        receiver.start()
+        receiver._thread.join(5.0)  # type: ignore[union-attr]
+        assert seen == [str(home)], "texts listeners and tray reads see this profile's home"
+        assert override.get() is None, "the test thread is untouched"
+
+
+def _deadlines(monkeypatch: pytest.MonkeyPatch, **overrides: float) -> dict[str, Any]:
+    """Build the real ReceiveLoop with shorter kit deadlines; returns what the
+    receiver passed."""
+    import agentchatme.integration as integration
+
+    real = integration.ReceiveLoop
+    passed: dict[str, Any] = {}
+
+    def make(*args: Any, **kwargs: Any) -> Any:
+        passed.update(kwargs)
+        return real(*args, **{**kwargs, **overrides})
+
+    monkeypatch.setattr(integration, "ReceiveLoop", make)
+    return passed
+
+
+def _offline(receiver: Receiver, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def never(*_a: Any, **_kw: Any) -> Any:
+        raise ConnectionError("no network in tests")
+
+    real_build = receiver._build_realtime_client
+    monkeypatch.setattr(receiver, "_build_realtime_client", lambda: real_build(websocket_connect=never, reconnect=False))
+
+
+def _until(check: Callable[[], bool], timeout: float = 10.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(0.02)
+    return check()
+
+
+class TestLoopHealth:
+    def test_the_health_record_carries_the_kits_recent_cycles(self, tmp_path: Path) -> None:
+        from agentchatme_hermes.cli import _describe_worker
+
+        receiver = _receiver(tmp_path)
+        receiver._thread = SimpleNamespace(is_alive=lambda: True)  # type: ignore[assignment]
+        recent: list[Any] = []
+
+        def cycle(outcome: str, failure: str | None = None) -> None:
+            recent.append(SimpleNamespace(outcome=outcome, failure=failure, at="2026-11-08T10:00:00.000Z"))
+
+        receiver._receive_loop = SimpleNamespace(  # type: ignore[assignment]
+            status=lambda: SimpleNamespace(
+                last_cycle=recent[-1] if recent else None,
+                recent_cycles=list(recent),
+                counters={},
+                coalescer={"state": "idle"},
+                socket=None,
+            )
+        )
+        cycle("decided")
+        for _ in range(3):
+            cycle("fail_closed", "model call failed: " + "x" * 500)
+        loop = receiver.worker_status()["loop"]
+        assert [c["outcome"] for c in loop["recent_cycles"]] == ["decided"] + ["fail_closed"] * 3
+        assert len(loop["recent_cycles"][-1]["failure"]) == receiver_module._FAILURE_TEXT_MAX
+        level, line = _describe_worker(receiver.worker_status(), now=time.time()) or ("", "")
+        assert level == "fail" and "last 3 cycles" in line and "fail_closed" in line
+        cycle("empty")
+        assert _describe_worker(receiver.worker_status(), now=time.time())[0] == "ok"  # type: ignore[index]
+        receiver._receive_loop = None
+        assert receiver.worker_status()["loop"]["recent_cycles"][-1]["outcome"] == "empty", "kept across a restart"
+
+    def test_the_debounce_setting_is_the_loops_quiet_window(self) -> None:
+        from agentchatme_hermes.receiver import _quiet_window
+
+        assert _quiet_window(_config()) == (None, None), "unset: the kit's defaults"
+        assert _quiet_window(_config(wake_debounce_s=2.0)) == (2000.0, 6000.0)
+        assert _quiet_window(_config(wake_debounce_s=10.0)) == (10000.0, 30000.0)
+        assert _quiet_window(_config(wake_debounce_s=0.0)) == (0.0, 6000.0)
+
+    def test_the_gate_call_deadline_follows_the_gate_timeout(self) -> None:
+        from agentchatme_hermes.receiver import _gate_call_deadline_ms
+
+        assert _gate_call_deadline_ms(30.0) == 60_000.0, "the kit's default"
+        assert _gate_call_deadline_ms(120.0) == 240_000.0, "a slow model the operator allowed for"
+
+    def test_a_wedged_gate_call_is_cut_off_and_told(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The model never answers: the kit's gate-call deadline ends the
+        cycle (fail_closed, nothing recorded), the cancel handle reaches the
+        Hermes call, and the debounce setting is the loop's quiet window."""
+        import agentchatme
+
+        monkeypatch.setattr(agentchatme, "AsyncAgentChatClient", _AsyncApi)
+        monkeypatch.setattr(hosted_tools_module, "hosted_tool_names", lambda: ["mcp__agentchat__agentchat_inbox"])
+        passed = _deadlines(monkeypatch, gate_call_timeout_ms=200)
+        told: list[bool] = []
+
+        def wedged(prompt: str, *, cancel: threading.Event | None = None) -> str:
+            assert cancel is not None, "the kit hands the receiver's call_model a cancel handle"
+            told.append(cancel.wait(10.0))
+            return "{}"
+
+        inv = AgentInvoker(config=SimpleNamespace(), identity=AgentIdentity(handle="me"), runtime=SimpleNamespace())
+        monkeypatch.setattr(inv, "_resolve_model_and_runtime", lambda: ("m", {}))
+        monkeypatch.setattr("agentchatme_hermes.agent_invoker.build_call_model", lambda **kw: wedged)
+        receiver = _receiver(tmp_path, inv, config=_config(wake_debounce_s=0.01))
+        _offline(receiver, monkeypatch)
+        receiver.start()
+        try:
+            assert _until(lambda: receiver._receive_loop is not None)
+            receiver.wake()
+            assert _until(lambda: bool(told)), "the call was told to stop"
+            assert _until(lambda: bool(receiver.worker_status()["loop"].get("recent_cycles")))
+            last = receiver.worker_status()["loop"]["recent_cycles"][-1]
+            assert last["outcome"] == "fail_closed" and "timed out" in (last["failure"] or "")
+        finally:
+            started = time.monotonic()
+            receiver.stop()
+            assert time.monotonic() - started < receiver_module._STOP_GRACE_SECONDS + 2.0
+        assert told == [True]
+        assert _AsyncApi.last is not None and _AsyncApi.last.recorded == [], "nothing recorded"
+        assert passed["gate_call_timeout_ms"] == 60_000.0
+        assert passed["quiet_ms"] == 10.0, "AGENTCHATME_WAKE_DEBOUNCE_S reaches the loop"
+
+    def test_a_wedged_cycle_is_abandoned_and_doctor_fails_after_three(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A step that never finishes (here the readiness check): the kit's
+        cycle watchdog abandons the cycle, the next wake runs a new one, and
+        three abandoned cycles in a row are an error in doctor."""
+        import agentchatme
+
+        from agentchatme_hermes.cli import _describe_worker
+
+        monkeypatch.setattr(agentchatme, "AsyncAgentChatClient", _AsyncApi)
+        _deadlines(monkeypatch, cycle_timeout_ms=150)
+        release = threading.Event()
+        inv = AgentInvoker(config=SimpleNamespace(), identity=AgentIdentity(handle="me"), runtime=SimpleNamespace())
+        monkeypatch.setattr(inv, "_resolve_model_and_runtime", lambda: ("m", {}))
+        monkeypatch.setattr(inv, "readiness", lambda: release.wait(30.0) and None)
+        receiver = _receiver(tmp_path, inv, config=_config(wake_debounce_s=0.01))
+        _offline(receiver, monkeypatch)
+
+        def abandoned() -> int:
+            return sum(c["outcome"] == "abandoned" for c in receiver.worker_status()["loop"].get("recent_cycles", []))
+
+        receiver.start()
+        try:
+            assert _until(lambda: receiver._receive_loop is not None)
+            for n in (1, 2, 3):
+                receiver.wake()
+                assert _until(lambda n=n: abandoned() >= n), f"cycle {n} abandoned"
+            level, line = _describe_worker(receiver.worker_status(), now=time.time()) or ("", "")
+            assert level == "fail" and "abandoned" in line
+        finally:
+            release.set()
+            receiver.stop()

@@ -18,15 +18,27 @@ Two ways to make that call, in this order:
    (``agent.auxiliary_client.call_llm``) pinned to the model and provider
    the invoker resolved from the profile's config.
 
+Cancelling: the receive loop hands ``call_model`` a ``cancel`` event, set
+when the answer is no longer wanted (the kit's gate-call deadline passed or
+the cycle was abandoned). Hermes' sync ``ctx.llm.complete`` and ``call_llm``
+cannot be interrupted, so with a ``cancel`` handle and an async
+``ctx.llm.acomplete`` the call runs that on a private event loop in this
+worker thread and cancels it when the event is set — the request itself
+ends. The other paths ignore ``cancel`` and end at their own ``timeout``.
+
 Lazy import: the plugin must register cleanly where ``agent.auxiliary_client``
 is not importable (pytest outside Hermes).
 """
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import inspect
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    import threading
+    from collections.abc import Awaitable, Mapping
 
 # Output ceiling for the verdict JSON: a few dozen tokens per card. The tray
 # is capped at 50 cards server-side.
@@ -35,8 +47,16 @@ DEFAULT_MAX_TOKENS = 2048
 # What Hermes' audit line for the call says it was for.
 GATE_CALL_PURPOSE = "agentchat gate call"
 
-CallModel = Callable[[str], str]
+# How often a cancellable call looks at its cancel event.
+_CANCEL_POLL_S = 0.05
+
+CallModel = Callable[..., str]
+"""``call_model(prompt, *, cancel=None) -> str``."""
 CallLlm = Callable[..., Any]
+
+
+class GateCallCancelled(Exception):
+    """The receive loop stopped waiting for this answer; the request was cancelled."""
 
 
 def build_call_model(
@@ -58,21 +78,30 @@ def build_call_model(
     runtime = dict(main_runtime)
 
     if host_llm is not None:
+        acomplete = getattr(host_llm, "acomplete", None)
+        cancellable = inspect.iscoroutinefunction(acomplete)
 
-        def call_host(prompt: str) -> str:
-            result = host_llm.complete(
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.0,
-                max_tokens=max_tokens,
-                timeout=timeout_s,
-                purpose=GATE_CALL_PURPOSE,
-            )
+        def call_host(prompt: str, *, cancel: threading.Event | None = None) -> str:
+            request: dict[str, Any] = {
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.0,
+                "max_tokens": max_tokens,
+                "timeout": timeout_s,
+                "purpose": GATE_CALL_PURPOSE,
+            }
+            if cancel is not None and cancellable:
+                assert acomplete is not None
+                result = until_cancelled(lambda: acomplete(**request), cancel)
+            else:
+                result = host_llm.complete(**request)
             text = getattr(result, "text", None)
             return str(text) if text else ""
 
         return call_host
 
-    def call_model(prompt: str) -> str:
+    def call_model(prompt: str, *, cancel: threading.Event | None = None) -> str:
+        # ``cancel`` is not used: Hermes' ``call_llm`` cannot be interrupted;
+        # it ends at ``timeout``.
         llm = call_llm if call_llm is not None else _hermes_call_llm()
         response = llm(
             task=None,
@@ -89,6 +118,27 @@ def build_call_model(
         return content_of(response)
 
     return call_model
+
+
+def until_cancelled(start: Callable[[], Awaitable[Any]], cancel: threading.Event) -> Any:
+    """Run the coroutine ``start()`` makes on a private event loop in this
+    (worker) thread; when ``cancel`` is set first, cancel it and raise
+    :class:`GateCallCancelled`."""
+
+    async def watch() -> Any:
+        task = asyncio.ensure_future(start())
+        while not cancel.is_set():
+            done, _ = await asyncio.wait({task}, timeout=_CANCEL_POLL_S)
+            if done:
+                return task.result()
+        task.cancel()
+        with contextlib.suppress(BaseException):
+            await task
+        raise GateCallCancelled("the receive loop stopped waiting for the gate call")
+
+    if cancel.is_set():
+        raise GateCallCancelled("the receive loop stopped waiting for the gate call")
+    return asyncio.run(watch())
 
 
 def content_of(response: Any) -> str:

@@ -354,3 +354,14 @@ class TestRewordSurvival:
         soul = tmp_path / "SOUL.md"
         write_soul_anchor(_line_v2("growth"), handle="growth", soul_path=soul)
         assert read_anchor_handle(soul_path=soul) == "growth", "still readable, so a key for @ops is caught"
+
+
+
+def test_the_markers_are_the_kits() -> None:
+    """The file I/O here wraps the kit's anchor; the markers it greps for
+    without importing the kit are the kit's own."""
+    from agentchatme.integration import anchor
+
+    from agentchatme_hermes.soul_anchor import ANCHOR_END, ANCHOR_START
+
+    assert (ANCHOR_START, ANCHOR_END) == (anchor.START_MARKER, anchor.END_MARKER)

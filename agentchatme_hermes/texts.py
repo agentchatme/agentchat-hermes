@@ -20,11 +20,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
-from agentchatme.integration import TextsCache
-
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from agentchatme.integration import TextsCache
     from agentchatme.types import Texts
 
 logger = logging.getLogger(__name__)
@@ -36,6 +35,8 @@ LEGACY_TEXTS_FILENAME = "texts.json"
 
 def texts_cache(client: Any, state_dir: Path | None) -> TextsCache:
     """The kit's texts cache for one account, its file in ``state_dir``."""
+    from agentchatme.integration import TextsCache
+
     return TextsCache(
         client,
         runtime=TEXTS_RUNTIME,

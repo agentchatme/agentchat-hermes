@@ -639,3 +639,61 @@ class TestUnload:
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
             _register.register(_BrokenCtx())
         assert any("unload hook" in r.getMessage() for r in caplog.records)
+
+
+
+class TestWithoutTheKit:
+    """An agentchatme without ``agentchatme.integration`` cannot receive: the
+    plugin says so once, loudly, keeps the CLI (doctor says it too) and the
+    manual, starts nothing, and never raises."""
+
+    def test_register_logs_one_error_and_keeps_the_cli(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agentchatme_hermes import _register
+        from agentchatme_hermes.kit import KIT_REQUIREMENT
+
+        monkeypatch.setitem(sys.modules, "agentchatme.integration", None)
+
+        def no_watcher(**_kw: Any) -> Any:
+            raise AssertionError("nothing starts without the kit")
+
+        monkeypatch.setattr(_register, "ActivationWatcher", no_watcher)
+        ctx = MagicMock()
+        with caplog.at_level(logging.DEBUG, logger="agentchatme_hermes"):
+            _register.register(ctx)
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1, [r.getMessage() for r in errors]
+        assert KIT_REQUIREMENT in errors[0].getMessage() and "not receiving" in errors[0].getMessage()
+        assert ctx.register_cli_command.called, "`hermes agentchat doctor` stays reachable"
+        assert ctx.register_skill.called
+
+    def test_the_plugin_and_its_cli_import_without_the_kit(self) -> None:
+        import os
+        import subprocess
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        script = (
+            "import sys\n"
+            "sys.modules['agentchatme.integration'] = None\n"
+            "import agentchatme_hermes, agentchatme_hermes.cli\n"
+            "from agentchatme_hermes.kit import kit_problem\n"
+            "print('problem:', kit_problem())\n"
+        )
+        env = {**os.environ, "PYTHONPATH": str(root)}
+        done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env, cwd=root, timeout=60)
+        assert done.returncode == 0, done.stderr
+        assert "problem: the installed agentchatme" in done.stdout and "pip install -U" in done.stdout
+
+    def test_doctor_fails_on_it(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        import argparse
+
+        from agentchatme_hermes import cli
+        from agentchatme_hermes.kit import KIT_REQUIREMENT
+
+        monkeypatch.setitem(sys.modules, "agentchatme.integration", None)
+        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: None)
+        rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
+        out = capsys.readouterr().out
+        assert rc >= 1 and "SDK kit missing" in out and KIT_REQUIREMENT in out

@@ -217,9 +217,11 @@ class TestDoctor:
         # A clean install has the hosted-tools entry. Stated, not read from
         # Hermes: with Hermes installed (the hermes-main workflow) the real
         # check would read this test machine's config.yaml.
-        from agentchatme_hermes import mcp_registration
+        from agentchatme_hermes import kit, mcp_registration
 
         monkeypatch.setattr(mcp_registration, "inspect_entry", lambda **_kw: "ours")  # type: ignore[attr-defined]
+        # The SDK stand-in above has no kit; a clean install has it.
+        monkeypatch.setattr(kit, "kit_problem", lambda: None)  # type: ignore[attr-defined]
 
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         captured = capsys.readouterr()  # type: ignore[attr-defined]

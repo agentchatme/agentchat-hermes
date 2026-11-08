@@ -72,6 +72,8 @@ def _patched_runtime(*, lock_winner: bool = True) -> Any:
 
     ws_cls = MagicMock()  # the receiver (socket + receive loop)
     invoker_cls = MagicMock()
+    # No turn running: an idle invoker runs the callback at once.
+    invoker_cls.return_value.when_idle.side_effect = lambda callback: callback() or True
     acquire = MagicMock(return_value=99 if lock_winner else None)
     release = MagicMock()
 
@@ -509,3 +511,104 @@ class TestUnloadedRuntime:
             fresh = runtime_module.get_runtime(_config(), gateway_mode=True)
             assert fresh is not rt
             runtime_module.forget_runtime(fresh)
+
+
+class TestReloadWithALiveTurn:
+    """A plugin reload (or stop) while an AgentChat turn runs: the old
+    instance keeps the account's leader lock until that turn's thread has
+    ended, so the reloaded instance stays a follower — no receiver, no second
+    turn for the conversation the old turn may still answer — and takes over
+    the moment it ends. Real lock file, real invoker, a turn that ignores
+    Hermes' interrupt."""
+
+    def test_the_new_instance_waits_for_the_old_turn(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import asyncio
+        import time
+
+        from agentchatme.integration import TurnRequest
+
+        from agentchatme_hermes import hosted_tools as hosted_tools_module
+        from agentchatme_hermes import runtime as runtime_module
+        from agentchatme_hermes import turn_runner as turn_runner_module
+        from agentchatme_hermes.leader_lock import try_acquire_ws_leader_lock
+        from agentchatme_hermes.runtime import Runtime
+
+        monkeypatch.setattr(runtime_module, "LEADER_RETRY_INTERVAL_S", 0.01)
+        monkeypatch.setattr(hosted_tools_module, "hosted_tool_names", lambda: ["mcp__agentchat__agentchat_inbox"])
+        released = threading.Event()
+        started = threading.Event()
+
+        class _StuckAgent:
+            def run_conversation(self, prompt: str, conversation_history: list[Any]) -> Any:
+                started.set()
+                released.wait(10.0)
+                return {"final_response": "", "messages": []}
+
+            def hard_interrupt(self, message: str | None = None, *, tool_reason: str | None = None) -> None:
+                return None  # it does not stop
+
+        fake_client = MagicMock()
+        fake_client.get_me.return_value = {"handle": "alice"}
+        receivers: list[Any] = []
+
+        def make_receiver(**_kw: Any) -> Any:
+            receivers.append(MagicMock())
+            return receivers[-1]
+
+        config = _config(hermes_home=tmp_path / ".hermes", lock_dir=tmp_path / "locks")
+        loop = asyncio.new_event_loop()
+        try:
+            with patch("agentchatme_hermes.runtime.Receiver", side_effect=make_receiver), patch(
+                "agentchatme_hermes.runtime.load_texts", MagicMock(return_value=None)
+            ), patch.object(Runtime, "_build_sync_client", return_value=fake_client):
+                old = Runtime(config, gateway_mode=True)
+                old.start()
+                assert old.is_leader and len(receivers) == 1
+                inv = old._invoker
+                assert inv is not None
+                inv._limits = turn_runner_module.TurnLimits(idle_s=None, max_s=None, grace_s=0.05, poll_s=0.01)
+                monkeypatch.setattr(inv, "_ensure_hermes_resolved", lambda: None)
+                monkeypatch.setattr(inv, "_build_agent", lambda _sid: _StuckAgent())
+                async def start() -> Any:
+                    # Built on the loop: Python 3.9 binds an asyncio.Event when it is made.
+                    request = TurnRequest(
+                        kind="reply", prompt="p", texts=MagicMock(), stopping=asyncio.Event(), conversation_id="conv_a",
+                        card={"conversation_id": "conv_a"}, anchor="msg_a", category="open_request", invite=None,
+                    )
+                    return await inv.start_turn(request)
+
+                admission = loop.run_until_complete(start())
+                assert admission.started and started.wait(5.0)
+
+                old.stop()  # the reload: the old code is unloaded mid-turn
+                assert try_acquire_ws_leader_lock(old.lock_path) is None, "the lock is still held"
+                new = Runtime(config, gateway_mode=True)
+                new.start()
+                time.sleep(0.2)
+                assert not new.is_leader and len(receivers) == 1, "the new instance stays a follower: no second turn"
+                fake_client.close.assert_not_called()
+
+                released.set()  # the old turn finally ends
+                deadline = time.monotonic() + 5.0
+                while not new.is_leader and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                assert new.is_leader and len(receivers) == 2, "it takes over at once"
+                receivers[1].start.assert_called_once()
+                fake_client.close.assert_called_once()
+                new.stop()
+        finally:
+            released.set()
+            loop.close()
+
+    def test_a_receiver_that_gave_up_hands_the_account_back(self) -> None:
+        from agentchatme_hermes.runtime import Runtime
+
+        with _patched_runtime(lock_winner=True) as (_ws, _inv, _client, _acquire, release):
+            rt = Runtime(_config(), gateway_mode=True)
+            rt.start()
+            assert rt.is_leader
+            rt._receiver_gave_up()
+            release.assert_called_once_with(99)
+            assert not rt.is_leader
+            rt.stop()
+            release.assert_called_once_with(99)

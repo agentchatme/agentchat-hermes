@@ -31,6 +31,15 @@ _VALID_STATES = {"starting", "connected", "reconnecting", "restart_wait", "stopp
 _VERSION = 1
 HEALTH_STALE_AFTER_SECONDS = 150.0
 
+# Cycle outcomes (the kit's ``CycleSummary.outcome``) that mean the receive
+# loop could not do its job that time: the tray unreadable, the model
+# unreachable or its answer unusable (``fail_closed``), no served texts, no
+# hosted tools or no turn can start (``tools_unavailable``), or a cycle that
+# never finished (``abandoned``). A run of them is what doctor alarms on.
+BAD_CYCLE_OUTCOMES = frozenset(
+    {"tray_failed", "fail_closed", "texts_missing", "tools_unavailable", "abandoned"}
+)
+
 
 class _WSHealthRequired(TypedDict):
     version: int
@@ -229,3 +238,19 @@ class HealthBoard:
 def health_age_seconds(health: WSHealth, *, now: float | None = None) -> float:
     timestamp = time.time() if now is None else now
     return max(0.0, timestamp - float(health["updated_at"]))
+
+
+def bad_cycle_run(recent: Any) -> tuple[int, dict[str, Any] | None]:
+    """How many of the newest cycles in ``recent`` (the health record's
+    ``worker.loop.recent_cycles``, oldest first) were bad in a row, and the
+    newest of them."""
+    if not isinstance(recent, list):
+        return 0, None
+    run = 0
+    newest: dict[str, Any] | None = None
+    for cycle in reversed(recent):
+        if not isinstance(cycle, dict) or cycle.get("outcome") not in BAD_CYCLE_OUTCOMES:
+            break
+        run += 1
+        newest = newest or cycle
+    return run, newest

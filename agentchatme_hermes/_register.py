@@ -59,6 +59,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from ._version import __version__
 from .config import ENV_API_KEY, ENV_API_KEY_LEGACY, ConfigError, load_config
+from .kit import kit_problem
 from .leader_lock import is_hermes_gateway_process
 from .profile_scope import profile_context, profile_label, resolve_hermes_home
 
@@ -86,10 +87,20 @@ def register(ctx: Any) -> None:
         from .cli import register_cli
 
         register_cli(ctx)
-    except ImportError:
-        # CLI module is built incrementally — tolerated during early
-        # bring-up. Once cli.py lands this branch is unreachable.
-        logger.debug("agentchatme_hermes.cli not yet present; skipping CLI registration")
+    except Exception:
+        logger.error(
+            "agentchat plugin: the `hermes agentchat` commands could not be registered",
+            exc_info=True,
+        )
+
+    # Receiving is the SDK kit's receive loop: an agentchatme without it can
+    # neither receive nor place the identity line. Say so once, loudly, and
+    # keep the CLI so `hermes agentchat doctor` says it too.
+    problem = kit_problem()
+    if problem is not None:
+        logger.error("agentchat plugin: not receiving — %s", problem)
+        _register_surface(ctx)
+        return
 
     hermes_home = resolve_hermes_home()
     profile = profile_label(hermes_home)
@@ -403,9 +414,9 @@ def _try_start_runtime(
     and restarts. None of them should kill the whole plugin load; we want
     the CLI subcommand to remain reachable so the user can diagnose.
     """
-    from .runtime import get_runtime
-
     try:
+        from .runtime import get_runtime
+
         runtime = get_runtime(config, gateway_mode=gateway_mode, host_llm=host_llm)
         runtime.start()
     except Exception as exc:

@@ -251,6 +251,51 @@ def test_plugin_llm_reaches_the_profiles_main_model(answering_model: _Stub, _her
     assert answering_model.requests[-1] == {"path": "/v1/chat/completions", "model": "contract-main-model", "tools": False}
 
 
+def _main_model_config(home: Path, base_url: str) -> None:
+    (home / "config.yaml").write_text(
+        f"model:\n  default: contract-main-model\n  provider: custom\n  base_url: {base_url}\n  api_key: contract-key\n",
+        encoding="utf-8",
+    )
+
+
+def test_plugin_llm_async_call_reaches_the_main_model(answering_model: _Stub, _hermes_home: Path) -> None:
+    """With the receive loop's cancel handle the gate call is
+    ``ctx.llm.acomplete`` on a private loop per call (Hermes rebinds its async
+    client to each loop): same model, same answer, twice in a row."""
+    from agentchatme_hermes.model_call import build_call_model
+
+    _main_model_config(_hermes_home, answering_model.base_url)
+    plugin_llm = _import("agent.plugin_llm")
+    assert inspect.iscoroutinefunction(plugin_llm.PluginLlm.acomplete)
+    assert {"messages", "temperature", "max_tokens", "timeout", "purpose"} <= _params(plugin_llm.PluginLlm.acomplete)
+    call_model = build_call_model(main_runtime={}, timeout_s=20.0, host_llm=plugin_llm.PluginLlm(plugin_id="agentchat"))
+    for _ in range(2):
+        assert call_model("THE PROMPT", cancel=threading.Event()) == "done"
+        assert answering_model.requests[-1] == {"path": "/v1/chat/completions", "model": "contract-main-model", "tools": False}
+
+
+def test_plugin_llm_async_call_is_cancelled_when_the_loop_stops_waiting(hanging_model: _Stub, _hermes_home: Path) -> None:
+    from agentchatme_hermes.model_call import GateCallCancelled, build_call_model
+
+    _main_model_config(_hermes_home, hanging_model.base_url)
+    plugin_llm = _import("agent.plugin_llm")
+    call_model = build_call_model(main_runtime={}, timeout_s=30.0, host_llm=plugin_llm.PluginLlm(plugin_id="agentchat"))
+    cancel = threading.Event()
+
+    def cancel_once_asked() -> None:
+        deadline = time.monotonic() + 15.0
+        while not hanging_model.requests and time.monotonic() < deadline:
+            time.sleep(0.01)
+        cancel.set()
+
+    threading.Thread(target=cancel_once_asked, daemon=True).start()
+    started = time.monotonic()
+    with pytest.raises(GateCallCancelled):
+        call_model("THE PROMPT", cancel=cancel)
+    assert hanging_model.requests, "the request reached the model"
+    assert time.monotonic() - started < 20.0, "ended by the cancel, not by its 30 s timeout"
+
+
 def test_auxiliary_call_llm_takes_what_the_fallback_passes() -> None:
     accepted = _params(_import("agent.auxiliary_client").call_llm)
     assert {"task", "provider", "model", "base_url", "api_key", "main_runtime", "messages", "temperature", "max_tokens", "timeout"} <= accepted
@@ -333,6 +378,26 @@ def test_hosted_tool_result_wrapper() -> None:
     """``count_agentchat_calls`` recognises a hosted result by this wrapper."""
     source = Path(_import("agent.tool_dispatch_helpers").__file__).read_text(encoding="utf-8")
     assert '<untrusted_tool_result source="{name}">' in source
+
+
+def test_compaction_marks_what_it_writes() -> None:
+    """``count_agentchat_calls`` returns ``None`` (unknown) for a transcript
+    carrying these keys: earlier tool calls may be gone from it."""
+    from agentchatme_hermes.turn_runner import _COMPACTION_KEYS
+
+    compressor = _import("agent.context_compressor")
+    assert (compressor.COMPRESSED_SUMMARY_METADATA_KEY, compressor.MICRO_COMPACT_MARKER_KEY) == _COMPACTION_KEYS
+
+
+def test_hosted_tool_results_have_the_counted_shapes() -> None:
+    """A hosted call succeeded only as ``{"result": …}``; an ``isError``
+    result is ``{"error": …}`` (``count_agentchat_calls``)."""
+    import json
+
+    assert json.loads(_import("tools.registry").tool_error("AWAITING_REPLY")) == {"error": "AWAITING_REPLY"}
+    source = Path(_import("tools.mcp_tool_handlers").__file__).read_text(encoding="utf-8")
+    assert 'json.dumps({"result": text_result}' in source
+    assert 'mcp_field(result, "is_error", "isError", False)' in source
 
 
 def test_gateway_marks_its_process() -> None:

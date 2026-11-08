@@ -372,30 +372,79 @@ _HOSTED_TOOL_MARK = f"{MCP_TOOL_PREFIX}{MCP_SERVER_NAME}__"
 _UNTRUSTED_SOURCE_MARK = f'source="{_HOSTED_TOOL_MARK}'
 
 
-def count_agentchat_calls(result: Any) -> AgentChatCallCount | None:
-    """Count the hosted AgentChat tool calls in a turn's transcript.
+# Hermes marks what its context compaction wrote into a transcript
+# (``agent/context_compressor.py``: ``COMPRESSED_SUMMARY_METADATA_KEY``,
+# ``MICRO_COMPACT_MARKER_KEY``). Earlier tool calls may be gone from such a
+# transcript, so its count is not exact.
+_COMPACTION_KEYS = ("_compressed_summary", "_micro_compact_marker")
 
-    Hermes returns ``result["messages"]``; each tool result is a ``role:
-    tool`` message with ``name`` (or ``tool_name``) and ``content``. A hosted
-    tool's result is wrapped with ``source="mcp__agentchat__…"``; an error is
-    a bare ``{"error": …}`` object. No ``messages`` list → ``None`` (unknown).
+
+def count_agentchat_calls(result: Any) -> AgentChatCallCount | None:
+    """Count the hosted AgentChat tool calls in a turn's transcript, exactly,
+    or ``None`` when the transcript cannot say (unknown, not zero).
+
+    Hermes returns ``result["messages"]``: assistant messages carry
+    ``tool_calls`` (``id``, ``function.name``); each result is a ``role:
+    tool`` message with ``tool_call_id``, ``name`` and ``content``, a hosted
+    tool's content possibly wrapped as ``<untrusted_tool_result
+    source="mcp__agentchat__…">``. A call **succeeded** only when its result
+    is Hermes' MCP success shape — a JSON object with ``result`` and no
+    ``error`` (an ``isError`` result is ``{"error": …}``). Anything else
+    counts as failed: an error, Hermes' own stubs ("Error executing tool: …",
+    "[Result unavailable …]"), a result cut short, or a call with no result.
+
+    ``None`` when there is no ``messages`` list or Hermes compacted the
+    context during the turn (earlier calls may be gone).
     """
     messages = result.get("messages") if isinstance(result, dict) else None
     if not isinstance(messages, list):
         return None
-    calls = 0
+    pending: dict[str, None] = {}  # hosted calls asked for, no result seen yet
+    made = 0
     failed = 0
     for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "tool":
+        if not isinstance(message, dict):
             continue
+        if any(message.get(key) for key in _COMPACTION_KEYS):
+            return None
+        role = message.get("role")
+        if role == "assistant":
+            for call in message.get("tool_calls") or ():
+                call_id, name = _tool_call(call)
+                if name.startswith(_HOSTED_TOOL_MARK):
+                    pending[call_id or f"#{len(pending)}"] = None
+            continue
+        if role != "tool":
+            continue
+        call_id = str(message.get("tool_call_id") or "")
         name = str(message.get("name") or message.get("tool_name") or "")
         text = _content_text(message.get("content"))
-        if not (name.startswith(_HOSTED_TOOL_MARK) or _UNTRUSTED_SOURCE_MARK in text):
+        hosted = call_id in pending or name.startswith(_HOSTED_TOOL_MARK) or _UNTRUSTED_SOURCE_MARK in text
+        if not hosted:
             continue
-        calls += 1
-        if _is_tool_error(text):
+        if call_id in pending:
+            del pending[call_id]
+        elif not call_id:
+            unnamed = next((key for key in pending if key.startswith("#")), None)
+            if unnamed is not None:
+                del pending[unnamed]
+        made += 1
+        if not _succeeded(text):
             failed += 1
-    return AgentChatCallCount(made=calls, failed=failed)
+    # A hosted call with no result: made, not known to have succeeded.
+    made += len(pending)
+    failed += len(pending)
+    return AgentChatCallCount(made=made, failed=failed)
+
+
+def _tool_call(call: Any) -> tuple[str, str]:
+    """``(id, function name)`` of one assistant ``tool_calls`` entry."""
+    if isinstance(call, dict):
+        function = call.get("function")
+        name = function.get("name") if isinstance(function, dict) else call.get("name")
+        return str(call.get("id") or ""), str(name or "")
+    function = getattr(call, "function", None)
+    return str(getattr(call, "id", "") or ""), str(getattr(function, "name", "") or "")
 
 
 def _content_text(content: Any) -> str:
@@ -409,21 +458,19 @@ def _content_text(content: Any) -> str:
         return str(content)
 
 
-def _is_tool_error(text: str) -> bool:
-    """A Hermes tool result that is an error: a bare ``{"error": …}`` payload
-    (unwrapped, or the only object inside the untrusted wrapper)."""
+def _succeeded(text: str) -> bool:
+    """A hosted tool result in Hermes' MCP success shape: a JSON object with
+    ``result`` and no ``error`` (unwrapped, or the object inside the
+    untrusted wrapper; trailing text Hermes appends is ignored)."""
     body = text.strip()
-    if _UNTRUSTED_SOURCE_MARK in body:
-        # Wrapped data: the payload follows the wrapper's blank line.
-        start = body.find("{")
-        body = body[start:] if start >= 0 else ""
-    if not body.startswith("{"):
+    start = body.find("{") if _UNTRUSTED_SOURCE_MARK in body else 0
+    if start < 0 or not body[start:].startswith("{"):
         return False
     try:
-        payload = json.loads(body[: body.rfind("}") + 1])
+        payload, _end = json.JSONDecoder().raw_decode(body[start:])
     except ValueError:
-        return body.startswith('{"error"')
-    return isinstance(payload, dict) and "error" in payload and "result" not in payload
+        return False
+    return isinstance(payload, dict) and "result" in payload and "error" not in payload
 
 
 def turn_failure(result: Any) -> str | None:

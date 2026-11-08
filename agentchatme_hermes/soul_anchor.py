@@ -51,17 +51,18 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agentchatme.integration import anchor
-
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
 
 # The kit's markers (shared with every integration, so a workspace that ends
-# up with two integrations sees one canonical block, not two).
-ANCHOR_START = anchor.START_MARKER
-ANCHOR_END = anchor.END_MARKER
+# up with two integrations sees one canonical block, not two); equal to
+# ``agentchatme.integration.anchor.START_MARKER`` / ``END_MARKER`` (a test
+# checks). Written out so this module imports where the kit is missing and
+# ``doctor`` can say so.
+ANCHOR_START = "<!-- agentchat:start -->"
+ANCHOR_END = "<!-- agentchat:end -->"
 
 
 class AnchorError(RuntimeError):
@@ -73,8 +74,17 @@ class AnchorError(RuntimeError):
     """
 
 
-normalize_handle = anchor.normalize_handle
-render_handle_marker = anchor.handle_line
+def normalize_handle(handle: str) -> str:
+    """Handles are canonical lowercase on the wire; a leading ``@`` is display only."""
+    from agentchatme.integration import anchor
+
+    return anchor.normalize_handle(handle)
+
+
+def render_handle_marker(handle: str) -> str:
+    from agentchatme.integration import anchor
+
+    return anchor.handle_line(handle)
 
 
 def render_anchor_block(identity_line: str, *, handle: str) -> str:
@@ -83,6 +93,8 @@ def render_anchor_block(identity_line: str, *, handle: str) -> str:
     Raises:
         AnchorError: the handle is empty or the line does not name ``@handle``.
     """
+    from agentchatme.integration import anchor
+
     try:
         return anchor.render({"identity_line": identity_line, "identity_line_template": ""}, handle)
     except ValueError as exc:
@@ -134,6 +146,8 @@ def write_soul_anchor(identity_line: str, *, handle: str, soul_path: Path | None
 
     target.parent.mkdir(parents=True, exist_ok=True)
     existing = target.read_text(encoding="utf-8") if target.exists() else ""
+    from agentchatme.integration import anchor
+
     target.write_text(anchor.replace(existing, block), encoding="utf-8")
 
     found = anchor.find(target.read_text(encoding="utf-8"))
@@ -162,6 +176,8 @@ def has_anchor(*, soul_path: Path | None = None) -> bool:
     re-run the wizard to upsert a fresh block in place.
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
+    from agentchatme.integration import anchor
+
     content = _read(target)
     return content is not None and anchor.find(content) is not None
 
@@ -196,6 +212,8 @@ def read_anchor_handle(
         return None
     # The kit always tries the handle line and the earlier wordings; each
     # served template is one more way to recognise an unmarked block.
+    from agentchatme.integration import anchor
+
     candidates: list[str | None] = [t for t in (template, *templates) if t]
     for candidate in candidates or [None]:
         found = anchor.find(content, template=candidate)
@@ -216,6 +234,8 @@ def anchor_is_current(
     recognise (a hand-edited block is the user's, and is left alone).
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
+    from agentchatme.integration import anchor
+
     content = _read(target)
     found = anchor.find(content, template=template) if content is not None else None
     if found is None or found.handle is None:
@@ -240,6 +260,8 @@ def remove_soul_anchor(*, soul_path: Path | None = None) -> bool:
     existing = _read(target)
     if existing is None:
         return False
+    from agentchatme.integration import anchor
+
     stripped = anchor.remove(existing)
     if stripped == existing:
         return False

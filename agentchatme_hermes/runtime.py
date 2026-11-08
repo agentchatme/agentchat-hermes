@@ -353,6 +353,7 @@ class Runtime:
             invoker=self._invoker,
             texts_factory=lambda client: texts_cache(client, state_dir),
             on_texts=self._set_texts,
+            on_exit=self._receiver_gave_up,
             hermes_home=self._hermes_home,
             health=health,
             health_path=health_path_for(self._lock_path),
@@ -408,13 +409,56 @@ class Runtime:
             except Exception:
                 logger.debug("agentchat runtime: receiver stop raised", exc_info=True)
             self._receiver = None
-        if self._invoker is not None:
-            self._invoker.stop()
+        invoker = self._invoker
+        if invoker is not None:
+            invoker.stop()
             self._invoker = None
-        if self._leader_lock_fd is not None:
-            release_leader_lock(self._leader_lock_fd)
-            self._leader_lock_fd = None
+        fd = self._leader_lock_fd
+        self._leader_lock_fd = None
         self._is_leader = False
+        self._release_when_idle(invoker, fd, None)
+
+    def _release_when_idle(self, invoker: AgentInvoker | None, fd: int | None, client: Any) -> None:
+        """Release the leader lock (and close ``client``) once no turn thread
+        runs. A turn interrupted by the stop usually ends at once; one still
+        running keeps the lock, so another instance for this account (a
+        reloaded plugin, a second gateway) stays a follower — and starts no
+        second turn for the same conversation — until it has ended."""
+
+        def release() -> None:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    logger.debug("agentchat runtime: client close raised", exc_info=True)
+            if fd is not None:
+                release_leader_lock(fd)
+                logger.info("agentchat runtime: leader lock released (%s)", self._lock_path)
+
+        if invoker is None or invoker.when_idle(release):
+            if invoker is None:
+                release()
+            return
+        logger.warning(
+            "agentchat runtime: keeping the leader lock for @%s until the running AgentChat turn "
+            "ends — no other instance takes over this account before then",
+            self._identity.handle if self._identity else "?",
+        )
+
+    def _receiver_gave_up(self) -> None:
+        """The receiver stopped for good (SystemExit or KeyboardInterrupt in
+        its thread): give the account to another process once turns end."""
+        with self._lock:
+            invoker = self._invoker
+            fd = self._leader_lock_fd
+            self._leader_lock_fd = None
+            self._is_leader = False
+        logger.error(
+            "agentchat runtime: the receive loop stopped for good — this process no longer "
+            "receives for @%s; releasing the leader lock once no turn runs",
+            self._identity.handle if self._identity else "?",
+        )
+        self._release_when_idle(invoker, fd, None)
 
     def stop(self) -> None:
         with self._lock:
@@ -435,19 +479,14 @@ class Runtime:
         if self._invoker is not None:
             self._invoker.stop()
 
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception:
-                logger.debug("agentchat runtime: client close raised", exc_info=True)
-
-        # Release the leader lock last — only after WS + invoker are
-        # gone, so any next-elected leader doesn't briefly see two
-        # active WS daemons during the handoff.
-        if self._leader_lock_fd is not None:
-            release_leader_lock(self._leader_lock_fd)
-            self._leader_lock_fd = None
-            self._is_leader = False
+        # The client and the leader lock last, and only once no turn thread
+        # runs: a turn detached by the stop still records its outcome
+        # through the client, and while it may still send, no other instance
+        # may take this account over (no second turn for its conversation).
+        fd = self._leader_lock_fd
+        self._leader_lock_fd = None
+        self._is_leader = False
+        self._release_when_idle(self._invoker, fd, self._client)
 
         logger.info("agentchat runtime stopped")
 

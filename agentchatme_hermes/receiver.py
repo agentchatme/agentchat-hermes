@@ -23,10 +23,15 @@ retrying slowly after an auth rejection. Turns that are still running when
 the loop goes away keep their conversations held until their threads end
 (:meth:`.agent_invoker.AgentInvoker.detach_turns`).
 
-Health: the socket's state and the receive side's (alive, the loop's last
-cycle, turns running or waiting, overrun turns) go to the account's health
-record (:mod:`.ws_health`) every minute and on every change; ``hermes
-agentchat doctor`` reads it.
+Health: the socket's state and the receive side's (alive, the kit's recent
+cycle outcomes, turns running or waiting, overrun turns) go to the account's
+health record (:mod:`.ws_health`) every minute and on every change; ``hermes
+agentchat doctor`` reads it (three bad cycles in a row are an error).
+
+Deadlines are the kit's: one gate call (60 s, or twice
+``AGENTCHATME_GATE_TIMEOUT_S`` when longer; the Hermes call is cancelled) and
+one cycle (10 min, not counting turn time; then abandoned, the next wake
+retries).
 """
 from __future__ import annotations
 
@@ -69,6 +74,11 @@ _STABLE_CONNECTION_S = 60.0
 
 TextsFactory = Callable[[Any], "TextsCache"]
 
+# The kit's last cycle summaries kept in the health record (doctor alarms on
+# a run of bad ones; ``ws_health.BAD_CYCLE_OUTCOMES``), each failure text cut.
+_RECENT_CYCLES_KEPT = 20
+_FAILURE_TEXT_MAX = 200
+
 
 def _restart_after_s(rt_client: Any) -> float:
     """How long a disconnected socket may stay down before the receiver
@@ -91,6 +101,39 @@ def _restart_after_s(rt_client: Any) -> float:
     return limit
 
 
+def _quiet_window(config: Any) -> tuple[float | None, float | None]:
+    """``AGENTCHATME_WAKE_DEBOUNCE_S`` as the loop's coalescing window: the
+    quiet time after the last wake (default 2 s) and the longest a burst may
+    hold a cycle back (three times that, at least the kit's 6 s)."""
+    from agentchatme.integration import DEFAULT_MAX_MS
+
+    seconds = getattr(config, "wake_debounce_s", None)
+    if not isinstance(seconds, (int, float)) or isinstance(seconds, bool) or seconds < 0:
+        return None, None
+    quiet_ms = float(seconds) * 1000.0
+    return quiet_ms, max(float(DEFAULT_MAX_MS), quiet_ms * 3.0)
+
+
+def _cycle_record(summary: Any) -> dict[str, Any]:
+    """One kit ``CycleSummary`` for the health record: when, what, why."""
+    failure = getattr(summary, "failure", None)
+    return {
+        "at": getattr(summary, "at", None),
+        "outcome": getattr(summary, "outcome", None),
+        "failure": None if failure is None else str(failure)[:_FAILURE_TEXT_MAX],
+    }
+
+
+def _gate_call_deadline_ms(gate_timeout_s: float) -> float:
+    """The kit's bound on one gate call: its default (60 s), or twice the
+    call's own request timeout (``AGENTCHATME_GATE_TIMEOUT_S``; Hermes
+    retries a transient failure once) when that is longer — a slow model the
+    operator allowed for is not cut off."""
+    from agentchatme.integration.receive_loop import GATE_CALL_TIMEOUT_MS
+
+    return max(float(GATE_CALL_TIMEOUT_MS), 2000.0 * float(gate_timeout_s))
+
+
 class Receiver:
     """Owns the receive loop for one account. Single-use: :meth:`start`, :meth:`stop`."""
 
@@ -102,6 +145,7 @@ class Receiver:
         invoker: AgentInvoker,
         texts_factory: TextsFactory,
         on_texts: Callable[[Texts], None] | None = None,
+        on_exit: Callable[[], None] | None = None,
         hermes_home: Path | None = None,
         health: HealthBoard | None = None,
         health_path: Path | None = None,
@@ -111,6 +155,7 @@ class Receiver:
         self._invoker = invoker
         self._texts_factory = texts_factory
         self._on_texts = on_texts
+        self._on_exit = on_exit
         self._hermes_home = hermes_home
         self._health = health
         self._health_path = health_path
@@ -131,8 +176,12 @@ class Receiver:
         self.restarts = 0
         self._last_error: str | None = None
         self._restarting = False
+        self._restart_since: float | None = None
+        self._stopped_at: float | None = None
         self._rewake_warned = False
         self._events: dict[str, int] = {}
+        # The last loop's ``recent_cycles``, kept across a stack restart.
+        self._recent_cycles: list[dict[str, Any]] = []
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -147,6 +196,7 @@ class Receiver:
     def stop(self) -> None:
         if self._stopped.is_set():
             return
+        self._stopped_at = time.time()
         self._stopped.set()
         self._invoker.stop()
         loop = self._loop
@@ -194,20 +244,24 @@ class Receiver:
                     "coalescer": snapshot.coalescer.get("state"),
                     "socket": snapshot.socket,
                 }
+                self._recent_cycles = [_cycle_record(c) for c in snapshot.recent_cycles][-_RECENT_CYCLES_KEPT:]
                 if status["state"] == "idle" and snapshot.coalescer.get("state") == "running":
                     status["state"] = "cycle"
             except Exception:
                 logger.debug("Receiver: loop status raised", exc_info=True)
+        loop_status = dict(loop_status or {})
+        loop_status["recent_cycles"] = list(self._recent_cycles)
         if self._restarting:
             status["state"] = "restart_wait"
+            status["since"] = self._restart_since
         if self._stopped.is_set():
             status["state"] = "stopped"
+            status["since"] = self._stopped_at
         status.update(
             {
                 "alive": self.alive,
                 "restarts": self.restarts,
                 "last_error": self._last_error,
-                "since": status.get("heartbeat_at"),
                 "loop": loop_status,
             }
         )
@@ -233,15 +287,24 @@ class Receiver:
                 first = False
             started = time.monotonic()
             error: BaseException | None = None
+            fatal = False
             try:
                 self._write_health("starting")
                 loop.run_until_complete(self._main())
                 if not self._stopped.is_set():
                     error = RuntimeError("the receive loop exited unexpectedly")
-            except Exception as exc:
+            except (SystemExit, KeyboardInterrupt) as exc:
+                # Not a crash to retry: stop cleanly and hand the account
+                # back (the runtime releases the leader lock once turns end).
+                error = exc
+                fatal = True
+                logger.error("Receiver: %s in the receive loop — stopping", type(exc).__name__)
+            except BaseException as exc:
+                # CancelledError and the like: whatever escaped, the thread must
+                # not die holding the account. Rebuild the loop.
                 error = exc
                 if not self._stopped.is_set():
-                    logger.exception("Receiver: the receive loop crashed")
+                    logger.error("Receiver: the receive loop crashed", exc_info=(type(exc), exc, exc.__traceback__))
             finally:
                 pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
                 for task in pending:
@@ -255,6 +318,17 @@ class Receiver:
                 asyncio.set_event_loop(None)
                 with contextlib.suppress(Exception):
                     loop.close()
+            if fatal:
+                self._stopped_at = time.time()
+                self._stopped.set()
+                self._invoker.stop()
+                self._last_error = f"{type(error).__name__}: {error}"
+                if self._on_exit is not None:
+                    try:
+                        self._on_exit()
+                    except Exception:
+                        logger.exception("Receiver: the exit callback raised")
+                break
             if self._stopped.is_set():
                 break
             if time.monotonic() - started >= _STABLE_CONNECTION_S:
@@ -268,6 +342,7 @@ class Receiver:
             delay = random.uniform(ceiling * 0.8, ceiling * 1.2)
             self._last_error = f"{type(error).__name__}: {error}" if error is not None else None
             self._restarting = True
+            self._restart_since = time.time()
             self._write_health("restart_wait", last_error=self._last_error)
             logger.warning(
                 "Receiver: restarting the receive loop in %.1fs (attempt %d, %s)",
@@ -304,6 +379,7 @@ class Receiver:
             texts.on_change(lambda served, _source: on_texts(served))
 
         invoker = self._invoker
+        quiet_ms, max_ms = _quiet_window(self._config)
         receive_loop = ReceiveLoop(
             self._http,
             texts,
@@ -318,6 +394,9 @@ class Receiver:
             on_event=self._on_event,
             max_concurrent_turns=1,
             turn_tracker=invoker.tracker,
+            quiet_ms=quiet_ms,
+            max_ms=max_ms,
+            gate_call_timeout_ms=_gate_call_deadline_ms(invoker.gate_timeout_s),
         )
         self._receive_loop = receive_loop
         invoker.set_wake(self.wake)

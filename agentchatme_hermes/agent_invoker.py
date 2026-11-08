@@ -9,7 +9,8 @@ hosts it. This module is what only Hermes can say, as the loop's callbacks:
 
 * :meth:`AgentInvoker.call_model` — the gate's one tool-less completion on
   the agent's own model: Hermes' ``ctx.llm`` (else its auxiliary client
-  pinned to the profile's model), inside the profile's runtime scope.
+  pinned to the profile's model), inside the profile's runtime scope;
+  cancelled when the loop stops waiting, where Hermes can (:mod:`.model_call`).
 * :meth:`AgentInvoker.readiness` — are the hosted ``mcp__agentchat__*``
   tools registered in Hermes; a turn without them cannot look. Holds up to
   30 s (:mod:`.hosted_tools`).
@@ -28,11 +29,25 @@ the loop moves on: in one step on the loop's thread, with no await in
 between, the shared :class:`~agentchatme.integration.TurnTracker` releases
 the loop's entry — the loop's wait on it ends with nothing recorded and its
 turn slot is freed at once (the next waiting turn starts) — and begins one
-of this module's for the same conversation, which is ended (and the loop
-woken) when the thread ends. So no second turn starts for a conversation while the
-first may still send, and one stuck turn does not stop the others. With
+of this module's for the same conversation. When the thread ends, this
+module applies the kit's rule on a fresh tray read (an answer it sent late is
+recorded as ``reply``), then ends its entry and wakes the loop. So no second
+turn starts for a conversation while the first may still send, and one stuck
+turn does not stop the others. With
 :data:`MAX_HUNG_TURNS` such turns still running, no new turn is admitted
-(the cards stay on the tray; the server re-wakes).
+(the cards stay on the tray; the server re-wakes), and :meth:`readiness`
+says not-ready, so no gate call is spent while no turn can start.
+
+A turn still running when its receive loop goes away (a supervisor rebuild)
+is detached the same way: the loop records nothing for it, its conversation
+stays held, and when its thread ends this module applies the kit's rule itself
+(``turn_outcome`` / ``invite_outcome`` on a fresh tray read through the
+runtime's client) before letting go — so a reply it sent is recorded and the
+card is not gated into a second turn.
+
+:meth:`AgentInvoker.when_idle` lets the runtime keep the leader lock until the
+last turn thread has ended (a plugin reload while a turn runs: the reloaded
+instance stays a follower meanwhile, so no second turn starts for it).
 """
 from __future__ import annotations
 
@@ -43,6 +58,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -53,6 +69,10 @@ from agentchatme.integration import (
     TurnAdmission,
     TurnEnd,
     TurnTracker,
+    apply_invite_outcome,
+    apply_outcome,
+    invite_outcome,
+    turn_outcome,
 )
 
 from .config import (
@@ -85,6 +105,9 @@ logger = logging.getLogger(__name__)
 # Fallback model when Hermes' config helpers are unavailable.
 _FALLBACK_MODEL = "claude-sonnet-4-6"
 
+# The largest tray the server builds (the loop's own read is the same).
+_TRAY_LIMIT = 50
+
 # Turns that overran and did not end after the interrupt keep their thread.
 # With this many still running, no new turn is admitted (the cards stay on
 # the tray) until one of them ends: a wedged provider must not pile up threads.
@@ -106,7 +129,18 @@ class _Turn:
     thread_done: bool = False
     """The turn's thread has ended (or never ran)."""
     host_handle: TurnHandle | None = None
-    """Set while this module holds the conversation for a turn that overran."""
+    """Set while this module holds the conversation for a turn that overran
+    (or was detached from its loop)."""
+    detached: bool = False
+    """This module records its outcome, once its thread has ended: its loop
+    went away before the turn ended, or it overran and the loop let it go."""
+    request: Any = None
+    """The loop's :class:`TurnRequest` (card, anchor, category, invite)."""
+    started_at: float = field(default_factory=time.time)
+    final: tuple[TurnReport | None] | None = None
+    """``(report,)`` once the turn's runner has returned."""
+    finishing: bool = False
+    """An owned turn's outcome is being recorded (exactly once)."""
 
 
 class AgentInvoker:
@@ -144,10 +178,13 @@ class AgentInvoker:
         self._turns: dict[str, _Turn] = {}
         self._wake: Callable[[], None] | None = None
         self._run_finished: threading.Event | None = None
+        self._idle_lock = threading.Lock()
+        self._idle_callbacks: list[Callable[[], None]] = []
 
         self._state_lock = threading.Lock()
         self._heartbeat_at = time.time()
         self._current_turn: dict[str, Any] | None = None
+        self._idle_since = time.time()
         self._last_turn: dict[str, Any] | None = None
         self.turns = 0
         self.runs = 0
@@ -190,12 +227,18 @@ class AgentInvoker:
     def status(self) -> dict[str, Any]:
         """The turn side of the health record (the receiver adds the loop's)."""
         with self._state_lock:
+            current = self._current_turn
             return {
-                "state": "turn" if self._current_turn else "idle",
+                "state": "turn" if current else "idle",
+                # When the current state began: the running turn's start, else
+                # when the last one ended (doctor's long-turn warning reads it).
+                "since": current["started_at"] if current else self._idle_since,
                 "heartbeat_at": self._heartbeat_at,
                 "turn": dict(self._current_turn) if self._current_turn else None,
                 "last_turn": dict(self._last_turn) if self._last_turn else None,
                 "hung_turns": self.hung_turns,
+                "max_hung_turns": MAX_HUNG_TURNS,
+                "live_turns": self.live_turns(),
                 "turns": self.turns,
                 "runs": self.runs,
                 "hung_total": self.hung_total,
@@ -205,10 +248,54 @@ class AgentInvoker:
         with self._state_lock:
             self._heartbeat_at = time.time()
 
+    def live_turns(self) -> int:
+        """Turn threads still running (reply, invite, or a single-run run)."""
+        with self._turns_lock:
+            turns = list(self._turns.values())
+        count = 0
+        for turn in turns:
+            with turn.lock:
+                if not turn.thread_done:
+                    count += 1
+        run = self._run_finished
+        if run is not None and not run.is_set():
+            count += 1
+        return count
+
+    def when_idle(self, callback: Callable[[], None]) -> bool:
+        """Call ``callback`` once no turn thread is running: now (``True``)
+        or when the last one ends (``False``; on that thread)."""
+        with self._idle_lock:
+            if self.live_turns() > 0:
+                self._idle_callbacks.append(callback)
+                return False
+        callback()
+        return True
+
+    def _maybe_idle(self) -> None:
+        with self._idle_lock:
+            if not self._idle_callbacks or self.live_turns() > 0:
+                return
+            callbacks = list(self._idle_callbacks)
+            self._idle_callbacks.clear()
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                logger.exception("AgentInvoker: an idle callback raised")
+
     # -- the loop's callbacks ---------------------------------------------------
 
-    def call_model(self, prompt: str) -> str:
-        """The gate's tool-less completion on the agent's own model (a worker thread)."""
+    @property
+    def gate_timeout_s(self) -> float:
+        """The gate call's own request timeout (``AGENTCHATME_GATE_TIMEOUT_S``)."""
+        return self._gate_timeout_s
+
+    def call_model(self, prompt: str, *, cancel: threading.Event | None = None) -> str:
+        """The gate's tool-less completion on the agent's own model (a worker
+        thread). ``cancel`` is the receive loop's handle, set when it stops
+        waiting: with Hermes' async ``ctx.llm`` the request is then cancelled
+        (:mod:`.model_call`)."""
         with self._scope():
             host_llm = self._host_llm_facade()
             model_call = build_call_model(
@@ -216,10 +303,17 @@ class AgentInvoker:
                 timeout_s=self._gate_timeout_s,
                 host_llm=host_llm,
             )
-            return model_call(prompt)
+            return model_call(prompt, cancel=cancel)
 
     def readiness(self) -> Readiness:
         """Could a turn started now reach AgentChat? (a worker thread)"""
+        hung = self.hung_turns
+        if hung >= MAX_HUNG_TURNS:
+            # No turn could be admitted: do not spend a gate call on it.
+            return Readiness(
+                ready=False,
+                reason=f"{hung} earlier turns overran and have not ended — no turn can start",
+            )
         with profile_context(self._home()):
             held = wait_for_hosted_tools(label="turn", stopped=self._stopped)
         if held is None:
@@ -254,6 +348,7 @@ class AgentInvoker:
             ),
             loop=loop,
             done=loop.create_future(),
+            request=request,
         )
         with self._turns_lock:
             self._turns[turn.key] = turn
@@ -280,11 +375,15 @@ class AgentInvoker:
             return RunEnd(status="not_started", detail="the previous run is still running")
         finished = threading.Event()
         self._run_finished = finished
+        def run_ended() -> None:
+            finished.set()
+            self._maybe_idle()
+
         report, reason = self._run_blocking(
-            prompt=with_manual(request.prompt), session_id=wake_session_id(), on_finished=finished.set
+            prompt=with_manual(request.prompt), session_id=wake_session_id(), on_finished=run_ended
         )
         if report is None:
-            finished.set()
+            run_ended()
             return RunEnd(status="not_started", detail=reason)
         self.runs += 1
         if report.status == "completed":
@@ -297,17 +396,46 @@ class AgentInvoker:
         report, reason = self._run_blocking(
             prompt=prompt, session_id=turn.session_id, on_finished=lambda: self._thread_ended(turn)
         )
-        if report is None:
-            with turn.lock:
+        with turn.lock:
+            if report is None:
                 turn.thread_done = True
+            turn.final = (report,)
+            # Already ours to record (detached): nobody else will.
+            owned = turn.detached
+            finish_here = owned and self._claim_finish(turn)
+        if report is None:
+            self._maybe_idle()
+        if owned:
+            if finish_here:
+                self._finish_detached(turn, report)
+            return
         try:
             turn.loop.call_soon_threadsafe(self._report_turn, turn, report, reason)
         except RuntimeError:
             # The loop that admitted the turn is gone (it restarted or stopped).
-            self._report_without_loop(turn)
+            self._report_without_loop(turn, report)
+
+    @staticmethod
+    def _claim_finish(turn: _Turn) -> bool:
+        """Under ``turn.lock``: may the caller record this owned turn's
+        outcome now? Once its runner has returned and its thread has really
+        ended — exactly once."""
+        if turn.finishing or turn.final is None or not turn.thread_done:
+            return False
+        turn.finishing = True
+        return True
 
     def _report_turn(self, turn: _Turn, report: TurnReport | None, reason: str | None) -> None:
         """On the loop's thread: hand the loop what became of the turn."""
+        with turn.lock:
+            owned = turn.detached
+            go = owned and self._claim_finish(turn)
+        if owned:
+            # Detached while the report was on its way: record it ourselves,
+            # off the loop's thread (it reads the tray and records over HTTP).
+            if go:
+                self._finish_in_thread(turn, report)
+            return
         with turn.lock:
             if turn.reported:
                 return
@@ -318,9 +446,11 @@ class AgentInvoker:
                 # Overran and still running: from the loop's entry to ours, in
                 # one step with no await in between, so no cycle sees the
                 # conversation free. The release ends the loop's wait (nothing
-                # recorded) and frees its slot; ``done`` below is for the record.
+                # recorded) and frees its slot; this module records the
+                # outcome once the thread has really ended (it may still send).
                 self.tracker.release(turn.key)
                 turn.host_handle = self.tracker.begin(turn.tracked)
+                turn.detached = True
                 self.hung_total += 1
                 end = TurnEnd(
                     status="failed",
@@ -334,7 +464,7 @@ class AgentInvoker:
                 end = TurnEnd(status="failed", agentchat_calls=report.calls, detail=report.detail)
             else:
                 end = report.turn_end()
-            finished = turn.thread_done and turn.host_handle is None
+            finished = turn.thread_done and not turn.detached
         if not turn.done.done():
             turn.done.set_result(end)
         if finished:
@@ -344,25 +474,26 @@ class AgentInvoker:
         """On the turn's own thread, when it really ends."""
         with turn.lock:
             turn.thread_done = True
-            handle = turn.host_handle
-            turn.host_handle = None
+            owned = turn.detached
+            go = owned and self._claim_finish(turn)
             reported = turn.reported
-        if handle is not None:
-            self.tracker.end(handle)
-            logger.warning(
-                "AgentInvoker: turn %s that overran has ended — %s may be gated again",
-                turn.session_id,
-                turn.key,
-            )
-            self._wake_loop()
-        if reported:
+        if owned:
+            # Ours to record; the hold stays until then (:meth:`_finish_detached`).
+            if go:
+                self._finish_in_thread(turn, turn.final[0] if turn.final else None)
+        elif reported:
             self._forget(turn)
+        self._maybe_idle()
 
     def detach_turns(self) -> None:
-        """The receive loop is going away (restart or stop), on its thread:
-        every turn not yet reported is reported now as failed, and a turn
-        whose thread still runs keeps its conversation held by this module
-        until that thread ends."""
+        """The receive loop is going away (restart or stop), on its thread.
+
+        Every turn not yet reported is reported now as failed, so the loop
+        records nothing for it, and this module takes over its hold: the
+        conversation stays held until the turn's thread has ended and its
+        outcome has been recorded here (:meth:`_finish_detached`), so a reply
+        it sent is recorded and the card is not gated into a second turn.
+        """
         with self._turns_lock:
             turns = list(self._turns.values())
         for turn in turns:
@@ -370,31 +501,103 @@ class AgentInvoker:
                 if turn.reported:
                     continue
                 turn.reported = True
-                if not turn.thread_done:
-                    self.tracker.release(turn.key)
-                    turn.host_handle = self.tracker.begin(turn.tracked)
-                finished = turn.thread_done
+                turn.detached = True
+                self.tracker.release(turn.key)
+                turn.host_handle = self.tracker.begin(turn.tracked)
+                # Its runner may have returned already, its report never to
+                # reach the loop (closing): record it now if it has ended.
+                go = self._claim_finish(turn)
+                final = turn.final
             if not turn.done.done():
                 turn.done.set_result(
                     TurnEnd(status="failed", detail="the receive loop stopped before the turn ended")
                 )
-            if finished:
-                self._forget(turn)
+            if go and final is not None:
+                self._finish_in_thread(turn, final[0])
 
-    def _report_without_loop(self, turn: _Turn) -> None:
+    def _report_without_loop(self, turn: _Turn, report: TurnReport | None) -> None:
+        """The loop that admitted the turn is closed: record its outcome here."""
         with turn.lock:
-            if turn.reported:
-                return
-            # Not detached (the loop vanished without its teardown): its entry
-            # was the loop's; take it over or free it.
-            turn.reported = True
-            self.tracker.release(turn.key)
-            if not turn.thread_done:
+            if not turn.reported:
+                # Not detached (the loop vanished without its teardown): take
+                # over its entry so the outcome is recorded before letting go.
+                turn.reported = True
+                turn.detached = True
+                self.tracker.release(turn.key)
                 turn.host_handle = self.tracker.begin(turn.tracked)
-            finished = turn.thread_done
-        if finished:
+            owned = turn.detached
+            go = owned and self._claim_finish(turn)
+        if go:
+            self._finish_detached(turn, report)
+        elif not owned:
+            self._wake_loop()
+
+    def _finish_in_thread(self, turn: _Turn, report: TurnReport | None) -> None:
+        threading.Thread(
+            target=self._finish_detached, args=(turn, report), name="agentchat-turn-record", daemon=True
+        ).start()
+
+    def _finish_detached(self, turn: _Turn, report: TurnReport | None) -> None:
+        """An owned turn's thread has ended: apply the kit's rule through the
+        runtime's client (a fresh tray read) — a turn that failed after
+        sending its answer records ``reply`` too — then let go of the
+        conversation."""
+        try:
+            if report is not None:
+                self._record_detached(turn, report)
+            else:
+                logger.info("AgentInvoker: detached turn %s never started — nothing recorded", turn.session_id)
+        except Exception as exc:
+            logger.warning(
+                "AgentInvoker: the outcome of detached turn %s was not recorded (%s) — the card "
+                "stays on the tray and the server re-wakes",
+                turn.session_id,
+                exc,
+            )
+        finally:
+            with turn.lock:
+                handle = turn.host_handle
+                turn.host_handle = None
+            if handle is not None:
+                self.tracker.end(handle)
             self._forget(turn)
-        self._wake_loop()
+            self._wake_loop()
+            self._maybe_idle()
+
+    def _record_detached(self, turn: _Turn, report: TurnReport) -> None:
+        client = getattr(self._runtime, "client", None)
+        request = turn.request
+        if client is None or request is None:
+            return
+        fresh = client.inbox.tray(wait_ms=0, limit=_TRAY_LIMIT, include_invites=True)
+        end = TurnEnd(
+            status="completed" if report.status == "completed" else "failed",
+            agentchat_calls=report.calls,
+            detail=report.detail,
+        )
+        if request.kind == "invite":
+            invited = invite_outcome(turn=end, invite=request.invite or {}, fresh_tray=fresh)
+            recorded = apply_invite_outcome(client, invited)
+            reason: str = invited.reason
+            action: str = invited.action
+        else:
+            replied = turn_outcome(
+                turn=end,
+                turn_started_at=datetime.fromtimestamp(turn.started_at, tz=timezone.utc),
+                gate_card=request.card or {},
+                category=request.category,
+                fresh_tray=fresh,
+            )
+            recorded = apply_outcome(client, replied)
+            reason, action = replied.reason, replied.action
+        logger.info(
+            "AgentInvoker: detached turn %s (%s): %s → %s (recorded=%s)",
+            turn.session_id,
+            end.status,
+            reason,
+            action,
+            recorded,
+        )
 
     def _forget(self, turn: _Turn) -> None:
         with self._turns_lock:
@@ -438,6 +641,7 @@ class AgentInvoker:
                 finally:
                     with self._state_lock:
                         self._current_turn = None
+                        self._idle_since = time.time()
         except ProfileScopeError as exc:
             logger.warning("AgentInvoker: turn %s not started — %s", session_id, exc)
             return None, f"profile scope unavailable: {exc}"

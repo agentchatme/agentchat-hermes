@@ -261,6 +261,8 @@ class _Agent:
         self.prompts: list[str] = []
         self.interrupts: list[str | None] = []
         self.on_run: Any = None
+        self.after_block: Any = None
+        """What a blocked turn returns once released (default: interrupted)."""
 
     def run_conversation(self, prompt: str, conversation_history: list[Any]) -> Any:
         self.prompts.append(prompt)
@@ -271,6 +273,8 @@ class _Agent:
             raise self.raises
         if self.block:
             self.release.wait(10.0)
+            if self.after_block is not None:
+                return self.after_block
             return {"completed": False, "interrupted": True, "messages": []}
         return self.result
 
@@ -432,7 +436,7 @@ class TestCallModel:
 
         def fake_build_call_model(**kw: Any) -> Any:
             seen.append(kw)
-            return lambda prompt: "answer"
+            return lambda prompt, **_: "answer"
 
         def broken() -> Any:
             raise ImportError("agent.plugin_llm")
@@ -659,7 +663,7 @@ class TestProfileScope:
             return "m", {}
 
         monkeypatch.setattr(inv, "_resolve_model_and_runtime", resolve)
-        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: (lambda prompt: "{}"))
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: (lambda prompt, **_: "{}"))
         inv.call_model("p")
         await _run(inv, _reply_request())
         assert seen["gate"] == ["key-up"] and seen["turn"] == ["key-up"] and seen["home"] == [str(up)]
@@ -670,7 +674,7 @@ class TestProfileScope:
         _launch, up = self._homes(tmp_path)
         _FakeHermesScopes(monkeypatch, {str(up): {}}, helper_raises=OSError("vault locked"))
         inv = _invoker(monkeypatch, home=up)
-        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: (lambda prompt: "{}"))
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: (lambda prompt, **_: "{}"))
         with pytest.raises(ProfileScopeError):
             inv.call_model("p")
 
@@ -678,7 +682,7 @@ class TestProfileScope:
         launch, up = self._homes(tmp_path)
         fake = _FakeHermesScopes(monkeypatch, self._secrets(launch, up), multiplex=False)
         inv = _invoker(monkeypatch, home=launch)
-        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: (lambda prompt: "{}"))
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: (lambda prompt, **_: "{}"))
         inv.call_model("p")
         assert fake.standalone_calls == 1 and fake.runtime_scope_calls == []
 
@@ -746,7 +750,7 @@ class _Server:
 def _gate_answer(server: _Server) -> Any:
     import json
 
-    def call_model(prompt: str) -> str:
+    def call_model(prompt: str, **_: Any) -> str:
         cards = [cid for cid in server.unread if f'"conversation_id":"{cid}"' in prompt.replace(" ", "")]
         return json.dumps({"decisions": [{"conversation_id": cid, "decision": server.answer.get(cid, "reply")} for cid in cards]})
 
@@ -817,6 +821,8 @@ class TestThroughTheReceiveLoop:
         loop.wake()
         assert await _until(lambda: ("conv_b", "reply", "msg_b") in server.recorded, timeout=10.0)
         assert inv.tracker.conversation_running("conv_a") and inv.hung_turns == 1
+        # conv_b's slot is freed just after its verdict is recorded.
+        assert await _until(lambda: loop.status().counters["turns_active"] == 0)
         status = loop.status()
         assert status.counters["turns_active"] == 0 and status.counters["turns_waiting"] == 0, "the slot was freed"
         assert [t.turn.conversation_id for t in status.turns] == ["conv_a"], "conv_a: held by the invoker"
@@ -829,3 +835,219 @@ class TestThroughTheReceiveLoop:
         stuck.release.set()
         assert await _until(lambda: not inv.tracker.conversation_running("conv_a"))
         await loop.stop()
+
+
+class _SyncServer:
+    """The runtime's sync client as a detached turn uses it."""
+
+    def __init__(self) -> None:
+        self.unread = {"conv_a": "msg_a"}
+        self.answered: dict[str, str] = {}
+        self.recorded: list[tuple[str, str, str | None]] = []
+        self.inbox = SimpleNamespace(tray=self._tray)
+        self.decisions = SimpleNamespace(record=self._record)
+        self.groups = SimpleNamespace(dismiss_invite=lambda invite_id: None)
+
+    def _tray(self, **_kw: Any) -> dict[str, Any]:
+        cards = [
+            {
+                "conversation_id": cid,
+                "type": "direct",
+                "you_owe_reply": self.answered.get(cid) != newest,
+                "preview": {"message_id": newest, "sender": "@peer", "text": "hi", "at": "2026-11-08T10:00:00.000Z"},
+            }
+            for cid, newest in self.unread.items()
+            if not any(r[0] == cid for r in self.recorded)
+        ]
+        return {"version": 1, "you": "@me", "question": "q", "categories": [], "conversations": cards, "deferred": 0, "truncated": False, "invites": [], "invites_truncated": False}
+
+    def _record(self, conversation_id: str, **kwargs: Any) -> dict[str, Any]:
+        self.recorded.append((conversation_id, kwargs["decision"], kwargs.get("through_message_id")))
+        return {}
+
+
+def _gate_card() -> dict[str, Any]:
+    return {"conversation_id": "conv_a", "type": "direct", "you_owe_reply": True, "preview": {"message_id": "msg_a", "sender": "@peer", "text": "hi", "at": "2026-11-08T10:00:00.000Z"}}
+
+
+class TestAcrossARestart:
+    """A turn still running when its receive loop goes away (a supervisor
+    rebuild) is detached: the loop records nothing, the conversation stays
+    held, and when the turn ends its outcome is recorded here — so a reply
+    it sent is recorded and the card is not gated into a second turn."""
+
+    def _request(self) -> TurnRequest:
+        request = _reply_request("conv_a", "msg_a")
+        return TurnRequest(**{**request.__dict__, "card": _gate_card(), "category": "open_request"})
+
+    async def test_a_detached_turn_records_the_reply_it_sent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _SyncServer()
+        agent = _Agent(block=True, obey=False)
+        agent.after_block = agent.result  # it completes, having sent
+        inv = _invoker(monkeypatch, agent)
+        inv._runtime.client = server
+        inv._limits = turn_runner_module.TurnLimits(idle_s=None, max_s=None, poll_s=0.01)
+        loop_handle = inv.tracker.begin(TrackedTurn.reply("conv_a", "msg_a"))
+        assert loop_handle is not None
+        admission = await inv.start_turn(self._request())
+        assert await _until(agent.started.is_set)
+
+        inv.detach_turns()  # the supervisor rebuilds the loop
+        assert await inv.tracker.confirmed_end(loop_handle, admission.done) is None, "the old loop records nothing"
+        assert inv.tracker.conversation_running("conv_a"), "held across the restart"
+
+        server.answered["conv_a"] = "msg_a"  # the turn sends its answer...
+        agent.release.set()  # ...and ends
+        assert await _until(lambda: server.recorded == [("conv_a", "reply", "msg_a")])
+        assert await _until(lambda: not inv.tracker.conversation_running("conv_a"))
+        assert inv.live_turns() == 0
+
+    async def test_a_report_still_queued_at_detach_is_recorded_exactly_once(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _SyncServer()
+        agent = _Agent()
+        agent.on_run = lambda: server.answered.__setitem__("conv_a", "msg_a")
+        inv = _invoker(monkeypatch, agent)
+        inv._runtime.client = server
+        loop_handle = inv.tracker.begin(TrackedTurn.reply("conv_a", "msg_a"))
+        assert loop_handle is not None
+        admission = await inv.start_turn(self._request())
+        # The turn finishes while this loop is busy: its report is queued.
+        deadline = time.monotonic() + 5.0
+        turn = inv._turns["conversation:conv_a"]
+        while turn.final is None and time.monotonic() < deadline:
+            # Deliberately blocking this loop: the turn's report must stay queued.
+            time.sleep(0.01)  # noqa: ASYNC251
+        assert turn.final is not None and not admission.done.done()
+        inv.detach_turns()  # the loop goes away before it runs the queued report
+        assert await inv.tracker.confirmed_end(loop_handle, admission.done) is None
+        await asyncio.sleep(0.05)  # the queued report runs now: already being recorded
+        assert await _until(lambda: server.recorded == [("conv_a", "reply", "msg_a")])
+        await asyncio.sleep(0.1)
+        assert server.recorded == [("conv_a", "reply", "msg_a")], "exactly once"
+        assert await _until(lambda: not inv.tracker.conversation_running("conv_a"))
+
+    async def test_a_detached_turn_that_failed_after_sending_records_the_reply(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The kit reads a failed turn on the card too: one that sent its
+        answer and then failed must not be gated into a second answer."""
+        server = _SyncServer()
+        agent = _Agent(block=True, obey=True)
+        inv = _invoker(monkeypatch, agent)
+        inv._runtime.client = server
+        inv._limits = turn_runner_module.TurnLimits(idle_s=None, max_s=None, grace_s=2.0, poll_s=0.01)
+        loop_handle = inv.tracker.begin(TrackedTurn.reply("conv_a", "msg_a"))
+        assert loop_handle is not None
+        await inv.start_turn(self._request())
+        assert await _until(agent.started.is_set)
+        server.answered["conv_a"] = "msg_a"  # it sent its answer...
+        inv.detach_turns()
+        inv.stop()  # ...and was then interrupted: a failed turn
+        assert await _until(lambda: server.recorded == [("conv_a", "reply", "msg_a")])
+        assert await _until(lambda: not inv.tracker.conversation_running("conv_a"))
+
+    async def test_a_detached_turn_that_overran_is_recorded_only_when_its_thread_ends(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _SyncServer()
+        agent = _Agent(block=True, obey=False)
+        inv = _invoker(monkeypatch, agent)
+        inv._runtime.client = server
+        inv._limits = turn_runner_module.TurnLimits(idle_s=None, max_s=0.1, grace_s=0.1, poll_s=0.01)
+        loop_handle = inv.tracker.begin(TrackedTurn.reply("conv_a", "msg_a"))
+        assert loop_handle is not None
+        await inv.start_turn(self._request())
+        assert await _until(agent.started.is_set)
+        inv.detach_turns()
+        turn = inv._turns["conversation:conv_a"]
+        assert await _until(lambda: turn.final is not None), "the runner gave up on it (timeout)"
+        await asyncio.sleep(0.1)
+        assert server.recorded == [] and inv.tracker.conversation_running("conv_a"), "it may still send"
+        server.answered["conv_a"] = "msg_a"
+        agent.release.set()  # the stuck call returns, having sent
+        assert await _until(lambda: server.recorded == [("conv_a", "reply", "msg_a")])
+        assert await _until(lambda: not inv.tracker.conversation_running("conv_a"))
+        assert inv.live_turns() == 0
+
+    async def test_a_detached_turn_that_failed_records_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _SyncServer()
+        agent = _Agent(block=True, obey=True)
+        inv = _invoker(monkeypatch, agent)
+        inv._runtime.client = server
+        inv._limits = turn_runner_module.TurnLimits(idle_s=None, max_s=None, grace_s=2.0, poll_s=0.01)
+        loop_handle = inv.tracker.begin(TrackedTurn.reply("conv_a", "msg_a"))
+        assert loop_handle is not None
+        await inv.start_turn(self._request())
+        assert await _until(agent.started.is_set)
+        inv.detach_turns()
+        inv.stop()  # interrupted: a failed turn
+        assert await _until(lambda: not inv.tracker.conversation_running("conv_a"))
+        assert server.recorded == []
+
+
+class TestOverranInTheLoop:
+    """A turn the loop let go of after it overran (the hung handoff) is this
+    module's to record: when its thread finally ends, a reply it sent is
+    recorded once, and only then is the conversation gated again."""
+
+    async def test_the_reply_it_sent_late_is_recorded_before_it_is_let_go(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _SyncServer()
+        agent = _Agent(block=True, obey=False)
+        inv = _invoker(monkeypatch, agent)
+        inv._runtime.client = server
+        woken: list[str] = []
+        inv.set_wake(lambda: woken.append("wake"))
+        loop_handle = inv.tracker.begin(TrackedTurn.reply("conv_a", "msg_a"))
+        assert loop_handle is not None
+        request = _reply_request("conv_a", "msg_a")
+        admission = await inv.start_turn(TurnRequest(**{**request.__dict__, "card": _gate_card(), "category": "open_request"}))
+        assert await inv.tracker.confirmed_end(loop_handle, admission.done) is None, "the loop records nothing"
+        assert inv.hung_turns == 1 and server.recorded == []
+
+        server.answered["conv_a"] = "msg_a"  # the stuck turn sends after all...
+        agent.release.set()  # ...and ends
+        assert await _until(lambda: server.recorded == [("conv_a", "reply", "msg_a")])
+        assert await _until(lambda: not inv.tracker.conversation_running("conv_a"))
+        assert woken == ["wake"] and inv.hung_turns == 0 and inv.live_turns() == 0
+        await asyncio.sleep(0.05)
+        assert server.recorded == [("conv_a", "reply", "msg_a")], "exactly once"
+
+
+class TestIdleAndReadiness:
+    async def test_when_idle_waits_for_the_last_turn_thread(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        agent = _Agent(block=True, obey=False)
+        inv = _invoker(monkeypatch, agent)
+        inv._limits = turn_runner_module.TurnLimits(idle_s=None, max_s=None, poll_s=0.01)
+        assert inv.when_idle(lambda: None) is True, "nothing running: at once"
+        handle = inv.tracker.begin(TrackedTurn.reply("conv_a", "msg_a"))
+        assert handle is not None
+        await inv.start_turn(_reply_request())
+        assert await _until(agent.started.is_set)
+        idle: list[str] = []
+        assert inv.when_idle(lambda: idle.append("idle")) is False
+        assert inv.live_turns() == 1 and idle == []
+        inv.stop()
+        agent.release.set()
+        assert await _until(lambda: idle == ["idle"])
+
+    async def test_readiness_is_not_ready_while_no_turn_can_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        agents = [_Agent(block=True, obey=False) for _ in range(invoker_module.MAX_HUNG_TURNS)]
+        inv = _invoker(monkeypatch)
+        built = iter(agents)
+        monkeypatch.setattr(inv, "_build_agent", lambda _sid: next(built))
+        assert inv.readiness().ready is True
+        for i in range(invoker_module.MAX_HUNG_TURNS):
+            await _run(inv, _reply_request(f"conv_{i}", f"msg_{i}"))
+        answer = inv.readiness()
+        assert answer.ready is False and "no turn can start" in (answer.reason or ""), "no gate call is spent"
+        status = inv.status()
+        assert status["hung_turns"] == status["max_hung_turns"] == invoker_module.MAX_HUNG_TURNS
+        for agent in agents:
+            agent.release.set()
+        assert await _until(lambda: inv.hung_turns == 0)
+        assert inv.readiness().ready is True
+
+    def test_since_is_the_turns_start_or_the_last_end(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv = _invoker(monkeypatch, _Agent())
+        before = inv.status()["since"]
+        inv.start_run(RunRequest(prompt="p", texts=TEXTS, cards=1, invites=0, stopping=asyncio.Event()))
+        assert inv.status()["since"] >= before, "the idle state began when the run ended"
+        with inv._state_lock:
+            inv._current_turn = {"session_id": "s", "started_at": 123.0}
+        assert inv.status()["state"] == "turn" and inv.status()["since"] == 123.0

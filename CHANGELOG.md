@@ -5,7 +5,8 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 ## [Unreleased]
 
 Needs the `agentchatme` SDK release that ships `agentchatme.integration` (contract v1) and a server that serves the gate-call texts;
-the dependency floor is set to that SDK version at release.
+the dependency floor is set to that SDK version at release. Without the kit the plugin does not receive and says so: one ERROR at
+load naming the required SDK version, and `hermes agentchat doctor` fails on it (the CLI and the manual stay registered).
 
 ### Changed
 
@@ -16,14 +17,19 @@ the dependency floor is set to that SDK version at release.
   a newer message or an `unanswered` wake), and no retry ladder. The plugin keeps only the Hermes side (`agent_invoker.py`): the gate's
   model call, the hosted-tools readiness check, and the turn (a transient `AIAgent` under the time limit, in the profile's scope). A turn
   that overran and does not end after Hermes' interrupt frees the loop's turn slot (it counts as failed) while its conversation stays
-  held in the shared turn tracker until its thread really ends. Deleted: `ws_daemon.py`, `wake.py`, the invoker's worker, cycle,
+  held in the shared turn tracker until its thread really ends. `AGENTCHATME_WAKE_DEBOUNCE_S` is the loop's quiet window (a burst
+  may hold a cycle back three times that, at least 6 s). The kit bounds each gate call (60 s, or twice `AGENTCHATME_GATE_TIMEOUT_S`
+  when that is longer) and each cycle (10 min, not counting turn time; past it the cycle is abandoned and the next wake retries).
+  Deleted: `ws_daemon.py`, `wake.py`, the invoker's worker, cycle,
   post-turn and invite logic, `RunningTurns`, `texts.py`'s fetch/cache/refresh (the kit's `TextsCache`, file `texts-hermes.json`; the
   old `texts.json` is removed), and the plugin's own prompt building (the kit's prompt plus where the manual is).
 - **What is recorded after a turn is contract v1's reply rule**, decided by the SDK kit (`agentchatme.integration.turn_outcome`,
   recorded with `apply_outcome`) from one fresh tray read and the turn's AgentChat call counts, never from "the turn ran": the turn
-  recorded its own verdict → nothing more; the answer went out → `reply` through the anchor the gate saw; no AgentChat call, or only
-  failed ones → nothing; it looked and did nothing → nothing the first time, `dismiss` (`no_action_needed`) the second time for the
-  same anchor. A failed tray read after the turn now records nothing (it recorded `reply` before); the card stays and the next wake
+  recorded its own verdict → nothing more; the answer went out → `reply` through the anchor the gate saw, also when the turn failed
+  after sending (so it is not gated into a second answer); otherwise a failed turn → nothing; no AgentChat call, or only failed ones
+  → nothing; it looked and did nothing → nothing the first time, the second time for the same anchor `dismiss`
+  (`no_action_needed`) when its AgentChat calls are known and all succeeded, else `defer` (unread, back on the server's reminder
+  ladder). A failed tray read after the turn now records nothing (it recorded `reply` before); the card stays and the next wake
   looks again. The local post-turn comparison it replaces is deleted.
 - **No local retry ladder; the server re-wakes.** The socket offers the `rewake` and `heartbeat` capabilities. A cycle that could not
   finish (model unreachable, server error, turn failed, card left after a silent turn) leaves the cards on the tray and arms nothing;
@@ -55,26 +61,40 @@ the dependency floor is set to that SDK version at release.
   (a stalled provider stream, a hung tool) stopped every later wake for the account while the socket stayed connected and the health
   record said so. Each turn now runs on its own thread under two limits — no activity for `AGENTCHATME_TURN_IDLE_TIMEOUT_S` (600 s,
   the inactivity limit Hermes' cron uses for its unattended turns) or a run past `AGENTCHATME_TURN_MAX_S` (3600 s). On overrun the
-  turn is stopped with Hermes' own `AIAgent.hard_interrupt` (`tool_reason="agentchat turn time limit"`) and counts as failed: nothing
-  is recorded, the cards stay on the tray. A turn that does not end within 30 s of the interrupt keeps its conversations held until
-  its thread really ends — no second turn starts for them meanwhile — and with two such turns still running no new turn starts. A
-  gateway stop interrupts a running turn the same way.
+  turn is stopped with Hermes' own `AIAgent.hard_interrupt` (`tool_reason="agentchat turn time limit"`) and counts as failed. A turn
+  that does not end within 30 s of the interrupt keeps its conversation held until its thread really ends — no second turn starts for
+  it meanwhile — and its outcome is then read on a fresh tray (an answer it sent late is recorded as `reply`) before the
+  conversation is gated again. With two such turns still running no new turn starts, the readiness check says so (no gate call is
+  spent), and doctor reports it as an error. A gateway stop interrupts a running turn the same way.
 - **A crashed worker restarts.** An exception that escaped the worker loop stopped every later cycle until the gateway restarted,
-  while the process kept the leader lock. The loop is now restarted with backoff (1 s doubling to 60 s) and reads the tray again.
+  while the process kept the leader lock. The loop is now restarted with backoff (1 s doubling to 60 s) and reads the tray again;
+  so is one ended by a `BaseException` such as `CancelledError`. `SystemExit` / `KeyboardInterrupt` in its thread stop receiving
+  cleanly and hand the account's leader lock back once no turn runs.
+- **A turn still running when the receive loop restarts is not lost.** Its outcome is recorded by the plugin through the runtime's
+  client (a fresh tray read, the kit's rule) when its thread ends, and its conversation stays held until then, so a reply it sent is
+  recorded and the card is not gated into a second turn.
 - **The health record shows the worker, not only the socket.** It gains a `worker` section (state, thread alive, heartbeat,
-  restarts, last error, the running turn, overrun turns still running, the last turn's outcome and AgentChat call counts);
-  `hermes agentchat doctor` reports a dead, stuck or restarting worker even while the socket is connected.
+  restarts, last error, the running turn, overrun turns still running, the last turn's outcome and AgentChat call counts, and the
+  kit's last cycle outcomes, `recent_cycles`); `hermes agentchat doctor` reports a dead, stuck or restarting worker even while the
+  socket is connected, a long-running turn, and three cycles in a row that did not get through (`fail_closed`,
+  `tools_unavailable`, `texts_missing`, `abandoned`, `tray_failed`) as an error.
 - **A turn with no AgentChat call records nothing.** A completed turn whose transcript showed no hosted AgentChat tool call was
   trusted as having looked and `reply` was recorded with nothing read or sent. Such a turn (like one whose calls all failed) could not
-  look: nothing is recorded and the card stays on the tray. A transcript Hermes did not return stays "unknown", as before.
+  look: nothing is recorded and the card stays on the tray. A transcript Hermes did not return stays "unknown", as before. The counts
+  are exact: a call succeeded only when its result is Hermes' MCP success shape (`{"result": …}`), so Hermes' own error stubs ("Error
+  executing tool", "Result unavailable") and a call with no result count as failed, and a transcript Hermes compacted during the turn
+  is "unknown".
 - **The gate call goes through Hermes' public plugin LLM.** On a Hermes with `ctx.llm` (since May 2026) the gate's one tool-less
-  completion is `ctx.llm.complete(...)` with no override: Hermes routes it to the profile's main model and credentials (or a fallback
-  the user declared), and the integration no longer reads `config.yaml` or resolves provider credentials for it. Older Hermes keeps the
-  previous path (`agent.auxiliary_client.call_llm` pinned to the resolved main model).
+  completion is `ctx.llm` with no override: Hermes routes it to the profile's main model and credentials (or a fallback the user
+  declared), and the integration no longer reads `config.yaml` or resolves provider credentials for it. It is `ctx.llm.acomplete` on a
+  private event loop in a worker thread, cancelled when the kit stops waiting (its gate-call deadline, an abandoned cycle), so the
+  request itself ends; `ctx.llm.complete` where there is no async call. Older Hermes keeps the previous path
+  (`agent.auxiliary_client.call_llm` pinned to the resolved main model; it cannot be interrupted and ends at its own timeout).
 - **A plugin reload no longer leaves the old runtime holding the socket.** The plugin registers Hermes' `ctx.on_unload`: when
   Hermes unloads it (reload, disable, remove) in a running process, the runtime is stopped — socket closed, wake worker and timers
-  stopped, leader lock released — and forgotten, so the reloaded code takes over at once. A runtime an activation attempt was still
-  starting when the unload came is stopped too.
+  stopped — and forgotten. The leader lock (and the client a turn records through) is released once the last turn thread has ended,
+  so the reloaded code stays a follower — and starts no second turn for a conversation the old turn may still answer — until then,
+  and takes over at once after. A runtime an activation attempt was still starting when the unload came is stopped too.
 - **A group-invite turn that crashed is retried.** The invite was marked as having had its turn before the turn ran, so a turn that
   crashed, overran or could not look was never run again. It is now marked only after a turn that looked.
 

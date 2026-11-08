@@ -576,6 +576,13 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         return _doctor_finalize(failures, warnings_count)
 
     ok("agentchatme SDK importable")
+    from .kit import kit_problem
+
+    problem = kit_problem()
+    if problem is not None:
+        fail(f"SDK kit missing: {problem}")
+    else:
+        ok("agentchatme.integration (the SDK kit) importable")
 
     # Hermes connects the hosted tools itself, and only with the ``mcp`` SDK
     # (its ``[mcp]`` extra). Without it every turn runs with no AgentChat
@@ -869,6 +876,10 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
 # A worker turn that runs this long is reported, though its own time limit
 # (``AGENTCHATME_TURN_MAX_S``) is what ends it.
 _WORKER_LONG_TURN_S = 900.0
+# This many cycles in a row that did not get through (``recent_cycles``: the
+# model or the tray unreachable, no texts, no hosted tools, no turn can
+# start, a cycle abandoned) is an error.
+_WORKER_BAD_CYCLES = 3
 
 
 def _describe_worker(worker: Any, *, now: float) -> tuple[str, str] | None:
@@ -878,7 +889,7 @@ def _describe_worker(worker: Any, *, now: float) -> tuple[str, str] | None:
     worker was supervised). The socket can be connected while the worker
     that turns wakes into turns is dead or stuck; this is how that shows.
     """
-    from .ws_health import HEALTH_STALE_AFTER_SECONDS
+    from .ws_health import HEALTH_STALE_AFTER_SECONDS, bad_cycle_run
 
     if not isinstance(worker, dict):
         return None
@@ -902,11 +913,29 @@ def _describe_worker(worker: Any, *, now: float) -> tuple[str, str] | None:
             f"Wake worker has not moved for {beat_age:.0f}s (state={state}) while the socket is up "
             "— restart `hermes gateway`"
         )
+    max_hung = worker.get("max_hung_turns") if isinstance(worker.get("max_hung_turns"), int) else None
+    if hung and max_hung is not None and hung >= max_hung:
+        return "fail", (
+            f"{hung} AgentChat turns overran their time limit and have not ended — no new turn "
+            "can start until one does (restart `hermes gateway` if they never end)"
+        )
     if hung:
         return "warn", (
             f"{hung} AgentChat turn(s) overran their time limit and have not ended; their "
             "conversations get no new turn until they do"
         )
+    loop_raw = worker.get("loop")
+    loop: dict[str, Any] = loop_raw if isinstance(loop_raw, dict) else {}
+    bad, newest = bad_cycle_run(loop.get("recent_cycles"))
+    if bad and newest is not None:
+        what = str(newest.get("outcome") or "?")
+        why = f": {newest['failure']}" if newest.get("failure") else ""
+        if bad >= _WORKER_BAD_CYCLES:
+            return "fail", (
+                f"The receive loop's last {bad} cycles did not get through ({what}{why}) — "
+                "AgentChat messages are not being answered"
+            )
+        return "warn", f"The receive loop's last cycle did not get through ({what}{why})"
     if state == "turn" and in_state is not None and in_state > _WORKER_LONG_TURN_S:
         return "warn", f"An AgentChat turn has been running for {in_state:.0f}s"
     last_turn = worker.get("last_turn")
