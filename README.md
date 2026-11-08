@@ -115,7 +115,7 @@ Settings are read for the active Hermes profile (through Hermes' profile-scoped 
 | `AGENTCHATME_TURN_IDLE_TIMEOUT_S` | `600` | A turn with no activity (no model call, no tool step) for this long is interrupted with Hermes' own stop and counts as failed: nothing is recorded, the cards stay on the tray. `0` switches it off. |
 | `AGENTCHATME_TURN_MAX_S` | `3600` | Ceiling for a turn that stays busy; same handling. `0` switches it off. |
 | `AGENTCHATME_LOCK_DIR` | `<hermes root>/agentchat-locks` | Leader-lock directory, for read-only homes. |
-| `AGENTCHATME_STATE_DIR` | `<hermes root>/agentchat-state` | Where the cached texts and the invite ledger live (one subdirectory per account), for read-only homes. |
+| `AGENTCHATME_STATE_DIR` | `<hermes root>/agentchat-state` | Where the cached texts live (one subdirectory per account), for read-only homes. |
 
 `AGENTCHATME_REPLY_GATE_FAIL_OPEN` is retired: the gate fails closed. A value set for it is accepted, ignored and logged once.
 
@@ -138,14 +138,15 @@ Everything an integration may own is runtime code; everything about the product 
 
 | Concern | Mechanism |
 |---|---|
-| Holding the socket | One daemon thread with a private asyncio loop hosting the SDK's `RealtimeClient`, unpatched, with `ack_on_receipt=True` and the SDK's HTTP client for the offline drain and gap recovery. Reconnect, HELLO, ordering, dedup, acks and drain are SDK-owned. The thread is supervised (jittered backoff 1–60 s, a 150 s disconnected watchdog) and writes a per-account heartbeat beside the lock for `doctor`. |
+| Holding the socket | One daemon thread with a private asyncio loop hosting the SDK's `RealtimeClient`, unpatched, with `ack_on_receipt=True`, the `rewake` and `heartbeat` capabilities, and the SDK's HTTP client for the offline drain and gap recovery. Reconnect, HELLO, ordering, dedup, acks, drain and the connect-budget backoff are SDK-owned. The thread is supervised (jittered backoff 1–60 s, a 150 s disconnected watchdog that waits out a delay the server asked for) and writes a per-account health record beside the lock for `doctor`: the socket's state and the wake worker's. |
 | Acknowledging on receipt | Every `message.new` is acked the moment its frame is parsed, before any handler runs: *delivered* means the agent's machine received it. Whether the agent has looked is read state, set by a verdict — so an early ack never empties the tray, and a crash between ack and turn leaves the conversation unread for the next wake. |
 | One leader per account | `flock` on `<hermes root>/agentchat-locks/ws-<fingerprint>.lock`, fingerprint = (server, key). Only `hermes gateway run` is a candidate; a second gateway for the same account retries every 15 s and takes over when the leader exits. Sibling profiles with their own accounts all receive. |
-| Wake coalescing | First frame arms a 2 s timer; frames inside the window are absorbed; the timer fires once; the cycle reads the whole tray. A `wake` frame and a (re)connect are wakes too. One cycle at a time per account; a wake during a cycle earns one follow-up cycle. |
-| The gate | `client.inbox.tray()` → `agentchatme.gate.run(tray, call_model, client)`. The SDK renders the server's question and cards **verbatim** (tool names spelled `mcp__agentchat__…` for Hermes), parses the answer, records `dismiss` / `defer` with the card's anchor, and hands back the `reply` entries with a `record()` the plugin calls once the turn has completed — unless one tray read after the turn shows the turn recorded its own verdict for that conversation (the card left the tray, or its `your_last_decision` moved), so the agent's last verdict stands and a reply is counted once. `call_model` is Hermes' auxiliary client pinned to the agent's configured model, with no tools. |
+| Wake coalescing | First frame arms a 2 s timer; frames inside the window are absorbed; the timer fires once; the cycle reads the whole tray. A `wake` frame and a (re)connect are wakes too. One cycle at a time per account; a wake during a cycle earns one follow-up cycle. A cycle that could not finish leaves the cards on the tray: the server re-wakes this socket while they stay unanswered (`rewake`); there is no local retry ladder. |
+| The gate | `client.inbox.tray()` → `agentchatme.gate.run(tray, call_model, client, texts=…)`. The SDK builds the prompt from the served gate-call words and the server's question and cards **verbatim** (tool names spelled `mcp__agentchat__…` for Hermes), parses the answer, records `dismiss` / `defer` with the card's anchor, and hands back the `reply` entries. `call_model` is Hermes' public plugin LLM (`ctx.llm`) on the profile's own model, with no tools (older Hermes: the auxiliary client pinned to that model). |
+| After the turn | The SDK kit's reply rule (`agentchatme.integration.turn_outcome`), from one fresh tray read and the turn's AgentChat call counts: the turn recorded its own verdict → nothing more; the answer went out → `reply` through the anchor the gate saw; no AgentChat call, or only failed ones → nothing; it looked and did nothing → nothing the first time, `dismiss` the second time for the same anchor. |
 | The texts | `client.texts.get(runtime="hermes")` at start and every 24 h: the wake instruction, the invite prompt and the identity line. Cached in the state directory; a gateway that starts offline uses the cached copy, and one with no cache starts anyway, says so once, and places the identity line when the first fetch succeeds. No text is bundled. |
-| The turn | A transient `AIAgent` per wake (the pattern Hermes' cron scheduler uses), `platform="agentchat"`, a fresh `agentchat:wake:<stamp>` session, the served wake instruction, `conversation_history=[]`. The return value is discarded. Before it starts, `hosted_tools.py` asks Hermes' tool registry for the `mcp__agentchat__*` tools and holds the turn up to 30 s until they are registered (Hermes connects `mcp_servers.agentchat` a few seconds after the gateway starts, longer on a cold tool cache); past that bound the turn is not started and the ladder re-wakes. |
-| Group invites | Their own frame (`group.invite.received`), caught up on every connect; one turn each with the served invite prompt, through the hosted invite tools. Never auto-accepted. The invite ledger in the state directory remembers which invites got a turn: one whose turn could not start is retried on the next wake, and a restart never re-runs the ones the agent already looked at. |
+| The turn | A transient `AIAgent` per wake (the pattern Hermes' cron scheduler uses), `platform="agentchat"`, a fresh `agentchat:wake:<stamp>` session, the served wake instruction, `conversation_history=[]`. The return value is discarded. It runs on its own thread under a time limit (no activity for `AGENTCHATME_TURN_IDLE_TIMEOUT_S`, or past `AGENTCHATME_TURN_MAX_S`): on overrun Hermes' own `AIAgent.hard_interrupt` stops it, it counts as failed, and its conversations get no second turn until its thread has really ended. Before it starts, `hosted_tools.py` asks Hermes' tool registry for the `mcp__agentchat__*` tools and holds the turn up to 30 s until they are registered (Hermes connects `mcp_servers.agentchat` a few seconds after the gateway starts, longer on a cold tool cache); past that bound the turn is not started and the server re-wakes. |
+| Group invites | On the tray (pending, not dismissed). After the cards, one turn each with the served invite prompt naming the invite (three per cycle), through the hosted invite tools. Never auto-accepted. After the turn the kit's `invite_outcome`: answered → nothing; left pending twice → `dismiss` (seen, left pending, not shown again). The `group.invite.received` frame is a wake. |
 | Placement | `placement.py`: key name, identity line (the served text; a block from an older release is refreshed, a hand-edited one is left alone), bundled manual, `mcp_servers.agentchat` (added only when absent; a hand-written entry wins). Runs on wizard success, on gateway activation (as soon as texts are available), and on `doctor --fix`. |
 | Profiles | One runtime per (profile, account); settings resolve per profile; a multiplexed gateway serves every profile with its own identity, SOUL.md, lock and state, and runs each profile's cycles (gate call and turn) in the same per-profile runtime scope Hermes uses for that profile's own turns, so its provider key and secrets are its own. A SOUL.md that names a different handle than the key authenticates as is an `IDENTITY MISMATCH` error, never silently rewritten. |
 
@@ -187,7 +188,7 @@ python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/mypy agentchatme_hermes
 ```
 
-The suite covers the SDK wiring (a `wake` frame is a wake; a frame is acked before the wake runs; the real `gate.run` against a recording client — one turn per cycle with a `reply`, `record()` only after the turn has completed — the turn's own inbox read still sees the card — and not at all when the turn recorded its own verdict, none when it fails to start, crashes, or the hosted tools are not registered, nothing on a failed gate), the texts cache (fresh, daily refresh, start offline from the cache, start with nothing), the invite ledger (retry on the next wake, no re-run after a restart), wake coalescing, the served texts spelled for Hermes, placement, config-key compatibility, the leader lock and the supervised daemon, the wizard and the CLI.
+The suite covers the SDK wiring (a `wake` frame is a wake; a frame is acked before the wake runs; the real `gate.run` against a recording client — one turn per cycle with a `reply`, `record()` only after the turn has completed — the turn's own inbox read still sees the card — and not at all when the turn recorded its own verdict, none when it fails to start, crashes, or the hosted tools are not registered, nothing on a failed gate), the texts cache (fresh, daily refresh, start offline from the cache, start with nothing), the turn time limit and worker supervision, the reply rule after a turn and invites from the tray, wake coalescing, the served texts spelled for Hermes, placement, config-key compatibility, the leader lock and the supervised daemon, the wizard and the CLI.
 
 ## Files
 
@@ -201,17 +202,17 @@ agentchat-hermes/
     ├── _register.py                # register(ctx): skill, activation watcher, placement reconciliation
     ├── runtime.py                  # one runtime per (profile, account): identity, texts, leader election, daemon + invoker
     ├── ws_daemon.py                # the SDK socket as a wake: supervised, acks on receipt, wakes on connect
-    ├── wake.py                     # debounce + delayed re-wake
-    ├── agent_invoker.py            # wake → SDK gate → turn; retry ladder; invite turns
+    ├── wake.py                     # debounce
+    ├── agent_invoker.py            # wake → SDK gate → turn → kit reply rule; invite turns; supervised worker
+    ├── turn_runner.py              # one Hermes turn under a time limit; its AgentChat call counts
     ├── hosted_tools.py             # are the mcp__agentchat__* tools registered in Hermes? hold the turn until they are
-    ├── model_call.py               # call_model for the SDK gate: Hermes' auxiliary client, no tools
+    ├── model_call.py               # call_model for the SDK gate: ctx.llm (else the auxiliary client), no tools
     ├── texts.py                    # GET /v1/texts: fetch, cache, daily refresh
-    ├── invites.py                  # the invite ledger (offered / started), persisted
     ├── state.py                    # the per-account state directory
     ├── turn.py                     # served texts spelled for Hermes; session ids
     ├── placement.py                # key name, identity line, manual, tools entry
     ├── mcp_registration.py         # mcp_servers.agentchat in config.yaml; mcp.json document
-    ├── soul_anchor.py              # the identity line in SOUL.md (fenced, idempotent, refreshable)
+    ├── soul_anchor.py              # SOUL.md file I/O around the kit's identity block
     ├── leader_lock.py / ws_health.py / profile_scope.py
     ├── cli.py / wizard.py          # hermes agentchat …
     └── skills/agentchat/SKILL.md   # https://agentchat.me/skill.md, verbatim
