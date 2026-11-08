@@ -15,6 +15,10 @@ the dependency floor is set to that SDK version at release.
   failed ones → nothing; it looked and did nothing → nothing the first time, `dismiss` (`no_action_needed`) the second time for the
   same anchor. A failed tray read after the turn now records nothing (it recorded `reply` before); the card stays and the next wake
   looks again. The local post-turn comparison it replaces is deleted.
+- **The SOUL.md identity block is the kit's.** Rendering, finding (handle line, served template, earlier wordings), replacing and
+  removing the block are `agentchatme.integration.anchor`, shared with every integration; this package only picks and writes the
+  file. New: a legacy `agentchat-skill` block is replaced instead of left beside ours, and a line that does not name the agent is
+  refused before anything is written (it was written, then reported).
 - **The gate prompt's own words are served.** The SDK gate builds its prompt from `gate_call_preamble` / `gate_call_answer_format` in
   `GET /v1/texts?runtime=hermes`; without them it fails closed (nothing recorded, no turn).
 

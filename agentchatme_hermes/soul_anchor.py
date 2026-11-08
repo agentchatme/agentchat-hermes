@@ -24,15 +24,15 @@ user-content-preserving.
 
 Recognising our own block
 ─────────────────────────
-The served wording may change at any time, and the refresh must keep
-working across any number of rewords — including rewords that happened
-while the gateway was down. So the block carries its own identity: a
-one-line HTML comment naming the handle (``<!-- agentchat:handle ops -->``)
-right after the opening marker. :func:`read_anchor_handle` reads that
-first. Blocks written by earlier releases have no such line; for those the
-served ``identity_line_template`` and the two shapes earlier releases wrote
-are recognised. A block in none of these shapes was hand-edited and is the
-user's: left alone, and ``doctor`` says so.
+The block's text and its parsing are the SDK kit's
+(``agentchatme.integration.anchor``, one copy for every integration, pinned by
+the shared conformance cases): the fences, a one-line handle comment
+(``<!-- agentchat:handle ops -->``) so a block is recognised whatever the
+served wording becomes, recognition of unmarked blocks by the served
+``identity_line_template`` and by the wordings earlier releases wrote, and
+the legacy ``agentchat-skill`` markers. A block in none of these shapes was
+hand-edited and is the user's: left alone, and ``doctor`` says so. This
+module only picks the file (the profile's ``SOUL.md``) and reads and writes it.
 
 Lifecycle
 ─────────
@@ -48,64 +48,45 @@ orphan  — if the user uninstalls the package without running ``logout``,
 from __future__ import annotations
 
 import logging
-import re
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from agentchatme.integration import anchor
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
 logger = logging.getLogger(__name__)
 
-# Marker pair shared with the OpenClaw plugin
-# (agentchat-openclaw/src/binding/agents-anchor.ts:63-64). Identical so a
-# user who somehow ends up with both plugins on a shared workspace sees
-# one canonical block, not two competing copies of the same identity.
-ANCHOR_START = "<!-- agentchat:start -->"
-ANCHOR_END = "<!-- agentchat:end -->"
-
-# The handle line inside our block: shape-independent recognition.
-HANDLE_MARKER_PREFIX = "<!-- agentchat:handle "
-HANDLE_MARKER_SUFFIX = " -->"
-_HANDLE_MARKER_RE = re.compile(r"<!-- agentchat:handle @?([a-z0-9][a-z0-9-]*) -->")
-
-_HANDLE_PLACEHOLDER = "<handle>"
-_HANDLE_RE = r"@?([a-z0-9][a-z0-9-]*)"
+# The kit's markers (shared with every integration, so a workspace that ends
+# up with two integrations sees one canonical block, not two).
+ANCHOR_START = anchor.START_MARKER
+ANCHOR_END = anchor.END_MARKER
 
 
 class AnchorError(RuntimeError):
-    """Raised when the anchor write produces a file we cannot verify.
+    """The identity block could not be written as asked.
 
-    Specifically: the post-write verify-handle check found that the
-    literal ``@<handle>`` did not land in the file. That means the line
-    we were given does not name this agent — fail loud at wizard time so
-    the operator can fix it before the agent reads a wrong identity on
-    every turn forever.
+    The line given does not name this agent (or the handle is empty): fail
+    loud at wizard time so the operator can fix it before the agent reads a
+    wrong identity on every turn.
     """
 
 
-def normalize_handle(handle: str) -> str:
-    """Handles are canonical lowercase on the wire; strip ``@`` and whitespace."""
-    return handle.strip().lstrip("@").lower()
-
-
-def render_handle_marker(handle: str) -> str:
-    return f"{HANDLE_MARKER_PREFIX}{normalize_handle(handle)}{HANDLE_MARKER_SUFFIX}"
+normalize_handle = anchor.normalize_handle
+render_handle_marker = anchor.handle_line
 
 
 def render_anchor_block(identity_line: str, *, handle: str) -> str:
-    """The fenced block to inject into SOUL.md: markers, the handle line, the served line.
+    """The fenced block for SOUL.md: markers, the handle line, the served line.
 
     Raises:
-        AnchorError: if the line or the handle is empty.
+        AnchorError: the handle is empty or the line does not name ``@handle``.
     """
-    line = identity_line.strip()
-    if not line:
-        raise AnchorError("render_anchor_block: identity line is empty")
-    trimmed = normalize_handle(handle)
-    if not trimmed:
-        raise AnchorError("render_anchor_block: handle is empty")
-    return "\n".join([ANCHOR_START, render_handle_marker(trimmed), line, ANCHOR_END])
+    try:
+        return anchor.render({"identity_line": identity_line, "identity_line_template": ""}, handle)
+    except ValueError as exc:
+        raise AnchorError(str(exc)) from exc
 
 
 def resolve_soul_path() -> Path:
@@ -130,14 +111,12 @@ def write_soul_anchor(identity_line: str, *, handle: str, soul_path: Path | None
 
     Mechanics:
     * Resolves SOUL.md (uses provided ``soul_path`` for tests).
+    * Refuses a line that does not name ``@handle`` before writing.
     * Creates the file (and parent dirs) if missing.
-    * If our markers are present, replaces the existing block in place.
-    * If markers absent, appends the block, separated by a blank line
-      from any existing content.
-    * Reads the file back and asserts the literal ``@<handle>`` is
-      present. Raises :class:`AnchorError` if not — mirrors the
-      ``grep -qF "@${HANDLE}"`` defense the OpenClaw plugin and the
-      universal-skill path both use.
+    * Replaces the first block in place and removes any other (current or
+      legacy); appends the block after a blank line when there is none
+      (``agentchatme.integration.anchor.replace``).
+    * Reads the file back and checks the block names ``@<handle>``.
 
     Returns:
         The :class:`Path` of the file that was written.
@@ -149,28 +128,19 @@ def write_soul_anchor(identity_line: str, *, handle: str, soul_path: Path | None
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
     trimmed = normalize_handle(handle)
-    if not trimmed:
-        raise AnchorError("write_soul_anchor: handle is empty")
-
+    # Checked before anything is written: a line that names nobody (or
+    # somebody else) must not reach the system prompt.
     block = render_anchor_block(identity_line, handle=trimmed)
 
     target.parent.mkdir(parents=True, exist_ok=True)
     existing = target.read_text(encoding="utf-8") if target.exists() else ""
-    next_content = _upsert_anchor_block(existing, block)
-    target.write_text(next_content, encoding="utf-8")
+    target.write_text(anchor.replace(existing, block), encoding="utf-8")
 
-    # Post-write verify — the identity defense. The served line carries
-    # the handle the key authenticates as; a line that names nobody (or
-    # somebody else) must not sit in the system prompt forever. The handle
-    # marker alone does not satisfy this: the check is on the text the
-    # model reads.
-    verify = target.read_text(encoding="utf-8")
-    body = _split_marker(_anchor_inner(verify) or "")[1]
-    if f"@{trimmed}" not in body:
+    found = anchor.find(target.read_text(encoding="utf-8"))
+    if found is None or found.handle != trimmed or f"@{trimmed}" not in found.body:
         raise AnchorError(
-            f"write_soul_anchor: handle @{trimmed} did not land in "
-            f"{target} — the identity line does not name this agent; remove the "
-            "agentchat anchor manually and re-run.",
+            f"write_soul_anchor: handle @{trimmed} did not land in {target} — remove the "
+            "agentchat block manually and re-run.",
         )
 
     logger.info("SOUL.md anchor upserted for @%s at %s", trimmed, target)
@@ -192,60 +162,15 @@ def has_anchor(*, soul_path: Path | None = None) -> bool:
     re-run the wizard to upsert a fresh block in place.
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
-    if not target.exists():
-        return False
+    content = _read(target)
+    return content is not None and anchor.find(content) is not None
+
+
+def _read(path: Path) -> str | None:
     try:
-        content = target.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
     except OSError:
-        return False
-    return ANCHOR_START in content and ANCHOR_END in content
-
-
-# The shapes of blocks earlier releases wrote without a handle line, so an
-# anchor from any of them is still recognised (and refreshed, see
-# :func:`anchor_is_current`): 0.3.0's "I am @handle on AgentChat", then
-# the pre-v3 "You are **@handle** on AgentChat". A block in none of the
-# recognised shapes was hand-edited and is the user's.
-_ANCHOR_HANDLE_RES = (
-    re.compile(r"I am @([a-z0-9][a-z0-9-]*) on AgentChat"),
-    re.compile(r"You are \*\*@([a-z0-9][a-z0-9-]*)\*\* on AgentChat"),
-)
-
-
-def _template_pattern(template: str | None) -> re.Pattern[str] | None:
-    """A recogniser built from a served ``identity_line_template``.
-
-    Anchored on the words before ``<handle>`` (whitespace normalised so a
-    reflowed block still matches); when the handle opens the template, on
-    the first words after it instead.
-    """
-    if not template or _HANDLE_PLACEHOLDER not in template:
         return None
-    head, _sep, tail = template.partition(_HANDLE_PLACEHOLDER)
-    prefix = " ".join(head.split())
-    if prefix:
-        return re.compile(re.escape(prefix) + r"\s*" + _HANDLE_RE)
-    suffix = " ".join(tail.split()[:3])
-    if not suffix:
-        return None
-    return re.compile(_HANDLE_RE + r"\s*" + re.escape(suffix))
-
-
-def _anchor_inner(content: str) -> str | None:
-    """The text between the markers, or ``None`` when there is no block."""
-    start_idx = content.find(ANCHOR_START)
-    end_idx = content.find(ANCHOR_END)
-    if start_idx < 0 or end_idx < 0 or end_idx < start_idx:
-        return None
-    return content[start_idx + len(ANCHOR_START) : end_idx]
-
-
-def _split_marker(inner: str) -> tuple[str | None, str]:
-    """``(handle from the marker line, the rest)`` of a block's inner text."""
-    match = _HANDLE_MARKER_RE.search(inner)
-    if match is None:
-        return None, inner
-    return match.group(1), inner[: match.start()] + inner[match.end() :]
 
 
 def read_anchor_handle(
@@ -256,37 +181,28 @@ def read_anchor_handle(
 ) -> str | None:
     """Return the handle named inside the fenced block, or ``None``.
 
-    The block's own handle line wins. Without one (a block written by an
-    earlier release), the served ``template`` (and any further
-    ``templates``) and the shapes earlier releases wrote are tried.
-    ``None`` when the file or the markers are absent, or when the block
-    was hand-edited into a shape we do not recognise. Used at plugin start
-    to detect a profile whose SOUL.md says one identity while its API key
-    authenticates as another — the mix-up behind the September 2026 fleet
-    incident, where a profile labelled *Growth* was sending as *Operations*.
+    The block's own handle line wins; without one (a block written by an
+    earlier release) the served ``template`` (and any further ``templates``)
+    and the wordings earlier releases wrote are tried. ``None`` when the
+    file or the block is absent, or the block was hand-edited into a shape
+    not recognised. Used at plugin start to detect a profile whose SOUL.md
+    says one identity while its API key authenticates as another — the
+    mix-up behind the September 2026 fleet incident, where a profile
+    labelled *Growth* was sending as *Operations*.
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
-    try:
-        content = target.read_text(encoding="utf-8")
-    except OSError:
+    content = _read(target)
+    if content is None:
         return None
-    inner = _anchor_inner(content)
-    if inner is None:
-        return None
-    marked, body = _split_marker(inner)
-    if marked is not None:
-        return marked
-    patterns: list[re.Pattern[str]] = []
-    for candidate in (template, *templates):
-        pattern = _template_pattern(candidate)
-        if pattern is not None:
-            patterns.append(pattern)
-    patterns.extend(_ANCHOR_HANDLE_RES)
-    normalised = " ".join(body.split())
-    for pattern in patterns:
-        match = pattern.search(normalised) or pattern.search(body)
-        if match:
-            return match.group(1)
+    # The kit always tries the handle line and the earlier wordings; each
+    # served template is one more way to recognise an unmarked block.
+    candidates: list[str | None] = [t for t in (template, *templates) if t]
+    for candidate in candidates or [None]:
+        found = anchor.find(content, template=candidate)
+        if found is None:
+            return None
+        if found.handle is not None:
+            return found.handle
     return None
 
 
@@ -300,87 +216,33 @@ def anchor_is_current(
     recognise (a hand-edited block is the user's, and is left alone).
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
-    if read_anchor_handle(soul_path=target, template=template) is None:
+    content = _read(target)
+    found = anchor.find(content, template=template) if content is not None else None
+    if found is None or found.handle is None:
         return None
-    inner = _anchor_inner(target.read_text(encoding="utf-8"))
-    if inner is None:
-        return None
-    _marked, body = _split_marker(inner)
-    return body.strip() == identity_line.strip()
+    return found.body.strip() == identity_line.strip()
 
 
 def remove_soul_anchor(*, soul_path: Path | None = None) -> bool:
     """Idempotently strip the AgentChat identity block from SOUL.md.
 
     Returns:
-        ``True`` if the block was found and removed, ``False`` if the
-        file or markers were absent.
+        ``True`` if a block was found and removed, ``False`` if the file or
+        the block was absent.
 
     Notes:
-        If the file becomes empty after stripping, it is left as an
-        empty file (not deleted) — Hermes treats absent and empty the
-        same way (``prompt_builder.py:1321-1323`` skips empty content).
+        If the file becomes empty after stripping, it is left as an empty
+        file (not deleted) — Hermes treats absent and empty the same way.
         Removing the file might surprise a user who hand-wrote other
-        content there and saw it disappear after we ran our strip; an
-        empty file is the safer default.
+        content there; an empty file is the safer default.
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
-    if not target.exists():
+    existing = _read(target)
+    if existing is None:
         return False
-
-    existing = target.read_text(encoding="utf-8")
-    stripped = _strip_anchor_block(existing)
+    stripped = anchor.remove(existing)
     if stripped == existing:
         return False
-
     target.write_text(stripped, encoding="utf-8")
     logger.info("SOUL.md anchor removed from %s", target)
     return True
-
-
-# ─── pure string helpers (extracted for unit testability) ──────────────────
-
-
-def _upsert_anchor_block(existing: str, block: str) -> str:
-    """Replace fenced block in-place, or append if absent.
-
-    Surrounding newlines are normalised so repeated runs don't
-    accumulate blank-line drift. Mirrors ``upsertAnchorBlock`` in
-    ``agents-anchor.ts:224-241`` of the OpenClaw plugin.
-    """
-    start_idx = existing.find(ANCHOR_START)
-    end_idx = existing.find(ANCHOR_END)
-    if start_idx >= 0 and end_idx >= 0 and end_idx > start_idx:
-        before = existing[:start_idx].rstrip("\n")
-        after = existing[end_idx + len(ANCHOR_END) :].lstrip("\n")
-        parts = [s for s in (before, block, after) if s]
-        return "\n\n".join(parts) + "\n"
-
-    trimmed = existing.rstrip("\n")
-    if not trimmed:
-        return block + "\n"
-    return trimmed + "\n\n" + block + "\n"
-
-
-def _strip_anchor_block(existing: str) -> str:
-    """Remove the fenced block, normalising surrounding newlines.
-
-    Mirrors ``stripBlockBetween`` in ``agents-anchor.ts:261-273`` —
-    handles the four cases (only block, leading content, trailing
-    content, sandwiched content) uniformly so the result file never
-    has stray blank lines from the strip.
-    """
-    start_idx = existing.find(ANCHOR_START)
-    end_idx = existing.find(ANCHOR_END)
-    if start_idx < 0 or end_idx < 0 or end_idx <= start_idx:
-        return existing
-
-    before = existing[:start_idx].rstrip("\n")
-    after = existing[end_idx + len(ANCHOR_END) :].lstrip("\n")
-    if not before and not after:
-        return ""
-    if not before:
-        return after if after.endswith("\n") else after + "\n"
-    if not after:
-        return before + "\n"
-    return before + "\n\n" + after + ("" if after.endswith("\n") else "\n")
