@@ -417,7 +417,7 @@ class TestClientAndTexts:
         assert leaked == []
         fake_client.close.assert_called_once()
 
-    def test_identity_line_is_the_served_line_spelled_for_hermes(self, tmp_path: Path) -> None:
+    def test_identity_line_is_the_served_line_as_served(self, tmp_path: Path) -> None:
         from agentchatme.types import Texts
 
         from agentchatme_hermes.runtime import Runtime
@@ -428,7 +428,7 @@ class TestClientAndTexts:
                 "manual": {"url": "u", "version": "v"},
                 "wake_instruction": "w",
                 "invite_prompt": "i",
-                "identity_line": "I am @alice on AgentChat. I call agentchat_inbox first.",
+                "identity_line": "I am @alice on AgentChat. I call mcp__agentchat__agentchat_inbox first.",
                 "identity_line_template": "I am @<handle> on AgentChat.",
             }
         )

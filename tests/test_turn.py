@@ -1,4 +1,4 @@
-"""Tests for ``agentchatme_hermes.turn`` — the served texts, spelled for Hermes."""
+"""Tests for ``agentchatme_hermes.turn`` — the served texts, used as served for Hermes."""
 from __future__ import annotations
 
 import re
@@ -15,31 +15,30 @@ from agentchatme_hermes.turn import (
     invite_session_id,
     invite_turn_prompt,
     mcp_tool_name,
-    spell_hosted_tools,
     wake_session_id,
     wake_turn_prompt,
 )
 
-# Shapes like the server's, with bare tool names (what ``?runtime=hermes``
-# serves today). Test data, not product text.
+# Shapes like the server's, as ``?runtime=hermes`` serves them: hosted tool
+# names already spelled the way Hermes shows them. Test data, not product text.
 TEXTS = Texts.model_validate(
     {
         "version": "1",
         "runtime": "hermes",
         "manual": {"url": "https://agentchat.me/skill.md", "version": "2.1.2"},
         "wake_instruction": (
-            "You were woken by AgentChat. Call agentchat_inbox first, then record "
-            "agentchat_decide or read with agentchat_get_conversation and reply with "
-            "agentchat_send_message."
+            "You were woken by AgentChat. Call mcp__agentchat__agentchat_inbox first, then record "
+            "mcp__agentchat__agentchat_decide or read with mcp__agentchat__agentchat_get_conversation and reply with "
+            "mcp__agentchat__agentchat_send_message."
         ),
         "invite_prompt": (
-            "A group invitation is pending. Call agentchat_list_group_invites first; "
-            "accept with agentchat_accept_group_invite or decline with "
-            "agentchat_reject_group_invite."
+            "A group invitation is pending. Call mcp__agentchat__agentchat_list_group_invites first; "
+            "accept with mcp__agentchat__agentchat_accept_group_invite or decline with "
+            "mcp__agentchat__agentchat_reject_group_invite."
         ),
         "identity_line": (
             "I am @alice on AgentChat (api.agentchat.me). On any AgentChat wake I call\n"
-            "agentchat_inbox first and decide per card."
+            "mcp__agentchat__agentchat_inbox first and decide per card."
         ),
         "identity_line_template": "I am @<handle> on AgentChat (api.agentchat.me).",
     }
@@ -72,21 +71,12 @@ class TestToolNames:
             assert len(mcp_tool_name(tool)) <= 64
 
 
-class TestSpelling:
-    def test_bare_hosted_names_become_hermes_names(self) -> None:
-        out = spell_hosted_tools("call agentchat_inbox, then agentchat_decide.")
-        assert out == "call mcp__agentchat__agentchat_inbox, then mcp__agentchat__agentchat_decide."
-
-    def test_idempotent(self) -> None:
-        once = spell_hosted_tools(TEXTS.wake_instruction)
-        assert spell_hosted_tools(once) == once
-        assert "mcp__agentchat__mcp__" not in once
-
-    def test_only_hosted_tool_tokens_change(self) -> None:
-        text = "AgentChat and agentchat.me and api.agentchat.me/mcp stay; agentchat_x goes."
-        assert spell_hosted_tools(text) == (
-            "AgentChat and agentchat.me and api.agentchat.me/mcp stay; mcp__agentchat__agentchat_x goes."
-        )
+class TestAsServed:
+    def test_texts_are_used_verbatim(self) -> None:
+        """No re-spelling, no text of our own inside the served words."""
+        assert wake_turn_prompt(TEXTS).startswith(TEXTS.wake_instruction.strip())
+        assert invite_turn_prompt(TEXTS).startswith(TEXTS.invite_prompt.strip())
+        assert identity_line(TEXTS) == TEXTS.identity_line.strip()
 
 
 class TestWakePrompt:
@@ -105,7 +95,7 @@ class TestWakePrompt:
     def test_states_the_gates_reply_ids_and_nothing_else(self) -> None:
         prompt = wake_turn_prompt(TEXTS, ("conv_a", "conv_b"))
         assert "decided to answer: conv_a, conv_b." in prompt
-        assert prompt.startswith(spell_hosted_tools(TEXTS.wake_instruction))
+        assert prompt.startswith(TEXTS.wake_instruction.strip())
         assert prompt.endswith(MANUAL_POINTER)
         assert "preview" not in prompt
         assert wake_turn_prompt(TEXTS, ()) == wake_turn_prompt(TEXTS)
@@ -116,7 +106,7 @@ class TestWakePrompt:
 
     def test_no_text_of_our_own_beyond_the_two_facts(self) -> None:
         prompt = wake_turn_prompt(TEXTS, ("conv_a",))
-        ours = prompt.replace(spell_hosted_tools(TEXTS.wake_instruction), "", 1)
+        ours = prompt.replace(TEXTS.wake_instruction.strip(), "", 1)
         ours = ours.replace(MANUAL_POINTER, "", 1)
         assert ours.strip() == (
             "The gate step before this turn decided to answer: conv_a. Any other card on the "

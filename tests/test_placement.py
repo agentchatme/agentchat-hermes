@@ -109,12 +109,12 @@ class TestResolveIdentityLine:
                 "manual": {"url": "https://agentchat.me/skill.md", "version": "2.1.2"},
                 "wake_instruction": "w",
                 "invite_prompt": "i",
-                "identity_line": "I am @alice on AgentChat. I call agentchat_inbox first.",
+                "identity_line": "I am @alice on AgentChat. I call mcp__agentchat__agentchat_inbox first.",
                 "identity_line_template": "I am @<handle> on AgentChat.",
             }
         )
 
-    def test_served_line_is_spelled_for_hermes(
+    def test_served_line_is_placed_as_served(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         seen: dict[str, Any] = {}

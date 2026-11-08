@@ -5,7 +5,7 @@
    The pre-v3 name ``AGENTCHATME_API_KEY`` is still read, and is kept in
    step while it exists so a downgrade keeps working.
 2. **The identity line** — the served ``identity_line`` (``GET /v1/texts``,
-   spelled for Hermes by :mod:`.turn`) into ``SOUL.md`` (:mod:`.soul_anchor`),
+   served spelled for Hermes) into ``SOUL.md`` (:mod:`.soul_anchor`),
    the file Hermes loads into every turn. Nothing is placed when the texts
    cannot be fetched and nothing is cached; the gateway places the line as
    soon as a fetch succeeds.
@@ -112,7 +112,7 @@ def resolve_identity_line(
     hermes_home: Path | None = None,
     state_dir: Path | None = None,
 ) -> str | None:
-    """The served identity line for the account behind ``api_key``, spelled for Hermes.
+    """The served identity line for the account behind ``api_key``, as served for Hermes.
 
     One fetch through the SDK (writing the account's texts cache), else the
     cached copy, else ``None``. For the wizard, the CLI and ``doctor``,

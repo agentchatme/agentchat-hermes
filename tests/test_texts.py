@@ -316,3 +316,33 @@ class TestStore:
             assert loaded.texts.wake_instruction == "From server."
         finally:
             second.stop()
+
+
+def test_a_version_1_cache_is_not_read(tmp_path: Path) -> None:
+    """A copy cached before the texts were served spelled for Hermes may name
+    the hosted tools bare; it is never used (the next fetch rewrites it)."""
+    import json as _json
+
+    from agentchatme_hermes.texts import CACHE_VERSION, read_cache
+
+    path = tmp_path / "texts.json"
+    path.write_text(
+        _json.dumps(
+            {
+                "version": 1,
+                "runtime": "hermes",
+                "fetched_at": 1.0,
+                "texts": {
+                    "version": "1",
+                    "manual": {"url": "https://agentchat.me/skill.md", "version": "2.1.2"},
+                    "wake_instruction": "Call agentchat_inbox first.",
+                    "invite_prompt": "i",
+                    "identity_line": "I am @a on AgentChat.",
+                    "identity_line_template": "I am @<handle> on AgentChat.",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert CACHE_VERSION == 2
+    assert read_cache(path) is None

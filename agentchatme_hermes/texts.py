@@ -18,8 +18,8 @@ Start-up policy
   trying; the first success fires :meth:`TextsStore.on_texts` callbacks so
   the identity line is placed late rather than never).
 
-Nothing here spells tool names: :mod:`.turn` renders the served texts the
-way Hermes names the hosted tools.
+Nothing here spells tool names: the server serves the texts spelled for
+Hermes (``runtime=hermes``).
 """
 from __future__ import annotations
 
@@ -45,7 +45,11 @@ TEXTS_RUNTIME = "hermes"
 REFRESH_INTERVAL_S = 24 * 60 * 60.0
 RETRY_INTERVAL_S = 5 * 60.0
 RETRY_MAX_S = 60 * 60.0
-CACHE_VERSION = 1
+# 2: the served texts are used as served (spelled for runtime=hermes by the
+# server since November 2026). A version-1 file may hold a copy from before
+# that, with bare tool names; it is not read, so such a copy can never reach
+# the model — the next fetch writes a version-2 file.
+CACHE_VERSION = 2
 
 TextsSource = Literal["server", "cache"]
 TextsCallback = Callable[["Texts"], None]

@@ -29,6 +29,9 @@ the dependency floor is set to that SDK version at release.
 - **The socket watchdog honours the server's delay.** Over the connect budget the server answers 429 / close 1013 with a delay (up
   to an hour); the daemon's wedged-client watchdog no longer replaces the client while the SDK waits it out (or while it retries
   slowly after an auth rejection), so it does not reconnect against the server's word.
+- **The served texts are used as served.** The server spells every text it serves for `runtime=hermes` with Hermes' tool names
+  (`mcp__agentchat__…`); the plugin's own re-spelling is deleted. The texts cache file moves to version 2, so a copy cached before
+  that (bare names) is never used; the next fetch rewrites it.
 - **The SOUL.md identity block is the kit's.** Rendering, finding (handle line, served template, earlier wordings), replacing and
   removing the block are `agentchatme.integration.anchor`, shared with every integration; this package only picks and writes the
   file. New: a legacy `agentchat-skill` block is replaced instead of left beside ours, and a line that does not name the agent is

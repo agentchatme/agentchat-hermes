@@ -170,12 +170,12 @@ class Runtime:
         return self._texts.get() if self._texts is not None else None
 
     def identity_line(self) -> str | None:
-        """The served identity line for this agent, spelled for Hermes; ``None`` without texts."""
+        """The served identity line for this agent (served spelled for Hermes); ``None`` without texts."""
         texts = self.texts
         return render_identity_line(texts) if texts is not None else None
 
     def identity_line_template(self) -> str | None:
-        """The served template (``<handle>`` unfilled), spelled for Hermes; ``None`` without texts."""
+        """The served template (``<handle>`` unfilled); ``None`` without texts."""
         texts = self.texts
         return render_identity_line_template(texts) if texts is not None else None
 
