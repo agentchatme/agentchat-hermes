@@ -89,3 +89,36 @@ git worktree add .worktrees/<branch> -b <branch> origin/main
 `.worktrees/` is ignored by git. The CI gate is `ruff check .`,
 `mypy agentchatme_hermes` and `pytest -q` on Python 3.9–3.13 (Linux) plus a
 macOS and a Windows smoke run; run all three locally before pushing.
+
+## Developing against an unreleased SDK
+
+The integration is built on the `agentchatme` SDK's kit
+(`agentchatme.integration`). When a change here needs SDK work that is not
+on PyPI yet, install the SDK from its branch into your environment, after
+this package:
+
+```bash
+python -m pip install -e '.[dev]'
+python -m pip install --force-reinstall --no-deps \
+  "agentchatme @ git+https://github.com/agentchatme/agentchat-python@<branch>"
+```
+
+(or `pip install -e ../agentchat-python` from a local clone). CI installs the
+SDK from PyPI, so such a branch is red on GitHub until that SDK release is
+published; the `agentchatme` floor in `pyproject.toml` moves to that release
+in the same PR.
+
+## Hermes coupling
+
+`docs/hermes-coupling.md` lists every Hermes internal this plugin touches and
+the public hook that would replace each. A change that adds one adds its row
+there and a check in `tests/test_hermes_contract.py`. Those checks run when
+Hermes is importable: locally, from a Hermes checkout,
+
+```bash
+cd hermes-agent && uv sync --locked --python 3.14 --extra mcp
+uv pip install --python .venv/bin/python -e "../agentchat-hermes[dev]"
+cd ../agentchat-hermes && HERMES_HOME="$(mktemp -d)" ../hermes-agent/.venv/bin/python -m pytest -q
+```
+
+and every night in the `hermes-main` workflow against hermes-agent `main`.

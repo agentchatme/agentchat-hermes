@@ -934,6 +934,12 @@ class AgentInvoker:
                     on_finished=lambda: self._running.release(token),
                     on_poll=self._beat,
                 )
+            except BaseException:
+                # Not expected (the runner reports, it does not raise). If it
+                # does, the turn's thread may be running: keep its
+                # conversations held until that thread ends, never release them.
+                self._running.abandon(token)
+                raise
             finally:
                 with self._state_lock:
                     self._current_turn = None
