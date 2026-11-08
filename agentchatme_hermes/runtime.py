@@ -58,6 +58,9 @@ logger = logging.getLogger(__name__)
 # socket without anyone restarting it. Module constant so tests can
 # shrink it.
 LEADER_RETRY_INTERVAL_S = 15.0
+# After the last turn, how long the lock waits for a closing receive loop
+# (it may still be recording a verdict through its own client).
+RECEIVER_EXIT_WAIT_S = 60.0
 
 
 class Runtime:
@@ -403,9 +406,10 @@ class Runtime:
 
     def _teardown_leader_components(self) -> None:
         """Undo :meth:`_start_leader_components` and release the lock."""
-        if self._receiver is not None:
+        receiver = self._receiver
+        if receiver is not None:
             try:
-                self._receiver.stop()
+                receiver.stop()
             except Exception:
                 logger.debug("agentchat runtime: receiver stop raised", exc_info=True)
             self._receiver = None
@@ -416,14 +420,20 @@ class Runtime:
         fd = self._leader_lock_fd
         self._leader_lock_fd = None
         self._is_leader = False
-        self._release_when_idle(invoker, fd, None)
+        self._release_when_idle(invoker, fd, None, receiver)
 
-    def _release_when_idle(self, invoker: AgentInvoker | None, fd: int | None, client: Any) -> None:
-        """Release the leader lock (and close ``client``) once no turn thread
-        runs. A turn interrupted by the stop usually ends at once; one still
-        running keeps the lock, so another instance for this account (a
-        reloaded plugin, a second gateway) stays a follower — and starts no
-        second turn for the same conversation — until it has ended."""
+    def _release_when_idle(
+        self, invoker: AgentInvoker | None, fd: int | None, client: Any, receiver: Receiver | None = None
+    ) -> None:
+        """Release the leader lock (and close ``client``) once no turn is
+        left — none running, none whose outcome is still to be recorded
+        through ``client`` — and the receive loop's thread has exited (it may
+        be recording a verdict through its own client; waited for up to
+        :data:`RECEIVER_EXIT_WAIT_S`). A turn interrupted by the stop usually
+        ends at once; one still running keeps the lock, so another instance
+        for this account (a reloaded plugin, a second gateway) stays a
+        follower — and starts no second turn for the same conversation —
+        until it has ended and its outcome is recorded."""
 
         def release() -> None:
             if client is not None:
@@ -435,13 +445,29 @@ class Runtime:
                 release_leader_lock(fd)
                 logger.info("agentchat runtime: leader lock released (%s)", self._lock_path)
 
-        if invoker is None or invoker.when_idle(release):
-            if invoker is None:
+        def after_the_receiver() -> None:
+            if receiver is None or receiver.wait_exited(0):
                 release()
+                return
+
+            def wait_then_release() -> None:
+                if not receiver.wait_exited(RECEIVER_EXIT_WAIT_S):
+                    logger.warning(
+                        "agentchat runtime: the receive loop's thread did not exit within %.0fs — "
+                        "releasing the leader lock anyway",
+                        RECEIVER_EXIT_WAIT_S,
+                    )
+                release()
+
+            threading.Thread(target=wait_then_release, name="agentchat-lock-release", daemon=True).start()
+
+        if invoker is None or invoker.when_idle(after_the_receiver):
+            if invoker is None:
+                after_the_receiver()
             return
         logger.warning(
             "agentchat runtime: keeping the leader lock for @%s until the running AgentChat turn "
-            "ends — no other instance takes over this account before then",
+            "ends and its outcome is recorded — no other instance takes over this account before then",
             self._identity.handle if self._identity else "?",
         )
 
@@ -450,6 +476,7 @@ class Runtime:
         its thread): give the account to another process once turns end."""
         with self._lock:
             invoker = self._invoker
+            receiver = self._receiver
             fd = self._leader_lock_fd
             self._leader_lock_fd = None
             self._is_leader = False
@@ -458,7 +485,7 @@ class Runtime:
             "receives for @%s; releasing the leader lock once no turn runs",
             self._identity.handle if self._identity else "?",
         )
-        self._release_when_idle(invoker, fd, None)
+        self._release_when_idle(invoker, fd, None, receiver)
 
     def stop(self) -> None:
         with self._lock:
@@ -486,7 +513,7 @@ class Runtime:
         fd = self._leader_lock_fd
         self._leader_lock_fd = None
         self._is_leader = False
-        self._release_when_idle(self._invoker, fd, self._client)
+        self._release_when_idle(self._invoker, fd, self._client, self._receiver)
 
         logger.info("agentchat runtime stopped")
 

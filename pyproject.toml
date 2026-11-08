@@ -82,6 +82,7 @@ include = [
     "SECURITY.md",
     "CONTRIBUTING.md",
     "CHANGELOG.md",
+    "RUNBOOK.md",
 ]
 
 [tool.ruff]

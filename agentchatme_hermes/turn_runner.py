@@ -30,7 +30,8 @@ How it works
 * On overrun (or when the integration stops) the agent is asked to stop
   with ``hard_interrupt`` (``interrupt`` on an agent without it), and the
   thread gets ``grace_s`` to end. Either way the turn is reported
-  ``timeout`` — a failed turn: nothing is recorded for it.
+  ``timeout`` — a failed turn: the reply rule records ``reply`` only if
+  the fresh card shows its answer went out, else nothing.
 * A thread that does not end within the grace keeps running in the
   background; :attr:`TurnReport.finished` is set only when it really ends.
   The caller keeps that turn's conversation held until then (in the kit's
@@ -218,8 +219,8 @@ def run_turn(
 
     reason = INTERRUPT_STOP_REASON if overrun == "stopping" else INTERRUPT_TOOL_REASON
     logger.warning(
-        "AgentInvoker: turn %s overran (%s) — interrupting it; it counts as failed and nothing "
-        "is recorded for it",
+        "AgentInvoker: turn %s overran (%s) — interrupting it; it counts as failed (an answer it "
+        "already sent is still recorded as reply)",
         session_id,
         overrun,
     )
@@ -389,9 +390,11 @@ def count_agentchat_calls(result: Any) -> AgentChatCallCount | None:
     tool's content possibly wrapped as ``<untrusted_tool_result
     source="mcp__agentchat__…">``. A call **succeeded** only when its result
     is Hermes' MCP success shape — a JSON object with ``result`` and no
-    ``error`` (an ``isError`` result is ``{"error": …}``). Anything else
-    counts as failed: an error, Hermes' own stubs ("Error executing tool: …",
-    "[Result unavailable …]"), a result cut short, or a call with no result.
+    ``error`` (an ``isError`` result is ``{"error": …}``), or a large result
+    Hermes persisted out of the transcript (``<persisted-output>``) whose
+    preview is not an error. Anything else counts as failed: an error,
+    Hermes' own stubs ("Error executing tool: …", "[Result unavailable …]"),
+    a result cut short, or a call with no result.
 
     ``None`` when there is no ``messages`` list or Hermes compacted the
     context during the turn (earlier calls may be gone).
@@ -458,19 +461,75 @@ def _content_text(content: Any) -> str:
         return str(content)
 
 
+# Hermes' untrusted-data wrapper around a hosted tool's result
+# (``agent/tool_dispatch_helpers._maybe_wrap_untrusted``).
+_WRAPPER_OPEN = "<untrusted_tool_result"
+_WRAPPER_CLOSE = "</untrusted_tool_result>"
+# Hermes keeps a large result out of the transcript and leaves a preview
+# (``tools/tool_result_storage.maybe_persist_tool_result``): a
+# ``<persisted-output>`` block, or, when it could not save the file, the
+# preview followed by a truncation note.
+PERSISTED_OUTPUT_OPEN = "<persisted-output>"
+PERSISTED_OUTPUT_CLOSE = "</persisted-output>"
+PERSISTED_PREVIEW_LABEL = "\nPreview (first "
+INLINE_TRUNCATED_NOTE = "\n\n[Truncated: tool response was "
+
+
 def _succeeded(text: str) -> bool:
     """A hosted tool result in Hermes' MCP success shape: a JSON object with
-    ``result`` and no ``error`` (unwrapped, or the object inside the
-    untrusted wrapper; trailing text Hermes appends is ignored)."""
+    ``result`` and no ``error`` (unwrapped, or inside the untrusted wrapper;
+    trailing text Hermes appends is ignored) — or a large result Hermes
+    persisted, unless its preview is an error. Only results too large for the
+    transcript are persisted, and an error is a short ``{"error": …}``."""
+    body = _unwrapped(text)
+    if body.startswith(PERSISTED_OUTPUT_OPEN):
+        return not _is_error(_persisted_preview(body))
+    if INLINE_TRUNCATED_NOTE in body:
+        return not _is_error(body.split(INLINE_TRUNCATED_NOTE, 1)[0])
+    payload = _json_object(body)
+    return payload is not None and "result" in payload and "error" not in payload
+
+
+def _unwrapped(text: str) -> str:
     body = text.strip()
-    start = body.find("{") if _UNTRUSTED_SOURCE_MARK in body else 0
-    if start < 0 or not body[start:].startswith("{"):
-        return False
+    if body.startswith(_WRAPPER_OPEN):
+        # The wrapper's notice ends at its first blank line; the data follows.
+        _notice, blank, rest = body.partition("\n\n")
+        body = rest.rstrip() if blank else ""
+        if body.endswith(_WRAPPER_CLOSE):
+            body = body[: -len(_WRAPPER_CLOSE)]
+    return body.strip()
+
+
+def _persisted_preview(block: str) -> str:
+    """The preview inside a ``<persisted-output>`` block (itself possibly a
+    wrapped result: Hermes' turn budget persists whole tool messages)."""
+    _head, label, rest = block.partition(PERSISTED_PREVIEW_LABEL)
+    if not label:
+        return ""
+    _count, _newline, preview = rest.partition("\n")
+    preview = preview.rsplit(PERSISTED_OUTPUT_CLOSE, 1)[0].rstrip()
+    if preview.endswith("\n..."):
+        preview = preview[: -len("\n...")]
+    return _unwrapped(preview)
+
+
+def _is_error(preview: str) -> bool:
+    payload = _json_object(preview)
+    if payload is not None:
+        return "error" in payload and "result" not in payload
+    return preview.lstrip().startswith('{"error"')
+
+
+def _json_object(text: str) -> dict[str, Any] | None:
+    body = text.strip()
+    if not body.startswith("{"):
+        return None
     try:
-        payload, _end = json.JSONDecoder().raw_decode(body[start:])
+        payload, _end = json.JSONDecoder().raw_decode(body)
     except ValueError:
-        return False
-    return isinstance(payload, dict) and "result" in payload and "error" not in payload
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def turn_failure(result: Any) -> str | None:

@@ -670,6 +670,17 @@ class TestProfileScope:
         assert fake.runtime_scope_calls == [str(up), str(up)] and fake.runtime_scope_exits == [None, None]
         assert fake.scope.get() is None and fake.override.get() is None, "nothing left bound on this thread"
 
+    def test_a_stopped_invoker_makes_no_gate_call_and_closes_its_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes.model_call import GateCallCancelled
+
+        inv = _invoker(monkeypatch)
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: (lambda prompt, **_: "{}"))
+        assert inv.call_model("p", cancel=threading.Event()) == "{}"
+        inv.stop()
+        with pytest.raises(GateCallCancelled):
+            inv.call_model("p", cancel=threading.Event())
+        assert inv._gate_loop._closed
+
     def test_a_gate_whose_scope_cannot_be_entered_raises(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         _launch, up = self._homes(tmp_path)
         _FakeHermesScopes(monkeypatch, {str(up): {}}, helper_raises=OSError("vault locked"))
@@ -1007,6 +1018,45 @@ class TestOverranInTheLoop:
         assert woken == ["wake"] and inv.hung_turns == 0 and inv.live_turns() == 0
         await asyncio.sleep(0.05)
         assert server.recorded == [("conv_a", "reply", "msg_a")], "exactly once"
+
+
+class TestIdleWaitsForTheRecord:
+    """The runtime closes its client and frees the leader lock when the
+    invoker is idle: an owned turn is not finished with until its outcome
+    is recorded through that client."""
+
+    async def test_idle_comes_only_after_the_detached_outcome_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _SyncServer()
+        agent = _Agent(block=True, obey=False)
+        inv = _invoker(monkeypatch, agent)
+        inv._runtime.client = server
+        inv._limits = turn_runner_module.TurnLimits(idle_s=None, max_s=None, poll_s=0.01)
+        recording = threading.Event()
+        proceed = threading.Event()
+        real_record = server._record
+
+        def slow_record(conversation_id: str, **kwargs: Any) -> dict[str, Any]:
+            recording.set()
+            proceed.wait(5.0)
+            return real_record(conversation_id, **kwargs)
+
+        server.decisions = SimpleNamespace(record=slow_record)
+        loop_handle = inv.tracker.begin(TrackedTurn.reply("conv_a", "msg_a"))
+        assert loop_handle is not None
+        request = _reply_request("conv_a", "msg_a")
+        await inv.start_turn(TurnRequest(**{**request.__dict__, "card": _gate_card(), "category": "open_request"}))
+        assert await _until(agent.started.is_set)
+        inv.detach_turns()
+        idle: list[list[Any]] = []
+        assert inv.when_idle(lambda: idle.append(list(server.recorded))) is False
+        server.answered["conv_a"] = "msg_a"
+        agent.release.set()  # the thread ends; the outcome is being recorded
+        assert await _until(recording.is_set)
+        await asyncio.sleep(0.05)
+        assert idle == [] and inv.live_turns() == 1, "not idle while the outcome is being recorded"
+        proceed.set()
+        assert await _until(lambda: bool(idle))
+        assert idle == [[("conv_a", "reply", "msg_a")]], "idle only after the record"
 
 
 class TestIdleAndReadiness:

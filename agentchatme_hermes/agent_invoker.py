@@ -82,7 +82,7 @@ from .config import (
     DEFAULT_TURN_MAX_S,
 )
 from .hosted_tools import wait_for_hosted_tools
-from .model_call import build_call_model
+from .model_call import GateCallCancelled, GateLoop, build_call_model
 from .profile_scope import (
     ProfileScopeError,
     profile_context,
@@ -174,6 +174,8 @@ class AgentInvoker:
         # turns that overran, in one place (it survives a loop restart).
         self.tracker = tracker if tracker is not None else TurnTracker()
         self._stopped = threading.Event()
+        # The gate's async model calls: one private loop for this invoker's life.
+        self._gate_loop = GateLoop()
         self._turns_lock = threading.Lock()
         self._turns: dict[str, _Turn] = {}
         self._wake: Callable[[], None] | None = None
@@ -206,8 +208,10 @@ class AgentInvoker:
         self._wake = wake
 
     def stop(self) -> None:
-        """No new turns; a running one is interrupted by its watch (it records nothing)."""
+        """No new turns; a running one is interrupted by its watch; a gate
+        call in flight is cancelled and the gate-call loop stopped."""
         self._stopped.set()
+        self._gate_loop.close()
 
     @property
     def stopping(self) -> threading.Event:
@@ -249,13 +253,16 @@ class AgentInvoker:
             self._heartbeat_at = time.time()
 
     def live_turns(self) -> int:
-        """Turn threads still running (reply, invite, or a single-run run)."""
+        """Turns not finished with (reply, invite, or a single-run run): a
+        thread still running, a report the loop has not taken yet, or an
+        owned turn whose outcome is not recorded yet — the runtime keeps the
+        client and the leader lock until there are none."""
         with self._turns_lock:
             turns = list(self._turns.values())
         count = 0
         for turn in turns:
             with turn.lock:
-                if not turn.thread_done:
+                if not turn.thread_done or not turn.reported or turn.detached:
                     count += 1
         run = self._run_finished
         if run is not None and not run.is_set():
@@ -296,12 +303,15 @@ class AgentInvoker:
         thread). ``cancel`` is the receive loop's handle, set when it stops
         waiting: with Hermes' async ``ctx.llm`` the request is then cancelled
         (:mod:`.model_call`)."""
+        if self._stopped.is_set():
+            raise GateCallCancelled("stopping")
         with self._scope():
             host_llm = self._host_llm_facade()
             model_call = build_call_model(
                 main_runtime=self._gate_runtime() if host_llm is None else {},
                 timeout_s=self._gate_timeout_s,
                 host_llm=host_llm,
+                gate_loop=self._gate_loop,
             )
             return model_call(prompt, cancel=cancel)
 
@@ -469,6 +479,7 @@ class AgentInvoker:
             turn.done.set_result(end)
         if finished:
             self._forget(turn)
+            self._maybe_idle()
 
     def _thread_ended(self, turn: _Turn) -> None:
         """On the turn's own thread, when it really ends."""
@@ -478,10 +489,13 @@ class AgentInvoker:
             go = owned and self._claim_finish(turn)
             reported = turn.reported
         if owned:
-            # Ours to record; the hold stays until then (:meth:`_finish_detached`).
+            # Ours to record; the hold — and the runtime's client and leader
+            # lock (``live_turns``) — stay until then: idle is told only by
+            # :meth:`_finish_detached`, once the outcome is recorded.
             if go:
                 self._finish_in_thread(turn, turn.final[0] if turn.final else None)
-        elif reported:
+            return
+        if reported:
             self._forget(turn)
         self._maybe_idle()
 

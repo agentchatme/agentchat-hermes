@@ -4,9 +4,15 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
-Needs the `agentchatme` SDK release that ships `agentchatme.integration` (contract v1) and a server that serves the gate-call texts;
-the dependency floor is set to that SDK version at release. Without the kit the plugin does not receive and says so: one ERROR at
-load naming the required SDK version, and `hermes agentchat doctor` fails on it (the CLI and the manual stay registered).
+**Requirements (hard).** This release needs:
+
+- **The AgentChat server with contract v1**: the `rewake` socket capability (the server re-wakes unanswered cards; there is no
+  local retry ladder any more), pending group invites on the tray (`invites=1`; there is no local invite ledger any more), and the
+  served gate-call texts. Against an older server, unanswered cards are not re-woken and invites are not seen.
+- **The `agentchatme` SDK release that ships `agentchatme.integration`** (the kit). `KIT_MIN_VERSION` (`kit.py`) and the
+  dependency floor in `pyproject.toml` are set to that SDK release's number at release time — the founder sets it; 1.3.0 is the
+  expected value per `VERSIONING.md`. Without the kit the plugin does not receive and says so: one ERROR at load naming the
+  required SDK version, and `hermes agentchat doctor` fails on it (the CLI and the manual stay registered).
 
 ### Changed
 
@@ -81,20 +87,25 @@ load naming the required SDK version, and `hermes agentchat doctor` fails on it 
 - **A turn with no AgentChat call records nothing.** A completed turn whose transcript showed no hosted AgentChat tool call was
   trusted as having looked and `reply` was recorded with nothing read or sent. Such a turn (like one whose calls all failed) could not
   look: nothing is recorded and the card stays on the tray. A transcript Hermes did not return stays "unknown", as before. The counts
-  are exact: a call succeeded only when its result is Hermes' MCP success shape (`{"result": …}`), so Hermes' own error stubs ("Error
-  executing tool", "Result unavailable") and a call with no result count as failed, and a transcript Hermes compacted during the turn
-  is "unknown".
+  are exact: a call succeeded only when its result is Hermes' MCP success shape (`{"result": …}`) — or a large result Hermes kept
+  out of the transcript (`<persisted-output>` preview, over 50K characters, 8K on small context windows) whose preview is not an
+  error — so Hermes' own error stubs ("Error executing tool", "Result unavailable") and a call with no result count as failed, and
+  a transcript Hermes compacted during the turn is "unknown".
 - **The gate call goes through Hermes' public plugin LLM.** On a Hermes with `ctx.llm` (since May 2026) the gate's one tool-less
   completion is `ctx.llm` with no override: Hermes routes it to the profile's main model and credentials (or a fallback the user
-  declared), and the integration no longer reads `config.yaml` or resolves provider credentials for it. It is `ctx.llm.acomplete` on a
-  private event loop in a worker thread, cancelled when the kit stops waiting (its gate-call deadline, an abandoned cycle), so the
-  request itself ends; `ctx.llm.complete` where there is no async call. Older Hermes keeps the previous path
+  declared), and the integration no longer reads `config.yaml` or resolves provider credentials for it. It is `ctx.llm.acomplete` on
+  one private event loop (its own thread, for the runtime's lifetime, so Hermes' async client and its connection are reused),
+  cancelled when the kit stops waiting (its gate-call deadline, an abandoned cycle), so the request itself ends; `ctx.llm.complete`
+  where there is no async call. A provider adapter whose async call is `asyncio.to_thread` over a sync one (Hermes' plugin-host
+  child, some auxiliary adapters) only stops being waited for: its worker thread runs on until the provider's own timeout. Older Hermes keeps the previous path
   (`agent.auxiliary_client.call_llm` pinned to the resolved main model; it cannot be interrupted and ends at its own timeout).
 - **A plugin reload no longer leaves the old runtime holding the socket.** The plugin registers Hermes' `ctx.on_unload`: when
   Hermes unloads it (reload, disable, remove) in a running process, the runtime is stopped — socket closed, wake worker and timers
-  stopped — and forgotten. The leader lock (and the client a turn records through) is released once the last turn thread has ended,
-  so the reloaded code stays a follower — and starts no second turn for a conversation the old turn may still answer — until then,
-  and takes over at once after. A runtime an activation attempt was still starting when the unload came is stopped too.
+  stopped — and forgotten. The leader lock (and the client a turn records through) is released only once no turn is left — none
+  running, none whose outcome is still being recorded through that client — and the receive loop's thread has exited (it may be
+  recording a verdict through its own client; up to 60 s). So the reloaded code stays a follower — and starts no second turn for a
+  conversation the old turn may still answer — until the old turn's reply is recorded, and takes over at once after. A turn that
+  never ends keeps the lock until a gateway restart (`RUNBOOK.md`). A runtime an activation attempt was still starting when the unload came is stopped too.
 - **A group-invite turn that crashed is retried.** The invite was marked as having had its turn before the turn ran, so a turn that
   crashed, overran or could not look was never run again. It is now marked only after a turn that looked.
 

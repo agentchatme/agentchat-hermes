@@ -21,7 +21,7 @@ import contextlib
 import logging
 import threading
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -579,6 +579,8 @@ class TestReloadWithALiveTurn:
 
                 admission = loop.run_until_complete(start())
                 assert admission.started and started.wait(5.0)
+                # What the real receiver's teardown does with a running turn.
+                receivers[0].stop.side_effect = inv.detach_turns
 
                 old.stop()  # the reload: the old code is unloaded mid-turn
                 assert try_acquire_ws_leader_lock(old.lock_path) is None, "the lock is still held"
@@ -600,6 +602,27 @@ class TestReloadWithALiveTurn:
             released.set()
             loop.close()
 
+    def test_the_lock_waits_for_a_closing_receive_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The loop's thread may still be recording a verdict through its own
+        client after the stop's grace: the lock waits for it to exit."""
+        import time
+
+        from agentchatme_hermes.runtime import Runtime
+
+        exited = threading.Event()
+        with _patched_runtime(lock_winner=True) as (ws_cls, _inv, _client, _acquire, release):
+            ws_cls.return_value.wait_exited.side_effect = lambda timeout: exited.wait(timeout)
+            rt = Runtime(_config(), gateway_mode=True)
+            rt.start()
+            rt.stop()
+            time.sleep(0.1)
+            release.assert_not_called()
+            exited.set()
+            deadline = time.monotonic() + 5.0
+            while not release.called and time.monotonic() < deadline:
+                time.sleep(0.01)
+            release.assert_called_once_with(99)
+
     def test_a_receiver_that_gave_up_hands_the_account_back(self) -> None:
         from agentchatme_hermes.runtime import Runtime
 
@@ -612,3 +635,194 @@ class TestReloadWithALiveTurn:
             assert not rt.is_leader
             rt.stop()
             release.assert_called_once_with(99)
+
+
+class _FakeApi:
+    """AgentChat's HTTP API on loopback, for the real SDK clients: the tray
+    (one card), the texts, ``/v1/agents/me`` and verdicts."""
+
+    TEXTS: ClassVar[dict[str, Any]] = {
+        "version": "1",
+        "runtime": "hermes",
+        "manual": {"url": "https://agentchat.me/skill.md", "version": "2.2.2"},
+        "wake_instruction": "You were woken. Call mcp__agentchat__agentchat_inbox first.",
+        "invite_prompt": "An invite is pending.",
+        "identity_line": "I am @alice on AgentChat.",
+        "identity_line_template": "I am @<handle> on AgentChat.",
+    }
+
+    def __init__(self) -> None:
+        import json
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        self.lock = threading.Lock()
+        self.answered = False
+        self.recorded: list[tuple[str, str, str | None]] = []
+        api = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def _send(self, status: int, body: Any) -> None:
+                data = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self) -> None:
+                path = self.path.split("?", 1)[0]
+                if path == "/v1/agents/me":
+                    self._send(200, {"handle": "alice", "status": "active"})
+                elif path == "/v1/texts":
+                    self._send(200, api.TEXTS)
+                elif path == "/v1/inbox":
+                    self._send(200, api.tray())
+                else:
+                    self._send(404, {"code": "NOT_FOUND", "message": path})
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("content-length") or 0)
+                body = json.loads(self.rfile.read(length) or b"{}")
+                parts = self.path.split("/")
+                if len(parts) == 5 and parts[2] == "conversations" and parts[4] == "decisions":
+                    with api.lock:
+                        api.recorded.append((parts[3], body.get("decision"), body.get("through_message_id")))
+                    self._send(201, {"decision": {"conversation_id": parts[3], "decision": body.get("decision")}})
+                else:
+                    self._send(404, {"code": "NOT_FOUND", "message": self.path})
+
+            def log_message(self, *_args: Any) -> None:
+                pass
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base_url = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tray(self) -> dict[str, Any]:
+        with self.lock:
+            read = any(cid == "conv_a" and decision in ("reply", "dismiss") for cid, decision, _a in self.recorded)
+            answered = self.answered
+        cards = [] if read else [
+            {
+                "conversation_id": "conv_a",
+                "type": "direct",
+                "counterparty": {"handle": "@peer"},
+                "relationship": "established",
+                "you_owe_reply": not answered,
+                "mentioned_you": False,
+                "unread": 1,
+                "pace": {"last_60s": 0, "last_10m": 1},
+                "preview": {"message_id": "msg_a", "sender": "@peer", "text": "hello", "at": "2026-11-08T10:00:00.000Z"},
+            }
+        ]
+        return {
+            "version": 1, "you": "@alice", "question": "Decide per card.", "categories": ["open_request"],
+            "conversations": cards, "deferred": 0, "truncated": False, "invites": [], "invites_truncated": False,
+        }
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestStopRecordsBeforeLettingGo:
+    """The real receiver, invoker, SDK clients and leader lock against
+    AgentChat's API on loopback (only Hermes is stood in for): a turn that
+    has sent its answer is stopped by the unload and ends on Hermes'
+    interrupt after the loop has let go of it. Its ``reply`` must be recorded
+    — through the runtime's client — before the client is closed and the
+    leader lock is freed for the reloaded instance."""
+
+    def test_the_reply_is_recorded_before_the_lock_is_released(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import json
+        import socket
+        import time
+
+        from agentchatme_hermes import agent_invoker as invoker_module
+        from agentchatme_hermes import hosted_tools as hosted_tools_module
+        from agentchatme_hermes import runtime as runtime_module
+        from agentchatme_hermes.agent_invoker import AgentInvoker
+        from agentchatme_hermes.leader_lock import try_acquire_ws_leader_lock
+        from agentchatme_hermes.runtime import Runtime
+
+        api = _FakeApi()
+        interrupted = threading.Event()
+        started = threading.Event()
+
+        class _Agent:
+            """Sends its answer, then runs until Hermes' interrupt; it ends a
+            moment after the stop, once the loop has let go of the turn."""
+
+            def run_conversation(self, prompt: str, conversation_history: list[Any]) -> Any:
+                with api.lock:
+                    api.answered = True  # the answer went out
+                started.set()
+                interrupted.wait(10.0)
+                time.sleep(0.5)
+                return {"completed": False, "interrupted": True, "messages": [
+                    {"role": "tool", "name": "mcp__agentchat__agentchat_send_message", "content": '{"result": "{}"}'},
+                ]}
+
+            def get_activity_summary(self) -> dict[str, Any]:
+                return {"last_activity_at": time.time(), "api_call_count": 1, "current_tool": None}
+
+            def hard_interrupt(self, message: str | None = None, *, tool_reason: str | None = None) -> None:
+                interrupted.set()
+
+        def gate_answer(**_kw: Any) -> Any:
+            return lambda prompt, **_: json.dumps({"decisions": [{"conversation_id": "conv_a", "decision": "reply"}]})
+
+        monkeypatch.setattr(AgentInvoker, "_build_agent", lambda self, _sid: _Agent())
+        monkeypatch.setattr(AgentInvoker, "_ensure_hermes_resolved", lambda self: None)
+        monkeypatch.setattr(AgentInvoker, "_resolve_model_and_runtime", lambda self: ("m", {}))
+        monkeypatch.setattr(invoker_module, "build_call_model", gate_answer)
+        monkeypatch.setattr(hosted_tools_module, "hosted_tool_names", lambda: ["mcp__agentchat__agentchat_inbox"])
+        at_release: list[list[tuple[str, str, str | None]]] = []
+        real_release = runtime_module.release_leader_lock
+
+        def spy_release(fd: int) -> None:
+            with api.lock:
+                at_release.append(list(api.recorded))
+            real_release(fd)
+
+        monkeypatch.setattr(runtime_module, "release_leader_lock", spy_release)
+
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        ws_port = closed.getsockname()[1]
+        closed.close()  # nothing listens there: the socket stays down, wakes are manual
+        config = _config(hermes_home=tmp_path / ".hermes", lock_dir=tmp_path / "locks")
+        config.api_base = api.base_url
+        config.ws_url = f"ws://127.0.0.1:{ws_port}/v1/ws"
+        config.state_dir = tmp_path / "state"
+        config.wake_debounce_s = 0.01
+        rt = Runtime(config, gateway_mode=True)
+        try:
+            rt.start()
+            assert rt.is_leader
+            deadline = time.monotonic() + 15.0
+            while not started.is_set() and time.monotonic() < deadline:
+                receiver = rt._receiver
+                if receiver is not None:
+                    receiver.wake()
+                time.sleep(0.05)
+            assert started.is_set(), "the gate decided reply and the turn started"
+
+            rt.stop()  # the unload, mid-turn
+            fd = None
+            while fd is None and time.monotonic() < deadline:
+                fd = try_acquire_ws_leader_lock(rt.lock_path)
+                if fd is None:
+                    time.sleep(0.02)
+            assert fd is not None, "the lock is released once the turn is done with"
+            real_release(fd)
+            assert at_release and ("conv_a", "reply", "msg_a") in at_release[0], (
+                f"the reply was recorded before the lock was released: {at_release}"
+            )
+            with api.lock:
+                assert api.recorded.count(("conv_a", "reply", "msg_a")) == 1
+        finally:
+            interrupted.set()
+            rt.stop()
+            api.close()

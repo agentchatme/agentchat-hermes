@@ -258,28 +258,56 @@ def _main_model_config(home: Path, base_url: str) -> None:
     )
 
 
+def _in_a_worker(fn: Any) -> Any:
+    """As the receive loop runs ``call_model``: on a worker thread."""
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(60.0)
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
 def test_plugin_llm_async_call_reaches_the_main_model(answering_model: _Stub, _hermes_home: Path) -> None:
     """With the receive loop's cancel handle the gate call is
-    ``ctx.llm.acomplete`` on a private loop per call (Hermes rebinds its async
-    client to each loop): same model, same answer, twice in a row."""
-    from agentchatme_hermes.model_call import build_call_model
+    ``ctx.llm.acomplete`` on the invoker's one gate loop: same model, same
+    answer, twice in a row on the same loop (Hermes' async client bound to it
+    is reused)."""
+    from agentchatme_hermes.model_call import GateLoop, build_call_model
 
     _main_model_config(_hermes_home, answering_model.base_url)
     plugin_llm = _import("agent.plugin_llm")
     assert inspect.iscoroutinefunction(plugin_llm.PluginLlm.acomplete)
     assert {"messages", "temperature", "max_tokens", "timeout", "purpose"} <= _params(plugin_llm.PluginLlm.acomplete)
-    call_model = build_call_model(main_runtime={}, timeout_s=20.0, host_llm=plugin_llm.PluginLlm(plugin_id="agentchat"))
-    for _ in range(2):
-        assert call_model("THE PROMPT", cancel=threading.Event()) == "done"
-        assert answering_model.requests[-1] == {"path": "/v1/chat/completions", "model": "contract-main-model", "tools": False}
+    gate_loop = GateLoop()
+    try:
+        call_model = build_call_model(
+            main_runtime={}, timeout_s=20.0, host_llm=plugin_llm.PluginLlm(plugin_id="agentchat"), gate_loop=gate_loop
+        )
+        for _ in range(2):
+            assert _in_a_worker(lambda: call_model("THE PROMPT", cancel=threading.Event())) == "done"
+            assert answering_model.requests[-1] == {"path": "/v1/chat/completions", "model": "contract-main-model", "tools": False}
+    finally:
+        gate_loop.close()
 
 
 def test_plugin_llm_async_call_is_cancelled_when_the_loop_stops_waiting(hanging_model: _Stub, _hermes_home: Path) -> None:
-    from agentchatme_hermes.model_call import GateCallCancelled, build_call_model
+    from agentchatme_hermes.model_call import GateCallCancelled, GateLoop, build_call_model
 
     _main_model_config(_hermes_home, hanging_model.base_url)
     plugin_llm = _import("agent.plugin_llm")
-    call_model = build_call_model(main_runtime={}, timeout_s=30.0, host_llm=plugin_llm.PluginLlm(plugin_id="agentchat"))
+    gate_loop = GateLoop()
+    call_model = build_call_model(
+        main_runtime={}, timeout_s=30.0, host_llm=plugin_llm.PluginLlm(plugin_id="agentchat"), gate_loop=gate_loop
+    )
     cancel = threading.Event()
 
     def cancel_once_asked() -> None:
@@ -290,10 +318,13 @@ def test_plugin_llm_async_call_is_cancelled_when_the_loop_stops_waiting(hanging_
 
     threading.Thread(target=cancel_once_asked, daemon=True).start()
     started = time.monotonic()
-    with pytest.raises(GateCallCancelled):
-        call_model("THE PROMPT", cancel=cancel)
-    assert hanging_model.requests, "the request reached the model"
-    assert time.monotonic() - started < 20.0, "ended by the cancel, not by its 30 s timeout"
+    try:
+        with pytest.raises(GateCallCancelled):
+            _in_a_worker(lambda: call_model("THE PROMPT", cancel=cancel))
+        assert hanging_model.requests, "the request reached the model"
+        assert time.monotonic() - started < 20.0, "ended by the cancel, not by its 30 s timeout"
+    finally:
+        gate_loop.close()
 
 
 def test_auxiliary_call_llm_takes_what_the_fallback_passes() -> None:
@@ -398,6 +429,37 @@ def test_hosted_tool_results_have_the_counted_shapes() -> None:
     source = Path(_import("tools.mcp_tool_handlers").__file__).read_text(encoding="utf-8")
     assert 'json.dumps({"result": text_result}' in source
     assert 'mcp_field(result, "is_error", "isError", False)' in source
+
+
+def test_a_large_hosted_result_hermes_persists_counts_as_a_success(_hermes_home: Path) -> None:
+    """Hermes keeps an oversized result out of the transcript
+    (``maybe_persist_tool_result``: 50K chars for MCP tools, less on small
+    context windows) and leaves a ``<persisted-output>`` preview, wrapped as
+    untrusted data like any hosted result; the turn budget can persist a
+    whole tool message, an error too."""
+    import json
+
+    storage = _import("tools.tool_result_storage")
+    wrap = _import("agent.tool_dispatch_helpers")._maybe_wrap_untrusted
+    name = "mcp__agentchat__agentchat_get_conversation"
+    assert (storage.PERSISTED_OUTPUT_TAG, storage.PERSISTED_OUTPUT_CLOSING_TAG) == (
+        turn_runner.PERSISTED_OUTPUT_OPEN,
+        turn_runner.PERSISTED_OUTPUT_CLOSE,
+    )
+    big = json.dumps({"result": json.dumps({"messages": [{"id": f"msg_{i}", "text": "x" * 200} for i in range(400)]})})
+    persisted = storage.maybe_persist_tool_result(content=big, tool_name=name, tool_use_id="call_big")
+    assert persisted.startswith(storage.PERSISTED_OUTPUT_TAG) and turn_runner.PERSISTED_PREVIEW_LABEL in persisted
+    error = _import("tools.registry").tool_error("AWAITING_REPLY: wait for their reply")
+    whole_error = storage.maybe_persist_tool_result(content=wrap(name, error), tool_name=name, tool_use_id="call_err", threshold=0)
+    assert whole_error.startswith(storage.PERSISTED_OUTPUT_TAG)
+    messages = [
+        {"role": "tool", "tool_call_id": "call_big", "name": name, "content": wrap(name, persisted)},
+        {"role": "tool", "tool_call_id": "call_err", "name": name, "content": whole_error},
+    ]
+    calls = turn_runner.count_agentchat_calls({"messages": messages})
+    assert calls is not None and (calls.made, calls.failed) == (2, 1)
+    source = Path(storage.__file__).read_text(encoding="utf-8")
+    assert turn_runner.INLINE_TRUNCATED_NOTE.strip("\n") in source, "the fallback when the file cannot be saved"
 
 
 def test_gateway_marks_its_process() -> None:

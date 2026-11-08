@@ -10,8 +10,9 @@ from __future__ import annotations
 import importlib
 
 # The first agentchatme release with ``agentchatme.integration`` (contract
-# v1). The founder confirms the number at release (VERSIONING.md: added
-# behaviour → minor +1), and the floor in pyproject.toml moves to it then.
+# v1). Set to that SDK release's number at release time — the founder sets
+# it; 1.3.0 is the expected value (VERSIONING.md: added behaviour → minor
+# +1 from 1.2.x) — and the floor in pyproject.toml moves to it then.
 KIT_MIN_VERSION = "1.3.0"
 KIT_REQUIREMENT = f"agentchatme>={KIT_MIN_VERSION}"
 

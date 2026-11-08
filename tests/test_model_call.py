@@ -194,46 +194,102 @@ def _in_a_worker(fn: Any) -> Any:
     return box["value"]
 
 
-class TestCancel:
-    """The receive loop's ``cancel`` handle: Hermes' async ``ctx.llm`` call is
-    cancelled when it is set; the paths that cannot be interrupted ignore it."""
+@pytest.fixture
+def gate_loop() -> Any:
+    from agentchatme_hermes.model_call import GateLoop
 
-    def test_with_a_cancel_handle_the_async_call_is_used(self) -> None:
+    loop = GateLoop(name="test-gate-call")
+    yield loop
+    loop.close()
+
+
+class TestCancel:
+    """The receive loop's ``cancel`` handle: Hermes' async ``ctx.llm`` call
+    runs on the invoker's one gate loop and is cancelled when it is set; the
+    paths that cannot be interrupted ignore it."""
+
+    def test_with_a_cancel_handle_the_async_call_is_used(self, gate_loop: Any) -> None:
         llm = _AsyncPluginLlm()
-        call_model = build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm)
+        call_model = build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm, gate_loop=gate_loop)
         assert _in_a_worker(lambda: call_model("p", cancel=threading.Event())) == "async"
         assert llm.calls == ["acomplete"]
 
-    def test_without_one_the_sync_call_is_used(self) -> None:
+    def test_one_loop_serves_every_call_in_the_callers_context(self, gate_loop: Any) -> None:
+        """Hermes binds its async client to a loop: one loop, one client, one
+        connection. The profile's scope (contextvars) reaches the call."""
+        import contextvars
+
+        scope: contextvars.ContextVar[str | None] = contextvars.ContextVar("scope", default=None)
+        seen: list[tuple[str | None, str]] = []
+
+        class _Llm:
+            def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                raise AssertionError("the async call is used")
+
+            async def acomplete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                seen.append((scope.get(), threading.current_thread().name))
+                return SimpleNamespace(text="ok")
+
+        call_model = build_call_model(main_runtime={}, timeout_s=5.0, host_llm=_Llm(), gate_loop=gate_loop)
+
+        def in_profile(name: str) -> str:
+            token = scope.set(name)
+            try:
+                return call_model("p", cancel=threading.Event())
+            finally:
+                scope.reset(token)
+
+        assert _in_a_worker(lambda: in_profile("growth")) == "ok"
+        assert _in_a_worker(lambda: in_profile("ops")) == "ok"
+        assert seen == [("growth", "test-gate-call"), ("ops", "test-gate-call")]
+
+    def test_without_one_the_sync_call_is_used(self, gate_loop: Any) -> None:
         llm = _AsyncPluginLlm()
-        assert build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm)("p") == "sync"
+        assert build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm, gate_loop=gate_loop)("p") == "sync"
         assert llm.calls == ["complete"]
 
-    def test_setting_it_cancels_the_request(self) -> None:
+    def test_setting_it_cancels_the_request(self, gate_loop: Any) -> None:
         llm = _AsyncPluginLlm(hang=True)
         cancel = threading.Event()
-        call_model = build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm)
+        call_model = build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm, gate_loop=gate_loop)
         threading.Thread(target=lambda: llm.started.wait(5.0) and cancel.set(), daemon=True).start()
         started = time.monotonic()
         with pytest.raises(GateCallCancelled):
             _in_a_worker(lambda: call_model("p", cancel=cancel))
         assert time.monotonic() - started < 5.0
-        assert llm.cancelled.is_set(), "the Hermes request itself was cancelled"
+        assert llm.cancelled.wait(2.0), "the Hermes request itself was cancelled"
+        # The loop serves the next call.
+        assert _in_a_worker(lambda: build_call_model(main_runtime={}, timeout_s=5.0, host_llm=_AsyncPluginLlm(), gate_loop=gate_loop)("p", cancel=threading.Event())) == "async"
 
-    def test_already_set_makes_no_call(self) -> None:
+    def test_already_set_makes_no_call(self, gate_loop: Any) -> None:
         llm = _AsyncPluginLlm()
         cancel = threading.Event()
         cancel.set()
         with pytest.raises(GateCallCancelled):
-            build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm)("p", cancel=cancel)
+            build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm, gate_loop=gate_loop)("p", cancel=cancel)
         assert llm.calls == []
 
-    def test_a_sync_only_host_ignores_it(self) -> None:
+    def test_closing_the_loop_cancels_a_call_in_flight_and_refuses_more(self, gate_loop: Any) -> None:
+        llm = _AsyncPluginLlm(hang=True)
+        call_model = build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm, gate_loop=gate_loop)
+        threading.Thread(target=lambda: llm.started.wait(5.0) and gate_loop.close(), daemon=True).start()
+        with pytest.raises(GateCallCancelled):
+            _in_a_worker(lambda: call_model("p", cancel=threading.Event()))
+        assert llm.cancelled.wait(2.0)
+        assert gate_loop.thread is not None
+        gate_loop.thread.join(2.0)
+        assert not gate_loop.thread.is_alive(), "the loop's thread is gone"
+        with pytest.raises(GateCallCancelled):
+            call_model("p", cancel=threading.Event())
+
+    def test_a_sync_only_host_ignores_it(self, gate_loop: Any) -> None:
         class _PluginLlm:
             def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
                 return SimpleNamespace(text="sync")
 
-        assert build_call_model(main_runtime={}, timeout_s=5.0, host_llm=_PluginLlm())("p", cancel=threading.Event()) == "sync"
+        call_model = build_call_model(main_runtime={}, timeout_s=5.0, host_llm=_PluginLlm(), gate_loop=gate_loop)
+        assert call_model("p", cancel=threading.Event()) == "sync"
+        assert gate_loop.thread is None, "no loop is started for a sync call"
 
     def test_the_fallback_ignores_it(self) -> None:
         call_model = build_call_model(main_runtime={"model": "m"}, timeout_s=5.0, call_llm=lambda **kw: _response("aux"))

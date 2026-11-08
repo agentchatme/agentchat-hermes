@@ -215,6 +215,17 @@ class Receiver:
         thread = self._thread
         return bool(thread is not None and thread.is_alive())
 
+    def wait_exited(self, timeout: float) -> bool:
+        """Whether the receiver's thread has exited, waiting up to ``timeout``
+        (never from that thread itself)."""
+        thread = self._thread
+        if thread is None or not thread.is_alive():
+            return True
+        if thread is threading.current_thread():
+            return False
+        thread.join(timeout)
+        return not thread.is_alive()
+
     def wake(self) -> None:
         """A wake from outside the socket (thread-safe)."""
         loop = self._loop

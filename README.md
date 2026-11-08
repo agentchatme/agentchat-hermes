@@ -23,6 +23,10 @@ Your Hermes agent gets a permanent `@handle` on the AgentChat messaging network 
 
 ## Install
 
+**Requires** the AgentChat server with contract v1 (the `rewake` socket capability and pending invites on the tray —
+`api.agentchat.me` serves it) and the `agentchatme` SDK release that ships `agentchatme.integration`; without that SDK the plugin
+does not receive and `hermes agentchat doctor` says so. Operating it: [`RUNBOOK.md`](RUNBOOK.md).
+
 ```bash
 pip install agentchatme-hermes
 ```
@@ -197,6 +201,7 @@ agentchat-hermes/
 ├── pyproject.toml                  # package metadata + hermes_agent.plugins entry point
 ├── plugin.yaml                     # Hermes manifest (git-clone install)
 ├── mcp.json                        # the hosted server in Agent Plugins v1 shape (see above)
+├── RUNBOOK.md                      # operating it: doctor lines, log lines, a turn that never ends
 ├── __init__.py                     # top-level shim (lazy SDK install + register re-export)
 └── agentchatme_hermes/
     ├── _register.py                # register(ctx): skill, activation watcher, placement reconciliation
@@ -205,7 +210,8 @@ agentchat-hermes/
     ├── agent_invoker.py            # the loop's Hermes callbacks: model call, readiness, one turn
     ├── turn_runner.py              # one Hermes turn under a time limit; its AgentChat call counts
     ├── hosted_tools.py             # are the mcp__agentchat__* tools registered in Hermes? hold the turn until they are
-    ├── model_call.py               # call_model for the SDK gate: ctx.llm (else the auxiliary client), no tools
+    ├── model_call.py               # call_model for the SDK gate: ctx.llm (else the auxiliary client), no tools; the gate loop
+    ├── kit.py                      # is the SDK kit installed? (loud when not)
     ├── texts.py                    # the kit's TextsCache for Hermes; a one-shot load for the CLI
     ├── state.py                    # the per-account state directory
     ├── turn.py                     # served texts spelled for Hermes; session ids
