@@ -2,9 +2,9 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.4.3] — 2026-11-08
 
-Proposed as 0.4.3 (fixed existing behaviour → patch +1, per `VERSIONING.md`; the release step sets the number). Same requirements as 0.4.2 (`agentchatme>=1.2.0,<2`); no setting changes.
+Patch release (fixed existing behaviour → patch +1, per `VERSIONING.md`). Same requirements as 0.4.2 (`agentchatme>=1.2.0,<2`); no setting changes.
 
 ### Fixed
 
