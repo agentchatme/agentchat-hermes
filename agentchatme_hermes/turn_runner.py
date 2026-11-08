@@ -41,8 +41,10 @@ What the turn did on AgentChat (the reply rule's inputs)
 ────────────────────────────────────────────────────────
 The transcript Hermes returns (``result["messages"]``) lists every tool
 call; :func:`count_agentchat_calls` counts the hosted AgentChat ones and
-how many of them failed. The host never records a verdict for a turn that
-made no AgentChat call, or whose calls all failed: it could not look.
+how many of them failed. :meth:`TurnReport.turn_end` hands that to the
+kit's reply rule (``agentchatme.integration.turn_outcome``), which records
+nothing for a turn that made no AgentChat call, or whose calls all failed:
+it could not look.
 """
 from __future__ import annotations
 
@@ -55,6 +57,8 @@ import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
+
+from agentchatme.integration import AgentChatCallCount, TurnEnd
 
 from .config import DEFAULT_TURN_IDLE_S, DEFAULT_TURN_MAX_S
 from .turn import MCP_SERVER_NAME, MCP_TOOL_PREFIX
@@ -86,28 +90,6 @@ class TurnLimits:
 
 
 @dataclass(frozen=True)
-class AgentChatCalls:
-    """The hosted AgentChat tool calls one turn made, from its transcript.
-
-    ``calls`` / ``failed`` are ``None`` when the transcript could not be
-    read (a result shape this code does not know): unknown, not zero.
-    """
-
-    calls: int | None = None
-    failed: int | None = None
-
-    @property
-    def could_not_look(self) -> bool:
-        """``True`` only on evidence: no AgentChat call at all, or every one failed."""
-        if self.calls is None:
-            return False
-        return self.calls == 0 or (self.failed is not None and self.failed >= self.calls)
-
-    def as_dict(self) -> dict[str, int | None]:
-        return {"calls": self.calls, "failed": self.failed}
-
-
-@dataclass(frozen=True)
 class TurnReport:
     """What became of one turn.
 
@@ -121,7 +103,10 @@ class TurnReport:
     started_at: float
     """Wall-clock start (epoch seconds), for logs and the health record."""
     duration_s: float
-    calls: AgentChatCalls
+    calls: AgentChatCallCount | None
+    """The turn's hosted AgentChat calls (``made``, ``failed``) from its
+    transcript; ``None`` when the transcript could not be read: unknown,
+    not zero."""
     detail: str | None = None
     result: Any = None
     finished: threading.Event = field(default_factory=threading.Event, repr=False, compare=False)
@@ -129,6 +114,23 @@ class TurnReport:
     @property
     def ended(self) -> bool:
         return self.finished.is_set()
+
+    def turn_end(self) -> TurnEnd:
+        """This report in the kit's terms (the reply rule's input).
+
+        A turn that overran and has not ended is ``still_running``: it keeps
+        its conversation. One the interrupt stopped is ``failed``.
+        """
+        if self.status == "completed":
+            return TurnEnd(status="completed", agentchat_calls=self.calls, detail=self.detail)
+        if self.status == "timeout" and not self.ended:
+            return TurnEnd(status="still_running", detail=self.detail)
+        return TurnEnd(status="failed", agentchat_calls=self.calls, detail=self.detail)
+
+    def calls_text(self) -> str:
+        if self.calls is None:
+            return "unknown AgentChat calls"
+        return f"{self.calls.made} AgentChat call(s), {self.calls.failed} failed"
 
 
 def run_turn(
@@ -189,7 +191,7 @@ def run_turn(
             session_id=session_id,
             started_at=started_at,
             duration_s=0.0,
-            calls=AgentChatCalls(),
+            calls=None,
             detail=f"could not start the turn thread: {exc}",
             finished=finished,
         )
@@ -241,7 +243,7 @@ def run_turn(
         session_id=session_id,
         started_at=started_at,
         duration_s=clock() - started,
-        calls=count_agentchat_calls(result) if finished.is_set() else AgentChatCalls(),
+        calls=count_agentchat_calls(result) if finished.is_set() else None,
         detail=overrun,
         result=result,
         finished=finished,
@@ -267,7 +269,7 @@ def _finished_report(
             session_id=session_id,
             started_at=started_at,
             duration_s=duration_s,
-            calls=AgentChatCalls(),
+            calls=None,
             detail=f"raised {type(error).__name__}: {str(error)[:300]}",
             finished=finished,
         )
@@ -370,17 +372,17 @@ _HOSTED_TOOL_MARK = f"{MCP_TOOL_PREFIX}{MCP_SERVER_NAME}__"
 _UNTRUSTED_SOURCE_MARK = f'source="{_HOSTED_TOOL_MARK}'
 
 
-def count_agentchat_calls(result: Any) -> AgentChatCalls:
+def count_agentchat_calls(result: Any) -> AgentChatCallCount | None:
     """Count the hosted AgentChat tool calls in a turn's transcript.
 
     Hermes returns ``result["messages"]``; each tool result is a ``role:
     tool`` message with ``name`` (or ``tool_name``) and ``content``. A hosted
     tool's result is wrapped with ``source="mcp__agentchat__…"``; an error is
-    a bare ``{"error": …}`` object. No ``messages`` list → unknown.
+    a bare ``{"error": …}`` object. No ``messages`` list → ``None`` (unknown).
     """
     messages = result.get("messages") if isinstance(result, dict) else None
     if not isinstance(messages, list):
-        return AgentChatCalls()
+        return None
     calls = 0
     failed = 0
     for message in messages:
@@ -393,7 +395,7 @@ def count_agentchat_calls(result: Any) -> AgentChatCalls:
         calls += 1
         if _is_tool_error(text):
             failed += 1
-    return AgentChatCalls(calls=calls, failed=failed)
+    return AgentChatCallCount(made=calls, failed=failed)
 
 
 def _content_text(content: Any) -> str:

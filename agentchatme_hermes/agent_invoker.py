@@ -9,8 +9,9 @@ What happens on a wake
    and its gate question, as it built them.
 3. **Gate.** The SDK's gate helper (:func:`agentchatme.gate.run`) shows the
    tray to the agent's own model (:mod:`.model_call`, a tool-less
-   completion), parses the verdicts, and records ``dismiss`` / ``defer`` at
-   once. ``reply`` entries come back with a ``record()`` for the host.
+   completion) with the served gate-call words, parses the verdicts, and
+   records ``dismiss`` / ``defer`` at once. ``reply`` entries come back to
+   the host.
 4. **Turn.** If anything was decided ``reply``, start ONE Hermes agent turn
    with the served wake instruction (:mod:`.turn`) naming the ids the gate
    chose. The agent reads and answers through the hosted MCP tools; the
@@ -20,27 +21,24 @@ What happens on a wake
    ``AGENTCHATME_TURN_MAX_S`` (3600 s) interrupts it with Hermes' own stop,
    and it counts as failed. Its conversations stay held until its thread has
    really ended, so no second turn starts for them meanwhile.
-5. **Record.** When that turn has **completed** and its transcript shows it
-   reached AgentChat (at least one hosted tool call that did not fail), call
-   ``record()`` on every ``reply`` entry: a turn that looked counts as read
-   — whether or not it chose to send. A turn with no AgentChat call, or only
-   failed ones, could not look and records nothing. Except where the turn recorded
-   a verdict for that conversation itself: the served texts tell the model
-   to record ``reply`` after its send, or ``dismiss`` when it read and chose
-   not to answer (or ``defer``). One fresh tray read after the turn shows
-   it — the card has left the tray (read, or hidden by a defer), or its
-   ``your_last_decision`` moved since the gate's tray — and the host then
-   records nothing more, so the agent's own last verdict stands and a reply
-   is counted once. If that read fails, or the card may sit past a
-   truncated tray, ``reply`` is recorded as before (reading is
-   forward-only, so a repeat never un-reads anything). Never earlier: recording marks
-   the conversation read and takes the card off the tray, so a turn that
-   records first finds an empty tray (the 0.4.0 live-fire: 25 s parked in
-   ``agentchat_inbox`` for nothing). A turn that could not start (Hermes
-   runtime not importable, texts not loaded, agent construction failed,
-   the hosted tools not registered in Hermes) or that raised records
-   nothing: the conversation stays unread, the card stays on the tray,
-   and the next wake gates it again.
+5. **Record.** After the turn, what is recorded for each ``reply`` card is
+   the kit's reply rule (``agentchatme.integration.turn_outcome``), decided
+   from one fresh tray read and the turn's AgentChat call counts — never
+   from "the turn ran". A turn that failed, overran or is still running →
+   nothing. The turn recorded its own verdict (the served texts tell the
+   model to record ``reply`` after its send, or ``dismiss`` / ``defer``) →
+   nothing more, so the agent's own verdict stands. The answer went out →
+   ``reply`` through the anchor the gate saw. No AgentChat call, or only
+   failed ones → nothing (it could not look). It looked and did nothing →
+   nothing the first time, ``dismiss`` (``no_action_needed``) the second
+   time for the same anchor. A failed tray read records nothing. Never
+   before the turn ends: recording marks the conversation read and takes
+   the card off the tray, so a turn that records first finds an empty tray
+   (the 0.4.0 live-fire: 25 s parked in ``agentchat_inbox`` for nothing). A
+   turn that could not start (Hermes runtime not importable, texts not
+   loaded, agent construction failed, the hosted tools not registered in
+   Hermes) records nothing: the card stays on the tray and the next wake
+   gates it again.
 
 The hosted tools must be there before a turn starts. Hermes registers the
 ``agentchat`` MCP server's tools some seconds after the gateway starts
@@ -88,11 +86,12 @@ import logging
 import random
 import threading
 import time
-from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from agentchatme import gate
+from agentchatme.integration import apply_outcome, turn_outcome
 
 from .config import (
     DEFAULT_GATE_TIMEOUT_S,
@@ -152,10 +151,14 @@ RETRY_LADDER_S: tuple[float, ...] = (60.0, 300.0, 1800.0)
 # limit (:mod:`.turn_runner`) and reports what became of it.
 StartedTurn = Callable[[], TurnReport]
 
-# What became of the cycle's turn. Only ``completed`` may record ``reply``;
-# ``could_not_look`` is a completed turn that made no AgentChat call, or
-# whose calls all failed.
-TurnOutcome = Literal["completed", "could_not_look", "crashed", "timeout", "not_started"]
+# What became of the cycle's turn. What is recorded after a ``completed``
+# one is the kit's reply rule (``agentchatme.integration.turn_outcome``).
+TurnRun = Literal["completed", "crashed", "timeout", "not_started"]
+
+# Turns per (conversation, anchor) that looked and did nothing, for the
+# reply rule's second look (``silent_before``). Bounded; lost on restart,
+# which gives the agent one more look, never a wrong verdict.
+_SILENT_MEMORY = 512
 
 # Worker supervision: a worker loop that dies is restarted after a backoff
 # (1 s doubling to 60 s, ±20 % jitter); a loop that ran this long before it
@@ -228,18 +231,19 @@ class AgentInvoker:
         self._current_turn: dict[str, Any] | None = None
         self._last_turn: dict[str, Any] | None = None
         self.worker_restarts = 0
-        # ``reply`` records that failed in the last cycle's turn (server
-        # error): the cards are still on the tray, the ladder re-wakes.
-        self._reply_record_failures = 0
+        # ``reply`` cards the last cycle's turn left on the tray (the reply
+        # rule recorded nothing, or its record failed): the ladder re-wakes.
+        self._cards_left_after_turn = 0
+        self._silent_turns: collections.OrderedDict[tuple[str, str], int] = collections.OrderedDict()
 
         # Counters for the heartbeat / doctor and for tests.
         self.cycles = 0
         self.turns = 0
         self.invite_turns = 0
         self.recorded_replies = 0
-        # ``reply`` entries the host left alone because the turn recorded a
-        # verdict for that conversation itself (see the module docstring).
-        self.turn_recorded_verdicts = 0
+        self.recorded_dismisses = 0
+        # How many times each reply-rule reason came up (doctor, tests).
+        self.outcomes: collections.Counter[str] = collections.Counter()
 
         # Hermes' public plugin LLM (``ctx.llm``), read when the gate needs it;
         # ``None`` on a Hermes without it (the gate then resolves the model
@@ -305,6 +309,7 @@ class AgentInvoker:
                 "cycles": self.cycles,
                 "turns": self.turns,
                 "recorded_replies": self.recorded_replies,
+                "recorded_dismisses": self.recorded_dismisses,
             }
 
     def _set_state(self, state: WorkerState, *, error: str | None = None) -> None:
@@ -595,7 +600,7 @@ class AgentInvoker:
                 "AgentInvoker: %d card(s) on the tray, gate disabled — starting the turn",
                 len(cards),
             )
-            turn: TurnOutcome = self._run_wake_turn(
+            turn: TurnRun = self._run_wake_turn(
                 reply=[], covering=[c["conversation_id"] for c in cards]
             )
             if turn != "completed":
@@ -612,8 +617,16 @@ class AgentInvoker:
             timeout_s=self._gate_timeout_s,
             host_llm=host_llm,
         )
+        # The gate prompt's own words are served (``gate_call_preamble``,
+        # ``gate_call_answer_format``); without texts the gate fails closed.
+        # The tray's question names the hosted tools bare: the namer spells
+        # them the way Hermes shows them (served texts already are).
         result = gate.run(
-            tray, call_model, client, tool_namer=gate.mcp_tool_namer(MCP_SERVER_NAME)
+            tray,
+            call_model,
+            client,
+            texts=getattr(self._runtime, "texts", None),
+            tool_namer=gate.mcp_tool_namer(MCP_SERVER_NAME),
         )
         counts = {"reply": 0, "dismiss": 0, "defer": 0}
         for verdict in result.verdicts:
@@ -647,16 +660,17 @@ class AgentInvoker:
             return result
 
         turn = "completed"
-        self._reply_record_failures = 0
+        self._cards_left_after_turn = 0
         if result.reply:
             turn = self._run_wake_turn(reply=result.reply)
 
         if turn != "completed":
             self._schedule_retry(f"turn {turn.replace('_', ' ')}")
-        elif result.record_failures or result.undecided or self._reply_record_failures:
-            # Some cards were not read (verdict rejected by the server — the
-            # gate's or this turn's — or the model skipped them). They are
-            # still on the tray; look again later.
+        elif result.record_failures or result.undecided or self._cards_left_after_turn:
+            # Some cards are still on the tray: a verdict the server
+            # rejected, a card the model skipped, or a reply card the turn
+            # left (it could not look, or looked once and did nothing — the
+            # second look dismisses it). Look again later.
             self._schedule_retry("cards left on the tray")
         else:
             self._retry_rung = 0
@@ -705,7 +719,7 @@ class AgentInvoker:
 
     def _run_wake_turn(
         self, *, reply: list[gate.GateReply], covering: Sequence[str] = ()
-    ) -> TurnOutcome:
+    ) -> TurnRun:
         """One turn for the cycle.
 
         ``reply`` entries are recorded only when the turn has **completed**
@@ -741,83 +755,89 @@ class AgentInvoker:
         report = started()
         if report.status != "completed":
             logger.warning(
-                "AgentInvoker: turn %s %s (%s) — reply verdict(s) for %s NOT recorded; the "
-                "conversation(s) stay unread and the next wake gates them again",
+                "AgentInvoker: turn %s %s (%s) — nothing recorded for %s; the conversation(s) "
+                "stay unread and the next wake gates them again",
                 session_id,
                 "timed out" if report.status == "timeout" else "did not complete",
                 report.detail or "no detail",
                 ", ".join(ids) or "no card",
             )
             return "timeout" if report.status == "timeout" else "crashed"
-        if report.calls.could_not_look:
-            logger.warning(
-                "AgentInvoker: turn %s ended with %s AgentChat call(s), %s failed — it could not "
-                "look; nothing is recorded, the cards stay on the tray",
-                session_id,
-                report.calls.calls,
-                report.calls.failed,
-            )
-            return "could_not_look"
         self.turns += 1
-        decided_in_turn = self._decided_in_turn(reply)
+        if reply:
+            self._record_after_turn(reply, report)
+        return "completed"
+
+    def _record_after_turn(self, reply: Sequence[gate.GateReply], report: TurnReport) -> None:
+        """Record what the turn's outcome calls for, per ``reply`` card.
+
+        The kit's reply rule (``agentchatme.integration.turn_outcome``)
+        decides from one fresh tray read and the turn's AgentChat call
+        counts, never from "the turn ran": the turn recorded its own verdict
+        → nothing; the answer went out → ``reply`` through the anchor the
+        gate saw; no AgentChat call, or only failed ones → nothing; looked
+        and did nothing → nothing the first time, ``dismiss`` the second
+        time for the same anchor. A failed tray read records nothing (the
+        card stays; the next wake looks again).
+        """
+        client = self._runtime.client
+        try:
+            fresh: Any = client.inbox.tray(wait_ms=0, limit=TRAY_LIMIT)
+        except Exception as exc:
+            logger.info("AgentInvoker: tray re-read after the turn failed (%s) — nothing recorded", exc)
+            fresh = None
+        end = report.turn_end()
+        started_at = datetime.fromtimestamp(report.started_at, tz=timezone.utc)
         for entry in reply:
-            if entry.conversation_id in decided_in_turn:
-                self.turn_recorded_verdicts += 1
-                logger.info(
-                    "AgentInvoker: conv=%s — the turn recorded its own verdict; reply not "
-                    "recorded again",
-                    entry.conversation_id,
-                )
+            key = (entry.conversation_id, entry.anchor_message_id or "")
+            outcome = turn_outcome(
+                turn=end,
+                turn_started_at=started_at,
+                gate_card=entry.card,
+                category=entry.category,
+                fresh_tray=fresh,
+                silent_before=self._silent_turns.get(key, 0),
+            )
+            self._remember_silence(key, outcome.reason)
+            self.outcomes[outcome.reason] += 1
+            logger.info(
+                "AgentInvoker: conv=%s after turn %s: %s → %s (%s)",
+                entry.conversation_id,
+                report.session_id,
+                outcome.reason,
+                outcome.action,
+                report.calls_text(),
+            )
+            if outcome.action == "none":
+                if outcome.reason not in ("turn_recorded_verdict", "card_left_tray"):
+                    self._cards_left_after_turn += 1
                 continue
             try:
-                entry.record()
-                self.recorded_replies += 1
+                apply_outcome(client, outcome)
             except Exception as exc:
-                self._reply_record_failures += 1
+                self._cards_left_after_turn += 1
                 logger.warning(
-                    "AgentInvoker: reply verdict for conv=%s not recorded (%s) — it stays "
-                    "unread and the next wake gates it again",
+                    "AgentInvoker: %s for conv=%s not recorded (%s) — it stays unread and the "
+                    "next wake gates it again",
+                    outcome.action,
                     entry.conversation_id,
                     exc,
                 )
-        return "completed"
-
-    def _decided_in_turn(self, reply: Sequence[gate.GateReply]) -> set[str]:
-        """The ``reply`` conversations the completed turn recorded a verdict
-        for itself, seen on one fresh tray read.
-
-        A card that left the tray was read (a verdict or a mark-read) or
-        hidden by a ``defer`` — either way by the turn, since the host had
-        recorded nothing for it. A card still there whose
-        ``your_last_decision`` differs from the gate's copy got a verdict in
-        the turn (a newer message keeps it on the tray). A card still there,
-        unchanged, got nothing: the host records ``reply``. When the read
-        fails, or a missing card may sit past a truncated tray, nothing is
-        claimed and ``reply`` is recorded as before.
-        """
-        if not reply:
-            return set()
-        try:
-            tray = self._runtime.client.inbox.tray(wait_ms=0, limit=TRAY_LIMIT)
-        except Exception as exc:
-            logger.info(
-                "AgentInvoker: tray re-read after the turn failed (%s) — recording reply "
-                "for every card the gate chose",
-                exc,
-            )
-            return set()
-        cards = {card["conversation_id"]: card for card in gate.cards_of(tray)}
-        truncated = _tray_truncated(tray)
-        decided: set[str] = set()
-        for entry in reply:
-            card = cards.get(entry.conversation_id)
-            if card is None:
-                if not truncated:
-                    decided.add(entry.conversation_id)
                 continue
-            if _last_decision_at(card) != _last_decision_at(entry.card):
-                decided.add(entry.conversation_id)
-        return decided
+            if outcome.action == "record_reply":
+                self.recorded_replies += 1
+            else:
+                self.recorded_dismisses += 1
+
+    def _remember_silence(self, key: tuple[str, str], reason: str) -> None:
+        if reason == "silent_first":
+            self._silent_turns[key] = self._silent_turns.get(key, 0) + 1
+            self._silent_turns.move_to_end(key)
+            while len(self._silent_turns) > _SILENT_MEMORY:
+                self._silent_turns.popitem(last=False)
+        elif reason not in ("turn_failed", "turn_running", "card_unknown", "could_not_look"):
+            # Recorded, answered, decided by the turn, or gone: start over.
+            self._silent_turns.pop(key, None)
 
     def _run_invite_turn(self, invite: GroupInviteEvent) -> None:
         if self._stopped.is_set():
@@ -844,7 +864,9 @@ class AgentInvoker:
             self._schedule_retry("invite turn not started")
             return
         report = started()
-        if report.status != "completed" or report.calls.could_not_look:
+        calls = report.calls
+        could_not_look = calls is not None and (calls.made <= 0 or calls.failed >= calls.made)
+        if report.status != "completed" or could_not_look:
             # Never marked started: a turn that crashed, overran or could not
             # look did not decide the invite. It stays offered and the next
             # wake runs it again (not while this one is still running).
@@ -852,8 +874,7 @@ class AgentInvoker:
                 "AgentInvoker: group-invite turn for %s did not decide it (%s) — it stays "
                 "offered and the next wake tries again",
                 invite.invite_id,
-                report.detail
-                or f"{report.calls.calls} AgentChat call(s), {report.calls.failed} failed",
+                report.detail or report.calls_text(),
             )
             self._schedule_retry("invite turn did not complete")
             return
@@ -924,15 +945,16 @@ class AgentInvoker:
                     "status": report.status,
                     "duration_s": round(report.duration_s, 1),
                     "ended": report.ended,
-                    **report.calls.as_dict(),
+                    "agentchat_calls": None
+                    if report.calls is None
+                    else {"made": report.calls.made, "failed": report.calls.failed},
                 }
             self._set_state("cycle")
             if report.status == "completed":
                 logger.info(
-                    "AgentInvoker: turn complete session=%s agentchat_calls=%s failed=%s %.1fs",
+                    "AgentInvoker: turn complete session=%s %s %.1fs",
                     session_id,
-                    report.calls.calls,
-                    report.calls.failed,
+                    report.calls_text(),
                     report.duration_s,
                 )
             return report
@@ -1072,35 +1094,6 @@ def _accepts_parameter(cls: Any, name: str) -> bool:
         return name in inspect.signature(cls).parameters
     except (TypeError, ValueError):
         return False
-
-
-def _card_data(card: Any) -> Mapping[str, Any]:
-    if isinstance(card, Mapping):
-        return card
-    dump = getattr(card, "model_dump", None)
-    if callable(dump):
-        data = dump(mode="json")
-        if isinstance(data, Mapping):
-            return data
-    return {}
-
-
-def _last_decision_at(card: Any) -> str | None:
-    """When the card's ``your_last_decision`` was recorded (server time), or
-    ``None`` when the agent never recorded one. Compared only with another
-    value from the same server field, so no clock is involved."""
-    last = _card_data(card).get("your_last_decision")
-    if isinstance(last, Mapping):
-        at = last.get("at")
-        if isinstance(at, str) and at:
-            return at
-    return None
-
-
-def _tray_truncated(tray: Any) -> bool:
-    if isinstance(tray, Mapping):
-        return bool(tray.get("truncated"))
-    return bool(getattr(tray, "truncated", False))
 
 
 def _coerce_model_string(value: Any) -> str:

@@ -913,8 +913,9 @@ def _describe_worker(worker: Any, *, now: float) -> tuple[str, str] | None:
     tail = ""
     if isinstance(last_turn, dict) and last_turn.get("status"):
         tail = f", last turn {last_turn['status']}"
-        if last_turn.get("calls") is not None:
-            tail += f" with {last_turn['calls']} AgentChat call(s)"
+        calls = last_turn.get("agentchat_calls")
+        if isinstance(calls, dict) and isinstance(calls.get("made"), int):
+            tail += f" with {calls['made']} AgentChat call(s)"
     return "ok", f"Wake worker {state}{extra}{tail}"
 
 

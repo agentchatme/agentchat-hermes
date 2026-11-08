@@ -4,6 +4,20 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+Needs the `agentchatme` SDK release that ships `agentchatme.integration` (contract v1) and a server that serves the gate-call texts;
+the dependency floor is set to that SDK version at release.
+
+### Changed
+
+- **What is recorded after a turn is contract v1's reply rule**, decided by the SDK kit (`agentchatme.integration.turn_outcome`,
+  recorded with `apply_outcome`) from one fresh tray read and the turn's AgentChat call counts, never from "the turn ran": the turn
+  recorded its own verdict → nothing more; the answer went out → `reply` through the anchor the gate saw; no AgentChat call, or only
+  failed ones → nothing; it looked and did nothing → nothing the first time, `dismiss` (`no_action_needed`) the second time for the
+  same anchor. A failed tray read after the turn now records nothing (it recorded `reply` before); the card stays and the next wake
+  looks again. The local post-turn comparison it replaces is deleted.
+- **The gate prompt's own words are served.** The SDK gate builds its prompt from `gate_call_preamble` / `gate_call_answer_format` in
+  `GET /v1/texts?runtime=hermes`; without them it fails closed (nothing recorded, no turn).
+
 ### Fixed
 
 - **A hung turn no longer stops receiving.** A turn ran inline on the wake worker with no time limit, so one turn that never ended

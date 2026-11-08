@@ -82,7 +82,9 @@ def test_completed_turn_reports_calls_and_has_ended() -> None:
     )
     report = run_turn(agent, "go", session_id="agentchat:wake:t1", limits=FAST)
     assert report.status == "completed" and report.ended
-    assert (report.calls.calls, report.calls.failed) == (2, 1)
+    assert report.calls is not None and (report.calls.made, report.calls.failed) == (2, 1)
+    end = report.turn_end()
+    assert end.status == "completed" and end.agentchat_calls == report.calls
     assert agent.interrupts == []
 
 
@@ -94,7 +96,8 @@ def test_failed_result_and_raising_turn_are_failed() -> None:
     agent.run_conversation.side_effect = RuntimeError("provider exploded")
     raised = run_turn(agent, "go", session_id="s", limits=FAST)
     assert raised.status == "failed" and raised.ended and "provider exploded" in (raised.detail or "")
-    assert raised.calls.calls is None, "a turn that raised has no transcript: unknown"
+    assert raised.calls is None, "a turn that raised has no transcript: unknown"
+    assert raised.turn_end().status == "failed"
 
 
 def test_idle_turn_is_interrupted_like_hermes_does_and_reported_timeout() -> None:
@@ -102,6 +105,7 @@ def test_idle_turn_is_interrupted_like_hermes_does_and_reported_timeout() -> Non
     report = run_turn(agent, "go", session_id="s", limits=FAST)
     assert report.status == "timeout" and report.ended
     assert agent.interrupts == [(f"AgentChat: {INTERRUPT_TOOL_REASON}", INTERRUPT_TOOL_REASON)]
+    assert report.turn_end().status == "failed", "stopped by the interrupt: a failed turn"
     assert "no activity" in (report.detail or "") and "waiting for the provider" in (report.detail or "")
 
 
@@ -138,6 +142,7 @@ def test_turn_that_ignores_the_interrupt_stays_held_until_it_really_ends() -> No
         on_finished=lambda: running.release(token),
     )
     assert report.status == "timeout" and not report.ended
+    assert report.turn_end().status == "still_running", "it keeps its conversation"
     running.abandon(token)
     assert running.busy() == {"conv_a"} and running.hung == 1
     assert released == []

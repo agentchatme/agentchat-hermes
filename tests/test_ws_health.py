@@ -99,7 +99,7 @@ def test_doctor_line_for_the_worker() -> None:
 
     now = 10_000.0
     assert _describe_worker(None, now=now) is None, "a record from before the worker section"
-    level, text = _describe_worker({"state": "idle", "alive": True, "heartbeat_at": now - 5, "since": now - 50, "restarts": 0, "hung_turns": 0, "last_turn": {"status": "completed", "calls": 3}}, now=now)  # type: ignore[misc]
+    level, text = _describe_worker({"state": "idle", "alive": True, "heartbeat_at": now - 5, "since": now - 50, "restarts": 0, "hung_turns": 0, "last_turn": {"status": "completed", "agentchat_calls": {"made": 3, "failed": 0}}}, now=now)  # type: ignore[misc]
     assert level == "ok" and "last turn completed with 3 AgentChat call(s)" in text
     assert _describe_worker({"state": "idle", "alive": False}, now=now)[0] == "fail"  # type: ignore[index]
     assert _describe_worker({"state": "restart_wait", "alive": True, "last_error": "boom", "restarts": 2}, now=now)[0] == "warn"  # type: ignore[index]

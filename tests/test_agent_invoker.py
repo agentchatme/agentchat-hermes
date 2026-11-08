@@ -57,6 +57,10 @@ TEXTS = Texts.model_validate(
         "invite_prompt": "An invite is pending. Call agentchat_list_group_invites first.",
         "identity_line": "I am @me on AgentChat.",
         "identity_line_template": "I am @<handle> on AgentChat.",
+        # The gate prompt's own words, served (contract v1): the SDK's
+        # conformance sample, tool names spelled as served for runtime=hermes.
+        "gate_call_preamble": 'You are triaging your AgentChat tray before any turn starts. This call has NO tools: do not call mcp__agentchat__agentchat_decide, do not open or send anything, and do not write a reply. Answer the question below for every card, in JSON only; the host records your verdicts from that JSON. Where the question says to record a verdict or to send, that happens later: for each conversation you mark "reply", a turn will be started in which you open it and reply.',
+        "gate_call_answer_format": 'Answer with ONLY a JSON object, no prose and no code fences, in this shape: {"decisions": [{"conversation_id": "<conversation_id from a card>", "decision": "reply" | "dismiss" | "defer", "category": "<one of: open_request, new_info, goal_followup, closing, acknowledgement, not_addressed, no_action_needed, spam, other>"}]} — one entry per card, every card decided.',
     }
 )
 
@@ -117,6 +121,9 @@ class _Client:
         # turn ends and consumed by the host's one post-turn read.
         self.turn_view: Any = None
         self.after_turn: Any = None
+        # Whether the default fake turn sent its answer: the post-turn view
+        # then shows the reply cards with ``you_owe_reply: false``.
+        self.turn_sends = True
         self.last_served: InboxTray | None = None
         self.inbox = SimpleNamespace(tray=self._tray)
         self.decisions = SimpleNamespace(record=self._record)
@@ -166,6 +173,8 @@ def _leave_unread_on_the_tray(client: _Client) -> None:
         return
     recorded = {cid for cid, _decision, _anchor in client.recorded}
     cards = [c for c in gate.cards_of(served) if c["conversation_id"] not in recorded]
+    if client.turn_sends:
+        cards = [{**c, "you_owe_reply": False, "your_last_message_at": "2026-11-04T23:00:00.000Z"} for c in cards]
     client.after_turn = _tray(*cards, truncated=bool(served.truncated))
 
 
@@ -442,7 +451,7 @@ class TestRunCycle:
         assert "record:a:reply" not in events
         assert inv.turns == 0 and inv.recorded_replies == 0
         assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
-        assert any("NOT recorded" in r.getMessage() for r in caplog.records)
+        assert any("nothing recorded" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.parametrize(
         "result",
@@ -493,13 +502,14 @@ class TestRunCycle:
             {"role": "assistant", "content": "Could not reach AgentChat."},
         ]
         agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": "Could not reach AgentChat.", "messages": transcript, "completed": True}
+        client.turn_sends = False
         scheduled: list[float] = []
         monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
-        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
+        with caplog.at_level(logging.INFO, logger="agentchatme_hermes.agent_invoker"):
             inv.run_cycle()
         assert client.recorded == [] and "record:a:reply" not in events
-        assert inv.turns == 0 and scheduled == [invoker_module.RETRY_LADDER_S[0]]
-        assert any("it could not look" in r.getMessage() for r in caplog.records)
+        assert inv.outcomes["could_not_look"] == 1 and scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert any("could_not_look" in r.getMessage() and "1 AgentChat call(s), 1 failed" in r.getMessage() for r in caplog.records)
 
     def test_turn_with_no_agentchat_call_records_nothing(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -516,14 +526,13 @@ class TestRunCycle:
             {"role": "assistant", "content": "Nothing to do."},
         ]
         agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": "Nothing to do.", "messages": transcript, "completed": True}
+        client.turn_sends = False
         scheduled: list[float] = []
         monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
-        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
-            inv.run_cycle()
+        inv.run_cycle()
         assert client.recorded == [] and "record:a:reply" not in events
-        assert inv.turns == 0 and scheduled == [invoker_module.RETRY_LADDER_S[0]]
-        assert any("ended with 0 AgentChat call(s)" in r.getMessage() for r in caplog.records)
-        assert inv.status()["last_turn"]["calls"] == 0
+        assert inv.outcomes["could_not_look"] == 1 and scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert inv.status()["last_turn"]["agentchat_calls"] == {"made": 0, "failed": 0}
 
     def test_count_agentchat_calls_helper(self) -> None:
         ok_wrapped = '<untrusted_tool_result source="mcp__agentchat__agentchat_inbox">\nThe following content ...\n\n{"result": "{\\n  \\"you\\": \\"@me\\"}"}'
@@ -534,24 +543,23 @@ class TestRunCycle:
             {"role": "tool", "name": "mcp__agentchat__agentchat_inbox", "content": err},
             {"role": "tool", "name": "mcp__agentchat__agentchat_get_conversation", "content": ok_wrapped},
         ]})
-        assert (both.calls, both.failed, both.could_not_look) == (2, 1, False)
+        assert both == turn_runner_module.AgentChatCallCount(made=2, failed=1)
         # through Hermes' tool_call bridge: the wrapper names the hosted tool
         bridged = count({"messages": [{"role": "tool", "name": "tool_call", "content": ok_wrapped}]})
-        assert (bridged.calls, bridged.failed, bridged.could_not_look) == (1, 0, False)
-        # every AgentChat call failed → could not look
+        assert bridged == turn_runner_module.AgentChatCallCount(made=1, failed=0)
+        # every AgentChat call failed
         failed = count({"messages": [
             {"role": "tool", "name": "mcp__agentchat__agentchat_inbox", "content": err},
             {"role": "tool", "name": "mcp__agentchat__agentchat_send_message", "content": err},
         ]})
-        assert (failed.calls, failed.failed, failed.could_not_look) == (2, 2, True)
-        # no AgentChat tool call at all → zero, could not look
+        assert failed == turn_runner_module.AgentChatCallCount(made=2, failed=2)
+        # no AgentChat tool call at all → zero (the reply rule: could not look)
         none = count({"messages": [{"role": "tool", "name": "terminal", "content": err}, {"role": "assistant", "content": "hi"}]})
-        assert (none.calls, none.failed, none.could_not_look) == (0, 0, True)
-        assert count({"messages": []}).could_not_look is True
-        # no transcript: unknown, not zero — never taken as "could not look"
+        assert none == turn_runner_module.AgentChatCallCount(made=0, failed=0)
+        assert count({"messages": []}) == turn_runner_module.AgentChatCallCount(made=0, failed=0)
+        # no transcript: unknown (None), not zero — the reply rule takes it as "it looked"
         for unknown in ({"final_response": "ok"}, "not a dict", None):
-            calls = count(unknown)
-            assert (calls.calls, calls.failed, calls.could_not_look) == (None, None, False)
+            assert count(unknown) is None
         # a wrapped error payload counts as an error; a wrapped result does not
         assert turn_runner_module._is_tool_error('<untrusted_tool_result source="mcp__agentchat__agentchat_inbox">\n\n{"error": "GROUP_DELETED"}') is True
         assert turn_runner_module._is_tool_error(ok_wrapped) is False
@@ -580,7 +588,7 @@ class TestRunCycle:
         inv.run_cycle()
         assert events == ["model", "build", "run"]
         assert client.recorded == []
-        assert inv.turn_recorded_verdicts == 1 and inv.recorded_replies == 0
+        assert inv.outcomes["card_left_tray"] == 1 and inv.recorded_replies == 0
         assert inv.turns == 1
 
     def test_a_verdict_in_the_turn_seen_on_a_card_kept_by_a_newer_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -592,31 +600,38 @@ class TestRunCycle:
         client.turn_view = _tray(after)
         inv.run_cycle()
         assert client.recorded == []
-        assert inv.turn_recorded_verdicts == 1
+        assert inv.outcomes["turn_recorded_verdict"] == 1
 
     def test_an_older_verdict_on_the_card_is_not_the_turns(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        # The card carried a verdict from an earlier cycle; the turn recorded
-        # nothing (same your_last_decision after it): the host records reply.
+        # The card carried a verdict from an earlier cycle; the turn sent its
+        # answer and recorded nothing (same your_last_decision after it, older
+        # than the turn): the host records reply.
         old = {"decision": "defer", "category": None, "at": "2026-11-06T09:00:00.000Z"}
         card = {**_card("a"), "your_last_decision": old}
         inv, client, _agent, _events = _invoker(monkeypatch, trays=[_tray(card)], answer=_answer(a="reply"))
-        client.turn_view = _tray(card)
+        client.turn_view = _tray({**card, "you_owe_reply": False})
         inv.run_cycle()
         assert client.recorded == [("a", "reply", "msg_a")]
-        assert inv.turn_recorded_verdicts == 0 and inv.recorded_replies == 1
+        assert inv.outcomes["answer_sent"] == 1 and inv.recorded_replies == 1
 
-    def test_a_failed_re_read_records_reply_as_before(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_failed_re_read_records_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Contract v1 (D5): what the turn did is unknown, so nothing is
+        # recorded; the card stays and the next wake looks again (the
+        # pre-kit integration recorded reply here).
         inv, client, _agent, _events = _invoker(monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply"))
         client.turn_view = RuntimeError("inbox down")
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
         inv.run_cycle()
-        assert client.recorded == [("a", "reply", "msg_a")]
+        assert client.recorded == [] and inv.outcomes["card_unknown"] == 1
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
 
-    def test_a_card_missing_from_a_truncated_tray_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_card_missing_from_a_truncated_tray_records_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Past a truncated page the card may still be unread: claim nothing.
         inv, client, _agent, _events = _invoker(monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply"))
         client.turn_view = _tray(_card("x"), truncated=True)
         inv.run_cycle()
-        assert client.recorded == [("a", "reply", "msg_a")]
+        assert client.recorded == [] and inv.outcomes["card_unknown"] == 1
 
     def test_turn_reads_the_card_before_reply_is_recorded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """What the ordering is for: the turn's first ``agentchat_inbox`` must
@@ -643,14 +658,32 @@ class TestRunCycle:
         assert client.recorded == [("a", "reply", "msg_a")]
         assert events.index("run") < events.index("record:a:reply")
 
-    def test_completed_turn_that_chose_silence_still_counts_as_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_turn_that_looked_and_did_nothing_is_dismissed_the_second_time(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Contract v1 (D5): looked, sent nothing, recorded nothing → nothing
+        # the first time (the card stays, the next wake looks again); the
+        # second time for the same anchor → dismiss, no_action_needed.
         inv, client, agent, _events = _invoker(
-            monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
+            monkeypatch, trays=[_tray(_card("a")), _tray(_card("a"))], answer=_answer(a="reply")
         )
+        client.turn_sends = False
         agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": ""}
         inv.run_cycle()
-        assert client.recorded == [("a", "reply", "msg_a")], "it looked; the conversation is read"
-        assert inv.turns == 1
+        assert client.recorded == [] and inv.outcomes["silent_first"] == 1
+        inv.run_cycle()
+        assert client.recorded == [("a", "dismiss", "msg_a")] and inv.outcomes["silent_again"] == 1
+        assert inv.recorded_dismisses == 1 and inv.turns == 2
+
+    def test_a_newer_anchor_starts_the_silence_count_over(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        newer = _card("a")
+        newer["preview"]["message_id"] = "msg_a2"
+        inv, client, agent, _events = _invoker(
+            monkeypatch, trays=[_tray(_card("a")), _tray(newer)], answer=_answer(a="reply")
+        )
+        client.turn_sends = False
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": ""}
+        inv.run_cycle()
+        inv.run_cycle()
+        assert client.recorded == [] and inv.outcomes["silent_first"] == 2
 
     def test_turn_waits_for_the_hosted_tools(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
         """Hermes registers the ``agentchat`` MCP tools after the gateway starts;
@@ -765,17 +798,20 @@ class TestRunCycle:
         assert scheduled == [invoker_module.RETRY_LADDER_S[0]], "only the failed cycle laddered"
         assert inv._retry_rung == 0 and client.recorded == [("a", "reply", "msg_a")]
 
-    def test_without_texts_no_turn_and_reply_stays_unrecorded(
+    def test_without_texts_the_gate_fails_closed(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        inv, client, agent, _events = _invoker(
+        # The gate prompt's words are served: without texts the SDK gate
+        # judges nothing (no model call), records nothing, starts nothing.
+        inv, client, agent, events = _invoker(
             monkeypatch, trays=[_tray(_card("a"), _card("b"))], answer=_answer(a="reply", b="defer"), texts=None
         )
         scheduled: list[float] = []
         monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
-        inv.run_cycle()
+        result = inv.run_cycle()
+        assert result is not None and result.outcome == "fail_closed"
         agent.run_conversation.assert_not_called()
-        assert client.recorded == [("b", "defer", "msg_b")]
+        assert client.recorded == [] and "model" not in events
         assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
 
     def test_gate_disabled_starts_the_turn_from_the_tray(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -918,11 +954,12 @@ class TestWorker:
         inv.wake()  # ignored after stop
 
 
-def _server_like_inbox(client: _Client, unread: dict[str, str]) -> Any:
+def _server_like_inbox(client: _Client, unread: dict[str, str], answered: dict[str, str] | None = None) -> Any:
     """The tray as the server builds it: one card per conversation with a
     message newer than its last ``reply``/``dismiss`` anchor. ``unread`` maps
     conversation id → newest message id and is mutated by the test as peers
-    write."""
+    write; a conversation the fake turn answered through its newest message
+    (``answered``: conversation id → message id) shows ``you_owe_reply: false``."""
 
     def tray() -> InboxTray:
         read_through = {
@@ -934,6 +971,8 @@ def _server_like_inbox(client: _Client, unread: dict[str, str]) -> Any:
                 continue
             card = _card(cid)
             card["preview"]["message_id"] = newest
+            if answered is not None and answered.get(cid) == newest:
+                card["you_owe_reply"] = False
             cards.append(card)
         return _tray(*cards)
 
@@ -952,7 +991,8 @@ class TestInFlightConversations:
     ) -> None:
         inv, client, agent, events = _invoker(monkeypatch, trays=[], answer=_answer(a="reply"))
         unread = {"a": "msg_a"}
-        client.live_inbox = _server_like_inbox(client, unread)
+        answered: dict[str, str] = {}
+        client.live_inbox = _server_like_inbox(client, unread, answered)
         in_turn = threading.Event()
         release = threading.Event()
 
@@ -960,6 +1000,7 @@ class TestInFlightConversations:
             events.append("run")
             in_turn.set()
             assert release.wait(5.0)
+            answered["a"] = unread["a"]  # the turn sent its answer
             return {"final_response": "sent"}
 
         agent.run_conversation.side_effect = long_turn
@@ -1014,7 +1055,8 @@ class TestInFlightConversations:
             monkeypatch, trays=[], answer=_answer(a="reply", b="dismiss")
         )
         unread = {"a": "msg_a"}
-        client.live_inbox = _server_like_inbox(client, unread)
+        answered: dict[str, str] = {}
+        client.live_inbox = _server_like_inbox(client, unread, answered)
         in_turn = threading.Event()
         release = threading.Event()
 
@@ -1022,6 +1064,7 @@ class TestInFlightConversations:
             events.append("run")
             in_turn.set()
             assert release.wait(5.0)
+            answered["a"] = unread["a"]  # the turn sent its answer
             return {"final_response": "sent"}
 
         agent.run_conversation.side_effect = long_turn

@@ -188,7 +188,8 @@ def test_a_hung_turn_is_stopped_by_the_time_limit(hanging_model: _Stub) -> None:
     assert isinstance(report.result, dict) and report.result.get("interrupted") is True
     assert "agentchat_turn_time_limit" in str(report.result.get("turn_exit_reason")), "Hermes attributes the stop to us"
     assert turn_runner.turn_failure(report.result) is not None
-    assert report.calls.calls == 0, "the transcript is a messages list"
+    assert report.calls is not None and report.calls.made == 0, "the transcript is a messages list"
+    assert report.turn_end().status == "failed"
 
 
 def test_a_completed_turn_reports_its_transcript(answering_model: _Stub) -> None:
