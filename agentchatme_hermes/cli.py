@@ -39,6 +39,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import time
 from getpass import getpass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -843,6 +844,10 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                         "WS leader lock is held but the daemon reports stopped — "
                         "restart `hermes gateway`"
                     )
+                worker_report = _describe_worker(health.get("worker"), now=time.time())
+                if worker_report is not None:
+                    level, text = worker_report
+                    {"ok": ok, "warn": warn, "fail": fail}[level](text)
         elif state == "free":
             warn(
                 f"WS leader lock file present but no holder ({lock_path}) — "
@@ -859,6 +864,58 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         warn("leader_lock module not importable — skipping lock check")
 
     return _doctor_finalize(failures, warnings_count)
+
+
+# A worker turn that runs this long is reported, though its own time limit
+# (``AGENTCHATME_TURN_MAX_S``) is what ends it.
+_WORKER_LONG_TURN_S = 900.0
+
+
+def _describe_worker(worker: Any, *, now: float) -> tuple[str, str] | None:
+    """``(ok|warn|fail, line)`` for the health record's ``worker`` section.
+
+    ``None`` when the record has none (written by a version before the
+    worker was supervised). The socket can be connected while the worker
+    that turns wakes into turns is dead or stuck; this is how that shows.
+    """
+    from .ws_health import HEALTH_STALE_AFTER_SECONDS
+
+    if not isinstance(worker, dict):
+        return None
+    state = str(worker.get("state") or "unknown")
+    restarts = worker.get("restarts") if isinstance(worker.get("restarts"), int) else 0
+    hung = worker.get("hung_turns") if isinstance(worker.get("hung_turns"), int) else 0
+    beat = worker.get("heartbeat_at")
+    beat_age = now - float(beat) if isinstance(beat, (int, float)) else None
+    since = worker.get("since")
+    in_state = now - float(since) if isinstance(since, (int, float)) else None
+    extra = f", restarts={restarts}" if restarts else ""
+    last_error = worker.get("last_error")
+    if worker.get("alive") is False and state != "stopped":
+        return "fail", f"Wake worker thread is not running (state={state}) — restart `hermes gateway`"
+    if state == "restart_wait":
+        return "warn", f"Wake worker is restarting after a crash ({last_error or 'no error text'}{extra})"
+    if beat_age is not None and beat_age > HEALTH_STALE_AFTER_SECONDS:
+        # The worker loop beats on every idle tick (60 s) and a running turn's
+        # watch every second; only a worker stuck outside both stops it.
+        return "fail", (
+            f"Wake worker has not moved for {beat_age:.0f}s (state={state}) while the socket is up "
+            "— restart `hermes gateway`"
+        )
+    if hung:
+        return "warn", (
+            f"{hung} AgentChat turn(s) overran their time limit and have not ended; their "
+            "conversations get no new turn until they do"
+        )
+    if state == "turn" and in_state is not None and in_state > _WORKER_LONG_TURN_S:
+        return "warn", f"An AgentChat turn has been running for {in_state:.0f}s"
+    last_turn = worker.get("last_turn")
+    tail = ""
+    if isinstance(last_turn, dict) and last_turn.get("status"):
+        tail = f", last turn {last_turn['status']}"
+        if last_turn.get("calls") is not None:
+            tail += f" with {last_turn['calls']} AgentChat call(s)"
+    return "ok", f"Wake worker {state}{extra}{tail}"
 
 
 def _doctor_finalize(failures: int, warnings_count: int) -> int:

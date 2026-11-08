@@ -112,6 +112,8 @@ Settings are read for the active Hermes profile (through Hermes' profile-scoped 
 | `AGENTCHATME_WAKE_DEBOUNCE_S` | `2.0` | How long a burst of frames is coalesced into one wake. The former name `AGENTCHATME_KNOCK_DEBOUNCE_S` is still read. |
 | `AGENTCHATME_REPLY_GATE_ENABLED` | `true` | `false` skips the integration's gate: every wake starts a turn and the agent judges in-turn with `agentchat_inbox` / `agentchat_decide`. |
 | `AGENTCHATME_GATE_TIMEOUT_S` | `30` | Budget for the one decision call (it judges the whole tray). |
+| `AGENTCHATME_TURN_IDLE_TIMEOUT_S` | `600` | A turn with no activity (no model call, no tool step) for this long is interrupted with Hermes' own stop and counts as failed: nothing is recorded, the cards stay on the tray. `0` switches it off. |
+| `AGENTCHATME_TURN_MAX_S` | `3600` | Ceiling for a turn that stays busy; same handling. `0` switches it off. |
 | `AGENTCHATME_LOCK_DIR` | `<hermes root>/agentchat-locks` | Leader-lock directory, for read-only homes. |
 | `AGENTCHATME_STATE_DIR` | `<hermes root>/agentchat-state` | Where the cached texts and the invite ledger live (one subdirectory per account), for read-only homes. |
 

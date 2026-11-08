@@ -55,6 +55,7 @@ if TYPE_CHECKING:
 
     from .config import Config
     from .types import AgentIdentity, GroupInviteEvent
+    from .ws_health import HealthBoard
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,7 @@ class WSDaemon:
         on_wake: Callable[[], None],
         on_group_invite: Callable[[GroupInviteEvent], None],
         health_path: Path | None = None,
+        health: HealthBoard | None = None,
     ) -> None:
         self._config = config
         self._identity = identity
@@ -93,8 +95,11 @@ class WSDaemon:
         self._on_group_invite = on_group_invite
         # Where the liveness record for THIS account is written. ``None``
         # falls back to the legacy per-machine file (test doubles only;
-        # the runtime always passes the per-account path).
+        # the runtime always passes the per-account path). With ``health``
+        # the record is the runtime's board, which also carries the
+        # worker's state; ``health_path`` is then unused.
         self._health_path = health_path
+        self._health = health
 
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
@@ -415,6 +420,14 @@ class WSDaemon:
         self, state: WSHealthState, *, last_error: str | None = None
     ) -> None:
         try:
+            if self._health is not None:
+                self._health.socket(
+                    state,
+                    restart_attempt=self._restart_attempt,
+                    last_error=last_error,
+                    last_connected_at=self._last_connected_at,
+                )
+                return
             write_ws_health(
                 handle=self._identity.handle,
                 state=state,

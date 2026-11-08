@@ -38,6 +38,7 @@ from agentchatme.types import InboxTray, Texts
 
 from agentchatme_hermes import agent_invoker as invoker_module
 from agentchatme_hermes import hosted_tools as hosted_tools_module
+from agentchatme_hermes import turn_runner as turn_runner_module
 from agentchatme_hermes.agent_invoker import _FALLBACK_MODEL, AgentInvoker, _coerce_model_string
 from agentchatme_hermes.invites import InviteLedger
 from agentchatme_hermes.turn import invite_turn_prompt, wake_turn_prompt
@@ -235,9 +236,9 @@ def _invoker(
             # off): the host makes no post-turn read.
             return started
 
-        def run() -> bool:
+        def run() -> Any:
             try:
-                return bool(started())
+                return started()
             finally:
                 _leave_unread_on_the_tray(client)
 
@@ -498,42 +499,74 @@ class TestRunCycle:
             inv.run_cycle()
         assert client.recorded == [] and "record:a:reply" not in events
         assert inv.turns == 0 and scheduled == [invoker_module.RETRY_LADDER_S[0]]
-        assert any("every AgentChat tool call in it failed" in r.getMessage() for r in caplog.records)
+        assert any("it could not look" in r.getMessage() for r in caplog.records)
 
-    def test_turn_looked_helper(self) -> None:
+    def test_turn_with_no_agentchat_call_records_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The reply rule: a turn that made no AgentChat call could not look.
+        It is not a success (the pre-kit integration recorded ``reply`` for
+        it): nothing is recorded, the card stays on the tray."""
+        inv, client, agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply")
+        )
+        transcript = [
+            {"role": "user", "content": "You were woken"},
+            {"role": "tool", "name": "terminal", "tool_call_id": "c1", "content": "ok"},
+            {"role": "assistant", "content": "Nothing to do."},
+        ]
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": "Nothing to do.", "messages": transcript, "completed": True}
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.agent_invoker"):
+            inv.run_cycle()
+        assert client.recorded == [] and "record:a:reply" not in events
+        assert inv.turns == 0 and scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert any("ended with 0 AgentChat call(s)" in r.getMessage() for r in caplog.records)
+        assert inv.status()["last_turn"]["calls"] == 0
+
+    def test_count_agentchat_calls_helper(self) -> None:
         ok_wrapped = '<untrusted_tool_result source="mcp__agentchat__agentchat_inbox">\nThe following content ...\n\n{"result": "{\\n  \\"you\\": \\"@me\\"}"}'
         err = '{"error": "MCP call failed: MCPError: Connection closed"}'
-        looked = invoker_module.turn_looked
+        count = turn_runner_module.count_agentchat_calls
         # one success among failures → looked
-        assert looked({"messages": [
+        both = count({"messages": [
             {"role": "tool", "name": "mcp__agentchat__agentchat_inbox", "content": err},
             {"role": "tool", "name": "mcp__agentchat__agentchat_get_conversation", "content": ok_wrapped},
-        ]}) is True
+        ]})
+        assert (both.calls, both.failed, both.could_not_look) == (2, 1, False)
         # through Hermes' tool_call bridge: the wrapper names the hosted tool
-        assert looked({"messages": [{"role": "tool", "name": "tool_call", "content": ok_wrapped}]}) is True
-        # every AgentChat call failed → did not look
-        assert looked({"messages": [
+        bridged = count({"messages": [{"role": "tool", "name": "tool_call", "content": ok_wrapped}]})
+        assert (bridged.calls, bridged.failed, bridged.could_not_look) == (1, 0, False)
+        # every AgentChat call failed → could not look
+        failed = count({"messages": [
             {"role": "tool", "name": "mcp__agentchat__agentchat_inbox", "content": err},
             {"role": "tool", "name": "mcp__agentchat__agentchat_send_message", "content": err},
-        ]}) is False
-        # no AgentChat tool call at all, or no transcript: unknown, trusted as before
-        assert looked({"messages": [{"role": "tool", "name": "terminal", "content": err}, {"role": "assistant", "content": "hi"}]}) is None
-        assert looked({"messages": []}) is None
-        assert looked({"final_response": "ok"}) is None
-        assert looked("not a dict") is None
+        ]})
+        assert (failed.calls, failed.failed, failed.could_not_look) == (2, 2, True)
+        # no AgentChat tool call at all → zero, could not look
+        none = count({"messages": [{"role": "tool", "name": "terminal", "content": err}, {"role": "assistant", "content": "hi"}]})
+        assert (none.calls, none.failed, none.could_not_look) == (0, 0, True)
+        assert count({"messages": []}).could_not_look is True
+        # no transcript: unknown, not zero — never taken as "could not look"
+        for unknown in ({"final_response": "ok"}, "not a dict", None):
+            calls = count(unknown)
+            assert (calls.calls, calls.failed, calls.could_not_look) == (None, None, False)
         # a wrapped error payload counts as an error; a wrapped result does not
-        assert invoker_module._is_tool_error('<untrusted_tool_result source="mcp__agentchat__agentchat_inbox">\n\n{"error": "GROUP_DELETED"}') is True
-        assert invoker_module._is_tool_error(ok_wrapped) is False
-        assert invoker_module._is_tool_error("plain text") is False
+        assert turn_runner_module._is_tool_error('<untrusted_tool_result source="mcp__agentchat__agentchat_inbox">\n\n{"error": "GROUP_DELETED"}') is True
+        assert turn_runner_module._is_tool_error(ok_wrapped) is False
+        assert turn_runner_module._is_tool_error("plain text") is False
 
     def test_turn_failure_helper(self) -> None:
-        assert invoker_module.turn_failure({"final_response": "ok"}) is None
-        assert invoker_module.turn_failure({"completed": True}) is None
-        assert invoker_module.turn_failure("not a dict") is None
-        assert invoker_module.turn_failure(None) is None
-        assert invoker_module.turn_failure({"failed": True, "error": "boom", "failure_reason": "provider_error"}) == "failed, provider_error: boom"
-        assert invoker_module.turn_failure({"partial": True, "error": "cut"}) == "partial: cut"
-        assert invoker_module.turn_failure({"completed": False}) == "not completed: no error text"
+        failure = turn_runner_module.turn_failure
+        assert failure({"final_response": "ok"}) is None
+        assert failure({"completed": True}) is None
+        assert failure("not a dict") is None
+        assert failure(None) is None
+        assert failure({"failed": True, "error": "boom", "failure_reason": "provider_error"}) == "failed, provider_error: boom"
+        assert failure({"partial": True, "error": "cut"}) == "partial: cut"
+        assert failure({"completed": False}) == "not completed: no error text"
+        assert failure({"completed": False, "interrupted": True, "turn_exit_reason": "interrupted_by_user"}) == "interrupted, interrupted_by_user: no error text"
 
     def test_turn_that_recorded_its_own_verdict_is_not_recorded_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The served texts tell the model to record reply after its send (or
@@ -1626,3 +1659,227 @@ class TestSessionPerTurn:
         inv.run_cycle()
         assert len(sessions) == 2 and sessions[0] != sessions[1]
         assert all(s.startswith("agentchat:wake:") for s in sessions)
+
+
+class _BlockingAgent:
+    """An ``AIAgent`` whose turn blocks until released; ``obey`` releases it
+    on ``hard_interrupt`` (Hermes' own stop), otherwise it ignores the stop."""
+
+    def __init__(self, *, obey: bool) -> None:
+        self.obey = obey
+        self.release = threading.Event()
+        self.started = threading.Event()
+        self.interrupts: list[str | None] = []
+        self.runs = 0
+
+    def run_conversation(self, prompt: str, conversation_history: list[Any]) -> dict[str, Any]:
+        self.runs += 1
+        self.started.set()
+        self.release.wait(10.0)
+        return {"completed": False, "interrupted": True, "messages": []}
+
+    def get_activity_summary(self) -> dict[str, Any]:
+        return {"last_activity_at": 1.0, "api_call_count": 1, "current_tool": None}
+
+    def hard_interrupt(self, message: str | None = None, *, tool_reason: str | None = None) -> None:
+        self.interrupts.append(tool_reason)
+        if self.obey:
+            self.release.set()
+
+
+def _fast_limits(inv: AgentInvoker, *, grace_s: float = 0.05) -> None:
+    inv._limits = turn_runner_module.TurnLimits(idle_s=0.05, max_s=5.0, grace_s=grace_s, poll_s=0.01)
+
+
+class TestTurnTimeLimit:
+    """A turn that hangs must not stop receiving: it is interrupted with
+    Hermes' own stop, counts as failed (nothing recorded), and its
+    conversations stay held until its thread has really ended."""
+
+    def test_overrun_records_nothing_and_holds_the_card_until_the_turn_ends(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        inv, client, _agent, events = _invoker(
+            monkeypatch, trays=[_tray(_card("a")), _tray(_card("a"))], answer=_answer(a="reply")
+        )
+        stuck = _BlockingAgent(obey=False)
+        monkeypatch.setattr(inv, "_build_agent", lambda _sid: stuck)
+        _fast_limits(inv)
+        scheduled: list[float] = []
+        wakes: list[str] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        monkeypatch.setattr(inv._coalescer, "wake", lambda: wakes.append("wake"))
+
+        inv.run_cycle()
+        assert client.recorded == [] and "record:a:reply" not in events
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert stuck.interrupts == [turn_runner_module.INTERRUPT_TOOL_REASON]
+        assert inv.in_flight() == {"a"}, "held: the stuck turn may still send"
+        status = inv.status()
+        assert status["hung_turns"] == 1
+        assert status["last_turn"]["status"] == "timeout" and status["last_turn"]["ended"] is False
+
+        # The next wake does not gate or start a second turn for "a".
+        inv.run_cycle()
+        assert events.count("model") == 1 and stuck.runs == 1
+
+        stuck.release.set()  # the stuck call finally returns
+        assert _wait_for(lambda: inv.in_flight() == set())
+        assert inv.status()["hung_turns"] == 0
+        assert "wake" in wakes, "the tray is read again once the overrun turn ended"
+
+    def test_interrupted_turn_that_ends_is_a_timeout_not_a_reply(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, _agent, _events = _invoker(monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply"))
+        obeying = _BlockingAgent(obey=True)
+        monkeypatch.setattr(inv, "_build_agent", lambda _sid: obeying)
+        _fast_limits(inv, grace_s=2.0)
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        inv.run_cycle()
+        assert client.recorded == [] and inv.turns == 0
+        assert inv.in_flight() == set() and inv.status()["hung_turns"] == 0
+        assert inv.status()["last_turn"]["ended"] is True
+        assert scheduled == [invoker_module.RETRY_LADDER_S[0]]
+
+    def test_no_new_turn_while_too_many_turns_are_hung(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+        inv, client, agent, _events = _invoker(monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply"))
+        for cid in ("x", "y")[: invoker_module.MAX_HUNG_TURNS]:
+            inv._running.abandon(inv._running.hold(frozenset({cid})))
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        with caplog.at_level(logging.ERROR, logger="agentchatme_hermes.agent_invoker"):
+            inv.run_cycle()
+        agent.run_conversation.assert_not_called()
+        assert client.recorded == [] and scheduled == [invoker_module.RETRY_LADDER_S[0]]
+        assert any("have not ended" in r.getMessage() for r in caplog.records)
+
+    def test_stop_interrupts_the_running_turn(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, client, _agent, _events = _invoker(monkeypatch, trays=[_tray(_card("a"))], answer=_answer(a="reply"))
+        turn = _BlockingAgent(obey=True)
+        monkeypatch.setattr(inv, "_build_agent", lambda _sid: turn)
+        inv._limits = turn_runner_module.TurnLimits(idle_s=None, max_s=None, grace_s=2.0, poll_s=0.01)
+        inv.start()
+        inv._on_wake_fired()
+        assert turn.started.wait(5.0)
+        inv.stop()
+        assert _wait_for(lambda: turn.interrupts == [turn_runner_module.INTERRUPT_STOP_REASON])
+        assert _wait_for(lambda: inv.status()["state"] == "stopped")
+        assert client.recorded == [], "a turn stopped mid-way records nothing"
+
+    def test_crashed_invite_turn_is_not_marked_started(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        ledger = InviteLedger(None)
+        inv, _client, agent, _events = _invoker(monkeypatch, trays=[], answer=_answer(), ledger=ledger)
+        agent.run_conversation.side_effect = RuntimeError("provider exploded")
+        scheduled: list[float] = []
+        monkeypatch.setattr(inv._coalescer, "wake_after", scheduled.append)
+        invite = _invite()
+        ledger.offer(invite)
+        inv._run_invite_turn(invite)
+        assert not ledger.is_started(invite.invite_id)
+        assert [i.invite_id for i in ledger.pending()] == [invite.invite_id], "retried on the next wake"
+        assert inv.invite_turns == 0 and scheduled == [invoker_module.RETRY_LADDER_S[0]]
+
+        agent.run_conversation.side_effect = lambda prompt, conversation_history: {"final_response": ""}
+        inv._run_invite_turn(invite)
+        assert ledger.is_started(invite.invite_id) and inv.invite_turns == 1
+
+
+class TestWorkerSupervision:
+    """A worker loop that dies is restarted with backoff and reads the tray
+    again; its state reaches the health record."""
+
+    def test_crashed_worker_restarts_and_reads_the_tray_again(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _client, _agent, _events = _invoker(monkeypatch, trays=[_tray(), _tray()], answer=_answer())
+        monkeypatch.setattr(invoker_module, "WORKER_BACKOFF_BASE_S", 0.01)
+        calls = {"n": 0}
+        real = inv._requeue_pending_invites
+
+        def flaky() -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("ledger exploded")
+            real()
+
+        monkeypatch.setattr(inv, "_requeue_pending_invites", flaky)
+        inv.start()
+        try:
+            inv._on_wake_fired()
+            assert _wait_for(lambda: inv.worker_restarts == 1 and inv.cycles >= 1, timeout=5.0)
+            status = inv.status()
+            assert status["alive"] is True and status["restarts"] == 1
+            assert "ledger exploded" in (status["last_error"] or "")
+            assert _wait_for(lambda: inv.status()["state"] == "idle")
+        finally:
+            inv.stop()
+        assert _wait_for(lambda: inv.status()["state"] == "stopped" and not inv.status()["alive"])
+
+    def test_backoff_grows_and_stop_ends_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        inv, _client, _agent, _events = _invoker(monkeypatch, trays=[], answer=_answer())
+        monkeypatch.setattr(invoker_module, "WORKER_BACKOFF_BASE_S", 0.01)
+        delays: list[float] = []
+        real_wait = inv._stopped.wait
+
+        def wait(timeout: float | None = None) -> bool:
+            if timeout is not None and timeout < 1.0:
+                delays.append(timeout)
+            return real_wait(timeout)
+
+        monkeypatch.setattr(inv._stopped, "wait", wait)
+        monkeypatch.setattr(inv, "_worker_body", lambda: (_ for _ in ()).throw(RuntimeError("always")))
+        inv.start()
+        assert _wait_for(lambda: len(delays) >= 3, timeout=5.0)
+        inv.stop()
+        assert delays[1] > delays[0] * 1.2 and delays[2] > delays[1] * 1.2, "doubling backoff"
+        assert _wait_for(lambda: inv.status()["state"] == "stopped")
+
+    def test_worker_state_reaches_the_health_record(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from agentchatme_hermes.ws_health import HealthBoard, read_ws_health
+
+        inv, _client, _agent, _events = _invoker(monkeypatch, trays=[], answer=_answer())
+        board = HealthBoard(handle="me", path=tmp_path / "ws.health.json", worker_status=inv.status)
+        inv._health = board
+        board.socket("connected", last_connected_at=1.0)
+        inv._set_state("cycle")
+        health = read_ws_health(tmp_path / "ws.health.json")
+        assert health is not None and health["state"] == "connected"
+        assert health["worker"]["state"] == "cycle" and health["worker"]["hung_turns"] == 0
+        inv._set_state("restart_wait", error="RuntimeError: boom")
+        health = read_ws_health(tmp_path / "ws.health.json")
+        assert health is not None and health["worker"]["state"] == "restart_wait"
+        assert health["worker"]["last_error"] == "RuntimeError: boom"
+        assert health["state"] == "connected", "the socket's state is kept across worker writes"
+
+
+class TestRunBudget:
+    """The ceiling also reaches Hermes' own cooperative budget
+    (``AIAgent(run_budget_seconds=...)``) when the constructor takes it."""
+
+    def _build(self, monkeypatch: pytest.MonkeyPatch, agent_cls: Any, config: Any) -> Any:
+        import sys
+        import types
+
+        module = types.ModuleType("run_agent")
+        module.AIAgent = agent_cls  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "run_agent", module)
+        inv = AgentInvoker(config=config, identity=AgentIdentity(handle="me"), runtime=SimpleNamespace(client=None, texts=TEXTS))
+        monkeypatch.setattr(inv, "_resolve_model_and_runtime", lambda: ("m", {}))
+        return inv._build_agent("agentchat:wake:test")
+
+    def test_budget_passed_when_accepted(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class NewAgent:
+            def __init__(self, *, run_budget_seconds: float | None = None, **kwargs: Any) -> None:
+                self.budget = run_budget_seconds
+                self.kwargs = kwargs
+
+        built = self._build(monkeypatch, NewAgent, SimpleNamespace(wake_debounce_s=0.0, turn_max_s=1200.0))
+        assert built.budget == 1200.0 and built.kwargs["platform"] == "agentchat"
+        off = self._build(monkeypatch, NewAgent, SimpleNamespace(wake_debounce_s=0.0, turn_max_s=0.0))
+        assert off.budget is None, "no ceiling, no budget"
+
+    def test_budget_omitted_for_an_older_hermes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        class OldAgent:
+            def __init__(self, *, model: str, session_id: str, session_db: Any, platform: str, quiet_mode: bool, load_soul_identity: bool, skip_context_files: bool) -> None:
+                self.platform = platform
+
+        built = self._build(monkeypatch, OldAgent, SimpleNamespace(wake_debounce_s=0.0))
+        assert built is not None and built.platform == "agentchat"

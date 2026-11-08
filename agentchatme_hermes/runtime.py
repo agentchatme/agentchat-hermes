@@ -42,7 +42,7 @@ from .turn import identity_line as render_identity_line
 from .turn import identity_line_template as render_identity_line_template
 from .types import AgentIdentity
 from .ws_daemon import WSDaemon
-from .ws_health import health_path_for
+from .ws_health import HealthBoard, health_path_for
 
 if TYPE_CHECKING:
     from agentchatme import AgentChatClient
@@ -326,18 +326,24 @@ class Runtime:
         produce exactly the same leader.
         """
         assert self._identity is not None
+        # One health record per account: the socket's state and the worker's,
+        # composed by one board so ``doctor`` sees both.
+        health = HealthBoard(handle=self._identity.handle, path=health_path_for(self._lock_path))
         self._invoker = AgentInvoker(
             config=self._config,
             identity=self._identity,
             runtime=self,
             ledger=self._invite_ledger,
+            health=health,
         )
+        health.set_worker_status(self._invoker.status)
         self._ws_daemon = WSDaemon(
             config=self._config,
             identity=self._identity,
             on_wake=self._invoker.wake,
             on_group_invite=self._invoker.handle_group_invite,
             health_path=health_path_for(self._lock_path),
+            health=health,
         )
         self._invoker.start()
         self._ws_daemon.start()

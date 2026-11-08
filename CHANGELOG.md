@@ -2,6 +2,29 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A hung turn no longer stops receiving.** A turn ran inline on the wake worker with no time limit, so one turn that never ended
+  (a stalled provider stream, a hung tool) stopped every later wake for the account while the socket stayed connected and the health
+  record said so. Each turn now runs on its own thread under two limits — no activity for `AGENTCHATME_TURN_IDLE_TIMEOUT_S` (600 s,
+  the inactivity limit Hermes' cron uses for its unattended turns) or a run past `AGENTCHATME_TURN_MAX_S` (3600 s). On overrun the
+  turn is stopped with Hermes' own `AIAgent.hard_interrupt` (`tool_reason="agentchat turn time limit"`) and counts as failed: nothing
+  is recorded, the cards stay on the tray. A turn that does not end within 30 s of the interrupt keeps its conversations held until
+  its thread really ends — no second turn starts for them meanwhile — and with two such turns still running no new turn starts. A
+  gateway stop interrupts a running turn the same way.
+- **A crashed worker restarts.** An exception that escaped the worker loop stopped every later cycle until the gateway restarted,
+  while the process kept the leader lock. The loop is now restarted with backoff (1 s doubling to 60 s) and reads the tray again.
+- **The health record shows the worker, not only the socket.** It gains a `worker` section (state, thread alive, heartbeat,
+  restarts, last error, the running turn, overrun turns still running, the last turn's outcome and AgentChat call counts);
+  `hermes agentchat doctor` reports a dead, stuck or restarting worker even while the socket is connected.
+- **A turn with no AgentChat call records nothing.** A completed turn whose transcript showed no hosted AgentChat tool call was
+  trusted as having looked and `reply` was recorded with nothing read or sent. Such a turn (like one whose calls all failed) could not
+  look: nothing is recorded and the card stays on the tray. A transcript Hermes did not return stays "unknown", as before.
+- **A group-invite turn that crashed is retried.** The invite was marked as having had its turn before the turn ran, so a turn that
+  crashed, overran or could not look was never run again. It is now marked only after a turn that looked.
+
 ## [0.4.3] — 2026-11-08
 
 Patch release (fixed existing behaviour → patch +1, per `VERSIONING.md`). Same requirements as 0.4.2 (`agentchatme>=1.2.0,<2`); no setting changes.
