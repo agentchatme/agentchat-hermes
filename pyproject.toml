@@ -38,7 +38,7 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "agentchatme>=1.2.0,<2",
+    "agentchatme>=1.3.0,<2",
 ]
 
 [project.optional-dependencies]
@@ -82,6 +82,7 @@ include = [
     "SECURITY.md",
     "CONTRIBUTING.md",
     "CHANGELOG.md",
+    "RUNBOOK.md",
 ]
 
 [tool.ruff]
@@ -141,6 +142,8 @@ asyncio_mode = "auto"
 # Python 3.10+ since Oct 2026). "function" is the documented default.
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+# Test-only helpers (tests/fake_keys.py) importable by name under importlib mode.
+pythonpath = ["tests"]
 # importlib mode prevents pytest's classic package-rootdir auto-detection
 # from treating the top-level git-clone shim (__init__.py) as the
 # project package root. Without this, pytest would try to import

@@ -52,6 +52,8 @@ ENV_WAKE_DEBOUNCE_S_LEGACY = "AGENTCHATME_KNOCK_DEBOUNCE_S"
 ENV_REPLY_GATE_ENABLED = "AGENTCHATME_REPLY_GATE_ENABLED"
 ENV_REPLY_GATE_FAIL_OPEN = "AGENTCHATME_REPLY_GATE_FAIL_OPEN"  # retired, see module docstring
 ENV_GATE_TIMEOUT_S = "AGENTCHATME_GATE_TIMEOUT_S"
+ENV_TURN_IDLE_S = "AGENTCHATME_TURN_IDLE_TIMEOUT_S"
+ENV_TURN_MAX_S = "AGENTCHATME_TURN_MAX_S"
 ENV_LOCK_DIR = "AGENTCHATME_LOCK_DIR"
 ENV_STATE_DIR = "AGENTCHATME_STATE_DIR"
 
@@ -84,6 +86,15 @@ DEFAULT_REPLY_GATE_ENABLED = True
 # 50 cards) in one answer, not one message.
 DEFAULT_GATE_TIMEOUT_S = 30.0
 
+# --- turn time limit ---------------------------------------------------------
+# A turn with no activity for this long (no model call, no tool step) is
+# interrupted and counts as failed: nothing is recorded, the cards stay on
+# the tray. Hermes' cron scheduler uses the same 600 s for its unattended
+# turns. The ceiling bounds a turn that stays busy. ``0`` switches a limit
+# off (a turn that never ends then stops this account's wakes again).
+DEFAULT_TURN_IDLE_S = 600.0
+DEFAULT_TURN_MAX_S = 3600.0
+
 _fail_open_warned = False
 
 
@@ -111,6 +122,8 @@ class Config:
     wake_debounce_s: float = DEFAULT_WAKE_DEBOUNCE_S
     reply_gate_enabled: bool = DEFAULT_REPLY_GATE_ENABLED
     gate_timeout_s: float = DEFAULT_GATE_TIMEOUT_S
+    turn_idle_s: float = DEFAULT_TURN_IDLE_S
+    turn_max_s: float = DEFAULT_TURN_MAX_S
     # The Hermes profile this configuration belongs to. Drives where the
     # SOUL.md anchor lives, how the runtime registry keys this profile,
     # and which root directory holds the leader locks and the state.
@@ -210,6 +223,15 @@ def load_config(*, hermes_home: Path | None = None) -> Config | None:
     reply_gate_enabled = _parse_bool_env(ENV_REPLY_GATE_ENABLED, DEFAULT_REPLY_GATE_ENABLED)
     _warn_retired_fail_open()
     gate_timeout_s = _parse_float_env(ENV_GATE_TIMEOUT_S, DEFAULT_GATE_TIMEOUT_S, minimum=1.0)
+    turn_idle_s = _parse_float_env(ENV_TURN_IDLE_S, DEFAULT_TURN_IDLE_S, minimum=0.0)
+    turn_max_s = _parse_float_env(ENV_TURN_MAX_S, DEFAULT_TURN_MAX_S, minimum=0.0)
+    if not turn_idle_s and not turn_max_s:
+        logger.warning(
+            "agentchat: %s=0 and %s=0 — turns have no time limit; one turn that never ends "
+            "stops this account's wakes until the gateway restarts",
+            ENV_TURN_IDLE_S,
+            ENV_TURN_MAX_S,
+        )
 
     lock_dir_raw = _setting(ENV_LOCK_DIR)
     lock_dir = Path(lock_dir_raw).expanduser() if lock_dir_raw else None
@@ -225,6 +247,8 @@ def load_config(*, hermes_home: Path | None = None) -> Config | None:
         wake_debounce_s=wake_debounce_s,
         reply_gate_enabled=reply_gate_enabled,
         gate_timeout_s=gate_timeout_s,
+        turn_idle_s=turn_idle_s,
+        turn_max_s=turn_max_s,
         hermes_home=hermes_home if hermes_home is not None else resolve_hermes_home(),
         lock_dir=lock_dir,
         state_dir=state_dir,
@@ -266,7 +290,7 @@ def _warn_retired_fail_open() -> None:
     logger.warning(
         "agentchat: %s is set but no longer does anything — the gate fails closed: when the "
         "model cannot be reached nothing is recorded, no turn starts, the cards stay on the "
-        "tray and the integration wakes again on its ladder. Remove the setting.",
+        "tray and the server wakes the agent again. Remove the setting.",
         ENV_REPLY_GATE_FAIL_OPEN,
     )
 

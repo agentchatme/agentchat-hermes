@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import pytest
+from fake_keys import api_key
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -80,10 +81,10 @@ class TestLoadConfig:
         assert load_config() is None
 
     def test_minimal_valid_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _isolated(monkeypatch, AGENTCHATME_API_KEY="ac_live_abc")
+        _isolated(monkeypatch, AGENTCHATME_API_KEY=api_key("abc"))
         cfg = load_config()
         assert cfg is not None
-        assert cfg.api_key == "ac_live_abc"
+        assert cfg.api_key == api_key("abc")
         assert cfg.api_base == DEFAULT_API_BASE
         assert cfg.ws_url == "wss://api.agentchat.me"
 
@@ -158,10 +159,10 @@ class TestLoadConfig:
             load_config()
 
     def test_api_key_whitespace_stripped(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _isolated(monkeypatch, AGENTCHATME_API_KEY="  ac_live_xyz  ")
+        _isolated(monkeypatch, AGENTCHATME_API_KEY=f"  {api_key('xyz')}  ")
         cfg = load_config()
         assert cfg is not None
-        assert cfg.api_key == "ac_live_xyz"
+        assert cfg.api_key == api_key("xyz")
 
 
 class TestGateConfig:
@@ -268,7 +269,7 @@ class TestProfileScopedConfig:
     def test_hermes_home_argument_is_bound(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        _isolated(monkeypatch, AGENTCHATME_API_KEY="ac_live_x")
+        _isolated(monkeypatch, AGENTCHATME_API_KEY=api_key("x"))
         home = tmp_path / ".hermes" / "profiles" / "growth"
         cfg = load_config(hermes_home=home)
         assert cfg is not None
@@ -276,7 +277,7 @@ class TestProfileScopedConfig:
         assert cfg.lock_dir is None
 
     def test_lock_dir_setting(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        _isolated(monkeypatch, AGENTCHATME_API_KEY="ac_live_x")
+        _isolated(monkeypatch, AGENTCHATME_API_KEY=api_key("x"))
         monkeypatch.setenv("AGENTCHATME_LOCK_DIR", str(tmp_path / "run"))
         cfg = load_config(hermes_home=tmp_path)
         assert cfg is not None
@@ -287,10 +288,10 @@ class TestProfileScopedConfig:
     ) -> None:
         from agentchatme_hermes.profile_scope import account_fingerprint
 
-        _isolated(monkeypatch, AGENTCHATME_API_KEY="ac_live_x")
+        _isolated(monkeypatch, AGENTCHATME_API_KEY=api_key("x"))
         cfg = load_config(hermes_home=tmp_path)
         assert cfg is not None
-        assert cfg.account_fingerprint == account_fingerprint(DEFAULT_API_BASE, "ac_live_x")
+        assert cfg.account_fingerprint == account_fingerprint(DEFAULT_API_BASE, api_key("x"))
 
     def test_values_come_from_the_profile_resolver(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

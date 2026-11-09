@@ -1,0 +1,107 @@
+name: hermes-main
+
+# The test suite against Hermes Agent's main branch, every night.
+#
+# The CI gate (ci.yml) runs without Hermes installed: Hermes is stubbed, so it
+# proves this package, not that Hermes still has what the package imports.
+# This workflow installs hermes-agent from main exactly the way Hermes' own CI
+# does (`uv sync --locked` from its uv.lock, Python 3.14), adds this package
+# to that environment, and runs the whole suite. With Hermes present the
+# contract tests in tests/test_hermes_contract.py run too: every internal
+# surface the plugin touches (docs/hermes-coupling.md), plus a real AIAgent
+# turn stopped by the time limit and a real ctx.llm call, both against a
+# localhost model stub. A red run means Hermes main changed something the
+# next Hermes release would break here; nothing is published or changed.
+#
+# Actions are pinned to commits (the version is in the trailing comment), as
+# in publish.yml. setup-uv and the uv version are the ones Hermes' tests.yml
+# pins.
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+    inputs:
+      hermes_ref:
+        description: "hermes-agent branch, tag or commit to test against"
+        required: false
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hermes-main
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: Suite vs hermes-agent ${{ inputs.hermes_ref || 'main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      HERMES_REF: ${{ inputs.hermes_ref || 'main' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: plugin
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_REF }}
+          path: hermes-agent
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
+        with:
+          version: "0.12.13"
+
+      - name: Hermes as its own CI installs it (uv.lock, Python 3.14, mcp extra)
+        working-directory: hermes-agent
+        run: |
+          set -euo pipefail
+          git log -1 --format='hermes-agent %H %cd'
+          uv sync --locked --python 3.14 --extra mcp
+
+      - name: Add this package to Hermes' environment
+        run: uv pip install --python hermes-agent/.venv/bin/python -e "./plugin[dev]"
+
+      - name: Lint (ruff)
+        working-directory: plugin
+        run: ../hermes-agent/.venv/bin/ruff check .
+
+      - name: Type-check (mypy)
+        working-directory: plugin
+        run: ../hermes-agent/.venv/bin/mypy agentchatme_hermes
+
+      - name: Test (pytest, with Hermes installed)
+        working-directory: plugin
+        env:
+          # Never the runner's real home: every test that needs a profile home
+          # sets its own; this catches one that forgets.
+          HERMES_HOME: ${{ runner.temp }}/hermes-home
+        run: |
+          set -euo pipefail
+          mkdir -p "$HERMES_HOME"
+          ../hermes-agent/.venv/bin/python -m pytest -ra
+          ../hermes-agent/.venv/bin/python -m pytest -ra -q tests/test_hermes_contract.py \
+            | tee "$RUNNER_TEMP/contract.txt"
+          if grep -q "skipped" "$RUNNER_TEMP/contract.txt" && ! grep -q "passed" "$RUNNER_TEMP/contract.txt"; then
+            echo "::error::the Hermes contract tests were skipped — Hermes did not import"
+            exit 1
+          fi
+
+  notify-failure:
+    needs: suite
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Post to Slack
+        env:
+          WEBHOOK: ${{ secrets.SLACK_WEBHOOK_WARNING }}
+          TEXT: ":warning: *agentchatme-hermes vs hermes-agent main failed* — Hermes main changed something this plugin uses: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        run: |
+          if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped"; exit 0; fi
+          printf '%s' "$TEXT" | jq -Rs '{text: .}' | curl -sS -o /dev/null --max-time 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK" || true

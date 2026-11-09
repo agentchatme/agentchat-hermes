@@ -36,9 +36,9 @@ HOSTED_TOOLSET = f"mcp-{MCP_SERVER_NAME}"
 HOSTED_TOOL_NAME_PREFIX = f"{MCP_TOOL_PREFIX}{MCP_SERVER_NAME}__"
 
 # How long a turn waits for Hermes to register the hosted tools before it
-# counts as "not started" (nothing recorded, the retry ladder re-wakes). A
+# counts as "not started" (nothing recorded; the server re-wakes). A
 # warm tool cache registers them 4-10 s after start; a cold one needs
-# Hermes' reconcile tick (~60 s) — the ladder's first rung covers that.
+# Hermes' reconcile tick (~60 s) — the server's first re-wake (+1 m) covers that.
 HOSTED_TOOLS_WAIT_S = 30.0
 HOSTED_TOOLS_POLL_S = 0.5
 
@@ -70,7 +70,7 @@ def hosted_tool_names() -> list[str] | None:
             names = [str(n) for n in all_names() if str(n).startswith(HOSTED_TOOL_NAME_PREFIX)]
     except Exception as exc:
         # Registry drift: unknown rather than "none registered", so a probe
-        # that cannot work does not hold and ladder every cycle.
+        # that cannot work does not hold every turn to its bound.
         _warn_once(f"hosted_tools: registry probe raised ({exc!r}) — not holding turns")
         return None
     return sorted(names)

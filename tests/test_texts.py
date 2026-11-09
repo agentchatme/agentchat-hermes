@@ -1,318 +1,95 @@
-"""Tests for ``agentchatme_hermes.texts`` — fetched, cached, refreshed; never bundled."""
+"""Tests for ``agentchatme_hermes.texts`` — the kit's TextsCache, for Hermes.
+
+The cache itself (fetch, file, daily refresh, listeners) is the SDK kit's and
+tested there. What is Hermes' own:
+
+* the runtime name and the file name in the account's state directory;
+* the one-shot load the CLI, the wizard and ``doctor`` use: the server, else
+  the cached copy, else ``None`` — never raising;
+* the pre-kit ``texts.json`` is never read (it may name the tools bare) and
+  is removed on start.
+"""
 from __future__ import annotations
 
-import logging
-import time
+import json
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-import pytest
 from agentchatme.types import Texts
 
-from agentchatme_hermes import texts as texts_module
 from agentchatme_hermes.texts import (
-    REFRESH_INTERVAL_S,
-    RETRY_INTERVAL_S,
-    TextsStore,
+    LEGACY_TEXTS_FILENAME,
+    TEXTS_FILENAME,
+    TEXTS_RUNTIME,
     load_texts,
-    read_cache,
-    write_cache,
+    remove_legacy_cache,
+    texts_cache,
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
     from pathlib import Path
 
-
-def _texts(wake: str = "Wake one.", handle: str = "alice") -> Texts:
-    return Texts.model_validate(
-        {
-            "version": "1",
-            "runtime": "hermes",
-            "manual": {"url": "https://agentchat.me/skill.md", "version": "2.1.2"},
-            "wake_instruction": wake,
-            "invite_prompt": "Invite.",
-            "identity_line": f"I am @{handle} on AgentChat (api.agentchat.me).",
-            "identity_line_template": "I am @<handle> on AgentChat (api.agentchat.me).",
-        }
-    )
+SERVED = {
+    "version": "1",
+    "runtime": "hermes",
+    "manual": {"url": "https://agentchat.me/skill.md", "version": "2.2.2"},
+    "wake_instruction": "You were woken. Call mcp__agentchat__agentchat_inbox first.",
+    "invite_prompt": "An invite is pending. Call mcp__agentchat__agentchat_list_group_invites first.",
+    "identity_line": "I am @me on AgentChat.",
+    "identity_line_template": "I am @<handle> on AgentChat.",
+}
 
 
 class _Client:
-    """``client.texts.get`` that serves, or raises, on demand."""
+    """A sync SDK client double: ``texts.get(runtime=...)``."""
 
-    def __init__(self, result: Any) -> None:
-        self.result = result
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
         self.calls: list[str] = []
         self.texts = SimpleNamespace(get=self._get)
 
-    def _get(self, *, runtime: str) -> Texts:
+    def _get(self, *, runtime: str, opts: Any = None) -> Texts:
         self.calls.append(runtime)
-        if isinstance(self.result, Exception):
-            raise self.result
-        assert isinstance(self.result, Texts)
-        return self.result
+        if self.fail:
+            raise ConnectionError("offline")
+        return Texts.model_validate(SERVED)
 
 
-class TestLoadTexts:
-    def test_fresh_fetch_writes_the_cache(
-        self, tmp_path: Path, assert_private_file: Callable[[Path], None]
-    ) -> None:
-        client = _Client(_texts())
-        cache = tmp_path / "state" / "texts.json"
-        loaded = load_texts(client, cache_path=cache, now=lambda: 1000.0)  # type: ignore[arg-type]
-        assert loaded is not None and loaded.source == "server"
-        assert client.calls == ["hermes"]
-        assert_private_file(cache)
-        cached = read_cache(cache)
-        assert cached is not None and cached.texts == _texts() and cached.fetched_at == 1000.0
-
-    def test_server_down_uses_the_cache_and_says_so_once(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        cache = tmp_path / "texts.json"
-        write_cache(cache, _texts("Cached wake."), fetched_at=0.0)
-        client = _Client(ConnectionError("offline"))
-        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.texts"):
-            loaded = load_texts(client, cache_path=cache, now=lambda: 7200.0)  # type: ignore[arg-type]
-        assert loaded is not None and loaded.source == "cache"
-        assert loaded.texts.wake_instruction == "Cached wake."
-        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == 1 and "cached copy from 2 h ago" in warnings[0]
-
-    def test_server_down_without_cache_is_none_with_one_warning(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        client = _Client(ConnectionError("offline"))
-        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.texts"):
-            assert load_texts(client, cache_path=tmp_path / "texts.json") is None  # type: ignore[arg-type]
-        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-        assert len(warnings) == 1 and "nothing is cached" in warnings[0]
-
-    def test_corrupt_cache_reads_as_nothing(self, tmp_path: Path) -> None:
-        cache = tmp_path / "texts.json"
-        cache.write_text("{not json", encoding="utf-8")
-        assert read_cache(cache) is None
-        cache.write_text('{"version": 99, "fetched_at": 1, "texts": {}}', encoding="utf-8")
-        assert read_cache(cache) is None
-
-    def test_cache_write_failure_does_not_lose_the_served_texts(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def boom(*_a: Any, **_k: Any) -> None:
-            raise OSError("read-only")
-
-        monkeypatch.setattr(texts_module, "write_cache", boom)
-        loaded = load_texts(_Client(_texts()), cache_path=tmp_path / "t.json")  # type: ignore[arg-type]
-        assert loaded is not None and loaded.source == "server"
+def test_the_cache_is_for_hermes_in_the_account_directory(tmp_path: Path) -> None:
+    cache = texts_cache(_Client(), tmp_path)
+    assert cache.runtime == TEXTS_RUNTIME == "hermes"
+    assert cache.file_path == tmp_path / TEXTS_FILENAME
+    assert TEXTS_FILENAME != LEGACY_TEXTS_FILENAME
 
 
-class TestStore:
-    def test_start_fetches_and_schedules_the_daily_refresh(self, tmp_path: Path) -> None:
-        clock = {"now": 1000.0}
-        store = TextsStore(
-            client=_Client(_texts()),  # type: ignore[arg-type]
-            cache_path=tmp_path / "texts.json",
-            now=lambda: clock["now"],
-        )
-        try:
-            loaded = store.start()
-            assert loaded is not None and loaded.source == "server"
-            assert store.get() == _texts()
-            assert store.next_delay() == pytest.approx(REFRESH_INTERVAL_S)
-            clock["now"] += 3600.0
-            assert store.next_delay() == pytest.approx(REFRESH_INTERVAL_S - 3600.0)
-        finally:
-            store.stop()
+def test_one_shot_load_from_the_server_writes_the_file(tmp_path: Path) -> None:
+    client = _Client()
+    texts = load_texts(client, state_dir=tmp_path)
+    assert texts is not None and texts.wake_instruction == SERVED["wake_instruction"]
+    assert client.calls == ["hermes"]
+    saved = json.loads((tmp_path / TEXTS_FILENAME).read_text(encoding="utf-8"))
+    assert saved["runtime"] == "hermes" and saved["texts"]["identity_line"] == SERVED["identity_line"]
 
-    def test_start_offline_with_cache_retries_sooner(self, tmp_path: Path) -> None:
-        cache = tmp_path / "texts.json"
-        write_cache(cache, _texts("Cached."), fetched_at=0.0)
-        store = TextsStore(client=_Client(ConnectionError("down")), cache_path=cache)  # type: ignore[arg-type]
-        try:
-            loaded = store.start()
-            assert loaded is not None and loaded.source == "cache"
-            assert store.get() is not None and store.get().wake_instruction == "Cached."  # type: ignore[union-attr]
-            assert store.next_delay() == pytest.approx(RETRY_INTERVAL_S)
-        finally:
-            store.stop()
 
-    def test_start_offline_without_cache_starts_anyway(self, tmp_path: Path) -> None:
-        store = TextsStore(client=_Client(ConnectionError("down")), cache_path=tmp_path / "t.json")  # type: ignore[arg-type]
-        try:
-            assert store.start() is None
-            assert store.get() is None
-            assert store.next_delay() == pytest.approx(RETRY_INTERVAL_S)
-            store.refresh()
-            assert store.next_delay() == pytest.approx(RETRY_INTERVAL_S * 2), "backs off"
-        finally:
-            store.stop()
+def test_offline_the_cached_copy_is_used(tmp_path: Path) -> None:
+    load_texts(_Client(), state_dir=tmp_path)
+    texts = load_texts(_Client(fail=True), state_dir=tmp_path)
+    assert texts is not None and texts.identity_line == SERVED["identity_line"]
 
-    def test_first_successful_refresh_notifies_listeners(self, tmp_path: Path) -> None:
-        client = _Client(ConnectionError("down"))
-        store = TextsStore(client=client, cache_path=tmp_path / "t.json")  # type: ignore[arg-type]
-        seen: list[str] = []
-        try:
-            store.start()
-            store.on_texts(lambda t: seen.append(t.wake_instruction))
-            assert seen == [], "nothing loaded yet — no callback"
-            client.result = _texts("Served now.")
-            loaded = store.refresh()
-            assert loaded is not None and loaded.source == "server"
-            assert seen == ["Served now."]
-            store.refresh()
-            assert seen == ["Served now."], "unchanged texts do not notify again"
-            client.result = _texts("Served again.")
-            store.refresh()
-            assert seen == ["Served now.", "Served again."]
-        finally:
-            store.stop()
 
-    def test_on_texts_calls_back_immediately_when_loaded(self, tmp_path: Path) -> None:
-        store = TextsStore(client=_Client(_texts()), cache_path=tmp_path / "t.json")  # type: ignore[arg-type]
-        seen: list[Texts] = []
-        try:
-            store.start()
-            store.on_texts(seen.append)
-            assert seen == [_texts()]
-        finally:
-            store.stop()
+def test_offline_with_nothing_cached_is_none(tmp_path: Path) -> None:
+    assert load_texts(_Client(fail=True), state_dir=tmp_path) is None
+    assert load_texts(_Client(fail=True), state_dir=None) is None
 
-    def test_refresh_failure_keeps_the_served_copy(self, tmp_path: Path) -> None:
-        client = _Client(_texts("Served."))
-        store = TextsStore(client=client, cache_path=tmp_path / "t.json")  # type: ignore[arg-type]
-        try:
-            store.start()
-            client.result = ConnectionError("blip")
-            loaded = store.refresh()
-            assert loaded is not None and loaded.source == "server"
-            assert loaded.texts.wake_instruction == "Served."
-            assert store.next_delay() == pytest.approx(RETRY_INTERVAL_S), "retry soon, not in a day"
-        finally:
-            store.stop()
 
-    def test_refresh_thread_runs_inside_the_thread_scope(self, tmp_path: Path) -> None:
-        """A served-texts change fires listeners on the refresh thread; they
-        must run in the profile's context (the runtime passes
-        ``profile_context``), or a multiplexed gateway's SOUL.md reconcile
-        would read and write the launch profile's file."""
-        import contextlib
-        import contextvars
-        import threading
-
-        marker: contextvars.ContextVar[str | None] = contextvars.ContextVar("profile", default=None)
-
-        @contextlib.contextmanager
-        def thread_scope() -> Any:
-            token = marker.set("profile-up")
-            try:
-                yield
-            finally:
-                marker.reset(token)
-
-        class Changing:
-            def __init__(self) -> None:
-                self.n = 0
-                self.texts = SimpleNamespace(get=self._get)
-
-            def _get(self, *, runtime: str) -> Texts:
-                self.n += 1
-                return _texts(wake=f"Wake {self.n}.")
-
-        calls: list[tuple[str, str | None]] = []
-        changed = threading.Event()
-        store = TextsStore(
-            client=Changing(),  # type: ignore[arg-type]
-            cache_path=tmp_path / "t.json",
-            refresh_interval_s=0.01,
-            thread_scope=thread_scope,
-        )
-
-        def listener(_texts: Texts) -> None:
-            calls.append((threading.current_thread().name, marker.get()))
-            if threading.current_thread().name == "agentchat-texts-refresh":
-                changed.set()
-
-        store.on_texts(listener)
-        store.start()
-        try:
-            assert changed.wait(5.0), "a refresh brought new texts and fired the listener"
-        finally:
-            store.stop()
-        refresh_calls = [scope for name, scope in calls if name == "agentchat-texts-refresh"]
-        assert refresh_calls and set(refresh_calls) == {"profile-up"}
-        assert marker.get() is None, "the caller's context is untouched"
-
-    def test_refresh_thread_runs_and_stops(self, tmp_path: Path) -> None:
-        store = TextsStore(
-            client=_Client(_texts()),  # type: ignore[arg-type]
-            cache_path=tmp_path / "t.json",
-            refresh_interval_s=0.01,
-        )
-        store.start()
-        deadline = time.monotonic() + 2.0
-        while store.refreshes < 3 and time.monotonic() < deadline:
-            time.sleep(0.01)
-        assert store.refreshes >= 3
-        store.stop()
-        assert store._thread is not None
-        store._thread.join(timeout=2.0)
-        assert not store._thread.is_alive()
-
-    def test_store_warns_once_per_outage_with_a_cache(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """The store re-enters ``load_texts`` every 5→60 min while offline;
-        the operator gets one line per outage, not one per retry."""
-        cache = tmp_path / "texts.json"
-        write_cache(cache, _texts("Cached."), fetched_at=0.0)
-        client = _Client(ConnectionError("down"))
-        store = TextsStore(client=client, cache_path=cache)  # type: ignore[arg-type]
-
-        def warnings() -> list[str]:
-            return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
-
-        try:
-            with caplog.at_level(logging.DEBUG, logger="agentchatme_hermes.texts"):
-                store.start()
-                for _ in range(4):
-                    store.refresh()
-                assert len(warnings()) == 1, warnings()
-                assert sum("unreachable" in r.getMessage() for r in caplog.records) == 5, "still logged, at DEBUG"
-                # The server comes back, then goes away again: one new warning.
-                client.result = _texts("Served.")
-                store.refresh()
-                assert len(warnings()) == 1
-                client.result = ConnectionError("down again")
-                store.refresh()
-                store.refresh()
-                assert len(warnings()) == 2, warnings()
-        finally:
-            store.stop()
-
-    def test_store_warns_once_per_outage_without_a_cache(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        store = TextsStore(client=_Client(ConnectionError("down")), cache_path=tmp_path / "t.json")  # type: ignore[arg-type]
-        try:
-            with caplog.at_level(logging.DEBUG, logger="agentchatme_hermes.texts"):
-                store.start()
-                store.refresh()
-                store.refresh()
-            warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
-            assert len(warnings) == 1 and "nothing is cached" in warnings[0].getMessage()
-        finally:
-            store.stop()
-
-    def test_second_start_uses_the_cache_written_by_the_first(self, tmp_path: Path) -> None:
-        cache = tmp_path / "t.json"
-        first = TextsStore(client=_Client(_texts("From server.")), cache_path=cache)  # type: ignore[arg-type]
-        first.start()
-        first.stop()
-        second = TextsStore(client=_Client(ConnectionError("down")), cache_path=cache)  # type: ignore[arg-type]
-        try:
-            loaded = second.start()
-            assert loaded is not None and loaded.source == "cache"
-            assert loaded.texts.wake_instruction == "From server."
-        finally:
-            second.stop()
+def test_the_pre_kit_file_is_never_read_and_is_removed(tmp_path: Path) -> None:
+    legacy = tmp_path / LEGACY_TEXTS_FILENAME
+    bare = {**SERVED, "wake_instruction": "Call agentchat_inbox first."}
+    legacy.write_text(
+        json.dumps({"version": 1, "runtime": "hermes", "fetched_at": 1.0, "texts": bare}),
+        encoding="utf-8",
+    )
+    assert load_texts(_Client(fail=True), state_dir=tmp_path) is None, "a copy with bare tool names never reaches the model"
+    remove_legacy_cache(tmp_path)
+    assert not legacy.exists()
+    remove_legacy_cache(tmp_path)  # idempotent

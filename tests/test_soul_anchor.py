@@ -16,8 +16,6 @@ from agentchatme_hermes.soul_anchor import (
     ANCHOR_END,
     ANCHOR_START,
     AnchorError,
-    _strip_anchor_block,
-    _upsert_anchor_block,
     anchor_is_current,
     has_anchor,
     read_anchor_handle,
@@ -196,55 +194,21 @@ class TestRemoveSoulAnchor:
 # ───────────────────────── pure helpers ─────────────────────────
 
 
-class TestUpsert:
-    def _block(self, handle: str = "alice") -> str:
-        return render_anchor_block(_line(handle), handle=handle)
+class TestKitBlock:
+    """The block's text is the SDK kit's (``agentchatme.integration.anchor``,
+    pinned by the shared ``anchor.cases.json``); here only what this file
+    layer adds on top."""
 
-    def test_appends_to_empty_string(self) -> None:
-        assert _upsert_anchor_block("", self._block()) == self._block() + "\n"
-
-    def test_appends_to_existing(self) -> None:
-        out = _upsert_anchor_block("# Mine\n", self._block())
-        assert out == "# Mine\n\n" + self._block() + "\n"
-
-    def test_replaces_in_place(self) -> None:
-        existing = "# Mine\n\n" + self._block("alice") + "\n\n## After"
-        out = _upsert_anchor_block(existing, self._block("bob"))
-        assert "I am @bob on AgentChat" in out
-        assert "I am @alice on AgentChat" not in out
-        assert out == "# Mine\n\n" + self._block("bob") + "\n\n## After\n"
-
-    def test_does_not_accumulate_trailing_newlines(self) -> None:
-        out = _upsert_anchor_block("# Mine\n\n\n\n", self._block())
-        assert out == "# Mine\n\n" + self._block() + "\n"
-
-
-class TestStrip:
-    def _block(self) -> str:
-        return render_anchor_block(_line(), handle="alice")
-
-    def test_no_op_on_string_without_markers(self) -> None:
-        assert _strip_anchor_block("# Mine\n") == "# Mine\n"
-
-    def test_strips_only_block(self) -> None:
-        assert _strip_anchor_block(self._block() + "\n") == ""
-
-    def test_strips_leading_block(self) -> None:
-        assert _strip_anchor_block(self._block() + "\n\n# After\n") == "# After\n"
-
-    def test_strips_trailing_block(self) -> None:
-        assert _strip_anchor_block("# Before\n\n" + self._block() + "\n") == "# Before\n"
-
-    def test_strips_sandwiched_block(self) -> None:
-        out = _strip_anchor_block("# Before\n\n" + self._block() + "\n\n# After\n")
-        assert out == "# Before\n\n# After\n"
-
-    def test_no_blank_line_accumulation_after_strip(self) -> None:
-        out = _strip_anchor_block("# Before\n\n\n" + self._block() + "\n\n\n# After\n")
-        assert "\n\n\n" not in out
-
-
-# ───────────────────────── has_anchor ─────────────────────────
+    def test_a_legacy_skill_block_is_replaced_not_duplicated(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(
+            "# Mine\n\n<!-- agentchat-skill:start -->\nYou are **@alice** on AgentChat.\n<!-- agentchat-skill:end -->\n",
+            encoding="utf-8",
+        )
+        write_soul_anchor(_line(), handle="alice", soul_path=soul)
+        content = soul.read_text(encoding="utf-8")
+        assert "agentchat-skill" not in content and content.count(ANCHOR_START) == 1
+        assert content.startswith("# Mine\n\n") and read_anchor_handle(soul_path=soul) == "alice"
 
 
 class TestHasAnchor:
@@ -390,3 +354,14 @@ class TestRewordSurvival:
         soul = tmp_path / "SOUL.md"
         write_soul_anchor(_line_v2("growth"), handle="growth", soul_path=soul)
         assert read_anchor_handle(soul_path=soul) == "growth", "still readable, so a key for @ops is caught"
+
+
+
+def test_the_markers_are_the_kits() -> None:
+    """The file I/O here wraps the kit's anchor; the markers it greps for
+    without importing the kit are the kit's own."""
+    from agentchatme.integration import anchor
+
+    from agentchatme_hermes.soul_anchor import ANCHOR_END, ANCHOR_START
+
+    assert (ANCHOR_START, ANCHOR_END) == (anchor.START_MARKER, anchor.END_MARKER)

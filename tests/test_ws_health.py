@@ -82,3 +82,54 @@ def test_health_path_sits_beside_its_lock(tmp_path: Path) -> None:
 
     lock = tmp_path / "agentchat-locks" / "ws-0123456789abcdef.lock"
     assert health_path_for(lock) == tmp_path / "agentchat-locks" / "ws-0123456789abcdef.health.json"
+
+
+def test_record_carries_the_worker_section_and_old_records_still_read(tmp_path: Path) -> None:
+    path = tmp_path / "ws.health.json"
+    write_ws_health(handle="me", state="connected", path=path, worker={"state": "idle", "alive": True})
+    health = read_ws_health(path)
+    assert health is not None and health["worker"] == {"state": "idle", "alive": True}
+    write_ws_health(handle="me", state="connected", path=path)
+    old = read_ws_health(path)
+    assert old is not None and "worker" not in old
+
+
+def test_doctor_line_for_the_worker() -> None:
+    from agentchatme_hermes.cli import _describe_worker
+
+    now = 10_000.0
+    assert _describe_worker(None, now=now) is None, "a record from before the worker section"
+    level, text = _describe_worker({"state": "idle", "alive": True, "heartbeat_at": now - 5, "since": now - 50, "restarts": 0, "hung_turns": 0, "last_turn": {"status": "completed", "agentchat_calls": {"made": 3, "failed": 0}}}, now=now)  # type: ignore[misc]
+    assert level == "ok" and "last turn completed with 3 AgentChat call(s)" in text
+    assert _describe_worker({"state": "idle", "alive": False}, now=now)[0] == "fail"  # type: ignore[index]
+    assert _describe_worker({"state": "restart_wait", "alive": True, "last_error": "boom", "restarts": 2}, now=now)[0] == "warn"  # type: ignore[index]
+    stale = _describe_worker({"state": "cycle", "alive": True, "heartbeat_at": now - 400}, now=now)
+    assert stale is not None and stale[0] == "fail" and "has not moved" in stale[1]
+    hung = _describe_worker({"state": "idle", "alive": True, "heartbeat_at": now, "hung_turns": 1}, now=now)
+    assert hung is not None and hung[0] == "warn" and "overran" in hung[1]
+    long_turn = _describe_worker({"state": "turn", "alive": True, "heartbeat_at": now - 1, "since": now - 1000}, now=now)
+    assert long_turn is not None and long_turn[0] == "warn" and "1000s" in long_turn[1]
+
+
+def test_doctor_line_for_a_stuck_cap_and_the_loop() -> None:
+    from agentchatme_hermes.cli import _describe_worker
+    from agentchatme_hermes.ws_health import bad_cycle_run
+
+    now = 10_000.0
+    base: dict[str, object] = {"state": "idle", "alive": True, "heartbeat_at": now - 1, "max_hung_turns": 2}
+    capped = _describe_worker({**base, "hung_turns": 2}, now=now)
+    assert capped is not None and capped[0] == "fail" and "no new turn" in capped[1], "no turn can start: an error"
+
+    def cycles(*outcomes: str) -> dict[str, object]:
+        recent = [{"at": "t", "outcome": o, "failure": "why" if o != "decided" else None} for o in outcomes]
+        return {**base, "hung_turns": 0, "loop": {"recent_cycles": recent}}
+
+    for bad in ("fail_closed", "tools_unavailable", "texts_missing", "abandoned", "tray_failed"):
+        line = _describe_worker(cycles("decided", bad, bad, bad), now=now)
+        assert line is not None and line[0] == "fail" and bad in line[1], bad
+    one = _describe_worker(cycles("decided", "fail_closed"), now=now)
+    assert one is not None and one[0] == "warn"
+    healed = _describe_worker(cycles("fail_closed", "fail_closed", "fail_closed", "empty"), now=now)
+    assert healed is not None and healed[0] == "ok", "a good cycle ends the run"
+    assert bad_cycle_run([{"outcome": "abandoned"}, {"outcome": "turns_started"}]) == (0, None)
+    assert bad_cycle_run(None) == (0, None)

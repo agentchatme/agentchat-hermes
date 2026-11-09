@@ -10,10 +10,12 @@ bound to that profile's own key, home, SOUL.md and leader lock. Owns:
   at start.
 * The sync SDK :class:`AgentChatClient`: identity, the tray, the verdicts
   and the texts all go through it.
-* The :class:`TextsStore` (the served texts, cached, refreshed daily) and
-  the :class:`InviteLedger`, both in the account's state directory.
-* The :class:`WSDaemon` background thread (where wakes come from), leader only.
-* The :class:`AgentInvoker` worker (wake → gate → turn), leader only.
+* The served texts in use (from the SDK kit's ``TextsCache``: a one-shot
+  load at start, then the receive loop's daily-refreshed cache), with
+  listeners for the SOUL.md identity line.
+* The :class:`~.receiver.Receiver` (the kit's receive loop on a supervised
+  thread: socket, texts, wakes, gate, turns), leader only.
+* The :class:`AgentInvoker` (the loop's Hermes callbacks: model call, turn), leader only.
 
 Accessed via :func:`get_runtime` (constructs if needed) and
 :func:`get_existing_runtime` (returns the registered runtime or ``None``).
@@ -23,26 +25,24 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
 from .agent_invoker import AgentInvoker
 from .client_identity import hermes_client_identity
-from .invites import InviteLedger
 from .leader_lock import lock_path_for, release_leader_lock, try_acquire_ws_leader_lock
 from .profile_scope import (
     account_fingerprint,
     hermes_home_key,
-    profile_context,
     profile_label,
     resolve_hermes_home,
 )
-from .state import INVITES_FILENAME, TEXTS_FILENAME, state_dir_for
-from .texts import TextsCallback, TextsStore
+from .receiver import Receiver
+from .state import LEGACY_INVITES_FILENAME, state_dir_for
+from .texts import load_texts, remove_legacy_cache, texts_cache
 from .turn import identity_line as render_identity_line
 from .turn import identity_line_template as render_identity_line_template
 from .types import AgentIdentity
-from .ws_daemon import WSDaemon
-from .ws_health import health_path_for
+from .ws_health import HealthBoard, health_path_for
 
 if TYPE_CHECKING:
     from agentchatme import AgentChatClient
@@ -58,6 +58,9 @@ logger = logging.getLogger(__name__)
 # socket without anyone restarting it. Module constant so tests can
 # shrink it.
 LEADER_RETRY_INTERVAL_S = 15.0
+# After the last turn, how long the lock waits for a closing receive loop
+# (it may still be recording a verdict through its own client).
+RECEIVER_EXIT_WAIT_S = 60.0
 
 
 class Runtime:
@@ -65,8 +68,8 @@ class Runtime:
 
     Has two operational modes, resolved at :meth:`start` time:
 
-    * **Leader mode** — full runtime: identity resolution + texts + WSDaemon
-      background thread + AgentInvoker worker. Reached only when the
+    * **Leader mode** — full runtime: identity resolution + texts + the
+      receiver (the kit's receive loop) + the AgentInvoker callbacks. Reached only when the
       constructor was called with ``gateway_mode=True``, the integration is
       not switched off, AND this process successfully acquired the
       per-account WS leader lock (see :mod:`.leader_lock`).
@@ -82,9 +85,18 @@ class Runtime:
     while letting sibling profiles with their own accounts receive.
     """
 
-    def __init__(self, config: Config, *, gateway_mode: bool) -> None:
+    def __init__(
+        self,
+        config: Config,
+        *,
+        gateway_mode: bool,
+        host_llm: Callable[[], Any] | None = None,
+    ) -> None:
         self._config = config
         self._gateway_mode_requested = gateway_mode
+        # Accessor for Hermes' public plugin LLM (``ctx.llm``) of the profile
+        # that registered this runtime; the invoker's gate call uses it.
+        self._host_llm = host_llm
 
         # Profile binding. Read defensively: production passes a
         # :class:`Config`, tests pass light doubles without these fields.
@@ -116,9 +128,10 @@ class Runtime:
 
         self._identity: AgentIdentity | None = None
         self._client: AgentChatClient | None = None
-        self._texts: TextsStore | None = None
-        self._invite_ledger: InviteLedger | None = None
-        self._ws_daemon: WSDaemon | None = None
+        self._texts_lock = threading.Lock()
+        self._texts_now: Texts | None = None
+        self._texts_listeners: list[Callable[[Texts], None]] = []
+        self._receiver: Receiver | None = None
         self._invoker: AgentInvoker | None = None
 
         # File-descriptor for the leader lock when held. ``None`` when
@@ -152,35 +165,41 @@ class Runtime:
         return self._client
 
     @property
-    def texts_store(self) -> TextsStore:
-        if self._texts is None:
-            raise RuntimeError("Runtime.start() has not completed")
-        return self._texts
-
-    @property
     def texts(self) -> Texts | None:
         """The served texts in use, or ``None`` while none could be loaded."""
-        return self._texts.get() if self._texts is not None else None
+        with self._texts_lock:
+            return self._texts_now
 
     def identity_line(self) -> str | None:
-        """The served identity line for this agent, spelled for Hermes; ``None`` without texts."""
+        """The served identity line for this agent (served spelled for Hermes); ``None`` without texts."""
         texts = self.texts
         return render_identity_line(texts) if texts is not None else None
 
     def identity_line_template(self) -> str | None:
-        """The served template (``<handle>`` unfilled), spelled for Hermes; ``None`` without texts."""
+        """The served template (``<handle>`` unfilled); ``None`` without texts."""
         texts = self.texts
         return render_identity_line_template(texts) if texts is not None else None
 
-    def on_texts(self, callback: TextsCallback) -> None:
+    def on_texts(self, callback: Callable[[Texts], None]) -> None:
         """Run ``callback(texts)`` now if texts are loaded, and whenever they change."""
-        self.texts_store.on_texts(callback)
+        with self._texts_lock:
+            self._texts_listeners.append(callback)
+            current = self._texts_now
+        if current is not None:
+            _notify(callback, current)
 
-    @property
-    def invite_ledger(self) -> InviteLedger:
-        if self._invite_ledger is None:
-            raise RuntimeError("Runtime.start() has not completed")
-        return self._invite_ledger
+    def _set_texts(self, texts: Texts | None) -> None:
+        """New texts from the start-time load or the receive loop's cache."""
+        if texts is None:
+            return
+        with self._texts_lock:
+            before = self._texts_now
+            changed = before is None or before.model_dump(mode="json") != texts.model_dump(mode="json")
+            self._texts_now = texts
+            listeners = list(self._texts_listeners)
+        if changed:
+            for listener in listeners:
+                _notify(listener, texts)
 
     @property
     def integration_enabled(self) -> bool:
@@ -198,7 +217,7 @@ class Runtime:
 
     @property
     def state_dir(self) -> Path:
-        """Where this account's texts cache and invite ledger live."""
+        """Where this account's texts cache lives."""
         return self._state_dir
 
     @property
@@ -231,19 +250,14 @@ class Runtime:
                 # gates the WS self-echo filter when one runs.
                 self._client = self._build_sync_client()
                 self._identity = self._resolve_identity(self._client)
-                # The served texts: one synchronous attempt now (server, else
-                # the cache), then a daily refresh. Starting without them is
-                # allowed; the store says so once and keeps trying.
-                home = self._hermes_home
-                self._texts = TextsStore(
-                    client=self._client,
-                    cache_path=self._state_dir / TEXTS_FILENAME,
-                    # The refresh thread's listeners (the SOUL.md reconcile)
-                    # must see this profile's home, not the launch profile's.
-                    thread_scope=lambda: profile_context(home),
-                )
-                self._texts.start()
-                self._invite_ledger = InviteLedger(self._state_dir / INVITES_FILENAME)
+                # The served texts: one attempt now (the server, else the
+                # cached copy). Starting without them is allowed; as leader
+                # the receive loop's cache keeps trying and refreshes daily.
+                remove_legacy_cache(self._state_dir)
+                self._set_texts(load_texts(self._client, state_dir=self._state_dir))
+                # Invites are on the tray (contract v1); the ledger file a
+                # release before kept is not read by anything any more.
+                _remove_quietly(self._state_dir / LEGACY_INVITES_FILENAME)
 
                 # Leader election. Only attempt when the caller asked for
                 # gateway mode (a real ``hermes gateway run``) and the
@@ -319,28 +333,36 @@ class Runtime:
         return True
 
     def _start_leader_components(self) -> None:
-        """Bring up invoker and WS daemon. Caller holds ``_lock``.
+        """Bring up the invoker and the receiver. Caller holds ``_lock``.
 
         Requires :attr:`_identity` and the leader lock. Shared by the
         start-time election and the follower takeover path so both
         produce exactly the same leader.
         """
         assert self._identity is not None
+        # One health record per account: the socket's state and the worker's,
+        # composed by one board so ``doctor`` sees both.
+        health = HealthBoard(handle=self._identity.handle, path=health_path_for(self._lock_path))
         self._invoker = AgentInvoker(
             config=self._config,
             identity=self._identity,
             runtime=self,
-            ledger=self._invite_ledger,
+            host_llm=self._host_llm,
         )
-        self._ws_daemon = WSDaemon(
+        state_dir = self._state_dir
+        self._receiver = Receiver(
             config=self._config,
             identity=self._identity,
-            on_wake=self._invoker.wake,
-            on_group_invite=self._invoker.handle_group_invite,
+            invoker=self._invoker,
+            texts_factory=lambda client: texts_cache(client, state_dir),
+            on_texts=self._set_texts,
+            on_exit=self._receiver_gave_up,
+            hermes_home=self._hermes_home,
+            health=health,
             health_path=health_path_for(self._lock_path),
         )
-        self._invoker.start()
-        self._ws_daemon.start()
+        health.set_worker_status(self._receiver.worker_status)
+        self._receiver.start()
 
     def _start_leader_retry(self) -> None:
         """Keep contesting the election from a follower-gateway runtime."""
@@ -384,22 +406,86 @@ class Runtime:
 
     def _teardown_leader_components(self) -> None:
         """Undo :meth:`_start_leader_components` and release the lock."""
-        if self._ws_daemon is not None:
+        receiver = self._receiver
+        if receiver is not None:
             try:
-                self._ws_daemon.stop()
+                receiver.stop()
             except Exception:
-                logger.debug("agentchat runtime: ws_daemon stop raised", exc_info=True)
-            self._ws_daemon = None
-        if self._invoker is not None:
-            try:
-                self._invoker.stop()
-            except Exception:
-                logger.debug("agentchat runtime: invoker stop raised", exc_info=True)
+                logger.debug("agentchat runtime: receiver stop raised", exc_info=True)
+            self._receiver = None
+        invoker = self._invoker
+        if invoker is not None:
+            invoker.stop()
             self._invoker = None
-        if self._leader_lock_fd is not None:
-            release_leader_lock(self._leader_lock_fd)
-            self._leader_lock_fd = None
+        fd = self._leader_lock_fd
+        self._leader_lock_fd = None
         self._is_leader = False
+        self._release_when_idle(invoker, fd, None, receiver)
+
+    def _release_when_idle(
+        self, invoker: AgentInvoker | None, fd: int | None, client: Any, receiver: Receiver | None = None
+    ) -> None:
+        """Release the leader lock (and close ``client``) once no turn is
+        left — none running, none whose outcome is still to be recorded
+        through ``client`` — and the receive loop's thread has exited (it may
+        be recording a verdict through its own client; waited for up to
+        :data:`RECEIVER_EXIT_WAIT_S`). A turn interrupted by the stop usually
+        ends at once; one still running keeps the lock, so another instance
+        for this account (a reloaded plugin, a second gateway) stays a
+        follower — and starts no second turn for the same conversation —
+        until it has ended and its outcome is recorded."""
+
+        def release() -> None:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    logger.debug("agentchat runtime: client close raised", exc_info=True)
+            if fd is not None:
+                release_leader_lock(fd)
+                logger.info("agentchat runtime: leader lock released (%s)", self._lock_path)
+
+        def after_the_receiver() -> None:
+            if receiver is None or receiver.wait_exited(0):
+                release()
+                return
+
+            def wait_then_release() -> None:
+                if not receiver.wait_exited(RECEIVER_EXIT_WAIT_S):
+                    logger.warning(
+                        "agentchat runtime: the receive loop's thread did not exit within %.0fs — "
+                        "releasing the leader lock anyway",
+                        RECEIVER_EXIT_WAIT_S,
+                    )
+                release()
+
+            threading.Thread(target=wait_then_release, name="agentchat-lock-release", daemon=True).start()
+
+        if invoker is None or invoker.when_idle(after_the_receiver):
+            if invoker is None:
+                after_the_receiver()
+            return
+        logger.warning(
+            "agentchat runtime: keeping the leader lock for @%s until the running AgentChat turn "
+            "ends and its outcome is recorded — no other instance takes over this account before then",
+            self._identity.handle if self._identity else "?",
+        )
+
+    def _receiver_gave_up(self) -> None:
+        """The receiver stopped for good (SystemExit or KeyboardInterrupt in
+        its thread): give the account to another process once turns end."""
+        with self._lock:
+            invoker = self._invoker
+            receiver = self._receiver
+            fd = self._leader_lock_fd
+            self._leader_lock_fd = None
+            self._is_leader = False
+        logger.error(
+            "agentchat runtime: the receive loop stopped for good — this process no longer "
+            "receives for @%s; releasing the leader lock once no turn runs",
+            self._identity.handle if self._identity else "?",
+        )
+        self._release_when_idle(invoker, fd, None, receiver)
 
     def stop(self) -> None:
         with self._lock:
@@ -408,37 +494,26 @@ class Runtime:
             self._stopped = True
             self._retry_stop.set()
 
-        # Order matters: stop inbound first (WS daemon) so no new
-        # events land in the queue, then drain the invoker, then the
-        # texts refresh, then close the HTTP client.
-        if self._ws_daemon is not None:
+        # Order matters: the receiver first (no new wakes or turns; a running
+        # turn is interrupted; the socket and the texts timer stop with its
+        # loop), then the HTTP client, then the lock.
+        if self._receiver is not None:
             try:
-                self._ws_daemon.stop()
+                self._receiver.stop()
             except Exception:
-                logger.exception("agentchat runtime: ws_daemon stop raised")
+                logger.exception("agentchat runtime: receiver stop raised")
 
         if self._invoker is not None:
-            try:
-                self._invoker.stop()
-            except Exception:
-                logger.exception("agentchat runtime: invoker stop raised")
+            self._invoker.stop()
 
-        if self._texts is not None:
-            self._texts.stop()
-
-        if self._client is not None:
-            try:
-                self._client.close()
-            except Exception:
-                logger.debug("agentchat runtime: client close raised", exc_info=True)
-
-        # Release the leader lock last — only after WS + invoker are
-        # gone, so any next-elected leader doesn't briefly see two
-        # active WS daemons during the handoff.
-        if self._leader_lock_fd is not None:
-            release_leader_lock(self._leader_lock_fd)
-            self._leader_lock_fd = None
-            self._is_leader = False
+        # The client and the leader lock last, and only once no turn thread
+        # runs: a turn detached by the stop still records its outcome
+        # through the client, and while it may still send, no other instance
+        # may take this account over (no second turn for its conversation).
+        fd = self._leader_lock_fd
+        self._leader_lock_fd = None
+        self._is_leader = False
+        self._release_when_idle(self._invoker, fd, self._client, self._receiver)
 
         logger.info("agentchat runtime stopped")
 
@@ -480,24 +555,13 @@ class Runtime:
         identity resolution leaves the daemons and invoker
         un-constructed.
         """
-        if self._ws_daemon is not None:
+        if self._receiver is not None:
             try:
-                self._ws_daemon.stop()
+                self._receiver.stop()
             except Exception:
-                logger.debug(
-                    "agentchat runtime: partial teardown ws_daemon",
-                    exc_info=True,
-                )
+                logger.debug("agentchat runtime: partial teardown receiver", exc_info=True)
         if self._invoker is not None:
-            try:
-                self._invoker.stop()
-            except Exception:
-                logger.debug(
-                    "agentchat runtime: partial teardown invoker",
-                    exc_info=True,
-                )
-        if self._texts is not None:
-            self._texts.stop()
+            self._invoker.stop()
         if self._client is not None:
             try:
                 self._client.close()
@@ -514,11 +578,27 @@ class Runtime:
         self._retry_stop.set()
         self._identity = None
         self._client = None
-        self._texts = None
-        self._invite_ledger = None
-        self._ws_daemon = None
+        self._receiver = None
         self._invoker = None
         self._is_leader = False
+
+
+def _notify(callback: Callable[[Texts], None], texts: Texts) -> None:
+    try:
+        callback(texts)
+    except Exception:
+        logger.exception("agentchat runtime: texts listener raised")
+
+
+def _remove_quietly(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.debug("agentchat runtime: could not remove %s: %s", path, exc)
+        return
+    logger.info("agentchat runtime: removed the old invite ledger %s (invites are on the tray)", path)
 
 
 # ─── registry ──────────────────────────────────────────────────────────────
@@ -554,7 +634,9 @@ _runtimes: dict[_RuntimeKey, Runtime] = {}
 _registry_lock = threading.Lock()
 
 
-def get_runtime(config: Config, *, gateway_mode: bool) -> Runtime:
+def get_runtime(
+    config: Config, *, gateway_mode: bool, host_llm: Callable[[], Any] | None = None
+) -> Runtime:
     """Return the runtime for ``config``'s profile and account, constructing if needed.
 
     Idempotent per key: the same profile + account resolves to the same
@@ -571,7 +653,7 @@ def get_runtime(config: Config, *, gateway_mode: bool) -> Runtime:
     with _registry_lock:
         existing = _runtimes.get(key)
         if existing is None:
-            existing = Runtime(config, gateway_mode=gateway_mode)
+            existing = Runtime(config, gateway_mode=gateway_mode, host_llm=host_llm)
             _runtimes[key] = existing
         elif existing.gateway_mode_requested != gateway_mode:
             logger.warning(
@@ -607,6 +689,18 @@ def get_existing_runtime(config: Config | None = None) -> Runtime | None:
                 len(_runtimes),
             )
         return None
+
+
+def forget_runtime(runtime: Runtime) -> bool:
+    """Drop ``runtime`` from the registry (after it was stopped for the
+    plugin's unload), so the next ``get_runtime`` for its profile builds a
+    fresh one instead of returning a stopped one. ``True`` when it was there."""
+    with _registry_lock:
+        for key, value in list(_runtimes.items()):
+            if value is runtime:
+                del _runtimes[key]
+                return True
+    return False
 
 
 def registered_runtimes() -> list[Runtime]:

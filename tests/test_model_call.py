@@ -2,14 +2,22 @@
 tool-less completion on the agent's own model."""
 from __future__ import annotations
 
+import asyncio
 import sys
+import threading
+import time
 import types
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
-from agentchatme_hermes.model_call import DEFAULT_MAX_TOKENS, build_call_model, content_of
+from agentchatme_hermes.model_call import (
+    DEFAULT_MAX_TOKENS,
+    GateCallCancelled,
+    build_call_model,
+    content_of,
+)
 
 _TOOL_KWARGS = {"tools", "tool_choice", "functions", "function_call", "tool_schemas", "parallel_tool_calls"}
 
@@ -106,3 +114,200 @@ class TestContentOf:
     )
     def test_odd_shapes_are_empty(self, response: Any) -> None:
         assert content_of(response) == ""
+
+
+class TestHostLlm:
+    """Hermes' public plugin LLM (``ctx.llm``) makes the gate call when the
+    host has it: no override (the profile's own model), no tools."""
+
+    def test_complete_on_the_hosts_llm(self) -> None:
+        seen: dict[str, Any] = {}
+
+        class _PluginLlm:
+            def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                seen["messages"] = messages
+                seen.update(kwargs)
+                return SimpleNamespace(text='{"decisions": []}')
+
+        def never(**_kw: Any) -> Any:
+            raise AssertionError("the auxiliary client is not used when ctx.llm is there")
+
+        call_model = build_call_model(main_runtime={"model": "ignored"}, timeout_s=9.0, call_llm=never, host_llm=_PluginLlm())
+        assert call_model("THE PROMPT") == '{"decisions": []}'
+        assert seen["messages"] == [{"role": "user", "content": "THE PROMPT"}]
+        assert seen["temperature"] == 0.0 and seen["timeout"] == 9.0
+        assert seen["max_tokens"] == DEFAULT_MAX_TOKENS and seen["purpose"] == "agentchat gate call"
+        assert not ({"provider", "model", "agent_id", "profile"} & set(seen)), "no override: the profile's own model"
+        assert not (_TOOL_KWARGS & set(seen))
+
+    def test_empty_text_is_empty(self) -> None:
+        class _PluginLlm:
+            def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                return SimpleNamespace(text=None)
+
+        assert build_call_model(main_runtime={}, timeout_s=1.0, host_llm=_PluginLlm())("p") == ""
+
+
+class _AsyncPluginLlm:
+    """``ctx.llm`` with Hermes' async sibling: ``acomplete`` can be cancelled."""
+
+    def __init__(self, *, hang: bool = False) -> None:
+        self.hang = hang
+        self.calls: list[str] = []
+        self.started = threading.Event()
+        self.cancelled = threading.Event()
+
+    def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+        self.calls.append("complete")
+        return SimpleNamespace(text="sync")
+
+    async def acomplete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+        self.calls.append("acomplete")
+        assert kwargs["purpose"] == "agentchat gate call" and kwargs["temperature"] == 0.0
+        self.started.set()
+        try:
+            if self.hang:
+                await asyncio.sleep(60)
+            return SimpleNamespace(text="async")
+        except asyncio.CancelledError:
+            self.cancelled.set()
+            raise
+
+
+def _in_a_worker(fn: Any) -> Any:
+    """Run ``fn`` on a worker thread, as the receive loop runs ``call_model``
+    (its private event loop is that thread's, never the main thread's)."""
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        try:
+            box["value"] = fn()
+        except BaseException as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    thread.join(10.0)
+    assert not thread.is_alive()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+@pytest.fixture
+def gate_loop() -> Any:
+    from agentchatme_hermes.model_call import GateLoop
+
+    loop = GateLoop(name="test-gate-call")
+    yield loop
+    loop.close()
+
+
+class TestCancel:
+    """The receive loop's ``cancel`` handle: Hermes' async ``ctx.llm`` call
+    runs on the invoker's one gate loop and is cancelled when it is set; the
+    paths that cannot be interrupted ignore it."""
+
+    def test_with_a_cancel_handle_the_async_call_is_used(self, gate_loop: Any) -> None:
+        llm = _AsyncPluginLlm()
+        call_model = build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm, gate_loop=gate_loop)
+        assert _in_a_worker(lambda: call_model("p", cancel=threading.Event())) == "async"
+        assert llm.calls == ["acomplete"]
+
+    def test_one_loop_serves_every_call_in_the_callers_context(self, gate_loop: Any) -> None:
+        """Hermes binds its async client to a loop: one loop, one client, one
+        connection. The profile's scope (contextvars) reaches the call."""
+        import contextvars
+
+        scope: contextvars.ContextVar[str | None] = contextvars.ContextVar("scope", default=None)
+        seen: list[tuple[str | None, str]] = []
+
+        class _Llm:
+            def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                raise AssertionError("the async call is used")
+
+            async def acomplete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                seen.append((scope.get(), threading.current_thread().name))
+                return SimpleNamespace(text="ok")
+
+        call_model = build_call_model(main_runtime={}, timeout_s=5.0, host_llm=_Llm(), gate_loop=gate_loop)
+
+        def in_profile(name: str) -> str:
+            token = scope.set(name)
+            try:
+                return call_model("p", cancel=threading.Event())
+            finally:
+                scope.reset(token)
+
+        assert _in_a_worker(lambda: in_profile("growth")) == "ok"
+        assert _in_a_worker(lambda: in_profile("ops")) == "ok"
+        assert seen == [("growth", "test-gate-call"), ("ops", "test-gate-call")]
+
+    def test_without_one_the_sync_call_is_used(self, gate_loop: Any) -> None:
+        llm = _AsyncPluginLlm()
+        assert build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm, gate_loop=gate_loop)("p") == "sync"
+        assert llm.calls == ["complete"]
+
+    def test_setting_it_cancels_the_request(self, gate_loop: Any) -> None:
+        llm = _AsyncPluginLlm(hang=True)
+        cancel = threading.Event()
+        call_model = build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm, gate_loop=gate_loop)
+        threading.Thread(target=lambda: llm.started.wait(5.0) and cancel.set(), daemon=True).start()
+        started = time.monotonic()
+        with pytest.raises(GateCallCancelled):
+            _in_a_worker(lambda: call_model("p", cancel=cancel))
+        assert time.monotonic() - started < 5.0
+        assert llm.cancelled.wait(2.0), "the Hermes request itself was cancelled"
+        # The loop serves the next call.
+        assert _in_a_worker(lambda: build_call_model(main_runtime={}, timeout_s=5.0, host_llm=_AsyncPluginLlm(), gate_loop=gate_loop)("p", cancel=threading.Event())) == "async"
+
+    def test_already_set_makes_no_call(self, gate_loop: Any) -> None:
+        llm = _AsyncPluginLlm()
+        cancel = threading.Event()
+        cancel.set()
+        with pytest.raises(GateCallCancelled):
+            build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm, gate_loop=gate_loop)("p", cancel=cancel)
+        assert llm.calls == []
+
+    def test_closing_the_loop_cancels_a_call_in_flight_and_refuses_more(self, gate_loop: Any) -> None:
+        llm = _AsyncPluginLlm(hang=True)
+        call_model = build_call_model(main_runtime={}, timeout_s=5.0, host_llm=llm, gate_loop=gate_loop)
+        threading.Thread(target=lambda: llm.started.wait(5.0) and gate_loop.close(), daemon=True).start()
+        with pytest.raises(GateCallCancelled):
+            _in_a_worker(lambda: call_model("p", cancel=threading.Event()))
+        assert llm.cancelled.wait(2.0)
+        assert gate_loop.thread is not None
+        gate_loop.thread.join(2.0)
+        assert not gate_loop.thread.is_alive(), "the loop's thread is gone"
+        with pytest.raises(GateCallCancelled):
+            call_model("p", cancel=threading.Event())
+
+    def test_a_sync_only_host_ignores_it(self, gate_loop: Any) -> None:
+        class _PluginLlm:
+            def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                return SimpleNamespace(text="sync")
+
+        call_model = build_call_model(main_runtime={}, timeout_s=5.0, host_llm=_PluginLlm(), gate_loop=gate_loop)
+        assert call_model("p", cancel=threading.Event()) == "sync"
+        assert gate_loop.thread is None, "no loop is started for a sync call"
+
+    def test_the_fallback_ignores_it(self) -> None:
+        call_model = build_call_model(main_runtime={"model": "m"}, timeout_s=5.0, call_llm=lambda **kw: _response("aux"))
+        assert call_model("p", cancel=threading.Event()) == "aux"
+
+
+def test_host_llm_accessor_is_static_and_lazy() -> None:
+    from agentchatme_hermes._register import host_llm_accessor
+
+    reads: list[str] = []
+
+    class _Ctx:
+        @property
+        def llm(self) -> Any:
+            reads.append("llm")
+            return "facade"
+
+    accessor = host_llm_accessor(_Ctx())
+    assert accessor is not None and reads == [], "the property is not read at register time"
+    assert accessor() == "facade" and reads == ["llm"]
+    assert host_llm_accessor(SimpleNamespace()) is None, "an older Hermes: no ctx.llm"

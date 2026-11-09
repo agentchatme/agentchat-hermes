@@ -39,6 +39,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
+import time
 from getpass import getpass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -575,6 +576,13 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         return _doctor_finalize(failures, warnings_count)
 
     ok("agentchatme SDK importable")
+    from .kit import kit_problem
+
+    problem = kit_problem()
+    if problem is not None:
+        fail(f"SDK kit missing: {problem}")
+    else:
+        ok("agentchatme.integration (the SDK kit) importable")
 
     # Hermes connects the hosted tools itself, and only with the ``mcp`` SDK
     # (its ``[mcp]`` extra). Without it every turn runs with no AgentChat
@@ -666,7 +674,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         # doctor. The gateway drains sync on every (re)connect, and a
         # doctor invocation while the gateway is up would race the
         # drain — the SDK has no peek/count variant, only "pull and
-        # ack." We instead rely on the WSDaemon heartbeat in the
+        # ack." We instead rely on the receiver heartbeat in the
         # gateway log for queue-depth visibility.
     finally:
         client.close()
@@ -843,6 +851,10 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                         "WS leader lock is held but the daemon reports stopped — "
                         "restart `hermes gateway`"
                     )
+                worker_report = _describe_worker(health.get("worker"), now=time.time())
+                if worker_report is not None:
+                    level, text = worker_report
+                    {"ok": ok, "warn": warn, "fail": fail}[level](text)
         elif state == "free":
             warn(
                 f"WS leader lock file present but no holder ({lock_path}) — "
@@ -859,6 +871,81 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         warn("leader_lock module not importable — skipping lock check")
 
     return _doctor_finalize(failures, warnings_count)
+
+
+# A worker turn that runs this long is reported, though its own time limit
+# (``AGENTCHATME_TURN_MAX_S``) is what ends it.
+_WORKER_LONG_TURN_S = 900.0
+# This many cycles in a row that did not get through (``recent_cycles``: the
+# model or the tray unreachable, no texts, no hosted tools, no turn can
+# start, a cycle abandoned) is an error.
+_WORKER_BAD_CYCLES = 3
+
+
+def _describe_worker(worker: Any, *, now: float) -> tuple[str, str] | None:
+    """``(ok|warn|fail, line)`` for the health record's ``worker`` section.
+
+    ``None`` when the record has none (written by a version before the
+    worker was supervised). The socket can be connected while the worker
+    that turns wakes into turns is dead or stuck; this is how that shows.
+    """
+    from .ws_health import HEALTH_STALE_AFTER_SECONDS, bad_cycle_run
+
+    if not isinstance(worker, dict):
+        return None
+    state = str(worker.get("state") or "unknown")
+    restarts = worker.get("restarts") if isinstance(worker.get("restarts"), int) else 0
+    hung = worker.get("hung_turns") if isinstance(worker.get("hung_turns"), int) else 0
+    beat = worker.get("heartbeat_at")
+    beat_age = now - float(beat) if isinstance(beat, (int, float)) else None
+    since = worker.get("since")
+    in_state = now - float(since) if isinstance(since, (int, float)) else None
+    extra = f", restarts={restarts}" if restarts else ""
+    last_error = worker.get("last_error")
+    if worker.get("alive") is False and state != "stopped":
+        return "fail", f"Wake worker thread is not running (state={state}) — restart `hermes gateway`"
+    if state == "restart_wait":
+        return "warn", f"Wake worker is restarting after a crash ({last_error or 'no error text'}{extra})"
+    if beat_age is not None and beat_age > HEALTH_STALE_AFTER_SECONDS:
+        # The worker loop beats on every idle tick (60 s) and a running turn's
+        # watch every second; only a worker stuck outside both stops it.
+        return "fail", (
+            f"Wake worker has not moved for {beat_age:.0f}s (state={state}) while the socket is up "
+            "— restart `hermes gateway`"
+        )
+    max_hung = worker.get("max_hung_turns") if isinstance(worker.get("max_hung_turns"), int) else None
+    if hung and max_hung is not None and hung >= max_hung:
+        return "fail", (
+            f"{hung} AgentChat turns overran their time limit and have not ended — no new turn "
+            "can start until one does (restart `hermes gateway` if they never end)"
+        )
+    if hung:
+        return "warn", (
+            f"{hung} AgentChat turn(s) overran their time limit and have not ended; their "
+            "conversations get no new turn until they do"
+        )
+    loop_raw = worker.get("loop")
+    loop: dict[str, Any] = loop_raw if isinstance(loop_raw, dict) else {}
+    bad, newest = bad_cycle_run(loop.get("recent_cycles"))
+    if bad and newest is not None:
+        what = str(newest.get("outcome") or "?")
+        why = f": {newest['failure']}" if newest.get("failure") else ""
+        if bad >= _WORKER_BAD_CYCLES:
+            return "fail", (
+                f"The receive loop's last {bad} cycles did not get through ({what}{why}) — "
+                "AgentChat messages are not being answered"
+            )
+        return "warn", f"The receive loop's last cycle did not get through ({what}{why})"
+    if state == "turn" and in_state is not None and in_state > _WORKER_LONG_TURN_S:
+        return "warn", f"An AgentChat turn has been running for {in_state:.0f}s"
+    last_turn = worker.get("last_turn")
+    tail = ""
+    if isinstance(last_turn, dict) and last_turn.get("status"):
+        tail = f", last turn {last_turn['status']}"
+        calls = last_turn.get("agentchat_calls")
+        if isinstance(calls, dict) and isinstance(calls.get("made"), int):
+            tail += f" with {calls['made']} AgentChat call(s)"
+    return "ok", f"Wake worker {state}{extra}{tail}"
 
 
 def _doctor_finalize(failures: int, warnings_count: int) -> int:
@@ -966,24 +1053,21 @@ def _doctor_identity_texts(
 ) -> tuple[str | None, str | None]:
     """``(identity line, template)`` for ``doctor``: one fetch on the open client, else the cache."""
     try:
-        from .state import TEXTS_FILENAME, state_dir_for_account
+        from .state import state_dir_for_account
         from .texts import load_texts
         from .turn import identity_line as render_identity_line
         from .turn import identity_line_template as render_identity_line_template
     except ImportError:
         return None, None
-    cache_path = (
-        state_dir_for_account(hermes_home=hermes_home, api_base=api_base, api_key=api_key)
-        / TEXTS_FILENAME
-    )
+    state_dir = state_dir_for_account(hermes_home=hermes_home, api_base=api_base, api_key=api_key)
     try:
-        loaded = load_texts(client, cache_path=cache_path)
+        texts = load_texts(client, state_dir=state_dir)
     except Exception as exc:
         logger.debug("doctor: texts load raised: %s", exc)
         return None, None
-    if loaded is None:
+    if texts is None:
         return None, None
-    return render_identity_line(loaded.texts), render_identity_line_template(loaded.texts)
+    return render_identity_line(texts), render_identity_line_template(texts)
 
 
 def _uninstall_mcp_registration() -> None:

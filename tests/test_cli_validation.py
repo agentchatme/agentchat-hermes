@@ -8,6 +8,7 @@ for low signal — the validators below are the load-bearing logic.
 from __future__ import annotations
 
 import pytest
+from fake_keys import api_key
 
 from agentchatme_hermes.cli import _validate_email, _validate_handle
 
@@ -110,9 +111,9 @@ class TestArgparseWiring:
         parser = argparse.ArgumentParser(prog="hermes-agentchat")
         setup_argparse(parser)
 
-        args = parser.parse_args(["login", "--api-key", "ac_live_xxx"])
+        args = parser.parse_args(["login", "--api-key", api_key("xxx")])
         assert args.action == "login"
-        assert args.api_key == "ac_live_xxx"
+        assert args.api_key == api_key("xxx")
 
     def test_setup_argparse_wires_status_and_logout(self) -> None:
         import argparse
@@ -185,7 +186,7 @@ class TestDoctor:
         from agentchatme_hermes import cli
 
         monkeypatch.setattr(  # type: ignore[attr-defined]
-            cli, "_read_saved_key_source", lambda: ("ac_live_xyz", cli._ENV_API_KEY)
+            cli, "_read_saved_key_source", lambda: (api_key("xyz"), cli._ENV_API_KEY)
         )
 
         fake_client = MagicMock()
@@ -213,6 +214,14 @@ class TestDoctor:
         monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)  # type: ignore[attr-defined]
         # Hermes' MCP client is present on a clean install (the [mcp] extra).
         monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)  # type: ignore[attr-defined]
+        # A clean install has the hosted-tools entry. Stated, not read from
+        # Hermes: with Hermes installed (the hermes-main workflow) the real
+        # check would read this test machine's config.yaml.
+        from agentchatme_hermes import kit, mcp_registration
+
+        monkeypatch.setattr(mcp_registration, "inspect_entry", lambda **_kw: "ours")  # type: ignore[attr-defined]
+        # The SDK stand-in above has no kit; a clean install has it.
+        monkeypatch.setattr(kit, "kit_problem", lambda: None)  # type: ignore[attr-defined]
 
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         captured = capsys.readouterr()  # type: ignore[attr-defined]
@@ -234,7 +243,7 @@ class TestDoctor:
         from agentchatme_hermes import cli
 
         monkeypatch.setattr(  # type: ignore[attr-defined]
-            cli, "_read_saved_key_source", lambda: ("ac_live_xyz", cli._ENV_API_KEY_LEGACY)
+            cli, "_read_saved_key_source", lambda: (api_key("xyz"), cli._ENV_API_KEY_LEGACY)
         )
         monkeypatch.setattr(cli, "_sdk_importable", lambda: False)  # type: ignore[attr-defined]
         import sys

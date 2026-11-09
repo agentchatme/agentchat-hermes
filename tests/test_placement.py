@@ -5,11 +5,11 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 from agentchatme.types import Texts
+from fake_keys import PREFIX, api_key
 
 from agentchatme_hermes import placement
 from agentchatme_hermes.config import ENV_API_KEY, ENV_API_KEY_LEGACY
 from agentchatme_hermes.soul_anchor import read_anchor_handle
-from agentchatme_hermes.texts import LoadedTexts
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -33,16 +33,16 @@ class _Env:
 class TestKey:
     def test_persist_writes_the_canonical_name_only_when_no_legacy(self) -> None:
         env = _Env()
-        written = placement.persist_api_key(env.save, api_key="ac_live_1", get_env_value=env.get)
+        written = placement.persist_api_key(env.save, api_key=api_key("1"), get_env_value=env.get)
         assert written == [ENV_API_KEY]
-        assert env.values == {ENV_API_KEY: "ac_live_1"}
+        assert env.values == {ENV_API_KEY: api_key("1")}
 
     def test_persist_keeps_a_legacy_line_in_step(self) -> None:
-        env = _Env(**{ENV_API_KEY_LEGACY: "ac_live_old"})
-        written = placement.persist_api_key(env.save, api_key="ac_live_new", get_env_value=env.get)
+        env = _Env(**{ENV_API_KEY_LEGACY: api_key("old")})
+        written = placement.persist_api_key(env.save, api_key=api_key("new"), get_env_value=env.get)
         assert written == [ENV_API_KEY, ENV_API_KEY_LEGACY]
-        assert env.values[ENV_API_KEY] == "ac_live_new"
-        assert env.values[ENV_API_KEY_LEGACY] == "ac_live_new"
+        assert env.values[ENV_API_KEY] == api_key("new")
+        assert env.values[ENV_API_KEY_LEGACY] == api_key("new")
 
     def test_persist_without_reader_writes_canonical_only(self) -> None:
         env = _Env()
@@ -54,9 +54,9 @@ class TestKey:
         assert env.values == {ENV_API_KEY: "", ENV_API_KEY_LEGACY: ""}
 
     def test_migrate_mirrors_legacy_once(self) -> None:
-        env = _Env(**{ENV_API_KEY_LEGACY: "ac_live_old"})
+        env = _Env(**{ENV_API_KEY_LEGACY: api_key("old")})
         assert placement.migrate_legacy_key(env.save, env.get) is True
-        assert env.values[ENV_API_KEY] == "ac_live_old"
+        assert env.values[ENV_API_KEY] == api_key("old")
         assert placement.migrate_legacy_key(env.save, env.get) is False, "canonical now present"
 
     def test_migrate_is_a_noop_without_a_legacy_value(self) -> None:
@@ -109,30 +109,29 @@ class TestResolveIdentityLine:
                 "manual": {"url": "https://agentchat.me/skill.md", "version": "2.1.2"},
                 "wake_instruction": "w",
                 "invite_prompt": "i",
-                "identity_line": "I am @alice on AgentChat. I call agentchat_inbox first.",
+                "identity_line": "I am @alice on AgentChat. I call mcp__agentchat__agentchat_inbox first.",
                 "identity_line_template": "I am @<handle> on AgentChat.",
             }
         )
 
-    def test_served_line_is_spelled_for_hermes(
+    def test_served_line_is_placed_as_served(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         seen: dict[str, Any] = {}
 
-        def fake_load(client: Any, *, cache_path: Path, **_kw: Any) -> LoadedTexts:
-            seen["cache_path"] = cache_path
-            return LoadedTexts(texts=self._texts(), fetched_at=0.0, source="server")
+        def fake_load(client: Any, *, state_dir: Path, **_kw: Any) -> Texts:
+            seen["state_dir"] = state_dir
+            return self._texts()
 
         monkeypatch.setattr(placement, "load_texts", fake_load)
         line = placement.resolve_identity_line(
-            api_key="ac_live_k", api_base="https://api.example.test", hermes_home=tmp_path
+            api_key=api_key("k"), api_base="https://api.example.test", hermes_home=tmp_path
         )
         assert line == "I am @alice on AgentChat. I call mcp__agentchat__agentchat_inbox first."
-        assert seen["cache_path"].parent.parent == tmp_path / "agentchat-state"
-        assert seen["cache_path"].name == "texts.json"
+        assert seen["state_dir"].parent == tmp_path / "agentchat-state"
 
     def test_nothing_available_is_none(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        monkeypatch.setattr(placement, "load_texts", lambda client, *, cache_path, **_kw: None)
+        monkeypatch.setattr(placement, "load_texts", lambda client, *, state_dir, **_kw: None)
         assert (
             placement.resolve_identity_line(
                 api_key="k", api_base="https://api.example.test", hermes_home=tmp_path
@@ -184,4 +183,4 @@ class TestNothingSecretLeaks:
             api_base="https://api.example.test",
             soul_path=tmp_path / "SOUL.md",
         )
-        assert all("ac_live" not in s.detail for s in steps)
+        assert all(PREFIX not in s.detail for s in steps)

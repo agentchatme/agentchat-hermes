@@ -19,6 +19,8 @@ import sys
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
+from fake_keys import api_key
+
 from agentchatme_hermes._register import _is_gateway_context
 from agentchatme_hermes.leader_lock import GATEWAY_ENV_MARKER
 
@@ -194,7 +196,7 @@ class TestReconcileSoulAnchor:
             with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
                 _register._reconcile_soul_anchor(runtime)
             assert soul.read_text(encoding="utf-8") == content
-            assert not caplog.records
+            assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
         # The guard: after the rewords a key for another agent is still caught.
         with caplog.at_level(logging.ERROR, logger="agentchatme_hermes._register"):
@@ -305,7 +307,9 @@ class TestReconcileSoulAnchor:
         monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
             _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
-        assert not caplog.records
+        # Quiet = no warning. (An idempotent rewrite logs at INFO, which shows
+        # when Hermes is installed and has raised the logging level.)
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert soul.read_text() == before
 
     def test_pre_v3_block_with_matching_handle_is_refreshed(
@@ -350,7 +354,7 @@ class TestReconcileKeyName:
         from agentchatme_hermes import _register
         from agentchatme_hermes.config import ENV_API_KEY, ENV_API_KEY_LEGACY
 
-        env = {ENV_API_KEY_LEGACY: "ac_live_old"}
+        env = {ENV_API_KEY_LEGACY: api_key("old")}
         module = types.ModuleType("hermes_cli.config")
         module.get_env_value = env.get  # type: ignore[attr-defined]
         module.save_env_value = env.__setitem__  # type: ignore[attr-defined]
@@ -358,7 +362,7 @@ class TestReconcileKeyName:
         monkeypatch.setitem(sys.modules, "hermes_cli.config", module)
 
         _register._reconcile_key_name(SimpleNamespace(api_key_source=ENV_API_KEY_LEGACY))
-        assert env[ENV_API_KEY] == "ac_live_old"
+        assert env[ENV_API_KEY] == api_key("old")
 
     def test_canonical_profile_is_untouched(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from types import SimpleNamespace
@@ -455,7 +459,7 @@ class TestActivationWatcher:
         configs: list[Any] = [None, SimpleNamespace(api_base="https://api.example.test")]
         monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: configs.pop(0))
         runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path)
-        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode: runtime)
+        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
         monkeypatch.setattr(_register, "_reconcile_key_name", lambda cfg: None)
         monkeypatch.setattr(_register, "_reconcile_mcp_registration", lambda rt: None)
@@ -482,7 +486,7 @@ class TestActivationWatcher:
         runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path)
         outcomes: list[Any] = [None, None, runtime]
         monkeypatch.setattr(
-            _register, "_try_start_runtime", lambda cfg, *, gateway_mode: outcomes.pop(0)
+            _register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: outcomes.pop(0)
         )
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
         monkeypatch.setattr(_register, "_reconcile_key_name", lambda cfg: None)
@@ -523,3 +527,173 @@ class TestActivationWatcher:
         monkeypatch.setattr(sys, "argv", ["hermes", "chat"])
         _register.register(MagicMock())
         assert started == []
+
+
+class _UnloadCtx:
+    """A plugin context with Hermes' ``on_unload``: records the callbacks."""
+
+    def __init__(self) -> None:
+        self.unloads: list[Any] = []
+
+    def on_unload(self, callback: Any) -> None:
+        self.unloads.append(callback)
+
+    def register_cli_command(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def register_skill(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+class TestUnload:
+    """``ctx.on_unload`` (a plugin reload, disable or remove in a running
+    process): the runtime is stopped — socket, worker, timers, leader lock —
+    and forgotten, so the reloaded code takes the socket and the lock."""
+
+    def _watched(self, monkeypatch: pytest.MonkeyPatch, runtime: Any) -> None:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register
+
+        monkeypatch.setattr(
+            _register, "load_config", lambda *, hermes_home=None: SimpleNamespace(api_base="https://api.example.test")
+        )
+        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)
+        monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
+        monkeypatch.setattr(_register, "_reconcile_key_name", lambda cfg: None)
+        monkeypatch.setattr(_register, "_reconcile_mcp_registration", lambda rt: None)
+
+    def test_unload_stops_the_runtime_and_forgets_it(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register
+        from agentchatme_hermes import runtime as runtime_module
+
+        runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path, stop=MagicMock())
+        self._watched(monkeypatch, runtime)
+        forgotten: list[Any] = []
+        monkeypatch.setattr(runtime_module, "forget_runtime", lambda rt: forgotten.append(rt) or True)
+        monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
+        monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
+        ctx = _UnloadCtx()
+        _register.register(ctx)
+        assert len(ctx.unloads) == 1
+        runtime.stop.assert_not_called()
+
+        ctx.unloads[0]()
+        runtime.stop.assert_called_once()
+        assert forgotten == [runtime]
+        ctx.unloads[0]()  # a second unload changes nothing
+        runtime.stop.assert_called_once()
+
+    def test_a_runtime_started_during_the_unload_is_stopped(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register
+        from agentchatme_hermes._register import ActivationWatcher
+
+        watcher = ActivationWatcher(hermes_home=tmp_path / ".hermes", profile="default", gateway_mode=True)
+        runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path, stop=MagicMock())
+
+        def start_while_unloading(cfg: Any, *, gateway_mode: bool, host_llm: Any = None) -> Any:
+            watcher.close()  # the unload lands while this attempt starts the runtime
+            return runtime
+
+        self._watched(monkeypatch, runtime)
+        monkeypatch.setattr(_register, "_try_start_runtime", start_while_unloading)
+        assert watcher.try_activate() == "closed"
+        runtime.stop.assert_called_once()
+        assert watcher.runtime is None and watcher.closed
+        assert watcher.try_activate() == "closed", "no further attempts"
+
+    def test_hermes_without_on_unload_still_loads(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register
+
+        class _OldCtx:
+            def register_cli_command(self, *_args: Any, **_kwargs: Any) -> None:
+                return None
+
+            def register_skill(self, *_args: Any, **_kwargs: Any) -> None:
+                return None
+
+        runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path, stop=MagicMock())
+        self._watched(monkeypatch, runtime)
+        monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
+        _register.register(_OldCtx())
+        runtime.stop.assert_not_called()
+
+    def test_a_raising_on_unload_is_a_warning(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register
+
+        class _BrokenCtx(_UnloadCtx):
+            def on_unload(self, callback: Any) -> None:
+                raise TypeError("on_unload callback must be callable")
+
+        runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path, stop=MagicMock())
+        self._watched(monkeypatch, runtime)
+        monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
+            _register.register(_BrokenCtx())
+        assert any("unload hook" in r.getMessage() for r in caplog.records)
+
+
+
+class TestWithoutTheKit:
+    """An agentchatme without ``agentchatme.integration`` cannot receive: the
+    plugin says so once, loudly, keeps the CLI (doctor says it too) and the
+    manual, starts nothing, and never raises."""
+
+    def test_register_logs_one_error_and_keeps_the_cli(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agentchatme_hermes import _register
+        from agentchatme_hermes.kit import KIT_REQUIREMENT
+
+        monkeypatch.setitem(sys.modules, "agentchatme.integration", None)
+
+        def no_watcher(**_kw: Any) -> Any:
+            raise AssertionError("nothing starts without the kit")
+
+        monkeypatch.setattr(_register, "ActivationWatcher", no_watcher)
+        ctx = MagicMock()
+        with caplog.at_level(logging.DEBUG, logger="agentchatme_hermes"):
+            _register.register(ctx)
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1, [r.getMessage() for r in errors]
+        assert KIT_REQUIREMENT in errors[0].getMessage() and "not receiving" in errors[0].getMessage()
+        assert ctx.register_cli_command.called, "`hermes agentchat doctor` stays reachable"
+        assert ctx.register_skill.called
+
+    def test_the_plugin_and_its_cli_import_without_the_kit(self) -> None:
+        import os
+        import subprocess
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        script = (
+            "import sys\n"
+            "sys.modules['agentchatme.integration'] = None\n"
+            "import agentchatme_hermes, agentchatme_hermes.cli\n"
+            "from agentchatme_hermes.kit import kit_problem\n"
+            "print('problem:', kit_problem())\n"
+        )
+        env = {**os.environ, "PYTHONPATH": str(root)}
+        done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env, cwd=root, timeout=60)
+        assert done.returncode == 0, done.stderr
+        assert "problem: the installed agentchatme" in done.stdout and "pip install -U" in done.stdout
+
+    def test_doctor_fails_on_it(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        import argparse
+
+        from agentchatme_hermes import cli
+        from agentchatme_hermes.kit import KIT_REQUIREMENT
+
+        monkeypatch.setitem(sys.modules, "agentchatme.integration", None)
+        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: None)
+        rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
+        out = capsys.readouterr().out
+        assert rc >= 1 and "SDK kit missing" in out and KIT_REQUIREMENT in out

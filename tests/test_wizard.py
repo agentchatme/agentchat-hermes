@@ -9,6 +9,7 @@ the parts most likely to regress.
 from __future__ import annotations
 
 import pytest
+from fake_keys import api_key
 
 from agentchatme_hermes.wizard import (
     _mask_key,
@@ -87,8 +88,8 @@ class TestValidateHandle:
 
 class TestMaskKey:
     def test_long_key_masked(self) -> None:
-        masked = _mask_key("ac_live_abcdef1234567890ghij")
-        assert masked.startswith("ac_live_")
+        masked = _mask_key(api_key("abcdef1234567890ghij"))
+        assert masked.startswith(api_key(""))
         assert masked.endswith("ghij")
         # Bulk of the secret is replaced by the ellipsis
         assert "abcdef1234567890" not in masked
@@ -100,8 +101,8 @@ class TestMaskKey:
 
     def test_exactly_12_chars(self) -> None:
         # At 12 chars we should mask normally (8 + 4)
-        masked = _mask_key("ac_live_xxxx")
-        assert masked == "ac_live_…xxxx"
+        masked = _mask_key(api_key("xxxx"))
+        assert masked == api_key("…xxxx")
 
 
 # ─── _RegisterError ────────────────────────────────────────────────────────

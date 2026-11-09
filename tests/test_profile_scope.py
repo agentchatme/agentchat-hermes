@@ -12,6 +12,7 @@ import types
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from fake_keys import api_key
 
 from agentchatme_hermes import profile_scope
 from agentchatme_hermes.profile_scope import (
@@ -70,8 +71,8 @@ class TestRootAndLabel:
 
 class TestAccountFingerprint:
     def test_stable_and_short(self) -> None:
-        a = account_fingerprint("https://api.agentchat.me", "ac_live_abc")
-        assert a == account_fingerprint("https://api.agentchat.me", "ac_live_abc")
+        a = account_fingerprint("https://api.agentchat.me", api_key("abc"))
+        assert a == account_fingerprint("https://api.agentchat.me", api_key("abc"))
         assert len(a) == 16
         int(a, 16)  # hex
 
@@ -88,7 +89,7 @@ class TestAccountFingerprint:
         )
 
     def test_not_the_raw_key(self) -> None:
-        assert "ac_live_secret" not in account_fingerprint("https://x", "ac_live_secret")
+        assert api_key("secret") not in account_fingerprint("https://x", api_key("secret"))
 
 
 def _install_fake_secret_scope(

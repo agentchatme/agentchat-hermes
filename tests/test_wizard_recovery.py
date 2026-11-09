@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 import pytest
+from fake_keys import api_key
 
 from agentchatme_hermes import wizard
 from agentchatme_hermes.wizard import (
@@ -195,12 +196,12 @@ class TestRecoverVerify:
 
         def fake(pending_id: str, code: str, *, base_url: str, client_identity: Any) -> Any:
             seen.update(pending_id=pending_id, code=code, base_url=base_url)
-            return "alice", "ac_live_newkey_000000000000", client
+            return "alice", api_key("newkey_000000000000"), client
 
         monkeypatch.setattr(AgentChatClient, "recover_verify", staticmethod(fake))
 
         assert _recover_verify(pending_id="pnd_1", code="123456") == (
-            "ac_live_newkey_000000000000",
+            api_key("newkey_000000000000"),
             "alice",
         )
         assert seen["pending_id"] == "pnd_1"
@@ -381,7 +382,7 @@ class TestRecoverLostKeyFlow:
 
         def verify(*, pending_id: str, code: str) -> tuple[str, str]:
             assert (pending_id, code) == ("pnd_1", "123456")
-            return "ac_live_newkey_000000000000", "alice"
+            return api_key("newkey_000000000000"), "alice"
 
         ok, out, _prompt, anchored = _run_flow(
             monkeypatch, ["a@b.co", "alice", "123456"], start=start, verify=verify
@@ -390,7 +391,7 @@ class TestRecoverLostKeyFlow:
         assert ok is True
         assert starts == [{"email": "a@b.co", "handle": "alice"}]
         assert out.env == {
-            "AGENTCHAT_API_KEY": "ac_live_newkey_000000000000",
+            "AGENTCHAT_API_KEY": api_key("newkey_000000000000"),
             "AGENTCHATME_HANDLE": "alice",
         }
         assert anchored == ["alice"]
@@ -405,7 +406,7 @@ class TestRecoverLostKeyFlow:
             return "pnd_1"
 
         def verify(*, pending_id: str, code: str) -> tuple[str, str]:
-            return "ac_live_newkey_000000000000", "alice"
+            return api_key("newkey_000000000000"), "alice"
 
         # Email typed, handle accepted on bare ENTER, then the code.
         ok, _out, prompt, _ = _run_flow(
@@ -427,7 +428,7 @@ class TestRecoverLostKeyFlow:
             return "pnd_1"
 
         def verify(*, pending_id: str, code: str) -> tuple[str, str]:
-            return "ac_live_newkey_000000000000", "alice"
+            return api_key("newkey_000000000000"), "alice"
 
         ok, _out, prompt, _ = _run_flow(
             monkeypatch,
