@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import sys
 import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -26,6 +27,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fake_keys import api_key
+
+# The tests that take the real leader lock: fcntl is POSIX-only, as in
+# test_leader_lock.py (the plugin receives only where Hermes' gateway runs).
+_posix_only = pytest.mark.skipif(sys.platform == "win32", reason="the real leader lock is fcntl, POSIX-only")
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -127,17 +132,19 @@ class TestRuntimeStartFollowerGateway:
         ):
             rt = Runtime(_config(), gateway_mode=True)
             rt.start()
-
-            assert acquire.called, (
-                "we should still attempt the acquire so we know we lost"
-            )
-            assert not ws_cls.called, (
-                "follower-gateway must NOT open a WS — fixes the "
-                "multi-WS-per-machine bug"
-            )
-            assert not invoker_cls.called
-            assert rt.is_leader is False
-            assert rt.identity.handle == "alice"
+            try:
+                assert acquire.called, (
+                    "we should still attempt the acquire so we know we lost"
+                )
+                assert not ws_cls.called, (
+                    "follower-gateway must NOT open a WS — fixes the "
+                    "multi-WS-per-machine bug"
+                )
+                assert not invoker_cls.called
+                assert rt.is_leader is False
+                assert rt.identity.handle == "alice"
+            finally:
+                rt.stop()  # ends the leader-retry thread while the lock is still mocked
 
 
 class TestRuntimeStartFollowerCli:
@@ -513,6 +520,7 @@ class TestUnloadedRuntime:
             runtime_module.forget_runtime(fresh)
 
 
+@_posix_only
 class TestReloadWithALiveTurn:
     """A plugin reload (or stop) while an AgentChat turn runs: the old
     instance keeps the account's leader lock until that turn's thread has
@@ -557,11 +565,13 @@ class TestReloadWithALiveTurn:
 
         config = _config(hermes_home=tmp_path / ".hermes", lock_dir=tmp_path / "locks")
         loop = asyncio.new_event_loop()
+        started_runtimes: list[Any] = []
         try:
             with patch("agentchatme_hermes.runtime.Receiver", side_effect=make_receiver), patch(
                 "agentchatme_hermes.runtime.load_texts", MagicMock(return_value=None)
             ), patch.object(Runtime, "_build_sync_client", return_value=fake_client):
                 old = Runtime(config, gateway_mode=True)
+                started_runtimes.append(old)
                 old.start()
                 assert old.is_leader and len(receivers) == 1
                 inv = old._invoker
@@ -585,6 +595,7 @@ class TestReloadWithALiveTurn:
                 old.stop()  # the reload: the old code is unloaded mid-turn
                 assert try_acquire_ws_leader_lock(old.lock_path) is None, "the lock is still held"
                 new = Runtime(config, gateway_mode=True)
+                started_runtimes.append(new)
                 new.start()
                 time.sleep(0.2)
                 assert not new.is_leader and len(receivers) == 1, "the new instance stays a follower: no second turn"
@@ -600,6 +611,8 @@ class TestReloadWithALiveTurn:
                 new.stop()
         finally:
             released.set()
+            for runtime in reversed(started_runtimes):
+                runtime.stop()  # idempotent; on a failed assert it ends the retry thread too
             loop.close()
 
     def test_the_lock_waits_for_a_closing_receive_loop(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -726,6 +739,7 @@ class _FakeApi:
         self.server.server_close()
 
 
+@_posix_only
 class TestStopRecordsBeforeLettingGo:
     """The real receiver, invoker, SDK clients and leader lock against
     AgentChat's API on loopback (only Hermes is stood in for): a turn that

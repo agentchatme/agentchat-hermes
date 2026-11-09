@@ -5,6 +5,17 @@ socket connect and every name lookup for a non-loopback destination is
 refused (``NetworkAccessBlocked``, an ``OSError``), and the test that tried
 fails — even when the code under test swallowed the error. Loopback and
 local (AF_UNIX) sockets stay open for local fake servers.
+
+The home guard: every test runs with ``HOME`` / ``USERPROFILE`` /
+``HERMES_HOME`` pointing at its own temporary directory, so nothing the
+plugin writes by default (the health record, the leader locks, ``.env``,
+``SOUL.md``) can land in the real home of whoever runs the suite — on a
+Hermes box, that is the live agent's.
+
+The thread guard: a test that leaves one of the plugin's threads
+(``agentchat-…``) running fails. A leaked leader-retry thread outlives the
+test's mocks, wins the real lock later and starts a real receiver in
+whatever test runs then.
 """
 from __future__ import annotations
 
@@ -12,6 +23,8 @@ import ipaddress
 import os
 import socket
 import stat
+import threading
+import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -83,6 +96,40 @@ def _network_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     yield
     if attempts:
         pytest.fail("the test tried to reach the network: " + "; ".join(attempts[:5]), pytrace=False)
+
+
+@pytest.fixture(autouse=True)
+def _home_guard(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path_factory.mktemp("home")
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+
+
+_THREAD_GRACE_S = 2.0
+
+
+@pytest.fixture(autouse=True)
+def _thread_guard() -> Iterator[None]:
+    before = {thread.ident for thread in threading.enumerate()}
+
+    def leaked() -> list[threading.Thread]:
+        return [
+            thread
+            for thread in threading.enumerate()
+            if thread.ident not in before and thread.is_alive() and thread.name.startswith("agentchat")
+        ]
+
+    yield
+    deadline = time.monotonic() + _THREAD_GRACE_S
+    while leaked() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    left = leaked()
+    if left:
+        pytest.fail(
+            "the test left the plugin's threads running: " + ", ".join(sorted(t.name for t in left)),
+            pytrace=False,
+        )
 
 
 @pytest.fixture
