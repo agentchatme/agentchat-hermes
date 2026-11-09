@@ -195,8 +195,18 @@ def test_no_limits_waits_for_the_end() -> None:
 def test_poll_callback_beats_while_the_turn_runs() -> None:
     agent = _Agent(block=True)
     beats: list[float] = []
-    threading.Timer(0.1, agent.release.set).start()
-    run_turn(agent, "go", session_id="s", limits=TurnLimits(idle_s=None, max_s=None, poll_s=0.01), on_poll=lambda: beats.append(1.0))
+
+    def beat() -> None:
+        beats.append(1.0)
+        if len(beats) >= 3:
+            agent.release.set()  # the turn can end only after three beats: no wall-clock count
+
+    backstop = threading.Timer(10.0, agent.release.set)  # a runner that never beats fails, not hangs
+    backstop.start()
+    try:
+        run_turn(agent, "go", session_id="s", limits=TurnLimits(idle_s=None, max_s=None, poll_s=0.01), on_poll=beat)
+    finally:
+        backstop.cancel()
     assert len(beats) >= 3
 
 
