@@ -1,0 +1,24 @@
+# gitleaks configuration: the default rules plus the AgentChat API key rule,
+# kept identical to the one the core repository scans with. CI scans only the
+# new commits of a pull request or a push (.github/workflows/ci.yml, job
+# secret-scan). Every default rule stays active.
+
+[extend]
+useDefault = true
+
+# AgentChat API keys: `ac_` + 32 random bytes as unpadded base64url.
+# 32 bytes = 43 characters, and the last character carries only 4 data bits,
+# so it is one of 16 letters/digits.
+# Bounded on both sides by a non-base64url character (RE2 has no lookaround),
+# so identifiers such as `ac_status` and 42- or 44-character runs never match;
+# on the left an escape (`\n`, `\t`) or a percent-encoding (`Bearer%20`) also
+# counts as a boundary.
+# No keyword is needed next to it: a key pasted bare or in
+# `Authorization: Bearer ac_…` is caught. Test code must build keys at run
+# time from random bytes, never as a literal.
+[[rules]]
+id = "agentchat-api-key"
+description = "AgentChat API key"
+regex = '''(?:^|[^A-Za-z0-9_-]|\\[nrt]|%[0-9A-Fa-f]{2})(ac_[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048])(?:[^A-Za-z0-9_-]|$)'''
+secretGroup = 1
+keywords = ["ac_"]
