@@ -1,0 +1,79 @@
+name: install-pinned-binary
+description: >-
+  Put one binary from a release tarball on PATH, at a pinned version whose
+  SHA-256 is pinned too. The archive is kept in the Actions cache (keyed on
+  name, version and checksum), so a job downloads it only on a cache miss;
+  a download retries transient failures for up to four minutes. The
+  checksum is checked on every run, cached archive or fresh download: it,
+  not the cache or the release host, decides what runs. A cached archive
+  that fails the check is discarded and downloaded again.
+
+  Why: GitHub's release-asset host answered 504 for minutes at a time on
+  2026-11-09 (the Fly deploy twice, the secret scan six retries in a row),
+  and an unpinned setup action (`setup-flyctl@master`, flyctl `latest`)
+  let both the action's code and the CLI change under the production
+  deploy. To move a version: change `version`, `url` and `sha256` together
+  at the call site (the publisher's checksums file, checked against the
+  archive's own hash).
+
+inputs:
+  name:
+    description: Short name, used in the cache key and the step names (e.g. flyctl).
+    required: true
+  version:
+    description: The pinned version (e.g. 0.5.5).
+    required: true
+  url:
+    description: The release tarball for that version (linux x86_64).
+    required: true
+  sha256:
+    description: The tarball's SHA-256 (hex).
+    required: true
+  binary:
+    description: The file inside the tarball to put on PATH.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Restore the ${{ inputs.name }} ${{ inputs.version }} archive
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ~/.cache/pinned-binaries/${{ inputs.name }}-${{ inputs.version }}.tar.gz
+        key: pinned-binary-${{ inputs.name }}-${{ inputs.version }}-${{ inputs.sha256 }}
+
+    - name: Install ${{ inputs.name }} ${{ inputs.version }} (checksum-pinned)
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        VERSION: ${{ inputs.version }}
+        URL: ${{ inputs.url }}
+        SHA256: ${{ inputs.sha256 }}
+        BINARY: ${{ inputs.binary }}
+      run: |
+        set -euo pipefail
+        archive="$HOME/.cache/pinned-binaries/${NAME}-${VERSION}.tar.gz"
+        mkdir -p "$(dirname "$archive")"
+        download() {
+          echo "downloading ${NAME} ${VERSION}"
+          curl --fail --silent --show-error --location \
+            --retry 8 --retry-all-errors --retry-delay 10 --retry-max-time 240 \
+            "$URL" --output "$archive"
+        }
+        verified() { echo "${SHA256}  ${archive}" | sha256sum --check --status; }
+        if [ -s "$archive" ] && verified; then
+          echo "${NAME} ${VERSION}: cached archive, checksum ok"
+        else
+          [ -s "$archive" ] && echo "::warning::cached ${NAME} archive failed its checksum; downloading again"
+          rm -f "$archive"
+          download
+          if ! verified; then
+            echo "::error::${NAME} ${VERSION}: the download does not match the pinned SHA-256"
+            exit 1
+          fi
+          echo "${NAME} ${VERSION}: downloaded, checksum ok"
+        fi
+        dest="$RUNNER_TEMP/pinned-bin/${NAME}"
+        mkdir -p "$dest"
+        tar -xzf "$archive" -C "$dest" "$BINARY"
+        echo "$dest" >> "$GITHUB_PATH"
