@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import contextvars
 import threading
-import time
 from typing import Any
 from unittest.mock import MagicMock
 
@@ -112,23 +111,27 @@ def test_idle_turn_is_interrupted_like_hermes_does_and_reported_timeout() -> Non
 
 
 def test_activity_keeps_the_turn_alive_until_the_ceiling() -> None:
+    # A controlled clock, advanced and paired with activity on every poll:
+    # each poll the turn is one ``step`` older and has made one more API
+    # call. Without the activity the idle limit (2 steps) would fire by the
+    # third poll; with it, only the ceiling (20 steps) can end the turn. No
+    # wall-clock race: a starved thread on a slow runner changes nothing.
     agent = _Agent(block=True)
-    stop = threading.Event()
+    step = 0.0625  # a power of two: the sums are exact, the 20th poll is exactly the ceiling
+    now = [0.0]
+    polls: list[float] = []
 
-    def busy() -> None:
-        while not stop.wait(0.02):
-            agent.api_calls += 1  # activity: the idle limit never fires
+    def tick() -> None:
+        now[0] += step
+        agent.api_calls += 1  # activity, seen by the next idle check
+        polls.append(now[0])
 
-    threading.Thread(target=busy, daemon=True).start()
-    try:
-        started = time.monotonic()
-        report = run_turn(
-            agent, "go", session_id="s", limits=TurnLimits(idle_s=0.1, max_s=0.4, grace_s=0.5, poll_s=0.01)
-        )
-    finally:
-        stop.set()
-    assert report.status == "timeout" and "ceiling" in (report.detail or "")
-    assert time.monotonic() - started >= 0.4, "not cut by the idle limit while busy"
+    limits = TurnLimits(idle_s=2 * step, max_s=20 * step, grace_s=0.5, poll_s=0.001)
+    report = run_turn(agent, "go", session_id="s", limits=limits, on_poll=tick, clock=lambda: now[0])
+    assert report.status == "timeout" and "ceiling" in (report.detail or ""), report.detail
+    assert report.duration_s == 20 * step, "busy ten times the idle limit, cut only at the ceiling"
+    assert len(polls) == 20, "the ceiling fired on the poll that reached it, not before"
+    assert agent.interrupts == [(f"AgentChat: {INTERRUPT_TOOL_REASON}", INTERRUPT_TOOL_REASON)]
 
 
 def test_turn_that_ignores_the_interrupt_ends_later() -> None:
