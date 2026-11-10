@@ -47,3 +47,49 @@ jobs:
 
       - name: Test (pytest)
         run: pytest -ra --cov=agentchatme_hermes --cov-report=term-missing
+
+  # Secret scan of the new commits only: the pull request's range, or the
+  # push's. The default gitleaks rules plus the AgentChat API key rule
+  # (.gitleaks.toml).
+  secret-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Checksum-pinned, cached: a download happens only on a cache miss
+      # (.github/actions/install-pinned-binary).
+      - uses: ./.github/actions/install-pinned-binary
+        with:
+          name: gitleaks
+          version: 8.30.1
+          url: https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          sha256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+          binary: gitleaks
+
+      - name: Select commits to scan
+        id: commits
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            echo "range=${BASE_SHA}..${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          elif [[ "$BEFORE_SHA" =~ ^0+$ ]]; then
+            echo "range=${HEAD_SHA}^..${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          else
+            echo "range=${BEFORE_SHA}..${HEAD_SHA}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Scan new commits for secrets
+        run: >-
+          gitleaks git
+          --redact
+          --no-banner
+          --log-opts="${{ steps.commits.outputs.range }}"
+          .
