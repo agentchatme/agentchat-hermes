@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Opens, updates or closes the one issue that says the nightly hermes-main run
 # is red. Run by .github/workflows/hermes-main.yml (job `report`), on
-# scheduled runs only, with the workflow's GITHUB_TOKEN — no other secret.
+# scheduled runs (and dispatches with report_issue), with the workflow's
+# GITHUB_TOKEN — no other secret.
 #
 # The issue is the open issue with the title below, created by
 # github-actions[bot]:
@@ -11,6 +12,11 @@
 # A leg that timed out or lost its runner can report `cancelled`; that is
 # red. A run that was itself cancelled (a newer run superseded it) never
 # gets here: the job runs only when `!cancelled()`.
+#
+# A red night must not lose its alert to an API hiccup: when the open issue
+# cannot be looked up, a new one is opened; when the job list cannot be
+# read, the issue says so. A green night that cannot look up the issue
+# fails this job, so the run shows red instead of leaving a stale issue.
 #
 # Environment: GH_TOKEN (issues: write, actions: read), GH_REPO, RUN_ID,
 # RUN_URL, REFS_RESULT and SUITE_RESULT (the jobs' results: success,
@@ -30,9 +36,14 @@ legs() {
     | jq -rs '.[].jobs[] | select(.name | test("^(Resolve hermes-agent refs|Suite vs )")) | "- \(.name): **\(.conclusion // .status)**"'
 }
 
-issue="$(open_issue)"
+lookup_ok=1
+issue="$(open_issue)" || { echo "::warning::could not look up the open nightly issue"; issue=""; lookup_ok=0; }
 
 if [[ "$REFS_RESULT" == success && "$SUITE_RESULT" == success ]]; then
+  if [[ "$lookup_ok" == 0 ]]; then
+    echo "::error::green, but the open nightly issue could not be looked up to close it"
+    exit 1
+  fi
   if [[ -n "$issue" ]]; then
     gh issue comment "$issue" --body "Green again: every leg passed in $RUN_URL. Closing."
     gh issue close "$issue" --reason completed
@@ -47,15 +58,16 @@ body="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/nightly-issue.md"
 {
   echo "The nightly run of this package's suite against hermes-agent is red."
   echo
-  legs
+  legs || echo "- (the job list could not be read; see the run)"
   echo
-  echo "- A red \`main\` leg: Hermes main changed something this plugin uses; the next Hermes release would break it."
-  echo "- A red \`latest release\` leg: this plugin's main fails on the Hermes release users run now."
-  echo "- A red \`Resolve hermes-agent refs\`: the latest release could not be looked up, so nothing was tested."
+  echo "A red leg means a test failed with that Hermes installed. Read the failing tests in the run: often Hermes changed"
+  echo "something this plugin uses (on \`main\`: the next Hermes release would break it; on \`latest release\`: the release"
+  echo "users run now), sometimes the plugin itself is red (a test of its own, such as the dated legacy-settings test)."
+  echo "A leg named \`unresolved\`: the latest release could not be looked up."
   echo
   echo "What each Hermes surface is for: \`docs/hermes-coupling.md\`. Run: $RUN_URL"
   echo
-  echo "Every red nightly comments here; the next green one closes this issue (\`.github/workflows/hermes-main.yml\`)."
+  echo "Every red scheduled run comments here; the next green scheduled run closes this issue (\`.github/workflows/hermes-main.yml\`)."
 } > "$body"
 
 if [[ -n "$issue" ]]; then

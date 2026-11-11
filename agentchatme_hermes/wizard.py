@@ -29,11 +29,12 @@ module is only the no-argument interactive entry.
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import re
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING, Any
 
 from .client_identity import hermes_client_identity
@@ -47,6 +48,7 @@ from .placement import (
 from .soul_anchor import remove_soul_anchor
 
 if TYPE_CHECKING:
+    import httpx
     from agentchatme import AgentChatError
 
 logger = logging.getLogger(__name__)
@@ -917,26 +919,29 @@ def _register_start(*, email: str, handle: str, display_name: str) -> str:
     body, not ``""``. One attempt (the SDK never retries a register), with
     the same 15 s budget the plugin's own post had.
 
-    Maps the SDK's errors onto field hints so the wizard's retry loop
-    re-prompts the right field; the messages are the wizard's own (see
-    :func:`_api_error_parts`, :func:`_transport_failure`).
+    Maps the answer onto field hints so the wizard's retry loop re-prompts
+    the right field. The messages are the wizard's own, worded from the
+    answer the SDK received (:class:`_AnswerTap`, :func:`_answer_parts`).
     """
     from agentchatme import AgentChatClient, AgentChatError
     from agentchatme import ConnectionError as SDKConnectionError
 
-    try:
-        data = AgentChatClient.register(
-            email=email,
-            handle=handle,
-            display_name=display_name or None,
-            base_url=_api_base(),
-            client_identity=hermes_client_identity(),
-            timeout_ms=_START_TIMEOUT_MS,
-        )
-    except SDKConnectionError as exc:
-        raise _RegisterError(_transport_failure(exc)) from exc
-    except AgentChatError as exc:
-        raise _register_error(exc) from exc
+    with _start_client() as (client, tap):
+        try:
+            # Typed as a dict by the SDK; the server may still send no body.
+            data: Any = AgentChatClient.register(
+                email=email,
+                handle=handle,
+                display_name=display_name or None,
+                base_url=_api_base(),
+                client_identity=hermes_client_identity(),
+                timeout_ms=_START_TIMEOUT_MS,
+                http_client=client,
+            )
+        except SDKConnectionError as exc:
+            raise _RegisterError(_transport_failure(exc)) from exc
+        except AgentChatError as exc:
+            raise _register_error(*_answer_parts(tap, exc)) from exc
 
     if not isinstance(data, Mapping):
         raise _RegisterError("invalid server response")
@@ -946,10 +951,10 @@ def _register_start(*, email: str, handle: str, display_name: str) -> str:
     return pending_id
 
 
-def _register_error(exc: AgentChatError) -> _RegisterError:
-    """The wizard's :class:`_RegisterError` for an SDK ``AgentChatError``
-    raised by :meth:`AgentChatClient.register`."""
-    code, message, details = _api_error_parts(exc)
+def _register_error(
+    code: str | None, message: str | None, details: Mapping[str, Any] | None, status: int
+) -> _RegisterError:
+    """The wizard's :class:`_RegisterError` for a rejected registration."""
     if code in {"HANDLE_TAKEN", "INVALID_HANDLE", "RESERVED_HANDLE"}:
         return _RegisterError(message or code, field="handle", code=code)
     if code == _LEGACY_EMAIL_TAKEN:
@@ -967,7 +972,7 @@ def _register_error(exc: AgentChatError) -> _RegisterError:
         )
     if code == "RATE_LIMITED":
         return _RegisterError("rate-limited — wait a minute and try again", code=code)
-    return _RegisterError(message or code or f"HTTP {exc.status}", code=code)
+    return _RegisterError(message or code or f"HTTP {status}", code=code)
 
 
 def _email_policy_message(code: str, server_message: str | None, limit: int | None) -> str:
@@ -1013,28 +1018,83 @@ def _handles_from_details(details: Any) -> list[str]:
     return [handle for handle in raw if isinstance(handle, str) and handle]
 
 
-def _api_error_parts(
-    exc: AgentChatError,
-) -> tuple[str | None, str | None, Mapping[str, Any] | None]:
-    """``(code, message, details)`` of an SDK ``AgentChatError``.
+class _AnswerTap:
+    """Keeps the HTTP answer the SDK received, so the wizard can word it.
 
-    Splices ``details.fieldErrors`` (a validation failure's per-field
-    reasons) onto the message, so the user sees which field broke rather
-    than the bare top-level ``Invalid request``. ``details`` is returned
-    as-is (or ``None``) so callers can read code-specific keys such as
-    ``limit``.
-
-    The SDK builds the error from the response body; a body that is not
-    an AgentChat error (a proxy's HTML page, an empty 502) arrives with a
-    code taken from the HTTP status and the HTTP reason phrase as its
-    message.
+    The SDK makes the request; the wizard words the answer, as it always
+    has. The SDK's exception keeps a server error's ``code``, ``message``
+    and ``details``, but not what the wizard shows for an answer that is
+    not an AgentChat error body: the HTTP status ("HTTP 520" — the
+    exception reads the reason phrase, or "Request failed"), or a code
+    sent without a message. Installed as the httpx response hook of the
+    client handed to the SDK (:func:`_start_client`), which makes one
+    request on it.
     """
+
+    def __init__(self) -> None:
+        self.response: httpx.Response | None = None
+
+    def __call__(self, response: httpx.Response) -> None:
+        response.read()
+        self.response = response
+
+
+@contextlib.contextmanager
+def _start_client() -> Iterator[tuple[httpx.Client, _AnswerTap]]:
+    """The httpx client for one unauthenticated start call, with its tap.
+
+    The SDK never closes a client it is given, so it is closed here. The
+    SDK still sets the per-request timeout from ``timeout_ms``.
+    """
+    import httpx
+
+    tap = _AnswerTap()
+    client = httpx.Client(
+        timeout=_START_TIMEOUT_MS / 1000, event_hooks={"response": [tap]}
+    )
+    try:
+        yield client, tap
+    finally:
+        client.close()
+
+
+def _answer_parts(
+    tap: _AnswerTap, exc: AgentChatError
+) -> tuple[str | None, str | None, Mapping[str, Any] | None, int]:
+    """``(code, message, details, status)`` of a rejected start call, read
+    from the answer itself (:func:`_parse_error_response`); from the SDK's
+    exception only if no answer was kept."""
+    if tap.response is not None:
+        return (*_parse_error_response(tap.response), tap.response.status_code)
     code = exc.code
-    message: str | None = str(exc)
-    details = exc.details
-    if isinstance(details, Mapping):
+    return (code if isinstance(code, str) else None, str(exc) or None, exc.details, exc.status)
+
+
+def _parse_error_response(
+    resp: Any,
+) -> tuple[str | None, str | None, Mapping[str, Any] | None]:
+    """Pull ``(code, message, details)`` from a JSON error response.
+
+    Surfaces ``details.fieldErrors`` when present so the user sees what
+    was actually wrong instead of the generic top-level ``message``.
+    ``details`` is returned as-is (or ``None``) so callers can read
+    code-specific keys such as ``limit``. A body that is not JSON, or
+    not an object, gives ``(None, None, None)``: the caller then shows
+    the HTTP status.
+    """
+    try:
+        data = resp.json()
+    except ValueError:
+        return None, None, None
+    code = data.get("code") if isinstance(data, dict) else None
+    message = data.get("message") if isinstance(data, dict) else None
+
+    # If validation failed with field-specific errors, splice them onto
+    # the message so the user can see which field broke.
+    details = data.get("details") if isinstance(data, dict) else None
+    if isinstance(details, dict):
         field_errors = details.get("fieldErrors")
-        if isinstance(field_errors, Mapping) and field_errors:
+        if isinstance(field_errors, dict) and field_errors:
             parts = []
             for field, errors in field_errors.items():
                 if isinstance(errors, list) and errors:
@@ -1045,8 +1105,8 @@ def _api_error_parts(
 
     return (
         code if isinstance(code, str) else None,
-        message or None,
-        details if isinstance(details, Mapping) else None,
+        message if isinstance(message, str) else None,
+        details if isinstance(details, dict) else None,
     )
 
 
@@ -1114,21 +1174,24 @@ def _recover_start(*, email: str, handle: str) -> str:
     from agentchatme import AgentChatClient, AgentChatError
     from agentchatme import ConnectionError as SDKConnectionError
 
-    try:
-        data = AgentChatClient.recover(
-            email,
-            handle=handle,
-            base_url=_api_base(),
-            client_identity=hermes_client_identity(),
-            timeout_ms=_START_TIMEOUT_MS,
-        )
-    except SDKConnectionError as exc:
-        raise _RecoverError(_transport_failure(exc)) from exc
-    except AgentChatError as exc:
-        raise _recover_error(exc) from exc
+    with _start_client() as (client, tap):
+        try:
+            # Typed as a dict by the SDK; the server may still send no body.
+            data: Any = AgentChatClient.recover(
+                email,
+                handle=handle,
+                base_url=_api_base(),
+                client_identity=hermes_client_identity(),
+                timeout_ms=_START_TIMEOUT_MS,
+                http_client=client,
+            )
+        except SDKConnectionError as exc:
+            raise _RecoverError(_transport_failure(exc)) from exc
+        except AgentChatError as exc:
+            raise _recover_error(*_answer_parts(tap, exc)) from exc
 
-    if data is None:
-        # A 2xx with an empty body.
+    if data is None and not (tap.response is not None and tap.response.content.strip()):
+        # A 2xx with an empty body (a JSON ``null`` reads as "no code issued").
         raise _RecoverError("invalid server response")
     pending_id = data.get("pending_id") if isinstance(data, Mapping) else None
     if not isinstance(pending_id, str) or not pending_id:
@@ -1139,13 +1202,13 @@ def _recover_start(*, email: str, handle: str) -> str:
     return pending_id
 
 
-def _recover_error(exc: AgentChatError) -> _RecoverError:
-    """The wizard's :class:`_RecoverError` for an SDK ``AgentChatError``
-    raised by :meth:`AgentChatClient.recover`."""
-    code, message, _details = _api_error_parts(exc)
+def _recover_error(
+    code: str | None, message: str | None, _details: Mapping[str, Any] | None, status: int
+) -> _RecoverError:
+    """The wizard's :class:`_RecoverError` for a rejected recovery start."""
     if code == "RATE_LIMITED":
         return _RecoverError("rate-limited — wait a minute and try again", code=code)
-    return _RecoverError(message or code or f"HTTP {exc.status}", code=code)
+    return _RecoverError(message or code or f"HTTP {status}", code=code)
 
 
 def _recover_verify(*, pending_id: str, code: str) -> tuple[str, str]:

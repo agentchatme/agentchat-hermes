@@ -14,21 +14,29 @@ the server with contract v1); no setting changes.
   SDK gaps that `agentchatme` 1.3.0 closed. They are now `AgentChatClient.register` / `recover`, like every other AgentChat
   request the plugin makes. The prompts, the re-prompts and the messages stay the same: one attempt, 15 s; a taken or invalid
   handle re-prompts the handle; the per-email caps open the same menu and quote the server's `details.limit`;
-  `RATE_LIMITED` reads "rate-limited — wait a minute and try again"; a validation error names the field; a connection failure
-  reads "network error: …". Two answers read differently, because the SDK reads them: a response that is not an AgentChat error
-  (a proxy's error page) reads by its HTTP reason phrase, e.g. "Bad Gateway" instead of "HTTP 502", and a 429 without a body
-  counts as rate-limited. A register answer whose JSON is not an object now reads "invalid server response" instead of failing
-  with an `AttributeError`.
-- **Keys are shown as `ac_…`.** Prompts, help text, README and SECURITY.md named an `ac_live_…` prefix that keys do not have (a
-  key is `ac_` and 43 random characters). The subcommands now mask a key like the wizard does, first 8 characters and last 4
-  (they showed the first 11), and a value of 12 characters or fewer reads `ac_…` instead of being shown whole.
+  `RATE_LIMITED` reads "rate-limited — wait a minute and try again"; a validation error names the field; an answer that is not
+  an AgentChat error (a proxy's page, an empty answer) reads "HTTP <status>"; a connection failure reads "network error: …".
+  The wizard words each answer from the response the SDK received, so nothing the SDK's error object leaves out (the HTTP
+  status, a code sent without a message) is lost. What reads differently: any 2xx is an answer (a 202 with a `pending_id`
+  continues, a 2xx without a body reads "invalid server response" rather than "HTTP 204"); a register answer whose JSON is
+  not an object reads "invalid server response" instead of failing with an `AttributeError`; a transport failure that is not
+  an `httpx` error reads "network error: …" (the wizard said "Could not reach AgentChat: …", the subcommands showed a
+  traceback).
+- **`hermes agentchat register`: a connection failure at the code step** reads "Verification failed: …" instead of a
+  traceback.
+- **Keys are shown as `ac_…`.** Prompts, help text, README and SECURITY.md named a `live` key prefix that keys do not have (a
+  key is `ac_` and 43 random characters). Wizard and subcommands now share one mask: the first 8 characters and the last 4
+  (the subcommands showed the first 11), and a value of 12 characters or fewer reads `ac_…` (the wizard showed one of exactly
+  12 whole; the subcommands printed a placeholder with the old prefix).
 
 ### CI
 
 - **The nightly also tests the latest Hermes release.** `hermes-main` resolves hermes-agent's newest release (not a draft, not a
-  pre-release) at run time and runs the suite against it and against `main`. A red scheduled run opens one issue (or comments on
-  the open one) with each leg's result, and the next green run closes it; Slack (`SLACK_WEBHOOK_WARNING`) stays an optional
-  extra. `docs/hermes-coupling.md` was re-checked against the latest release and `main`.
+  pre-release) at run time and runs the suite against it and against `main` (if the lookup fails, `main` still runs and the
+  release leg fails). A red scheduled run opens one issue (or comments on the open one) with each leg's result, and the next
+  green scheduled run closes it; Slack (`SLACK_WEBHOOK_WARNING`) stays an optional extra. `docs/hermes-coupling.md` was
+  re-checked against v0.23.1 and `main` of 2026-11-11, including Hermes' tool search, which puts the hosted tools behind its
+  `tool_call` bridge by default.
 - **The old setting names have a removal date in the suite.** Contract v1 keeps `AGENTCHATME_DOORBELL`,
   `AGENTCHATME_KNOCK_DEBOUNCE_S` and the ignored `AGENTCHATME_REPLY_GATE_FAIL_OPEN` until 2027-02-01;
   `tests/test_legacy_settings_removal.py` fails from that date until their readers are removed.

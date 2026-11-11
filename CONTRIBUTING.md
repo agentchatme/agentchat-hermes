@@ -105,4 +105,4 @@ cd ../agentchat-hermes && HERMES_HOME="$(mktemp -d)" ../hermes-agent/.venv/bin/p
 
 and every night in the `hermes-main` workflow against hermes-agent `main` and its
 latest release. A red scheduled run opens an issue (or comments on the open one);
-the next green run closes it.
+the next green scheduled run closes it.

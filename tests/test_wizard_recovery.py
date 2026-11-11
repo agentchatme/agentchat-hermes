@@ -174,11 +174,17 @@ class TestRecoverStart:
         assert str(info.value) == "Invalid request (handle: Invalid handle)"
 
     def test_error_page_that_is_not_an_api_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A proxy's HTML 502: the SDK names it by the HTTP reason phrase."""
+        """A proxy's HTML 502 reads by its status, as before."""
         _patch_post(monkeypatch, raw(502, b"<html>bad gateway</html>"))
         with pytest.raises(_RecoverError) as info:
             _recover_start(email="a@b.co", handle="alice")
-        assert str(info.value) == "Bad Gateway"
+        assert str(info.value) == "HTTP 502"
+        assert info.value.code is None
+
+    def test_json_null_reports_no_code_issued(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_post(monkeypatch, raw(200, b"null", "application/json"))
+        with pytest.raises(_RecoverError, match="no recovery code was issued"):
+            _recover_start(email="a@b.co", handle="alice")
 
     def test_network_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
         wire = _patch_post(monkeypatch, connect_error("dns"))

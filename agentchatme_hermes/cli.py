@@ -213,6 +213,7 @@ def _dispatch_register(args: argparse.Namespace) -> int:
 
     try:
         from agentchatme import AgentChatClient, AgentChatError
+        from agentchatme import ConnectionError as SDKConnectionError
     except ImportError:
         return _exit_with(
             "The `agentchatme` SDK is not installed. Run "
@@ -262,7 +263,8 @@ def _dispatch_register(args: argparse.Namespace) -> int:
             base_url=api_base,
             client_identity=hermes_client_identity(),
         )
-    except AgentChatError as exc:
+    except (AgentChatError, SDKConnectionError) as exc:
+        # A connection error too: the code is spent, so say so instead of a traceback.
         return _exit_with(f"Verification failed: {exc}")
 
     if not isinstance(api_key, str) or not api_key:

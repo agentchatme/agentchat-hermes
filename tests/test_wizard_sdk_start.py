@@ -97,7 +97,7 @@ class TestRegisterAnswers:
         err, _wire = _register_fails(monkeypatch, api_error(409, code, "That handle is taken."))
         assert (str(err), err.field, err.code) == ("That handle is taken.", "handle", code)
 
-    def test_handle_code_without_a_message_uses_the_code(
+    def test_handle_code_with_an_empty_message_uses_the_code(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         err, _wire = _register_fails(monkeypatch, api_error(409, "HANDLE_TAKEN", ""))
@@ -137,15 +137,44 @@ class TestRegisterAnswers:
         err, _wire = _register_fails(monkeypatch, api_error(422, "SOMETHING_NEW", "New rule."))
         assert (str(err), err.field, err.code) == ("New rule.", None, "SOMETHING_NEW")
 
-    def test_error_page_that_is_not_an_api_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A proxy's HTML page: the SDK names it by the HTTP reason phrase."""
-        err, _wire = _register_fails(monkeypatch, raw(502, b"<html>bad gateway</html>"))
-        assert str(err) == "Bad Gateway"
-        assert err.field is None
+    @pytest.mark.parametrize(
+        ("status", "body"),
+        [
+            (502, b"<html>bad gateway</html>"),
+            (502, b""),
+            (520, b""),
+            (403, b"forbidden"),
+            (429, b""),
+        ],
+    )
+    def test_an_answer_that_is_not_an_api_error_reads_by_its_status(
+        self, monkeypatch: pytest.MonkeyPatch, status: int, body: bytes
+    ) -> None:
+        """A proxy's page, an empty answer, a status with no reason phrase:
+        "HTTP <status>", as the plugin's own post printed."""
+        err, wire = _register_fails(monkeypatch, raw(status, body))
+        assert (str(err), err.field, err.code) == (f"HTTP {status}", None, None)
+        assert len(wire.requests) == 1
 
-    def test_bodiless_429_counts_as_rate_limited(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        err, _wire = _register_fails(monkeypatch, raw(429, b""))
-        assert str(err) == "rate-limited — wait a minute and try again"
+    def test_json_that_is_not_an_object(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        err, _wire = _register_fails(monkeypatch, answer(500, ["oops"]))
+        assert str(err) == "HTTP 500"
+
+    def test_code_without_a_message_still_reprompts_the_handle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The SDK keeps a code only next to a string message; the wizard
+        reads the answer itself, so the code still decides."""
+        err, _wire = _register_fails(monkeypatch, answer(409, {"code": "HANDLE_TAKEN"}))
+        assert (str(err), err.field, err.code) == ("HANDLE_TAKEN", "handle", "HANDLE_TAKEN")
+
+    def test_cap_without_a_message_still_opens_the_menu(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        err, _wire = _register_fails(
+            monkeypatch, answer(409, {"code": "EMAIL_LIMIT_REACHED", "details": {"limit": 3}})
+        )
+        assert err.field == "email"
+        assert err.code == "EMAIL_LIMIT_REACHED"
+        assert "3 active agents" in str(err)
 
     def test_success_that_is_not_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
         err, _wire = _register_fails(monkeypatch, raw(200, b"<html>captive portal</html>"))
@@ -457,7 +486,7 @@ class TestRecoverFlowOnTheWire:
                 "Recovery request failed: no recovery code was issued (the server returned "
                 "no pending_id) — check the email and @handle and try again",
             ),
-            (raw(502, b"<html/>"), "Recovery request failed: Bad Gateway"),
+            (raw(502, b"<html/>"), "Recovery request failed: HTTP 502"),
         ],
     )
     def test_start_failures(self, monkeypatch: pytest.MonkeyPatch, route: Route, warning: str) -> None:
@@ -555,6 +584,21 @@ class TestSubcommandsOnTheWire:
         rc = cli._dispatch_register(argparse.Namespace(email="a@b.co", handle="alice", display_name="Al"))
         assert rc == _EXIT_API_ERR
         assert "Registration request failed: network error: dns" in capsys.readouterr().err
+
+    def test_register_network_error_at_verify(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        _cli_env: list[dict[str, str]],
+    ) -> None:
+        serve(
+            monkeypatch,
+            {_REGISTER: answer(200, {"pending_id": "pnd_1"}), _REGISTER_VERIFY: connect_error("dns")},
+        )
+        rc = cli._dispatch_register(argparse.Namespace(email="a@b.co", handle="alice", display_name=None))
+        assert rc == _EXIT_API_ERR
+        assert "Verification failed: dns" in capsys.readouterr().err
+        assert _cli_env == []
 
     def test_recover(
         self,

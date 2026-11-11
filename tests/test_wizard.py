@@ -117,21 +117,34 @@ class TestMaskKey:
 
 
 class TestKeyShapeText:
-    def test_no_shipped_text_names_a_live_prefix(self) -> None:
-        """Keys are ``ac_`` and 43 random characters; there is no
-        ``ac_live_`` prefix, so no prompt, help text or doc may show one
-        (the CHANGELOG keeps its history)."""
+    def test_no_tracked_text_names_a_live_prefix(self) -> None:
+        """Keys are ``ac_`` and 43 random characters; there is no ``live``
+        prefix, so no prompt, help text, doc, manifest or workflow may show
+        one. The CHANGELOG keeps its history, the tests build keys at run
+        time, and the bundled manual is the published text verbatim."""
+        import subprocess
         from pathlib import Path
 
         root = Path(__file__).resolve().parents[1]
-        shipped = [*sorted((root / "agentchatme_hermes").rglob("*.py"))]
-        shipped += [root / name for name in ("README.md", "SECURITY.md", "CONTRIBUTING.md", "RUNBOOK.md")]
+        try:
+            listed = subprocess.run(
+                ["git", "ls-files"], cwd=root, capture_output=True, text=True, check=True
+            ).stdout.splitlines()
+        except (OSError, subprocess.CalledProcessError):
+            pytest.skip("not a git checkout")
+        skipped = ("CHANGELOG.md", "tests/", "agentchatme_hermes/skills/agentchat/SKILL.md")
         needle = "ac_" + "live"
-        offenders = [
-            str(path.relative_to(root))
-            for path in shipped
-            if needle in path.read_text(encoding="utf-8")
-        ]
+        offenders = []
+        for name in listed:
+            if name.startswith(skipped):
+                continue
+            path = root / name
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            if needle in text:
+                offenders.append(name)
         assert offenders == []
 
 

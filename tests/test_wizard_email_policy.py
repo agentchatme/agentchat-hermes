@@ -22,11 +22,13 @@ from agentchatme_hermes.wizard import (
     _EMAIL_EXHAUSTED,
     _EMAIL_LIMIT_REACHED,
     _EMAIL_POLICY_CODES,
-    _api_error_parts,
+    _answer_parts,
+    _AnswerTap,
     _email_error_recovery,
     _email_policy_message,
     _handles_from_details,
     _limit_from_details,
+    _parse_error_response,
     _register_start,
     _RegisterError,
 )
@@ -168,27 +170,28 @@ class TestHandlesFromDetails:
         assert _handles_from_details(details) == expected
 
 
-# ─── _api_error_parts ──────────────────────────────────────────────────────
+# ─── _parse_error_response / _answer_parts ─────────────────────────────────
 
 
-def _sdk_error(status: int, body: dict[str, Any]) -> Any:
-    """The exception the SDK raises for this error response."""
-    from agentchatme.errors import create_agentchat_error
+def _answer(status: int, payload: Any = None, *, content: bytes | None = None) -> Any:
+    import httpx
 
-    return create_agentchat_error(body, status)
+    if content is not None:
+        return httpx.Response(status, content=content)
+    return httpx.Response(status, json=payload)
 
 
-class TestApiErrorParts:
+class TestParseErrorResponse:
     def test_returns_code_message_and_details(self) -> None:
-        code, message, details = _api_error_parts(
-            _sdk_error(409, {"code": "X", "message": "m", "details": {"limit": 3}})
+        code, message, details = _parse_error_response(
+            _answer(409, {"code": "X", "message": "m", "details": {"limit": 3}})
         )
         assert (code, message) == ("X", "m")
         assert details == {"limit": 3}
 
     def test_field_errors_spliced_into_message(self) -> None:
-        code, message, details = _api_error_parts(
-            _sdk_error(
+        code, message, details = _parse_error_response(
+            _answer(
                 400,
                 {
                     "code": "VALIDATION_ERROR",
@@ -202,18 +205,15 @@ class TestApiErrorParts:
         assert details is not None and "fieldErrors" in details
 
     def test_field_errors_without_a_message(self) -> None:
-        _code, message, _details = _api_error_parts(
-            _sdk_error(
-                400,
-                {"code": "VALIDATION_ERROR", "message": "", "details": {"fieldErrors": {"handle": ["x"]}}},
-            )
+        _code, message, _details = _parse_error_response(
+            _answer(400, {"code": "VALIDATION_ERROR", "details": {"fieldErrors": {"handle": ["x"]}}})
         )
         assert message == "handle: x"
 
     def test_empty_or_malformed_field_errors_leave_the_message(self) -> None:
         for field_errors in ({}, {"handle": []}, {"handle": "not a list"}, ["x"]):
-            _code, message, _details = _api_error_parts(
-                _sdk_error(
+            _code, message, _details = _parse_error_response(
+                _answer(
                     400,
                     {
                         "code": "VALIDATION_ERROR",
@@ -224,12 +224,45 @@ class TestApiErrorParts:
             )
             assert message == "Invalid request", field_errors
 
-    def test_no_details(self) -> None:
-        assert _api_error_parts(_sdk_error(500, {"code": "INTERNAL_ERROR", "message": "boom"})) == (
-            "INTERNAL_ERROR",
-            "boom",
+    def test_code_without_a_message(self) -> None:
+        assert _parse_error_response(_answer(409, {"code": "HANDLE_TAKEN"})) == (
+            "HANDLE_TAKEN",
+            None,
             None,
         )
+
+    def test_invalid_json(self) -> None:
+        assert _parse_error_response(_answer(502, content=b"<html/>")) == (None, None, None)
+
+    def test_empty_body(self) -> None:
+        assert _parse_error_response(_answer(502, content=b"")) == (None, None, None)
+
+    def test_non_dict_body(self) -> None:
+        assert _parse_error_response(_answer(500, ["not", "a", "dict"])) == (None, None, None)
+
+
+class TestAnswerParts:
+    def test_reads_the_answer_with_its_status(self) -> None:
+        tap = _AnswerTap()
+        tap.response = _answer(520, content=b"")
+        assert _answer_parts(tap, _sdk_error(520, {"code": "INTERNAL_ERROR", "message": "Request failed"})) == (
+            None,
+            None,
+            None,
+            520,
+        )
+
+    def test_without_an_answer_falls_back_to_the_sdk_error(self) -> None:
+        assert _answer_parts(
+            _AnswerTap(), _sdk_error(409, {"code": "HANDLE_TAKEN", "message": "taken", "details": {"a": 1}})
+        ) == ("HANDLE_TAKEN", "taken", {"a": 1}, 409)
+
+
+def _sdk_error(status: int, body: dict[str, Any]) -> Any:
+    """The exception the SDK raises for this error response."""
+    from agentchatme.errors import create_agentchat_error
+
+    return create_agentchat_error(body, status)
 
 
 # ─── _email_error_recovery menu positions ──────────────────────────────────
