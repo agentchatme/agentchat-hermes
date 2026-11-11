@@ -367,6 +367,51 @@ class TestRegisterFlowOnTheWire:
         assert wire.calls() == [("POST", _REGISTER)]
         assert session.env == {}
 
+    def test_cap_menu_cancel_stops(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        wire = serve(monkeypatch, {_REGISTER: api_error(409, "EMAIL_LIMIT_REACHED", "full", {"limit": 10})})
+        session = _Session(monkeypatch, ["a@b.co", "alice", ""], menu=3)
+        assert session.register() is False
+        assert wire.calls() == [("POST", _REGISTER)]
+        assert session.env == {}
+
+    def test_cap_menu_paste_validates_the_key_on_the_wire(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        wire = serve(
+            monkeypatch,
+            {
+                _REGISTER: api_error(409, "EMAIL_EXHAUSTED", "spent", {"limit": 30}),
+                "/v1/agents/me": answer(200, {"handle": "alice", "status": "active"}),
+            },
+        )
+        session = _Session(monkeypatch, ["a@b.co", "alice", "", _KEY], menu=1)
+        assert session.register() is True
+        assert session.prompt.questions[-1] == "API key (ac_…)"
+        assert wire.calls() == [("POST", _REGISTER), ("GET", "/v1/agents/me")]
+        assert wire.requests[1].headers["authorization"] == f"Bearer {_KEY}"
+        assert session.env == {"AGENTCHAT_API_KEY": _KEY, "AGENTCHATME_HANDLE": "alice"}
+
+    def test_a_non_sdk_failure_reads_could_not_reach(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme import AgentChatClient
+
+        def broken(**_kwargs: Any) -> Any:
+            raise TypeError("unexpected keyword")
+
+        monkeypatch.setattr(AgentChatClient, "register", staticmethod(broken))
+        session = _Session(monkeypatch, ["a@b.co", "alice", ""])
+        assert session.register() is False
+        assert session.warning == ["Could not reach AgentChat: unexpected keyword"]
+
+    def test_network_error_at_verify(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        serve(
+            monkeypatch,
+            {_REGISTER: answer(200, {"pending_id": "pnd_1"}), _REGISTER_VERIFY: connect_error("dns")},
+        )
+        session = _Session(monkeypatch, ["a@b.co", "alice", "", "123456"])
+        assert session.register() is False
+        assert session.warning == ["Verification failed: dns"]
+        assert session.env == {}
+
     def test_wrong_code_at_verify(self, monkeypatch: pytest.MonkeyPatch) -> None:
         serve(
             monkeypatch,
