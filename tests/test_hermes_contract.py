@@ -346,20 +346,20 @@ def test_the_hosted_tools_entry_round_trips_through_hermes_config(
     _hermes_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Through Hermes' own reader and saver: an earlier release's entry gains
-    the client headers and keeps the keys the user added, the key stays a
-    template in config.yaml with the key loaded, a second pass writes
-    nothing, and logout removes the entry."""
+    the client header and keeps the keys the user added and the file's
+    comments, the key stays a template in config.yaml with the key loaded, a
+    second pass writes nothing, and logout removes the entry."""
     from fake_keys import api_key
 
     from agentchatme_hermes import mcp_registration as reg
-    from agentchatme_hermes._version import __version__
 
     key = api_key("contract_round_trip_value")
     monkeypatch.setenv("AGENTCHAT_API_KEY", key)
     config_path = _hermes_home / "config.yaml"
     config_path.write_text(
+        "# the operator's own note\n"
         "mcp_servers:\n"
-        "  agentchat:\n"
+        "  agentchat:  # hosted tools\n"
         '    url: "https://api.agentchat.me/mcp"\n'
         "    headers:\n"
         '      Authorization: "Bearer ${AGENTCHAT_API_KEY}"\n'
@@ -372,11 +372,11 @@ def test_the_hosted_tools_entry_round_trips_through_hermes_config(
     assert reg.install_entry() == "upgraded"
     text = config_path.read_text(encoding="utf-8")
     assert key not in text, "the key must never be written into config.yaml"
+    assert "# the operator's own note" in text and "# hosted tools" in text, "Hermes keeps comments"
     entry = config.read_user_config_raw()["mcp_servers"]["agentchat"]
     assert entry["headers"] == {
         "Authorization": "Bearer ${AGENTCHAT_API_KEY}",
         "X-AgentChat-Client": "hermes",
-        "X-AgentChat-Client-Version": __version__,
     }
     assert entry["timeout"] == 120
     assert reg.inspect_entry_identity() == ("ours", "current")

@@ -58,10 +58,8 @@ imports cleanly without it; that's a regression gate.
 ## Release process
 
 Maintainers only. The version number is the maintainer's decision
-(`VERSIONING.md`); set it in `agentchatme_hermes/_version.py`, both
-`plugin.yaml` files, `mcp.json` and the README's hand-written tools entry
-(the client-version header; tests fail on a mismatch), merge, then push a tag
-on main:
+(`VERSIONING.md`); set it in `agentchatme_hermes/_version.py` and both
+`plugin.yaml` files, merge, then push a tag on main:
 
 ```bash
 git tag -a v0.3.1 origin/main -m v0.3.1 && git push origin v0.3.1

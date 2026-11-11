@@ -22,7 +22,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # The entry an earlier release placed: Authorization only.
 OLD_ENTRY = {"url": "https://api.agentchat.me/mcp", "headers": {"Authorization": "Bearer ${AGENTCHAT_API_KEY}"}}
-CLIENT_HEADERS = {"X-AgentChat-Client": "hermes", "X-AgentChat-Client-Version": __version__}
+CLIENT_HEADERS = {"X-AgentChat-Client": "hermes"}
 
 
 class TestEntry:
@@ -34,14 +34,15 @@ class TestEntry:
         }
         assert PREFIX not in json.dumps(entry)
 
-    def test_client_headers_are_the_sdk_identity(self) -> None:
-        """The same name and version the SDK sends on REST and the socket."""
+    def test_the_client_header_is_the_sdk_name_and_static(self) -> None:
+        """The name the SDK sends on REST and the socket; no version, so the
+        entry never changes between releases (it is written unprompted)."""
         from agentchatme_hermes.client_identity import hermes_client_identity
 
-        identity = hermes_client_identity()
         headers = reg.server_entry()["headers"]
-        assert headers["X-AgentChat-Client"] == identity.name == "hermes"
-        assert headers["X-AgentChat-Client-Version"] == identity.version == __version__
+        assert headers["X-AgentChat-Client"] == hermes_client_identity().name == "hermes"
+        assert not any(name.lower() == "x-agentchat-client-version" for name in headers)
+        assert __version__ not in json.dumps(reg.server_entry())
 
     def test_hosted_url_follows_api_base(self) -> None:
         assert reg.hosted_mcp_url("http://localhost:3000/") == "http://localhost:3000/mcp"
@@ -52,8 +53,7 @@ class TestEntry:
         assert "  agentchat:" in snippet
         assert 'url: "https://api.agentchat.me/mcp"' in snippet
         assert 'Authorization: "Bearer ${AGENTCHAT_API_KEY}"' in snippet
-        assert '      X-AgentChat-Client: "hermes"\n' in snippet
-        assert f'      X-AgentChat-Client-Version: "{__version__}"\n' in snippet
+        assert snippet.endswith('      X-AgentChat-Client: "hermes"\n')
 
 
 class TestDescribeEnsureRemove:
@@ -106,23 +106,35 @@ class TestDescribeEnsureRemove:
         assert config["mcp_servers"]["github"] == {"url": "https://x/mcp"}
         assert reg.ensure_entry(config) == "present", "once current, nothing more to do"
 
-    def test_an_older_version_is_refreshed_whatever_its_casing(self) -> None:
+    def test_an_entry_that_names_hermes_is_never_rewritten(self) -> None:
+        """Any casing, with or without a version header (as a development
+        build of this release wrote): ours, left exactly as it is."""
+        for headers in (
+            {"authorization": "Bearer ${AGENTCHAT_API_KEY}", "x-agentchat-client": "Hermes"},
+            {
+                "Authorization": "Bearer ${AGENTCHAT_API_KEY}",
+                "X-AgentChat-Client": "hermes",
+                "X-AgentChat-Client-Version": "0.5.0",
+            },
+        ):
+            entry = {"url": reg.hosted_mcp_url(), "headers": headers}
+            config: dict[str, Any] = {"mcp_servers": {"agentchat": json.loads(json.dumps(entry))}}
+            assert reg.describe_entry(config) == "ours"
+            assert reg.entry_identity(entry) == "current"
+            assert reg.ensure_entry(config) == "present"
+            assert config["mcp_servers"]["agentchat"] == entry
+
+    def test_the_upgrade_adds_only_the_client_header(self) -> None:
         entry = {
             "url": reg.hosted_mcp_url(),
-            "headers": {
-                "authorization": "Bearer ${AGENTCHAT_API_KEY}",
-                "x-agentchat-client": "Hermes",
-                "x-agentchat-client-version": "0.5.0",
-                "X-Extra": "kept",
-            },
+            "headers": {"Authorization": "Bearer ${AGENTCHAT_API_KEY}", "X-Extra": "kept", "x-agentchat-client": " "},
         }
         config: dict[str, Any] = {"mcp_servers": {"agentchat": entry}}
-        assert reg.entry_identity(entry) == "stale"
         assert reg.ensure_entry(config) == "upgraded"
         assert config["mcp_servers"]["agentchat"]["headers"] == {
-            "authorization": "Bearer ${AGENTCHAT_API_KEY}",
+            "Authorization": "Bearer ${AGENTCHAT_API_KEY}",
             "X-Extra": "kept",
-            **CLIENT_HEADERS,
+            "X-AgentChat-Client": "hermes",
         }
 
     def test_a_client_header_naming_another_client_is_left_alone(self) -> None:
@@ -155,12 +167,11 @@ class TestDescribeEnsureRemove:
             ({}, "missing"),
             ({"headers": None}, "missing"),
             ({"headers": {"X-AgentChat-Client": "  "}}, "missing"),
-            ({"headers": {"X-AgentChat-Client": "hermes"}}, "stale"),
-            ({"headers": {"X-AgentChat-Client": "hermes", "X-AgentChat-Client-Version": __version__}}, "current"),
+            ({"headers": {"X-AgentChat-Client": "hermes"}}, "current"),
+            ({"headers": {"x-agentchat-client": " HERMES "}}, "current"),
+            ({"headers": {"X-AgentChat-Client": "hermes", "X-AgentChat-Client-Version": "0.0.1"}}, "current"),
+            ({"headers": {"X-AgentChat-Client-Version": "0.5.1"}}, "missing"),
             ({"headers": {"X-AgentChat-Client": "openclaw"}}, "other"),
-            ({"headers": {"X-AgentChat-Client": "hermes", "X-AgentChat-Client-Version": "99.0.0"}}, "current"),
-            ({"headers": {"X-AgentChat-Client": "hermes", "X-AgentChat-Client-Version": "0.0.1"}}, "stale"),
-            ({"headers": {"X-AgentChat-Client": "hermes", "X-AgentChat-Client-Version": "junk"}}, "stale"),
             ("not a mapping", "missing"),
         ],
     )
@@ -324,48 +335,18 @@ class TestHermesBacked:
         assert "mcp_servers" not in fake_hermes.on_disk
         assert reg.uninstall_entry() is False
 
-    def test_two_installs_sharing_a_profile_settle_on_the_newer(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Alternating activations by an rc build and its release (same x.y.z)
-        write once, then never again."""
+    def test_the_unprompted_upgrade_writes_once_per_install(
+        self, fake_hermes: _FakeHermesConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every activation runs install_entry, under every release the
+        profile goes through; the static entry means one write, ever."""
         from agentchatme_hermes import client_identity
 
-        config: dict[str, Any] = {"mcp_servers": {"agentchat": json.loads(json.dumps(OLD_ENTRY))}}
-        writes = 0
-        for version in ("0.5.2rc1", "0.5.2", "0.5.2rc1", "0.5.2", "0.5.2+local", "0.5.2"):
+        fake_hermes.on_disk = {"mcp_servers": {"agentchat": json.loads(json.dumps(OLD_ENTRY))}}
+        for version in ("0.5.1", "0.5.2rc1", "0.5.2", "0.6.0", "0.5.1"):
             monkeypatch.setattr(client_identity, "__version__", version)
-            if reg.ensure_entry(config) == "upgraded":
-                writes += 1
-        # The rc's first activation, the release's, the local build's; never back.
-        assert writes == 3
-        assert config["mcp_servers"]["agentchat"]["headers"]["X-AgentChat-Client-Version"] == "0.5.2+local"
-
-    @pytest.mark.parametrize(
-        ("older", "newer"),
-        [
-            ("0.5.1", "0.5.2"),
-            ("0.5.2rc1", "0.5.2"),
-            ("0.5.2rc1", "0.5.2rc2"),
-            ("0.5.9", "0.10.0"),
-            ("0.5.2", "0.5.2+local"),
-            ("0.5.2", "0.5.2.post1"),
-        ],
-    )
-    def test_version_order(self, older: str, newer: str) -> None:
-        older_key, newer_key = reg._version_key(older), reg._version_key(newer)
-        assert older_key is not None and newer_key is not None and older_key < newer_key
-
-    def test_a_newer_version_is_never_downgraded(self) -> None:
-        entry = {
-            "url": reg.hosted_mcp_url(),
-            "headers": {
-                "Authorization": "Bearer ${AGENTCHAT_API_KEY}",
-                "X-AgentChat-Client": "hermes",
-                "X-AgentChat-Client-Version": "99.0.0",
-            },
-        }
-        config: dict[str, Any] = {"mcp_servers": {"agentchat": json.loads(json.dumps(entry))}}
-        assert reg.ensure_entry(config) == "present"
-        assert config["mcp_servers"]["agentchat"] == entry
+            reg.install_entry()
+        assert len(fake_hermes.saved) == 1
 
     def test_without_hermes_the_error_carries_the_manual_snippet(
         self, monkeypatch: pytest.MonkeyPatch
@@ -398,9 +379,7 @@ class TestPortableDeclaration:
         assert portable["url"] == native["url"]
         assert portable["headers"] == native["headers"]
 
-    def test_readme_snippet_names_this_version(self) -> None:
-        """The README's hand-written entry carries the version; a release
-        bump must update it (and mcp.json) with the package."""
+    def test_readme_snippet_is_the_entry(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        assert '      X-AgentChat-Client: "hermes"\n' in readme
-        assert f'      X-AgentChat-Client-Version: "{__version__}"\n' in readme
+        assert reg.manual_snippet() in readme.replace("```yaml\n", "", 1)
+        assert "X-AgentChat-Client-Version" not in readme

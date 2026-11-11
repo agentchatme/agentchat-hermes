@@ -352,11 +352,6 @@ class TestDoctorClientHeader:
         assert "[warn] mcp_servers.agentchat does not say it is Hermes" in out
         assert "doctor --fix" in out
 
-    def test_stale_version_is_not_a_warning(self, monkeypatch: Any, capsys: Any) -> None:
-        out = self._run(monkeypatch, capsys, "ours", "stale")
-        assert "client header names another plugin version" in out
-        assert "[warn] mcp_servers.agentchat does not say" not in out
-
     def test_another_client_name_is_left_alone_and_said(self, monkeypatch: Any, capsys: Any) -> None:
         out = self._run(monkeypatch, capsys, "ours", "other")
         assert "names another client, not hermes — left alone" in out
@@ -364,15 +359,13 @@ class TestDoctorClientHeader:
     def test_hand_written_entry_without_the_header_says_what_to_add(
         self, monkeypatch: Any, capsys: Any
     ) -> None:
-        from agentchatme_hermes._version import __version__
-
         out = self._run(monkeypatch, capsys, "user_managed", "missing")
         assert "managed by hand in config.yaml — left alone" in out
         assert "the hand-written mcp_servers.agentchat does not say it is Hermes" in out
-        assert "replace any existing X-AgentChat-Client lines; a key may appear only once, in any casing" in out
-        # The README entry's indent, under `headers:`.
+        assert "replace any existing X-AgentChat-Client line; a key may appear only once, in any casing" in out
+        # The README entry's indent, under `headers:`; static, no version.
         assert '\n      X-AgentChat-Client: "hermes"\n' in out
-        assert f'\n      X-AgentChat-Client-Version: "{__version__}"\n' in out
+        assert "X-AgentChat-Client-Version" not in out
 
     def test_hand_written_entry_naming_another_client(self, monkeypatch: Any, capsys: Any) -> None:
         out = self._run(monkeypatch, capsys, "user_managed", "other")

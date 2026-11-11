@@ -797,9 +797,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             warn(f"hosted-tools entry not checked — {exc}")
         else:
             set_headers = (
-                "set these two headers under its `headers:` (replace any existing "
-                "X-AgentChat-Client lines; a key may appear only once, in any casing), then "
-                "restart the gateway or /reload-mcp:\n" + client_header_lines("      ")
+                "set this header under its `headers:` (replace any existing X-AgentChat-Client "
+                "line; a key may appear only once, in any casing), then restart the gateway or "
+                "/reload-mcp:\n" + client_header_lines("      ")
             )
             if entry_state == "ours":
                 ok(
@@ -812,11 +812,6 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                         "header), so the hosted tools treat this agent as an unknown client and "
                         "offer it webhook-setup tools it does not need — `hermes agentchat doctor "
                         "--fix` adds the header (the gateway also does at its next start)"
-                    )
-                elif identity == "stale":
-                    ok(
-                        "client header names another plugin version — `hermes agentchat doctor "
-                        "--fix` refreshes it (the gateway also does at its next start)"
                     )
                 elif identity == "other":
                     warn(

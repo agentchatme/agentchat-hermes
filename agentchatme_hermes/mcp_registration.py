@@ -13,7 +13,10 @@ the headers and reload rules again on v0.23.1 and main, 2026-11-11):
   ``_env_ref_lookup``; docs *reference/mcp-config-reference*), and an unset
   variable fails the connect closed with the variable named in the server's
   status. Every configured header is sent on each request, unchanged
-  (``tools/mcp_tool_transport.py`` ``_http_endpoint``). The gateway watches
+  (``tools/mcp_tool_transport.py`` ``_http_endpoint``). ``save_config``
+  writes through a ruamel round trip that keeps the file's comments, key
+  order, quotes and blank lines and reassigns only the nodes that changed
+  (``utils.atomic_roundtrip_yaml_save``; v0.22.5, v0.23.1 and main). The gateway watches
   ``config.yaml`` and connects a new entry within about a minute; a session
   picks it up on ``/reload-mcp`` or on the next session. A changed entry
   (new headers) is used once its connection is rebuilt: ``/reload-mcp``, a
@@ -21,9 +24,11 @@ the headers and reload rules again on v0.23.1 and main, 2026-11-11):
   ``mcp__<server>__<tool>``.
 * The hosted tool layer knows the client only from request headers
   (``X-AgentChat-Client``), not from MCP ``clientInfo``. The entry carries
-  the plugin's identity (:func:`client_identity.hermes_client_headers`), so
-  the server treats this agent as the Hermes socket integration and shows
-  it no wake-webhook tools — the socket is its wake path.
+  the plugin's name (:func:`client_identity.hermes_mcp_headers`), so the
+  server treats this agent as the Hermes socket integration and shows it no
+  wake-webhook tools — the socket is its wake path. The entry is static (no
+  version header): it is written without a prompt, at plugin activation,
+  and must not change from release to release.
 * A portable *Agent Plugins v1* package may declare the same server in a
   root ``mcp.json``, but Hermes reads that file only for ``plugin.json``
   packages; a directory that also has ``plugin.yaml`` is loaded as a native
@@ -44,27 +49,21 @@ key never lands in ``config.yaml``.
 An entry with this URL and the ``${AGENTCHAT_API_KEY}`` bearer is the
 plugin's (an earlier release's, or the documented snippet copied by hand;
 they cannot be told apart), with any keys the user added (``trust``,
-``timeout``, ``tools``) kept. When its client headers are missing or name
-an older version, :func:`ensure_entry` sets them in place and changes
-nothing else (a newer version is left as it is, so two installs sharing a
-profile never rewrite it back and forth); a client header someone set to
-another name is left alone.
+``timeout``, ``tools``) kept. When it has no client header,
+:func:`ensure_entry` adds ``X-AgentChat-Client: hermes`` and changes
+nothing else: at most one write per install, never again. An entry that
+already says ``hermes`` is left as it is (a version header too, if one is
+there); a client header someone set to another name is left alone.
 Any other same-name entry is the user's and is never modified; ``doctor``
 says how to add the headers to it.
 """
 from __future__ import annotations
 
 import logging
-import re
 from collections.abc import Mapping, MutableMapping
 from typing import Any, Callable, Literal
 
-from .client_identity import (
-    CLIENT_HEADER,
-    CLIENT_NAME,
-    CLIENT_VERSION_HEADER,
-    hermes_client_headers,
-)
+from .client_identity import CLIENT_HEADER, CLIENT_NAME, hermes_mcp_headers
 from .config import DEFAULT_API_BASE, ENV_API_KEY
 from .turn import MCP_SERVER_NAME
 
@@ -79,11 +78,10 @@ MCP_JSON_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
 
 EntryState = Literal["missing", "ours", "user_managed", "disabled"]
 EnsureOutcome = Literal["added", "present", "upgraded", "user_managed", "disabled"]
-# How an entry's headers name the client: ``current`` (hermes, this version or
-# a newer one), ``stale`` (hermes, an older or unreadable version, or none),
-# ``missing`` (no client header: placed before 0.5.1, or written by hand),
-# ``other`` (a name someone chose).
-IdentityState = Literal["current", "stale", "missing", "other"]
+# How an entry's headers name the client: ``current`` (hermes), ``missing`` (no
+# client header: placed before 0.5.1, or written by hand), ``other`` (a name
+# someone chose).
+IdentityState = Literal["current", "missing", "other"]
 
 
 class McpRegistrationError(RuntimeError):
@@ -98,7 +96,7 @@ def server_entry(api_base: str = DEFAULT_API_BASE) -> dict[str, Any]:
     """The ``mcp_servers.agentchat`` value this plugin writes."""
     return {
         "url": hosted_mcp_url(api_base),
-        "headers": {"Authorization": AUTH_HEADER_TEMPLATE, **hermes_client_headers()},
+        "headers": {"Authorization": AUTH_HEADER_TEMPLATE, **hermes_mcp_headers()},
     }
 
 
@@ -115,8 +113,8 @@ def manual_snippet(api_base: str = DEFAULT_API_BASE) -> str:
 
 
 def client_header_lines(indent: str = "") -> str:
-    """The two client headers as YAML lines, for a hand-written entry."""
-    return "".join(f'{indent}{name}: "{value}"\n' for name, value in hermes_client_headers().items())
+    """The client header as a YAML line, for a hand-written entry."""
+    return "".join(f'{indent}{name}: "{value}"\n' for name, value in hermes_mcp_headers().items())
 
 
 def mcp_json_document(api_base: str = DEFAULT_API_BASE) -> dict[str, Any]:
@@ -133,7 +131,7 @@ def mcp_json_document(api_base: str = DEFAULT_API_BASE) -> dict[str, Any]:
             MCP_SERVER_NAME: {
                 "type": "streamable-http",
                 "url": hosted_mcp_url(api_base),
-                "headers": {"Authorization": AUTH_HEADER_TEMPLATE, **hermes_client_headers()},
+                "headers": {"Authorization": AUTH_HEADER_TEMPLATE, **hermes_mcp_headers()},
             }
         },
     }
@@ -191,47 +189,26 @@ def entry_identity(entry: Any) -> IdentityState:
     client = _header(headers, CLIENT_HEADER)
     if not isinstance(client, str) or not client.strip():
         return "missing"
-    if client.strip().lower() != CLIENT_NAME:
-        return "other"
-    ours = hermes_client_headers()[CLIENT_VERSION_HEADER]
-    theirs = _header(headers, CLIENT_VERSION_HEADER)
-    if theirs == ours:
-        return "current"
-    ours_key, theirs_key = _version_key(ours), _version_key(theirs)
-    if ours_key is not None and theirs_key is not None and theirs_key > ours_key:
-        return "current"  # a newer install shares this profile; never downgrade it
-    return "stale"
+    return "current" if client.strip().lower() == CLIENT_NAME else "other"
 
 
-def _version_key(version: Any) -> tuple[int, int, int, int, str] | None:
-    """A total order on version strings, else ``None``: ``x.y.z`` numerically,
-    then pre-releases (``rc1``) below the release and post or local builds
-    (``.post1``, ``+local``) above it, then the suffix as text. Total, so two
-    installs never both see the other as older."""
-    match = re.match(r"^\s*(\d+)\.(\d+)\.(\d+)(.*)$", version) if isinstance(version, str) else None
-    if match is None:
-        return None
-    suffix = match[4].strip()
-    rank = 1 if not suffix else 2 if suffix.startswith(("+", ".post", "post", "-post")) else 0
-    return (int(match[1]), int(match[2]), int(match[3]), rank, suffix)
-
-
-def _set_client_headers(entry: MutableMapping[str, Any]) -> None:
-    """Set the two client headers on our entry, replacing any casing of
-    them; every other header and key stays as it is."""
+def _set_client_header(entry: MutableMapping[str, Any]) -> None:
+    """Set ``X-AgentChat-Client: hermes`` on our entry, replacing any casing
+    of it; every other header and key stays as it is."""
     headers = dict(entry.get("headers") or {})
-    names = {CLIENT_HEADER.lower(), CLIENT_VERSION_HEADER.lower()}
-    kept = {k: v for k, v in headers.items() if not (isinstance(k, str) and k.lower() in names)}
-    entry["headers"] = {**kept, **hermes_client_headers()}
+    name = CLIENT_HEADER.lower()
+    kept = {k: v for k, v in headers.items() if not (isinstance(k, str) and k.lower() == name)}
+    entry["headers"] = {**kept, **hermes_mcp_headers()}
 
 
 def ensure_entry(
     config: MutableMapping[str, Any], *, api_base: str = DEFAULT_API_BASE
 ) -> EnsureOutcome:
-    """Add the entry when absent; bring our entry's client headers up to date.
+    """Add the entry when absent; add the client header to our entry when it
+    has none (once per install).
 
-    Never touches a user-managed or disabled entry, nor a client header
-    someone set to another name.
+    Never touches a user-managed or disabled entry, an entry that already
+    names a client (``hermes`` or another), or a version header.
     """
     state = describe_entry(config, api_base=api_base)
     if state == "missing":
@@ -243,8 +220,8 @@ def ensure_entry(
         return "added"
     if state == "ours":
         entry = config["mcp_servers"][MCP_SERVER_NAME]
-        if entry_identity(entry) in ("missing", "stale") and isinstance(entry, MutableMapping):
-            _set_client_headers(entry)
+        if entry_identity(entry) == "missing" and isinstance(entry, MutableMapping):
+            _set_client_header(entry)
             return "upgraded"
         return "present"
     return state
@@ -318,7 +295,7 @@ def _hermes_raw_config() -> dict[str, Any]:
 
 
 def install_entry(*, api_base: str = DEFAULT_API_BASE) -> EnsureOutcome:
-    """Ensure the entry exists, with current client headers, in the active
+    """Ensure the entry exists, naming this client, in the active
     profile's ``config.yaml``. Writes only when something changes, and
     raises :class:`McpRegistrationError` when the change did not land."""
     read, save_config, is_managed = _hermes_config_io()
@@ -339,7 +316,7 @@ def install_entry(*, api_base: str = DEFAULT_API_BASE) -> EnsureOutcome:
     if outcome == "added":
         logger.info("mcp_registration: added mcp_servers.%s → %s", MCP_SERVER_NAME, hosted_mcp_url(api_base))
     else:
-        logger.info("mcp_registration: set the client headers on mcp_servers.%s", MCP_SERVER_NAME)
+        logger.info("mcp_registration: added the client header to mcp_servers.%s", MCP_SERVER_NAME)
     return outcome
 
 

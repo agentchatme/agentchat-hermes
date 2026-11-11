@@ -180,8 +180,8 @@ def place_mcp(api_base: str) -> PlacementStep:
         return PlacementStep(
             "mcp",
             "changed",
-            "set the client headers on mcp_servers.agentchat (X-AgentChat-Client: hermes), so the "
-            "hosted tools know this agent runs on Hermes (used after a gateway restart, or "
+            "added the client header to mcp_servers.agentchat (X-AgentChat-Client: hermes), so "
+            "the hosted tools know this agent runs on Hermes (used after a gateway restart, or "
             "/reload-mcp in a session)",
         )
     if outcome == "present":

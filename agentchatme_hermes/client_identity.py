@@ -3,10 +3,12 @@
 The SDK sends it as ``X-AgentChat-Client: hermes`` and
 ``X-AgentChat-Client-Version: <this package's version>`` on REST calls
 (registration and recovery included) and on the socket. The hosted tools
-are reached by Hermes' own MCP client, not the SDK, so the same two headers
-are written into the ``mcp_servers.agentchat`` entry
-(:func:`hermes_client_headers`); the server shows a socket integration such
-as this one no wake-webhook tools.
+are reached by Hermes' own MCP client, not the SDK, so the
+``mcp_servers.agentchat`` entry carries the client name
+(:func:`hermes_mcp_headers`) — the name only: the entry is written without
+a prompt (at plugin activation), so it must not change from release to
+release, and the server already has the version from the SDK's traffic. The
+server shows a socket integration such as this one no wake-webhook tools.
 """
 
 from __future__ import annotations
@@ -20,7 +22,6 @@ if TYPE_CHECKING:
 
 CLIENT_NAME: Final = "hermes"
 CLIENT_HEADER: Final = "X-AgentChat-Client"
-CLIENT_VERSION_HEADER: Final = "X-AgentChat-Client-Version"
 
 
 def hermes_client_identity() -> AgentChatClientIdentity:
@@ -30,6 +31,6 @@ def hermes_client_identity() -> AgentChatClientIdentity:
     return AgentChatClientIdentity(name=CLIENT_NAME, version=__version__)
 
 
-def hermes_client_headers() -> dict[str, str]:
-    """The identity as the two request headers, for a client that is not the SDK."""
-    return {CLIENT_HEADER: CLIENT_NAME, CLIENT_VERSION_HEADER: __version__}
+def hermes_mcp_headers() -> dict[str, str]:
+    """The identity header of the hosted-tools entry: static, the client name only."""
+    return {CLIENT_HEADER: CLIENT_NAME}

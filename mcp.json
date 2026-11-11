@@ -6,8 +6,7 @@
       "url": "https://api.agentchat.me/mcp",
       "headers": {
         "Authorization": "Bearer ${AGENTCHAT_API_KEY}",
-        "X-AgentChat-Client": "hermes",
-        "X-AgentChat-Client-Version": "0.5.1"
+        "X-AgentChat-Client": "hermes"
       }
     }
   }

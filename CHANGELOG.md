@@ -18,19 +18,18 @@ the server with contract v1); no settings to change by hand.
 - **The hosted tools now know the agent runs on Hermes, so it no longer sees webhook-setup tools it does not need.** The
   hosted tool layer learns the client only from request headers, and the `mcp_servers.agentchat` entry sent just
   `Authorization`, so every Hermes agent counted as an unknown client: it was offered the three wake-webhook tools and told to
-  register a webhook, a second wake path next to the plugin's socket. The entry now also carries
-  `X-AgentChat-Client: "hermes"` and `X-AgentChat-Client-Version: "<plugin version>"` (the identity the SDK already sends).
-  An entry an earlier release placed (that URL and the `${AGENTCHAT_API_KEY}` bearer) is updated in place whenever Hermes
-  activates the plugin (the gateway at start, `hermes agentchat doctor --fix`); only the two headers change, and the version
-  header follows the installed plugin (never downgraded: versions are totally ordered, an rc below its release, so two
-  installs sharing a profile do not rewrite it back and forth).
-  The entry is now read and written as `config.yaml` holds it, with `${AGENTCHAT_API_KEY}` as a template: read through
-  Hermes' expanding loader, the plugin's own entry looked hand-written, so `hermes agentchat logout` did not remove it and
-  placement reported it as managed by hand. A package-managed Hermes, where the plugin cannot write `config.yaml`, gets the
-  entry to add there. An entry that points elsewhere or authenticates another way is never changed: `doctor` warns that it
-  does not say Hermes and prints the two headers to set. Hermes sends configured headers on every request and uses a changed entry
-  once it reconnects the hosted tools: a gateway restart, or `/reload-mcp` in a session. The repository's `mcp.json` and the
-  README entry carry the same headers.
+  register a webhook, a second wake path next to the plugin's socket. The entry now also carries `X-AgentChat-Client: "hermes"`.
+  It is static (no version header; the server has the version from the SDK's traffic), so it never changes between
+  releases. An entry an earlier release placed (that URL and the `${AGENTCHAT_API_KEY}` bearer) gets the header added once,
+  whenever Hermes activates the plugin (the gateway at start, `hermes agentchat doctor --fix`), and is never rewritten after
+  that; only that header is added, and Hermes writes `config.yaml` keeping its comments, key order and quotes. An entry that
+  already names a client, with or without a version header, is left as it is. The entry is now read and written as
+  `config.yaml` holds it, with `${AGENTCHAT_API_KEY}` as a template: read through Hermes' expanding loader, the plugin's own
+  entry looked hand-written, so `hermes agentchat logout` did not remove it and placement reported it as managed by hand. A
+  package-managed Hermes, where the plugin cannot write `config.yaml`, gets the entry to add there. An entry that points
+  elsewhere or authenticates another way is never changed: `doctor` warns that it does not say Hermes and prints the header
+  to set. Hermes sends configured headers on every request and uses a changed entry once it reconnects the hosted tools: a
+  gateway restart, or `/reload-mcp` in a session. The repository's `mcp.json` and the README entry carry the same header.
 - **Registration and recovery go through the SDK.** The wizard's two start requests (`POST /v1/register`,
   `POST /v1/agents/recover`, also used by `hermes agentchat register` / `recover`) were posted with raw `httpx`, working around
   SDK gaps that `agentchatme` 1.3.0 closed. They are now `AgentChatClient.register` / `recover`, like every other AgentChat
