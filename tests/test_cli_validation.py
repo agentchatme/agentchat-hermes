@@ -206,6 +206,11 @@ class TestDoctor:
         fake_sdk.AgentChatClientIdentity = MagicMock  # type: ignore[attr-defined]
         fake_sdk.AgentChatError = Exception  # type: ignore[attr-defined]
         fake_sdk.UnauthorizedError = Exception  # type: ignore[attr-defined]
+
+        class _ConnectionError(Exception):
+            pass
+
+        fake_sdk.ConnectionError = _ConnectionError  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "agentchatme", fake_sdk)  # type: ignore[attr-defined]
 
         # SOUL anchor + gateway check — let the soul_anchor module work

@@ -635,3 +635,64 @@ class TestSubcommandsOnTheWire:
             in capsys.readouterr().err
         )
         assert _cli_env == []
+
+
+# ─── the other subcommands, offline ────────────────────────────────────────
+
+
+@pytest.fixture
+def _offline(monkeypatch: pytest.MonkeyPatch) -> Wire:
+    """``GET /v1/agents/me`` cannot connect. The SDK retries a GET; its
+    backoff sleeps are skipped."""
+    import time
+    import types
+
+    from agentchatme import _http
+
+    monkeypatch.setattr(
+        _http, "time", types.SimpleNamespace(sleep=lambda _s: None, perf_counter=time.perf_counter)
+    )
+    return serve(monkeypatch, {"/v1/agents/me": connect_error("dns")})
+
+
+class TestOfflineSubcommands:
+    """The SDK's ``ConnectionError`` is not an ``AgentChatError``: login,
+    status and doctor say they could not connect instead of a traceback."""
+
+    def test_login(
+        self, _offline: Wire, _cli_env: list[dict[str, str]], capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rc = cli._dispatch_login(argparse.Namespace(api_key=_KEY))
+        assert rc == _EXIT_API_ERR
+        assert "Key validation failed: dns" in capsys.readouterr().err
+        assert _cli_env == []
+        assert {path for _method, path in _offline.calls()} == {"/v1/agents/me"}
+
+    def test_status(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        _offline: Wire,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.setattr(cli, "_read_saved_key", lambda: _KEY)
+        rc = cli._dispatch_status(argparse.Namespace())
+        assert rc == _EXIT_API_ERR
+        assert "Status fetch failed: dns" in capsys.readouterr().err
+
+    def test_doctor(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        _offline: Wire,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from agentchatme_hermes import kit, mcp_registration
+
+        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: (_KEY, cli._ENV_API_KEY))
+        monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)
+        monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)
+        monkeypatch.setattr(mcp_registration, "inspect_entry", lambda **_kw: "ours")
+        monkeypatch.setattr(kit, "kit_problem", lambda: None)
+        rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
+        out = capsys.readouterr().out
+        assert rc >= 1
+        assert "[fail] Could not reach /v1/agents/me: dns" in out

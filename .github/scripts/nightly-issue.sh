@@ -18,12 +18,20 @@
 # read, the issue says so. A green night that cannot look up the issue
 # fails this job, so the run shows red instead of leaving a stale issue.
 #
+# A dispatch (report_issue) reports to its own issue, never the nightly's:
+# it may test one ref, or a branch's code, so its green must not close the
+# real alert.
+#
 # Environment: GH_TOKEN (issues: write, actions: read), GH_REPO, RUN_ID,
-# RUN_URL, REFS_RESULT and SUITE_RESULT (the jobs' results: success,
-# failure, cancelled or skipped).
+# RUN_URL, EVENT_NAME, REFS_RESULT and SUITE_RESULT (the jobs' results:
+# success, failure, cancelled or skipped).
 set -euo pipefail
 
-TITLE="Nightly: the suite fails against hermes-agent"
+if [[ "${EVENT_NAME:-}" == schedule ]]; then
+  TITLE="Nightly: the suite fails against hermes-agent"
+else
+  TITLE="Nightly (dispatch test): the suite fails against hermes-agent"
+fi
 
 open_issue() {
   gh api -X GET "repos/$GH_REPO/issues" -f state=open -f creator='github-actions[bot]' -f per_page=100 --paginate \
@@ -61,7 +69,7 @@ body="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/nightly-issue.md"
   legs || echo "- (the job list could not be read; see the run)"
   echo
   # One echo per paragraph: GitHub shows a line break inside an issue paragraph as a break.
-  echo "A red leg means a test failed with that Hermes installed; read the failing tests in the run. Often Hermes changed something this plugin uses (on \`main\`: the next Hermes release would break it; on \`latest release\`: the release users run now); sometimes the plugin itself is red (a test of its own, such as the dated legacy-settings test). A leg named \`unresolved\`: the latest release could not be looked up."
+  echo "A red leg means a step failed with that Hermes (checkout, install, lint, type-check or a test); read it in the run. Often Hermes changed something this plugin uses (on \`main\`: the next Hermes release would break it; on \`latest release\`: the release users run now); sometimes the plugin itself is red (a test of its own, such as the dated legacy-settings test). A leg named \`unresolved\`: the latest release could not be looked up."
   echo
   echo "What each Hermes surface is for: \`docs/hermes-coupling.md\`. Run: $RUN_URL"
   echo

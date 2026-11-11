@@ -21,9 +21,10 @@ name: hermes-main
 #
 # Alerting: a red scheduled run opens one issue, or comments on the open one,
 # and the next green scheduled run closes it (.github/scripts/nightly-issue.sh,
-# with the GITHUB_TOKEN; no secret needed). A dispatch reports the same way
-# only with report_issue (to exercise that path). Slack is an extra channel
-# that does nothing until a SLACK_WEBHOOK_WARNING secret exists.
+# with the GITHUB_TOKEN; no secret needed). A dispatch reports only with
+# report_issue, to its own "dispatch test" issue, so it never closes the real
+# one. Slack is an extra channel that does nothing until a
+# SLACK_WEBHOOK_WARNING secret exists.
 #
 # If the latest release cannot be looked up, `main` is still tested and the
 # release leg fails, so the night is red rather than empty.
@@ -185,6 +186,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           REFS_RESULT: ${{ needs.refs.result }}
           SUITE_RESULT: ${{ needs.suite.result }}

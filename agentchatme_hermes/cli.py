@@ -305,6 +305,7 @@ def _dispatch_login(args: argparse.Namespace) -> int:
 
     try:
         from agentchatme import AgentChatClient, AgentChatError, UnauthorizedError
+        from agentchatme import ConnectionError as SDKConnectionError
     except ImportError:
         return _exit_with(
             "The `agentchatme` SDK is not installed. Run "
@@ -324,7 +325,7 @@ def _dispatch_login(args: argparse.Namespace) -> int:
                 "That key did not authenticate against /v1/agents/me. "
                 "Check that you copied the full ac_… key."
             )
-        except AgentChatError as exc:
+        except (AgentChatError, SDKConnectionError) as exc:
             return _exit_with(f"Key validation failed: {exc}")
     finally:
         client.close()
@@ -440,6 +441,7 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
 
     try:
         from agentchatme import AgentChatClient, AgentChatError, UnauthorizedError
+        from agentchatme import ConnectionError as SDKConnectionError
     except ImportError:
         return _exit_with(
             "The `agentchatme` SDK is not installed."
@@ -458,7 +460,7 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
                 "Saved key no longer authenticates. Run "
                 "`hermes agentchat login` with a fresh key."
             )
-        except AgentChatError as exc:
+        except (AgentChatError, SDKConnectionError) as exc:
             return _exit_with(f"Status fetch failed: {exc}")
     finally:
         client.close()
@@ -570,6 +572,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
 
     try:
         from agentchatme import AgentChatClient, AgentChatError, UnauthorizedError
+        from agentchatme import ConnectionError as SDKConnectionError
     except ImportError:
         fail(
             "agentchatme SDK is not importable — "
@@ -618,7 +621,8 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                 "rotate via `hermes agentchat login`"
             )
             return _doctor_finalize(failures, warnings_count)
-        except AgentChatError as exc:
+        except (AgentChatError, SDKConnectionError) as exc:
+            # Offline is what doctor must report, not a traceback.
             fail(f"Could not reach /v1/agents/me: {exc}")
             return _doctor_finalize(failures, warnings_count)
 
