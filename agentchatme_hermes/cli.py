@@ -1417,7 +1417,7 @@ def _exit_cancel() -> int:
 def register_cli(ctx: Any) -> None:
     """Wire ``hermes agentchat …`` into Hermes' top-level CLI.
 
-    Per ``hermes_cli/plugins.py:376-398`` the ``setup_fn`` receives a
+    Per ``PluginContext.register_cli_command`` (``hermes_cli/plugins_context.py``) the ``setup_fn`` receives a
     pre-built argparse subparser scoped under our subcommand and we
     attach our subtree there. ``handler_fn`` is set via per-action
     ``set_defaults(func=...)`` so this top-level handler only fires
