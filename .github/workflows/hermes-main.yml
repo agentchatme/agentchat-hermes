@@ -144,7 +144,9 @@ jobs:
   report:
     name: Open, update or close the nightly issue
     needs: [refs, suite]
-    if: always() && github.event_name == 'schedule'
+    # Also after a failed or timed-out leg; never for a run that was itself
+    # cancelled (a newer run in the concurrency group superseded it).
+    if: ${{ !cancelled() && github.event_name == 'schedule' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -162,7 +164,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_ID: ${{ github.run_id }}
-          RUN_ATTEMPT: ${{ github.run_attempt }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           REFS_RESULT: ${{ needs.refs.result }}
           SUITE_RESULT: ${{ needs.suite.result }}
@@ -170,7 +171,7 @@ jobs:
 
   notify-failure:
     needs: [refs, suite]
-    if: failure() && github.event_name == 'schedule'
+    if: ${{ !cancelled() && github.event_name == 'schedule' && (needs.refs.result != 'success' || needs.suite.result != 'success') }}
     runs-on: ubuntu-24.04
     steps:
       - name: Post to Slack

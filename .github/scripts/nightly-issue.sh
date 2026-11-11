@@ -5,13 +5,16 @@
 #
 # The issue is the open issue with the title below, created by
 # github-actions[bot]:
-#   red run        → comment on it with the legs, or open it;
-#   green run      → comment and close it;
-#   cancelled run  → leave it as it is (a newer run superseded this one).
+#   green run (every job succeeded) → comment and close it;
+#   anything else                   → comment on it with each leg's result,
+#                                     or open it.
+# A leg that timed out or lost its runner can report `cancelled`; that is
+# red. A run that was itself cancelled (a newer run superseded it) never
+# gets here: the job runs only when `!cancelled()`.
 #
 # Environment: GH_TOKEN (issues: write, actions: read), GH_REPO, RUN_ID,
-# RUN_ATTEMPT, RUN_URL, REFS_RESULT and SUITE_RESULT (the jobs' results:
-# success, failure, cancelled or skipped).
+# RUN_URL, REFS_RESULT and SUITE_RESULT (the jobs' results: success,
+# failure, cancelled or skipped).
 set -euo pipefail
 
 TITLE="Nightly: the suite fails against hermes-agent"
@@ -22,14 +25,10 @@ open_issue() {
 }
 
 legs() {
-  gh api "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs?per_page=100" --paginate \
+  # filter=latest: each job's newest attempt, so a re-run still lists every leg.
+  gh api "repos/$GH_REPO/actions/runs/$RUN_ID/jobs?filter=latest&per_page=100" --paginate \
     | jq -rs '.[].jobs[] | select(.name | test("^(Resolve hermes-agent refs|Suite vs )")) | "- \(.name): **\(.conclusion // .status)**"'
 }
-
-if [[ "$REFS_RESULT" == cancelled || "$SUITE_RESULT" == cancelled ]]; then
-  echo "The run was cancelled: the nightly issue is left as it is."
-  exit 0
-fi
 
 issue="$(open_issue)"
 
