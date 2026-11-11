@@ -5,7 +5,7 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 ## [0.5.1] — 2026-11-11
 
 Patch release (fixed existing behaviour → patch +1, per `VERSIONING.md`). Same requirements as 0.5.0 (`agentchatme>=1.3.0,<2`,
-the server with contract v1); no setting changes.
+the server with contract v1); no settings to change by hand.
 
 ### Changed
 
@@ -20,9 +20,12 @@ the server with contract v1); no setting changes.
   `Authorization`, so every Hermes agent counted as an unknown client: it was offered the three wake-webhook tools and told to
   register a webhook, a second wake path next to the plugin's socket. The entry now also carries
   `X-AgentChat-Client: "hermes"` and `X-AgentChat-Client-Version: "<plugin version>"` (the identity the SDK already sends).
-  An entry an earlier release placed (that URL and the `${AGENTCHAT_API_KEY}` bearer) is updated in place when the gateway
-  activates the plugin, or by `hermes agentchat doctor --fix`; only the two headers change, and the version header follows the
-  installed plugin. An entry that points elsewhere or authenticates another way is never changed: `doctor` warns that it does
+  An entry an earlier release placed (that URL and the `${AGENTCHAT_API_KEY}` bearer) is updated in place whenever Hermes
+  activates the plugin (the gateway at start, `hermes agentchat doctor --fix`); only the two headers change, and the version
+  header follows the installed plugin (never downgraded, so two installs sharing a profile do not rewrite it back and forth).
+  The entry is now read and written as `config.yaml` holds it, with `${AGENTCHAT_API_KEY}` as a template: read through
+  Hermes' expanding loader, the plugin's own entry looked hand-written, so `hermes agentchat logout` did not remove it and
+  placement reported it as managed by hand. A package-managed Hermes, where the plugin cannot write `config.yaml`, gets the entry to add there. An entry that points elsewhere or authenticates another way is never changed: `doctor` warns that it does
   not say Hermes and prints the two lines to add. Hermes sends configured headers on every request and uses a changed entry
   once it reconnects the hosted tools: a gateway restart, or `/reload-mcp` in a session. The repository's `mcp.json` and the
   README entry carry the same headers.
@@ -45,9 +48,11 @@ the server with contract v1); no setting changes.
   /v1/agents/me: …".
 - **`hermes agentchat doctor` warns when two `agentchat` plugins are installed.** A git-clone directory plugin in the
   profile's `plugins/` next to the pip package shadows it: Hermes keeps the directory plugin and drops the entry point of the
-  same name, so the pip package never runs and installing a newer one changes nothing. Doctor now names both copies and the
-  fix (`hermes plugins remove agentchat`, then restart the gateway). The README says PyPI is the install path and warns
-  against mixing it with the git clone, which installs GitHub `main`, not a release.
+  same name, so the pip package never runs and installing a newer one changes nothing. A second directory copy (a backup left
+  under `plugins/`) shadows the same way. Doctor now names every copy, says which one Hermes loads, and gives the fix: remove
+  each directory, then `hermes plugins enable agentchat` (removal also takes it off `plugins.enabled`) and restart the
+  gateway. The README says PyPI is the install path, adds the `hermes plugins enable agentchat` step Hermes' opt-in plugins
+  need, and warns against mixing it with the git clone, which installs GitHub `main` unless given `--ref`.
 - **Keys are shown as `ac_…`.** Prompts, help text, README and SECURITY.md named a `live` key prefix that keys do not have (a
   key is `ac_` and 43 random characters). Wizard and subcommands now share one mask: the first 8 characters and the last 4
   (the subcommands showed the first 11), and a value of 12 characters or fewer reads `ac_…` (the wizard showed one of exactly

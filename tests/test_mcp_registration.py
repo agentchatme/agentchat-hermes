@@ -158,6 +158,9 @@ class TestDescribeEnsureRemove:
             ({"headers": {"X-AgentChat-Client": "hermes"}}, "stale"),
             ({"headers": {"X-AgentChat-Client": "hermes", "X-AgentChat-Client-Version": __version__}}, "current"),
             ({"headers": {"X-AgentChat-Client": "openclaw"}}, "other"),
+            ({"headers": {"X-AgentChat-Client": "hermes", "X-AgentChat-Client-Version": "99.0.0"}}, "current"),
+            ({"headers": {"X-AgentChat-Client": "hermes", "X-AgentChat-Client-Version": "0.0.1"}}, "stale"),
+            ({"headers": {"X-AgentChat-Client": "hermes", "X-AgentChat-Client-Version": "junk"}}, "stale"),
             ("not a mapping", "missing"),
         ],
     )
@@ -184,28 +187,48 @@ class TestDescribeEnsureRemove:
 
 
 class _FakeHermesConfig:
+    """``hermes_cli.config`` as the plugin uses it. ``load_config`` expands
+    ``${VAR}`` from the environment like Hermes' does (a running Hermes has
+    the profile's ``.env`` loaded); ``read_user_config_raw`` returns the file
+    as written; ``save_config`` writes what it is given."""
+
     def __init__(self, initial: dict[str, Any]) -> None:
         self.on_disk = initial
         self.saved: list[dict[str, Any]] = []
+        self.managed = False
+        self.drop_saves = False
 
     def load_config(self) -> dict[str, Any]:
-        return json.loads(json.dumps(self.on_disk))
+        import os
+        import re
+
+        text = json.dumps(self.on_disk)
+        return json.loads(
+            re.sub(r"\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}", lambda m: os.environ.get(m[1], ""), text)
+        )
 
     def save_config(self, config: dict[str, Any]) -> None:
-        self.saved.append(config)
-        self.on_disk = config
+        self.saved.append(json.loads(json.dumps(config)))
+        if not self.drop_saves:
+            self.on_disk = json.loads(json.dumps(config))
 
     def read_user_config_raw(self) -> dict[str, Any]:
-        return self.on_disk
+        return json.loads(json.dumps(self.on_disk))
+
+    def is_managed(self) -> bool:
+        return self.managed
 
 
 @pytest.fixture
 def fake_hermes(monkeypatch: pytest.MonkeyPatch) -> _FakeHermesConfig:
+    # A running Hermes has the profile's .env in the environment.
+    monkeypatch.setenv("AGENTCHAT_API_KEY", PREFIX + "secret_value_000000000000")
     fake = _FakeHermesConfig({"model": {"default": "x"}})
     module = types.ModuleType("hermes_cli.config")
     module.load_config = fake.load_config  # type: ignore[attr-defined]
     module.save_config = fake.save_config  # type: ignore[attr-defined]
     module.read_user_config_raw = fake.read_user_config_raw  # type: ignore[attr-defined]
+    module.is_managed = fake.is_managed  # type: ignore[attr-defined]
     package = types.ModuleType("hermes_cli")
     package.config = module  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "hermes_cli", package)
@@ -227,6 +250,53 @@ class TestHermesBacked:
         assert reg.inspect_entry_identity() == ("missing", None)
         reg.install_entry()
         assert reg.inspect_entry() == "ours"
+        assert reg.inspect_entry_identity() == ("ours", "current")
+
+    def test_the_fake_expands_like_hermes(self, fake_hermes: _FakeHermesConfig) -> None:
+        """Guards the tests below: through the expanding loader our own entry
+        would read as hand-written (a literal key)."""
+        fake_hermes.on_disk = {"mcp_servers": {"agentchat": json.loads(json.dumps(OLD_ENTRY))}}
+        import hermes_cli.config as hermes_config  # the fake
+
+        assert reg.describe_entry(hermes_config.load_config()) == "user_managed"
+        assert reg.describe_entry(fake_hermes.read_user_config_raw()) == "ours"
+
+    def test_upgrade_keeps_the_key_a_template(self, fake_hermes: _FakeHermesConfig) -> None:
+        fake_hermes.on_disk = {"mcp_servers": {"agentchat": json.loads(json.dumps(OLD_ENTRY))}}
+        assert reg.install_entry() == "upgraded"
+        written = json.dumps(fake_hermes.saved)
+        assert "secret_value" not in written, "the key must never be written into config.yaml"
+        assert fake_hermes.on_disk["mcp_servers"]["agentchat"]["headers"]["Authorization"] == "Bearer ${AGENTCHAT_API_KEY}"
+
+    def test_logout_removes_ours_with_the_key_loaded_or_cleared(
+        self, fake_hermes: _FakeHermesConfig, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for value in (PREFIX + "loaded_000000000000", ""):
+            monkeypatch.setenv("AGENTCHAT_API_KEY", value)
+            fake_hermes.on_disk = {"mcp_servers": {"agentchat": reg.server_entry()}}
+            assert reg.uninstall_entry() is True
+            assert "mcp_servers" not in fake_hermes.on_disk
+
+    def test_a_managed_hermes_gets_the_entry_to_add_and_no_write(self, fake_hermes: _FakeHermesConfig) -> None:
+        fake_hermes.managed = True
+        fake_hermes.on_disk = {"mcp_servers": {"agentchat": json.loads(json.dumps(OLD_ENTRY))}}
+        with pytest.raises(reg.McpRegistrationError, match="managed by a package manager") as info:
+            reg.install_entry()
+        assert "X-AgentChat-Client" in str(info.value)
+        assert fake_hermes.saved == []
+        fake_hermes.on_disk = {"mcp_servers": {"agentchat": reg.server_entry()}}
+        assert reg.install_entry() == "present", "nothing to write, nothing to refuse"
+
+    def test_a_save_that_does_not_land_is_an_error(self, fake_hermes: _FakeHermesConfig) -> None:
+        fake_hermes.drop_saves = True
+        with pytest.raises(reg.McpRegistrationError, match="did not save"):
+            reg.install_entry()
+
+    def test_install_then_inspect_agree(self, fake_hermes: _FakeHermesConfig) -> None:
+        """doctor --fix and the check after it read the same file the same way."""
+        fake_hermes.on_disk = {"mcp_servers": {"agentchat": json.loads(json.dumps(OLD_ENTRY))}}
+        assert reg.inspect_entry_identity() == ("ours", "missing")
+        reg.install_entry()
         assert reg.inspect_entry_identity() == ("ours", "current")
 
     def test_install_upgrades_an_old_entry_with_one_write(self, fake_hermes: _FakeHermesConfig) -> None:
@@ -253,6 +323,19 @@ class TestHermesBacked:
         assert reg.uninstall_entry() is True
         assert "mcp_servers" not in fake_hermes.on_disk
         assert reg.uninstall_entry() is False
+
+    def test_a_newer_version_is_never_downgraded(self) -> None:
+        entry = {
+            "url": reg.hosted_mcp_url(),
+            "headers": {
+                "Authorization": "Bearer ${AGENTCHAT_API_KEY}",
+                "X-AgentChat-Client": "hermes",
+                "X-AgentChat-Client-Version": "99.0.0",
+            },
+        }
+        config: dict[str, Any] = {"mcp_servers": {"agentchat": json.loads(json.dumps(entry))}}
+        assert reg.ensure_entry(config) == "present"
+        assert config["mcp_servers"]["agentchat"] == entry
 
     def test_without_hermes_the_error_carries_the_manual_snippet(
         self, monkeypatch: pytest.MonkeyPatch

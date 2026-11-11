@@ -35,23 +35,27 @@ the headers and reload rules again on v0.23.1 and main, 2026-11-11):
   identical declaration in the portable shape for any harness that reads
   it; :func:`mcp_json_document` is its single source of truth.
 
-The entry is written the way Hermes' own ``hermes mcp install`` writes one
-(``hermes_cli/mcp_catalog.py``: ``load_config()`` → mutate ``mcp_servers`` →
-``save_config()``), so ``${AGENTCHAT_API_KEY}`` stays a template on disk and
-the key never lands in ``config.yaml``.
+The entry is read, changed and saved as written: ``read_user_config_raw()``
+→ change ``mcp_servers`` → ``save_config()``, Hermes' own write-back round
+trip (``load_config()`` would expand ``${AGENTCHAT_API_KEY}`` from the
+``.env`` first). ``${AGENTCHAT_API_KEY}`` stays a template on disk and the
+key never lands in ``config.yaml``.
 
 An entry with this URL and the ``${AGENTCHAT_API_KEY}`` bearer is the
 plugin's (an earlier release's, or the documented snippet copied by hand;
 they cannot be told apart), with any keys the user added (``trust``,
 ``timeout``, ``tools``) kept. When its client headers are missing or name
 an older version, :func:`ensure_entry` sets them in place and changes
-nothing else; a client header someone set to another name is left alone.
+nothing else (a newer version is left as it is, so two installs sharing a
+profile never rewrite it back and forth); a client header someone set to
+another name is left alone.
 Any other same-name entry is the user's and is never modified; ``doctor``
 says how to add the headers to it.
 """
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Mapping, MutableMapping
 from typing import Any, Callable, Literal
 
@@ -75,9 +79,10 @@ MCP_JSON_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
 
 EntryState = Literal["missing", "ours", "user_managed", "disabled"]
 EnsureOutcome = Literal["added", "present", "upgraded", "user_managed", "disabled"]
-# How an entry's headers name the client: ``current`` (hermes, this version),
-# ``stale`` (hermes, another version or none), ``missing`` (no client header:
-# placed before 0.5.1, or written by hand), ``other`` (a name someone chose).
+# How an entry's headers name the client: ``current`` (hermes, this version or
+# a newer one), ``stale`` (hermes, an older or unreadable version, or none),
+# ``missing`` (no client header: placed before 0.5.1, or written by hand),
+# ``other`` (a name someone chose).
 IdentityState = Literal["current", "stale", "missing", "other"]
 
 
@@ -188,8 +193,20 @@ def entry_identity(entry: Any) -> IdentityState:
         return "missing"
     if client.strip().lower() != CLIENT_NAME:
         return "other"
-    wanted = hermes_client_headers()[CLIENT_VERSION_HEADER]
-    return "current" if _header(headers, CLIENT_VERSION_HEADER) == wanted else "stale"
+    ours = hermes_client_headers()[CLIENT_VERSION_HEADER]
+    theirs = _header(headers, CLIENT_VERSION_HEADER)
+    if theirs == ours:
+        return "current"
+    ours_t, theirs_t = _release(ours), _release(theirs)
+    if ours_t is not None and theirs_t is not None and theirs_t > ours_t:
+        return "current"  # a newer install shares this profile; never downgrade it
+    return "stale"
+
+
+def _release(version: Any) -> tuple[int, int, int] | None:
+    """``(major, minor, patch)`` of a version string, else ``None``."""
+    match = re.match(r"^\s*(\d+)\.(\d+)\.(\d+)", version) if isinstance(version, str) else None
+    return (int(match[1]), int(match[2]), int(match[3])) if match else None
 
 
 def _set_client_headers(entry: MutableMapping[str, Any]) -> None:
@@ -243,54 +260,97 @@ ConfigLoader = Callable[[], dict[str, Any]]
 ConfigSaver = Callable[[dict[str, Any]], Any]
 
 
-def _hermes_config_api() -> tuple[ConfigLoader, ConfigSaver]:
+def _hermes_config_io() -> tuple[ConfigLoader, ConfigSaver, Callable[[], bool]]:
+    """Hermes' reader for ``config.yaml`` *as written*, its saver, and its
+    "is this install managed" check.
+
+    Ownership is decided on the file as written. ``load_config()`` expands
+    ``${AGENTCHAT_API_KEY}`` from the profile's ``.env``, which every running
+    Hermes has loaded, so read through it our own entry carries a literal
+    key and looks hand-written. ``read_user_config_raw()`` is Hermes' reader
+    for exactly this write-back round trip, and ``save_config()`` keeps the
+    templates.
+    """
     try:
-        from hermes_cli.config import load_config, save_config
+        from hermes_cli import config as hermes_config
     except ImportError as exc:
         raise McpRegistrationError(
             "Hermes' config helpers are not importable here, so the tool source could not "
             "be registered. Add this to the profile's config.yaml by hand:\n" + manual_snippet()
         ) from exc
-    return load_config, save_config
+    reader = next(
+        (
+            fn
+            for fn in (getattr(hermes_config, name, None) for name in ("read_user_config_raw", "read_raw_config"))
+            if callable(fn)
+        ),
+        None,
+    )
+    saver = getattr(hermes_config, "save_config", None)
+    if reader is None or not callable(saver):
+        raise McpRegistrationError(
+            "this Hermes has no raw config reader or saver the plugin knows, so the tool source "
+            "could not be registered. Add this to the profile's config.yaml by hand:\n" + manual_snippet()
+        )
+    managed = getattr(hermes_config, "is_managed", None)
+
+    def is_managed() -> bool:
+        return bool(managed()) if callable(managed) else False
+
+    def read() -> dict[str, Any]:
+        data = reader()
+        return data if isinstance(data, dict) else {}
+
+    return read, saver, is_managed
 
 
 def _hermes_raw_config() -> dict[str, Any]:
     """The profile's ``config.yaml`` with ``${VAR}`` templates intact."""
-    try:
-        from hermes_cli import config as hermes_config
-    except ImportError as exc:
-        raise McpRegistrationError("Hermes' config helpers are not importable here") from exc
-    for name in ("read_user_config_raw", "read_raw_config", "load_config"):
-        reader = getattr(hermes_config, name, None)
-        if callable(reader):
-            data = reader()
-            return data if isinstance(data, dict) else {}
-    raise McpRegistrationError("Hermes exposes no config reader this plugin knows")
+    read, _save, _is_managed = _hermes_config_io()
+    return read()
 
 
 def install_entry(*, api_base: str = DEFAULT_API_BASE) -> EnsureOutcome:
-    """Ensure the entry exists in the active profile's ``config.yaml``."""
-    load_config, save_config = _hermes_config_api()
-    config = load_config()
+    """Ensure the entry exists, with current client headers, in the active
+    profile's ``config.yaml``. Writes only when something changes, and
+    raises :class:`McpRegistrationError` when the change did not land."""
+    read, save_config, is_managed = _hermes_config_io()
+    config = read()
     outcome = ensure_entry(config, api_base=api_base)
+    if outcome not in ("added", "upgraded"):
+        return outcome
+    if is_managed():
+        raise McpRegistrationError(
+            "Hermes' configuration is managed by a package manager, so the plugin cannot write "
+            "config.yaml. Declare the hosted tools there:\n" + manual_snippet(api_base)
+        )
+    save_config(config)
+    if ensure_entry(read(), api_base=api_base) != "present":
+        raise McpRegistrationError(
+            "Hermes did not save the change to config.yaml. Add this by hand:\n" + manual_snippet(api_base)
+        )
     if outcome == "added":
-        save_config(config)
         logger.info("mcp_registration: added mcp_servers.%s → %s", MCP_SERVER_NAME, hosted_mcp_url(api_base))
-    elif outcome == "upgraded":
-        save_config(config)
+    else:
         logger.info("mcp_registration: set the client headers on mcp_servers.%s", MCP_SERVER_NAME)
     return outcome
 
 
 def uninstall_entry(*, api_base: str = DEFAULT_API_BASE) -> bool:
     """Remove our entry from the active profile's ``config.yaml`` (user entries untouched)."""
-    load_config, save_config = _hermes_config_api()
-    config = load_config()
-    removed = remove_entry(config, api_base=api_base)
-    if removed:
-        save_config(config)
-        logger.info("mcp_registration: removed mcp_servers.%s", MCP_SERVER_NAME)
-    return removed
+    read, save_config, is_managed = _hermes_config_io()
+    config = read()
+    if describe_entry(config, api_base=api_base) != "ours":
+        return False
+    if is_managed():
+        raise McpRegistrationError(
+            "Hermes' configuration is managed by a package manager, so the plugin cannot remove "
+            f"mcp_servers.{MCP_SERVER_NAME}; remove it there"
+        )
+    remove_entry(config, api_base=api_base)
+    save_config(config)
+    logger.info("mcp_registration: removed mcp_servers.%s", MCP_SERVER_NAME)
+    return True
 
 
 def inspect_entry(*, api_base: str = DEFAULT_API_BASE) -> EntryState:

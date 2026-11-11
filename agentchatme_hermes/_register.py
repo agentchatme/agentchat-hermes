@@ -587,14 +587,18 @@ def _reconcile_key_name(config: Any) -> None:
 
 
 def _reconcile_mcp_registration(runtime: Any) -> None:
-    """Ensure ``mcp_servers.agentchat`` exists in this profile's ``config.yaml``.
+    """Ensure ``mcp_servers.agentchat`` exists in this profile's ``config.yaml``,
+    with current client headers.
 
     The agent's tools live on the hosted MCP server; without this entry a
     wake starts a turn that has no AgentChat tools. The wizard writes it;
     this is the non-wizard path (upgrade from pre-v3, env-var-direct
-    install). Adds only when absent — a user-managed entry is never
-    touched. The gateway's config watcher connects a new entry within
-    about a minute. Non-fatal: failures are logged with the fix.
+    install, an entry an earlier release placed without the client
+    headers). Adds an absent entry and sets the two client headers on ours;
+    a user-managed entry is never touched. The gateway's config watcher
+    connects a new entry within about a minute; changed headers are used
+    once Hermes reconnects the hosted tools. Non-fatal: failures are logged
+    with the fix.
     """
     try:
         from .placement import place_mcp

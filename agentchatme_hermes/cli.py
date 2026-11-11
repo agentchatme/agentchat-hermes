@@ -521,20 +521,32 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     ok(f"Profile: {profile_label(hermes_home)} ({hermes_home})")
 
     directory_copies, pip_version = _plugin_copies(hermes_home)
-    if directory_copies and pip_version is not None:
-        warn(
-            f"two agentchat plugins in this profile: the directory plugin at {directory_copies[0]} "
-            f"(a git clone: GitHub main, not a release) and agentchatme-hermes {pip_version} from "
-            "pip. Hermes loads the directory plugin and drops the same-named pip entry point, so "
-            "the pip package never runs and installing a newer one changes nothing. Keep one: "
-            "`hermes plugins remove agentchat` removes the directory plugin; then restart the "
-            "gateway (`hermes gateway restart`)"
-        )
-    elif directory_copies:
-        ok(
-            f"installed as a directory plugin at {directory_copies[0]} (a git clone of GitHub "
-            "main, not a release)"
-        )
+    if directory_copies:
+        # Hermes scans plugins/ in sorted order and the later same-named copy wins.
+        loaded = directory_copies[-1]
+        clone = "a git clone: GitHub main unless installed with --ref, not a PyPI release"
+        listed = ", ".join(str(path) for path in directory_copies)
+        removals = " and ".join(f"`hermes plugins remove {path.name}`" for path in directory_copies)
+        if pip_version is not None:
+            warn(
+                f"{len(directory_copies) + 1} agentchat plugins in this profile: the directory "
+                f"plugin{'s' if len(directory_copies) > 1 else ''} at {listed} ({clone}) and "
+                f"agentchatme-hermes {pip_version} from pip. Hermes loads {loaded} and drops the "
+                "same-named pip entry point, so the pip package never runs and installing a newer "
+                f"one changes nothing. To keep pip: {removals}, then `hermes plugins enable "
+                "agentchat` (removing a plugin also takes it off plugins.enabled, and the pip copy "
+                "has the same name), then `hermes gateway restart`"
+            )
+        elif len(directory_copies) > 1:
+            warn(
+                f"{len(directory_copies)} agentchat directory plugins in this profile: {listed}. "
+                f"Hermes loads {loaded}; the others are dead copies (a backup under plugins/ "
+                "shadows the real plugin by name). Remove the ones you do not want with "
+                "`hermes plugins remove <directory>`, then `hermes plugins enable agentchat` and "
+                "`hermes gateway restart`"
+            )
+        else:
+            ok(f"installed as a directory plugin at {loaded} ({clone})")
 
     from .config import ENV_INTEGRATION, ENV_INTEGRATION_LEGACY, INTEGRATION_OFF
 
@@ -781,9 +793,10 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         except McpRegistrationError as exc:
             warn(f"hosted-tools entry not checked — {exc}")
         else:
-            add_headers = (
-                "add these lines under its `headers:` and restart the gateway (or /reload-mcp):\n"
-                + client_header_lines("    ")
+            set_headers = (
+                "set these two headers under its `headers:` (replace any existing "
+                "X-AgentChat-Client lines; a key may appear only once), then restart the gateway "
+                "or /reload-mcp:\n" + client_header_lines("      ")
             )
             if entry_state == "ours":
                 ok(
@@ -809,11 +822,17 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                     )
             elif entry_state == "user_managed":
                 ok("mcp_servers.agentchat is managed by hand in config.yaml — left alone")
-                if identity != "current" and identity != "stale":
+                if identity == "other":
+                    warn(
+                        "X-AgentChat-Client in the hand-written mcp_servers.agentchat names another "
+                        "client, so the hosted tools treat this agent as that client; to say it is "
+                        "Hermes, " + set_headers
+                    )
+                elif identity == "missing":
                     warn(
                         "the hand-written mcp_servers.agentchat does not say it is Hermes, so the "
                         "hosted tools treat this agent as an unknown client and offer it "
-                        "webhook-setup tools it does not need; " + add_headers
+                        "webhook-setup tools it does not need; " + set_headers
                     )
             elif entry_state == "disabled":
                 warn(
@@ -1421,18 +1440,21 @@ def _print_status(me: dict[str, Any]) -> None:
 # ───────────────────────── I/O glue ─────────────────────────
 
 
-_PLUGIN_NAME_LINE = re.compile(r"^name:\s*['\"]?agentchat['\"]?\s*$", re.MULTILINE)
+_MANIFEST_NAME = re.compile(r"^name:\s*['\"]?([^'\"#\s]+)['\"]?\s*(?:#.*)?$", re.MULTILINE)
 
 
 def _plugin_copies(hermes_home: Path) -> tuple[list[Path], str | None]:
     """The ``agentchat`` plugins Hermes can find for this profile.
 
     Returns the directory plugins named ``agentchat`` under the profile's
-    ``plugins/`` (a ``hermes plugins install`` git clone), and the version
-    of the pip distribution when its ``agentchat`` entry point is installed
-    (else ``None``). Hermes keeps a directory plugin and drops an entry
-    point with the same name, so with both present the pip package never
-    runs. Never raises.
+    ``plugins/`` (a ``hermes plugins install`` git clone, or a copy left
+    there), sorted the way Hermes scans them (the last one is the one it
+    loads), and the version of the pip distribution when its ``agentchat``
+    entry point is installed (else ``None``). A directory's name is its
+    manifest's ``name:`` (``plugin.yaml`` or ``plugin.yml``), or the
+    directory name when the manifest has none, as in Hermes. Hermes keeps a
+    directory plugin and drops an entry point with the same name, so with
+    both present the pip package never runs. Never raises.
     """
     directories: list[Path] = []
     plugins_dir = hermes_home / "plugins"
@@ -1441,11 +1463,17 @@ def _plugin_copies(hermes_home: Path) -> tuple[list[Path], str | None]:
     except OSError:
         candidates = []
     for candidate in candidates:
-        try:
-            manifest = (candidate / "plugin.yaml").read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+        manifest_file = next(
+            (f for f in (candidate / "plugin.yaml", candidate / "plugin.yml") if f.is_file()), None
+        )
+        if manifest_file is None:
             continue
-        if _PLUGIN_NAME_LINE.search(manifest):
+        try:
+            manifest = manifest_file.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        named = _MANIFEST_NAME.search(manifest)
+        if (named[1] if named else candidate.name) == "agentchat":
             directories.append(candidate)
 
     from importlib import metadata
