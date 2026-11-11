@@ -1,9 +1,10 @@
 """The Hermes surfaces this plugin depends on, checked against a real Hermes.
 
 Skipped unless Hermes is importable (the unit suite runs without it). The
-scheduled ``hermes-main`` workflow installs hermes-agent from its main branch
-and runs the whole suite with it, so a Hermes change that breaks one of these
-couplings shows within a day instead of at the next release. What each one is
+scheduled ``hermes-main`` workflow installs hermes-agent from its main branch,
+and from its latest release, and runs the whole suite with each, so a Hermes
+change that breaks one of these couplings shows within a day instead of at the
+next release, and a break on the release users run shows too. What each one is
 for, and which public hook would replace it, is ``docs/hermes-coupling.md``.
 
 Nothing here reaches a network service: the model is a localhost stub and

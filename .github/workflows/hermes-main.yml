@@ -1,17 +1,28 @@
 name: hermes-main
 
-# The test suite against Hermes Agent's main branch, every night.
+# The test suite against Hermes Agent, every night: its main branch and its
+# latest release.
 #
 # The CI gate (ci.yml) runs without Hermes installed: Hermes is stubbed, so it
 # proves this package, not that Hermes still has what the package imports.
-# This workflow installs hermes-agent from main exactly the way Hermes' own CI
-# does (`uv sync --locked` from its uv.lock, Python 3.14), adds this package
-# to that environment, and runs the whole suite. With Hermes present the
+# This workflow installs hermes-agent exactly the way Hermes' own CI does
+# (`uv sync --locked` from its uv.lock, Python 3.14), adds this package to
+# that environment, and runs the whole suite. With Hermes present the
 # contract tests in tests/test_hermes_contract.py run too: every internal
 # surface the plugin touches (docs/hermes-coupling.md), plus a real AIAgent
 # turn stopped by the time limit and a real ctx.llm call, both against a
-# localhost model stub. A red run means Hermes main changed something the
-# next Hermes release would break here; nothing is published or changed.
+# localhost model stub.
+#
+# Two legs. `main`: a red leg means Hermes main changed something the next
+# Hermes release would break here. `latest release`: the newest hermes-agent
+# release that is neither a draft nor a pre-release, looked up at run time
+# from its GitHub releases — what users run today; a red leg means this
+# package's main fails on it. Nothing is published or changed.
+#
+# Alerting: a red scheduled run opens one issue, or comments on the open one,
+# and the next green scheduled run closes it (.github/scripts/nightly-issue.sh,
+# with the GITHUB_TOKEN; no secret needed). Slack is an extra channel that
+# does nothing until a SLACK_WEBHOOK_WARNING secret exists.
 #
 # Actions are pinned to commits (the version is in the trailing comment), as
 # in publish.yml. setup-uv and the uv version are the ones Hermes' tests.yml
@@ -23,24 +34,61 @@ on:
   workflow_dispatch:
     inputs:
       hermes_ref:
-        description: "hermes-agent branch, tag or commit to test against"
+        description: "hermes-agent branch, tag or commit to test against (empty: main and the latest release)"
         required: false
-        default: main
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: hermes-main
+  group: hermes-main-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  refs:
+    name: Resolve hermes-agent refs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.refs.outputs.matrix }}
+    steps:
+      - name: main and the latest release, or the ref asked for
+        id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.hermes_ref }}
+        run: |
+          set -euo pipefail
+          ref_shape='^[A-Za-z0-9][A-Za-z0-9._/-]*$'
+          if [ -n "$REQUESTED" ]; then
+            if ! [[ "$REQUESTED" =~ $ref_shape ]]; then
+              echo "::error::hermes_ref must be a branch, tag or commit name, got '$REQUESTED'"
+              exit 1
+            fi
+            matrix=$(jq -cn --arg ref "$REQUESTED" '{include: [{ref: $ref, leg: "requested"}]}')
+          else
+            latest=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name)
+            if ! [[ "$latest" =~ $ref_shape ]]; then
+              echo "::error::hermes-agent's latest release has no usable tag name: '$latest'"
+              exit 1
+            fi
+            echo "hermes-agent latest release: $latest"
+            matrix=$(jq -cn --arg tag "$latest" \
+              '{include: [{ref: "main", leg: "main"}, {ref: $tag, leg: "latest release"}]}')
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   suite:
-    name: Suite vs hermes-agent ${{ inputs.hermes_ref || 'main' }}
+    name: Suite vs hermes-agent ${{ matrix.ref }} (${{ matrix.leg }})
+    needs: refs
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.refs.outputs.matrix) }}
     env:
-      HERMES_REF: ${{ inputs.hermes_ref || 'main' }}
+      HERMES_REF: ${{ matrix.ref }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,15 +141,42 @@ jobs:
             exit 1
           fi
 
+  report:
+    name: Open, update or close the nightly issue
+    needs: [refs, suite]
+    if: always() && github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REFS_RESULT: ${{ needs.refs.result }}
+          SUITE_RESULT: ${{ needs.suite.result }}
+        run: bash .github/scripts/nightly-issue.sh
+
   notify-failure:
-    needs: suite
+    needs: [refs, suite]
     if: failure() && github.event_name == 'schedule'
     runs-on: ubuntu-24.04
     steps:
       - name: Post to Slack
         env:
           WEBHOOK: ${{ secrets.SLACK_WEBHOOK_WARNING }}
-          TEXT: ":warning: *agentchatme-hermes vs hermes-agent main failed* — Hermes main changed something this plugin uses: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT: ":warning: *agentchatme-hermes nightly vs hermes-agent failed* (main or the latest release) — see the nightly issue: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
-          if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped"; exit 0; fi
+          if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped (the nightly issue carries the alert)"; exit 0; fi
           printf '%s' "$TEXT" | jq -Rs '{text: .}' | curl -sS -o /dev/null --max-time 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK" || true
