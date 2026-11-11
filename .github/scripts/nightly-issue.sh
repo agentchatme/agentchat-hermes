@@ -60,10 +60,8 @@ body="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/nightly-issue.md"
   echo
   legs || echo "- (the job list could not be read; see the run)"
   echo
-  echo "A red leg means a test failed with that Hermes installed. Read the failing tests in the run: often Hermes changed"
-  echo "something this plugin uses (on \`main\`: the next Hermes release would break it; on \`latest release\`: the release"
-  echo "users run now), sometimes the plugin itself is red (a test of its own, such as the dated legacy-settings test)."
-  echo "A leg named \`unresolved\`: the latest release could not be looked up."
+  # One echo per paragraph: GitHub shows a line break inside an issue paragraph as a break.
+  echo "A red leg means a test failed with that Hermes installed; read the failing tests in the run. Often Hermes changed something this plugin uses (on \`main\`: the next Hermes release would break it; on \`latest release\`: the release users run now); sometimes the plugin itself is red (a test of its own, such as the dated legacy-settings test). A leg named \`unresolved\`: the latest release could not be looked up."
   echo
   echo "What each Hermes surface is for: \`docs/hermes-coupling.md\`. Run: $RUN_URL"
   echo
