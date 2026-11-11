@@ -33,8 +33,15 @@ the server with contract v1); no setting changes.
   not an object reads "invalid server response" instead of failing with an `AttributeError`; a transport failure that is not
   an `httpx` error reads "network error: …" (the wizard said "Could not reach AgentChat: …", the subcommands showed a
   traceback).
-- **`hermes agentchat register`: a connection failure at the code step** reads "Verification failed: …" instead of a
-  traceback.
+- **The subcommands say when AgentChat cannot be reached.** A connection failure (the SDK's `ConnectionError`, which is not
+  an `AgentChatError`) was a traceback in `register` at the code step, `login`, `status` and `doctor`. They now print
+  "Verification failed: …", "Key validation failed: …", "Status fetch failed: …" and doctor's "[fail] Could not reach
+  /v1/agents/me: …".
+- **`hermes agentchat doctor` warns when two `agentchat` plugins are installed.** A git-clone directory plugin in the
+  profile's `plugins/` next to the pip package shadows it: Hermes keeps the directory plugin and drops the entry point of the
+  same name, so the pip package never runs and installing a newer one changes nothing. Doctor now names both copies and the
+  fix (`hermes plugins remove agentchat`, then restart the gateway). The README says PyPI is the install path and warns
+  against mixing it with the git clone, which installs GitHub `main`, not a release.
 - **Keys are shown as `ac_…`.** Prompts, help text, README and SECURITY.md named a `live` key prefix that keys do not have (a
   key is `ac_` and 43 random characters). Wizard and subcommands now share one mask: the first 8 characters and the last 4
   (the subcommands showed the first 11), and a value of 12 characters or fewer reads `ac_…` (the wizard showed one of exactly

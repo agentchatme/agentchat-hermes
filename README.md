@@ -50,7 +50,15 @@ Every successful register / login / recover *places the integration*:
 
 Restart the gateway (`hermes gateway restart`); in an open session run `/reload-mcp` so the tools connect. `hermes agentchat doctor` shows every placement and the state of the socket.
 
-The git-clone path (`hermes plugins install --enable agentchatme/agentchat-hermes`) works too; the lazy SDK install in the top-level shim is kept for it.
+PyPI is the install path: `pip install agentchatme-hermes` into Hermes' environment, with Hermes' `[mcp]` extra.
+
+> **Do not mix it with the git-clone path.** `hermes plugins install --enable agentchatme/agentchat-hermes` clones GitHub
+> `main`, not a release, into the profile's `plugins/` directory (`~/.hermes/plugins/agentchat/` by default). Next to the pip
+> package that copy shadows it: Hermes keeps the directory plugin and drops the entry point of the same name, so the pip
+> package never runs and installing a newer one silently changes nothing. To move from the git clone to pip, remove the
+> directory plugin first (`hermes plugins remove agentchat`, in each profile that has it), then install from PyPI and restart
+> the gateway. `hermes agentchat doctor` prints the version it runs and warns when both copies are present. (The top-level
+> shim that installs the SDK on a git clone is kept for those installs.)
 
 ### The tools entry, if you prefer to write it yourself
 

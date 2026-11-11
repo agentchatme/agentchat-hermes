@@ -375,3 +375,73 @@ class TestDoctorClientHeader:
     def test_hand_written_entry_with_the_header_is_fine(self, monkeypatch: Any, capsys: Any) -> None:
         out = self._run(monkeypatch, capsys, "user_managed", "current")
         assert "does not say it is Hermes" not in out
+
+
+class TestDoctorTwoPlugins:
+    """A git-clone directory plugin next to the pip package shadows it:
+    Hermes keeps the directory plugin and drops the same-named entry point,
+    so upgrading the pip package silently changes nothing."""
+
+    @staticmethod
+    def _entry_points(monkeypatch: Any, names: list[str]) -> None:
+        from importlib import metadata
+        from types import SimpleNamespace
+
+        class _Found:
+            def select(self, *, group: str) -> list[Any]:
+                return [SimpleNamespace(name=n) for n in names] if group == "hermes_agent.plugins" else []
+
+        monkeypatch.setattr(metadata, "entry_points", lambda: _Found())
+        monkeypatch.setattr(metadata, "version", lambda name: "0.5.1")
+
+    @staticmethod
+    def _directory_plugin(home: Any, name: str, manifest_name: str) -> Any:
+        directory = home / "plugins" / name
+        directory.mkdir(parents=True)
+        (directory / "plugin.yaml").write_text(f"name: {manifest_name}\nversion: 0.4.0\n", encoding="utf-8")
+        return directory
+
+    def test_finds_the_directory_plugin_and_the_pip_entry_point(self, monkeypatch: Any, tmp_path: Any) -> None:
+        from agentchatme_hermes import cli
+
+        self._entry_points(monkeypatch, ["agentchat", "other"])
+        ours = self._directory_plugin(tmp_path, "agentchat", "agentchat")
+        self._directory_plugin(tmp_path, "weather", "weather")
+        (tmp_path / "plugins" / "broken").mkdir()
+        assert cli._plugin_copies(tmp_path) == ([ours], "0.5.1")
+
+    def test_no_plugins_dir_and_no_entry_point(self, monkeypatch: Any, tmp_path: Any) -> None:
+        from agentchatme_hermes import cli
+
+        self._entry_points(monkeypatch, ["other"])
+        assert cli._plugin_copies(tmp_path) == ([], None)
+
+    def _doctor(self, monkeypatch: Any, capsys: Any, home: Any) -> str:
+        import argparse
+
+        from agentchatme_hermes import cli, profile_scope
+
+        monkeypatch.setattr(profile_scope, "resolve_hermes_home", lambda: home)
+        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: None)
+        cli._dispatch_doctor(argparse.Namespace(fix=False))
+        return str(capsys.readouterr().out)
+
+    def test_doctor_warns_on_two_copies_with_the_fix(self, monkeypatch: Any, capsys: Any, tmp_path: Any) -> None:
+        self._entry_points(monkeypatch, ["agentchat"])
+        self._directory_plugin(tmp_path, "agentchat", "agentchat")
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "[warn] two agentchat plugins in this profile" in out
+        assert "agentchatme-hermes 0.5.1 from pip" in out
+        assert "`hermes plugins remove agentchat`" in out
+
+    def test_doctor_notes_a_directory_only_install(self, monkeypatch: Any, capsys: Any, tmp_path: Any) -> None:
+        self._entry_points(monkeypatch, [])
+        self._directory_plugin(tmp_path, "agentchat", "agentchat")
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "[ok]   installed as a directory plugin" in out
+        assert "two agentchat plugins" not in out
+
+    def test_pip_only_says_nothing_extra(self, monkeypatch: Any, capsys: Any, tmp_path: Any) -> None:
+        self._entry_points(monkeypatch, ["agentchat"])
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "directory plugin" not in out

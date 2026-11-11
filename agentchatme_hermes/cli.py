@@ -520,6 +520,22 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     hermes_home = resolve_hermes_home()
     ok(f"Profile: {profile_label(hermes_home)} ({hermes_home})")
 
+    directory_copies, pip_version = _plugin_copies(hermes_home)
+    if directory_copies and pip_version is not None:
+        warn(
+            f"two agentchat plugins in this profile: the directory plugin at {directory_copies[0]} "
+            f"(a git clone: GitHub main, not a release) and agentchatme-hermes {pip_version} from "
+            "pip. Hermes loads the directory plugin and drops the same-named pip entry point, so "
+            "the pip package never runs and installing a newer one changes nothing. Keep one: "
+            "`hermes plugins remove agentchat` removes the directory plugin; then restart the "
+            "gateway (`hermes gateway restart`)"
+        )
+    elif directory_copies:
+        ok(
+            f"installed as a directory plugin at {directory_copies[0]} (a git clone of GitHub "
+            "main, not a release)"
+        )
+
     from .config import ENV_INTEGRATION, ENV_INTEGRATION_LEGACY, INTEGRATION_OFF
 
     for env_name in (ENV_INTEGRATION, ENV_INTEGRATION_LEGACY):
@@ -1403,6 +1419,50 @@ def _print_status(me: dict[str, Any]) -> None:
 
 
 # ───────────────────────── I/O glue ─────────────────────────
+
+
+_PLUGIN_NAME_LINE = re.compile(r"^name:\s*['\"]?agentchat['\"]?\s*$", re.MULTILINE)
+
+
+def _plugin_copies(hermes_home: Path) -> tuple[list[Path], str | None]:
+    """The ``agentchat`` plugins Hermes can find for this profile.
+
+    Returns the directory plugins named ``agentchat`` under the profile's
+    ``plugins/`` (a ``hermes plugins install`` git clone), and the version
+    of the pip distribution when its ``agentchat`` entry point is installed
+    (else ``None``). Hermes keeps a directory plugin and drops an entry
+    point with the same name, so with both present the pip package never
+    runs. Never raises.
+    """
+    directories: list[Path] = []
+    plugins_dir = hermes_home / "plugins"
+    try:
+        candidates = sorted(path for path in plugins_dir.iterdir() if path.is_dir())
+    except OSError:
+        candidates = []
+    for candidate in candidates:
+        try:
+            manifest = (candidate / "plugin.yaml").read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        if _PLUGIN_NAME_LINE.search(manifest):
+            directories.append(candidate)
+
+    from importlib import metadata
+
+    try:
+        found: Any = metadata.entry_points()
+        select = getattr(found, "select", None)
+        group = select(group="hermes_agent.plugins") if callable(select) else found.get("hermes_agent.plugins", ())
+        has_entry_point = any(getattr(ep, "name", None) == "agentchat" for ep in group)
+    except Exception:
+        has_entry_point = False
+    if not has_entry_point:
+        return directories, None
+    try:
+        return directories, metadata.version("agentchatme-hermes")
+    except metadata.PackageNotFoundError:
+        return directories, "(version unknown)"
 
 
 def _printline(message: str) -> None:
