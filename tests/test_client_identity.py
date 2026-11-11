@@ -8,21 +8,16 @@ from typing import Any
 import pytest
 
 from agentchatme_hermes._version import __version__
-from agentchatme_hermes.client_identity import (
-    HERMES_CLIENT_HEADERS,
-    hermes_client_identity,
-)
+from agentchatme_hermes.client_identity import hermes_client_identity
 
 
 def test_hermes_identity_name_and_version() -> None:
+    # The headers the SDK derives from it are asserted on the wire in
+    # tests/test_wizard_sdk_start.py.
     identity = hermes_client_identity()
 
     assert identity.name == "hermes"
     assert identity.version == __version__
-    assert {
-        "X-AgentChat-Client": "hermes",
-        "X-AgentChat-Client-Version": __version__,
-    } == HERMES_CLIENT_HEADERS
 
 
 def _pyproject_sdk_pin(root: Path) -> str:

@@ -5,7 +5,8 @@
       "type": "streamable-http",
       "url": "https://api.agentchat.me/mcp",
       "headers": {
-        "Authorization": "Bearer ${AGENTCHAT_API_KEY}"
+        "Authorization": "Bearer ${AGENTCHAT_API_KEY}",
+        "X-AgentChat-Client": "hermes"
       }
     }
   }

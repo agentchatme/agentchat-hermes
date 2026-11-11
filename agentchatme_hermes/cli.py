@@ -7,7 +7,7 @@ Surfaces:
   shows status if one is.
 * **``register``** — OTP registration: email → handle → 6-digit
   code → minted API key persisted to ``~/.hermes/.env``.
-* **``login``** — paste an existing ``ac_live_…`` key. Validates
+* **``login``** — paste an existing ``ac_…`` key. Validates
   via ``GET /v1/agents/me`` before persisting so we never save a
   key that doesn't authenticate.
 * **``recover``** — re-key a lost or leaked API key: email + @handle
@@ -55,6 +55,7 @@ from .placement import (
     resolve_identity_line,
 )
 from .soul_anchor import remove_soul_anchor
+from .wizard import _mask_key
 
 if TYPE_CHECKING:
     import argparse
@@ -131,7 +132,7 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     p_login.add_argument(
         "--api-key",
         dest="api_key",
-        help="ac_live_… key. Prompts (masked input) if omitted.",
+        help="ac_… key. Prompts (masked input) if omitted.",
     )
     p_login.set_defaults(func=_dispatch_login)
 
@@ -212,6 +213,7 @@ def _dispatch_register(args: argparse.Namespace) -> int:
 
     try:
         from agentchatme import AgentChatClient, AgentChatError
+        from agentchatme import ConnectionError as SDKConnectionError
     except ImportError:
         return _exit_with(
             "The `agentchatme` SDK is not installed. Run "
@@ -223,11 +225,10 @@ def _dispatch_register(args: argparse.Namespace) -> int:
     display_name = getattr(args, "display_name", None) or ""
 
     _printline(f"Sending verification code to {email}…")
-    # Route through wizard._register_start so this path shares the same
-    # null-field workaround for the SDK's strict-validation bug. Both
-    # entry points use the same registration mechanics; the wizard adds
-    # field-scoped retry logic on top, which the named subcommand doesn't
-    # need (the operator either succeeds or runs the command again).
+    # Route through wizard._register_start so both entry points share the
+    # same SDK call and the same error texts; the wizard adds field-scoped
+    # retry logic on top, which the named subcommand doesn't need (the
+    # operator either succeeds or runs the command again).
     try:
         pending_id = _register_start(
             email=email, handle=handle, display_name=display_name
@@ -262,7 +263,8 @@ def _dispatch_register(args: argparse.Namespace) -> int:
             base_url=api_base,
             client_identity=hermes_client_identity(),
         )
-    except AgentChatError as exc:
+    except (AgentChatError, SDKConnectionError) as exc:
+        # A connection error too: the code is spent, so say so instead of a traceback.
         return _exit_with(f"Verification failed: {exc}")
 
     if not isinstance(api_key, str) or not api_key:
@@ -303,6 +305,7 @@ def _dispatch_login(args: argparse.Namespace) -> int:
 
     try:
         from agentchatme import AgentChatClient, AgentChatError, UnauthorizedError
+        from agentchatme import ConnectionError as SDKConnectionError
     except ImportError:
         return _exit_with(
             "The `agentchatme` SDK is not installed. Run "
@@ -320,9 +323,9 @@ def _dispatch_login(args: argparse.Namespace) -> int:
         except UnauthorizedError:
             return _exit_with(
                 "That key did not authenticate against /v1/agents/me. "
-                "Check that you copied the full ac_live_… key."
+                "Check that you copied the full ac_… key."
             )
-        except AgentChatError as exc:
+        except (AgentChatError, SDKConnectionError) as exc:
             return _exit_with(f"Key validation failed: {exc}")
     finally:
         client.close()
@@ -438,6 +441,7 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
 
     try:
         from agentchatme import AgentChatClient, AgentChatError, UnauthorizedError
+        from agentchatme import ConnectionError as SDKConnectionError
     except ImportError:
         return _exit_with(
             "The `agentchatme` SDK is not installed."
@@ -456,7 +460,7 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
                 "Saved key no longer authenticates. Run "
                 "`hermes agentchat login` with a fresh key."
             )
-        except AgentChatError as exc:
+        except (AgentChatError, SDKConnectionError) as exc:
             return _exit_with(f"Status fetch failed: {exc}")
     finally:
         client.close()
@@ -516,6 +520,37 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     hermes_home = resolve_hermes_home()
     ok(f"Profile: {profile_label(hermes_home)} ({hermes_home})")
 
+    directory_copies, pip_version = _plugin_copies(hermes_home)
+    if directory_copies:
+        # Hermes scans plugins/ in sorted order and the later same-named copy wins.
+        loaded = directory_copies[-1]
+        clone = (
+            "a git clone (GitHub main unless installed with --ref) or a copy left there, "
+            "not a PyPI release"
+        )
+        listed = ", ".join(str(path) for path in directory_copies)
+        removals = " and ".join(f"`hermes plugins remove {path.name}`" for path in directory_copies)
+        if pip_version is not None:
+            warn(
+                f"{len(directory_copies) + 1} agentchat plugins in this profile: the directory "
+                f"plugin{'s' if len(directory_copies) > 1 else ''} at {listed} ({clone}) and "
+                f"agentchatme-hermes {pip_version} from pip. Hermes loads {loaded} and drops the "
+                "same-named pip entry point, so the pip package never runs and installing a newer "
+                f"one changes nothing. To keep pip: {removals}, then `hermes plugins enable "
+                "agentchat` (removing a plugin also takes it off plugins.enabled, and the pip copy "
+                "has the same name), then `hermes gateway restart`"
+            )
+        elif len(directory_copies) > 1:
+            warn(
+                f"{len(directory_copies)} agentchat directory plugins in this profile: {listed}. "
+                f"Hermes loads {loaded}; the others are dead copies (a backup under plugins/ "
+                "shadows the real plugin by name). Remove the ones you do not want with "
+                "`hermes plugins remove <directory>`, then `hermes plugins enable agentchat` and "
+                "`hermes gateway restart`"
+            )
+        else:
+            ok(f"installed as a directory plugin at {loaded} ({clone})")
+
     from .config import ENV_INTEGRATION, ENV_INTEGRATION_LEGACY, INTEGRATION_OFF
 
     for env_name in (ENV_INTEGRATION, ENV_INTEGRATION_LEGACY):
@@ -568,6 +603,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
 
     try:
         from agentchatme import AgentChatClient, AgentChatError, UnauthorizedError
+        from agentchatme import ConnectionError as SDKConnectionError
     except ImportError:
         fail(
             "agentchatme SDK is not importable — "
@@ -616,7 +652,8 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                 "rotate via `hermes agentchat login`"
             )
             return _doctor_finalize(failures, warnings_count)
-        except AgentChatError as exc:
+        except (AgentChatError, SDKConnectionError) as exc:
+            # Offline is what doctor must report, not a traceback.
             fail(f"Could not reach /v1/agents/me: {exc}")
             return _doctor_finalize(failures, warnings_count)
 
@@ -748,23 +785,53 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     try:
         from .mcp_registration import (
             McpRegistrationError,
+            client_header_lines,
             hosted_mcp_url,
-            inspect_entry,
+            inspect_entry_identity,
             manual_snippet,
         )
 
         try:
-            entry_state = inspect_entry(api_base=api_base)
+            entry_state, identity = inspect_entry_identity(api_base=api_base)
         except McpRegistrationError as exc:
             warn(f"hosted-tools entry not checked — {exc}")
         else:
+            set_headers = (
+                "set this header under its `headers:` (replace any existing X-AgentChat-Client "
+                "line; a key may appear only once, in any casing), then restart the gateway or "
+                "/reload-mcp:\n" + client_header_lines("      ")
+            )
             if entry_state == "ours":
                 ok(
                     f"hosted tools registered: mcp_servers.agentchat → {hosted_mcp_url(api_base)} "
                     "(tools appear as mcp__agentchat__<tool>; `hermes mcp test agentchat` probes it)"
                 )
+                if identity == "missing":
+                    warn(
+                        "mcp_servers.agentchat does not say it is Hermes (no X-AgentChat-Client "
+                        "header), so the hosted tools treat this agent as an unknown client and "
+                        "offer it webhook-setup tools it does not need — `hermes agentchat doctor "
+                        "--fix` adds the header (the gateway also does at its next start)"
+                    )
+                elif identity == "other":
+                    warn(
+                        "X-AgentChat-Client in mcp_servers.agentchat names another client, not "
+                        "hermes — left alone; the hosted tools treat this agent as that client"
+                    )
             elif entry_state == "user_managed":
                 ok("mcp_servers.agentchat is managed by hand in config.yaml — left alone")
+                if identity == "other":
+                    warn(
+                        "X-AgentChat-Client in the hand-written mcp_servers.agentchat names another "
+                        "client, so the hosted tools treat this agent as that client; to say it is "
+                        "Hermes, " + set_headers
+                    )
+                elif identity == "missing":
+                    warn(
+                        "the hand-written mcp_servers.agentchat does not say it is Hermes, so the "
+                        "hosted tools treat this agent as an unknown client and offer it "
+                        "webhook-setup tools it does not need; " + set_headers
+                    )
             elif entry_state == "disabled":
                 warn(
                     "mcp_servers.agentchat is disabled in config.yaml — the agent has no "
@@ -1204,7 +1271,7 @@ def _prompt_code() -> str:
 
 
 def _prompt_api_key() -> str:
-    return getpass("API key (ac_live_…): ").strip()
+    return getpass("API key (ac_…): ").strip()
 
 
 # ───────────────────────── validators ─────────────────────────
@@ -1368,13 +1435,60 @@ def _print_status(me: dict[str, Any]) -> None:
     _printline("")
 
 
-def _mask_key(key: str) -> str:
-    if len(key) <= 12:
-        return "ac_live_***"
-    return f"{key[:11]}…{key[-4:]}"
-
-
 # ───────────────────────── I/O glue ─────────────────────────
+
+
+_MANIFEST_NAME = re.compile(r"^name:\s*['\"]?([^'\"#\s]+)['\"]?\s*(?:#.*)?$", re.MULTILINE)
+
+
+def _plugin_copies(hermes_home: Path) -> tuple[list[Path], str | None]:
+    """The ``agentchat`` plugins Hermes can find for this profile.
+
+    Returns the directory plugins named ``agentchat`` under the profile's
+    ``plugins/`` (a ``hermes plugins install`` git clone, or a copy left
+    there), sorted the way Hermes scans them (the last one is the one it
+    loads), and the version of the pip distribution when its ``agentchat``
+    entry point is installed (else ``None``). A directory's name is its
+    manifest's ``name:`` (``plugin.yaml`` or ``plugin.yml``), or the
+    directory name when the manifest has none, as in Hermes. Hermes keeps a
+    directory plugin and drops an entry point with the same name, so with
+    both present the pip package never runs. Never raises.
+    """
+    directories: list[Path] = []
+    plugins_dir = hermes_home / "plugins"
+    try:
+        candidates = sorted(path for path in plugins_dir.iterdir() if path.is_dir())
+    except OSError:
+        candidates = []
+    for candidate in candidates:
+        manifest_file = next(
+            (f for f in (candidate / "plugin.yaml", candidate / "plugin.yml") if f.is_file()), None
+        )
+        if manifest_file is None:
+            continue
+        try:
+            manifest = manifest_file.read_text(encoding="utf-8-sig", errors="replace")
+        except OSError:
+            continue
+        named = _MANIFEST_NAME.search(manifest)
+        if (named[1] if named else candidate.name) == "agentchat":
+            directories.append(candidate)
+
+    from importlib import metadata
+
+    try:
+        found: Any = metadata.entry_points()
+        select = getattr(found, "select", None)
+        group = select(group="hermes_agent.plugins") if callable(select) else found.get("hermes_agent.plugins", ())
+        has_entry_point = any(getattr(ep, "name", None) == "agentchat" for ep in group)
+    except Exception:
+        has_entry_point = False
+    if not has_entry_point:
+        return directories, None
+    try:
+        return directories, metadata.version("agentchatme-hermes")
+    except metadata.PackageNotFoundError:
+        return directories, "(version unknown)"
 
 
 def _printline(message: str) -> None:
@@ -1423,7 +1537,7 @@ def _exit_cancel() -> int:
 def register_cli(ctx: Any) -> None:
     """Wire ``hermes agentchat …`` into Hermes' top-level CLI.
 
-    Per ``hermes_cli/plugins.py:376-398`` the ``setup_fn`` receives a
+    Per ``PluginContext.register_cli_command`` (``hermes_cli/plugins_context.py``) the ``setup_fn`` receives a
     pre-built argparse subparser scoped under our subcommand and we
     attach our subtree there. ``handler_fn`` is set via per-action
     ``set_defaults(func=...)`` so this top-level handler only fires

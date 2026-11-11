@@ -5,10 +5,14 @@ When a user runs::
     hermes plugins install --enable agentchatme/agentchat-hermes
 
 Hermes ``git clone``s this repo into ``~/.hermes/plugins/agentchat/``
-and loads THIS file as ``hermes_plugins.agentchat`` via
-:meth:`hermes_cli.plugins.PluginManager._load_directory_module`.
-``hermes plugins install`` does NOT pip-install our dependencies,
-only clones the repo. So this module owns two jobs:
+and loads THIS file through its directory-module loader
+(``hermes_cli/plugins_loader.py``; the module is ``hermes_plugins.agentchat``
+for the first profile, a per-profile name for others). Older Hermes
+releases only clone the repo; current ones ask before installing the
+declared Python dependencies at install, reinstall or update
+(``--yes-deps`` when headless) and leave the plugin disabled on a no.
+Either way the SDK may be missing or too old, so this module owns two
+jobs:
 
 1. Lazy-install ``agentchatme`` if the import fails, or upgrade one older
    than the release with the integration kit (mirrors the self-bootstrap

@@ -143,7 +143,13 @@ class TestResolveIdentityLine:
 class TestMcpStep:
     @pytest.mark.parametrize(
         ("outcome", "status"),
-        [("added", "changed"), ("present", "ok"), ("user_managed", "skipped"), ("disabled", "skipped")],
+        [
+            ("added", "changed"),
+            ("upgraded", "changed"),
+            ("present", "ok"),
+            ("user_managed", "skipped"),
+            ("disabled", "skipped"),
+        ],
     )
     def test_outcomes_map_to_statuses(
         self, monkeypatch: pytest.MonkeyPatch, outcome: str, status: str
@@ -151,6 +157,14 @@ class TestMcpStep:
         monkeypatch.setattr(placement, "install_entry", lambda *, api_base: outcome)
         step = placement.place_mcp("https://api.example.test")
         assert step.name == "mcp" and step.status == status
+
+    def test_an_upgraded_entry_says_what_changed_and_when_it_is_used(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(placement, "install_entry", lambda *, api_base: "upgraded")
+        detail = placement.place_mcp("https://api.example.test").detail
+        assert "X-AgentChat-Client: hermes" in detail
+        assert "gateway restart" in detail and "/reload-mcp" in detail
 
     def test_registration_error_is_a_failed_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def boom(*, api_base: str) -> str:

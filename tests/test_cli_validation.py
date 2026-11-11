@@ -7,6 +7,8 @@ for low signal — the validators below are the load-bearing logic.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from fake_keys import api_key
 
@@ -206,6 +208,11 @@ class TestDoctor:
         fake_sdk.AgentChatClientIdentity = MagicMock  # type: ignore[attr-defined]
         fake_sdk.AgentChatError = Exception  # type: ignore[attr-defined]
         fake_sdk.UnauthorizedError = Exception  # type: ignore[attr-defined]
+
+        class _ConnectionError(Exception):
+            pass
+
+        fake_sdk.ConnectionError = _ConnectionError  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "agentchatme", fake_sdk)  # type: ignore[attr-defined]
 
         # SOUL anchor + gateway check — let the soul_anchor module work
@@ -219,7 +226,7 @@ class TestDoctor:
         # check would read this test machine's config.yaml.
         from agentchatme_hermes import kit, mcp_registration
 
-        monkeypatch.setattr(mcp_registration, "inspect_entry", lambda **_kw: "ours")  # type: ignore[attr-defined]
+        monkeypatch.setattr(mcp_registration, "inspect_entry_identity", lambda **_kw: ("ours", "current"))  # type: ignore[attr-defined]
         # The SDK stand-in above has no kit; a clean install has it.
         monkeypatch.setattr(kit, "kit_problem", lambda: None)  # type: ignore[attr-defined]
 
@@ -298,3 +305,183 @@ class TestDoctorHermesMcpClient:
 
         monkeypatch.setattr(importlib, "import_module", fake_import)  # type: ignore[attr-defined]
         assert cli._hermes_mcp_client_importable() is True
+
+
+class TestDoctorClientHeader:
+    """The hosted-tools entry must say it is Hermes (``X-AgentChat-Client``),
+    or the hosted tools treat the agent as an unknown client and offer it the
+    wake-webhook tools a socket integration does not need."""
+
+    @staticmethod
+    def _run(monkeypatch: Any, capsys: Any, state: str, identity: str | None) -> str:
+        import argparse
+        import sys
+        import types as _types
+        from unittest.mock import MagicMock
+
+        from agentchatme_hermes import cli, kit, mcp_registration
+
+        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: (api_key("xyz"), cli._ENV_API_KEY))
+        fake_client = MagicMock()
+        fake_client.get_me.return_value = {"handle": "alice", "status": "active"}
+        fake_sdk = _types.ModuleType("agentchatme")
+        fake_sdk.AgentChatClient = MagicMock(return_value=fake_client)  # type: ignore[attr-defined]
+        fake_sdk.AgentChatClientIdentity = MagicMock  # type: ignore[attr-defined]
+        fake_sdk.AgentChatError = Exception  # type: ignore[attr-defined]
+        fake_sdk.UnauthorizedError = Exception  # type: ignore[attr-defined]
+
+        class _ConnectionError(Exception):
+            pass
+
+        fake_sdk.ConnectionError = _ConnectionError  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "agentchatme", fake_sdk)
+        monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)
+        monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)
+        monkeypatch.setattr(kit, "kit_problem", lambda: None)
+        monkeypatch.setattr(mcp_registration, "inspect_entry_identity", lambda **_kw: (state, identity))
+        cli._dispatch_doctor(argparse.Namespace(fix=False))
+        return str(capsys.readouterr().out)
+
+    def test_current_entry_has_no_header_warning(self, monkeypatch: Any, capsys: Any) -> None:
+        out = self._run(monkeypatch, capsys, "ours", "current")
+        assert "hosted tools registered" in out
+        assert "X-AgentChat-Client" not in out
+
+    def test_entry_from_an_earlier_release_warns_with_the_fix(self, monkeypatch: Any, capsys: Any) -> None:
+        out = self._run(monkeypatch, capsys, "ours", "missing")
+        assert "[warn] mcp_servers.agentchat does not say it is Hermes" in out
+        assert "doctor --fix" in out
+
+    def test_another_client_name_is_left_alone_and_said(self, monkeypatch: Any, capsys: Any) -> None:
+        out = self._run(monkeypatch, capsys, "ours", "other")
+        assert "names another client, not hermes — left alone" in out
+
+    def test_hand_written_entry_without_the_header_says_what_to_add(
+        self, monkeypatch: Any, capsys: Any
+    ) -> None:
+        out = self._run(monkeypatch, capsys, "user_managed", "missing")
+        assert "managed by hand in config.yaml — left alone" in out
+        assert "the hand-written mcp_servers.agentchat does not say it is Hermes" in out
+        assert "replace any existing X-AgentChat-Client line; a key may appear only once, in any casing" in out
+        # The README entry's indent, under `headers:`; static, no version.
+        assert '\n      X-AgentChat-Client: "hermes"\n' in out
+        assert "X-AgentChat-Client-Version" not in out
+
+    def test_hand_written_entry_naming_another_client(self, monkeypatch: Any, capsys: Any) -> None:
+        out = self._run(monkeypatch, capsys, "user_managed", "other")
+        assert "names another client" in out
+        assert "does not say it is Hermes" not in out
+        assert '      X-AgentChat-Client: "hermes"' in out
+
+    def test_hand_written_entry_with_the_header_is_fine(self, monkeypatch: Any, capsys: Any) -> None:
+        out = self._run(monkeypatch, capsys, "user_managed", "current")
+        assert "does not say it is Hermes" not in out
+
+
+class TestDoctorTwoPlugins:
+    """A git-clone directory plugin next to the pip package shadows it:
+    Hermes keeps the directory plugin and drops the same-named entry point,
+    so upgrading the pip package silently changes nothing."""
+
+    @staticmethod
+    def _entry_points(monkeypatch: Any, names: list[str], *, as_dict: bool = False) -> None:
+        """``entry_points()`` as 3.10+ returns it (``.select``), or as 3.9's dict."""
+        from importlib import metadata
+        from types import SimpleNamespace
+
+        eps = [SimpleNamespace(name=n) for n in names]
+
+        class _Found:
+            def select(self, *, group: str) -> list[Any]:
+                return eps if group == "hermes_agent.plugins" else []
+
+        found: Any = {"hermes_agent.plugins": eps} if as_dict else _Found()
+        monkeypatch.setattr(metadata, "entry_points", lambda: found)
+        monkeypatch.setattr(metadata, "version", lambda name: "0.5.1")
+
+    @staticmethod
+    def _directory_plugin(
+        home: Any, name: str, manifest: str, *, filename: str = "plugin.yaml", encoding: str = "utf-8"
+    ) -> Any:
+        directory = home / "plugins" / name
+        directory.mkdir(parents=True)
+        (directory / filename).write_text(manifest, encoding=encoding)
+        return directory
+
+    def test_finds_the_directory_plugin_and_the_pip_entry_point(self, monkeypatch: Any, tmp_path: Any) -> None:
+        from agentchatme_hermes import cli
+
+        self._entry_points(monkeypatch, ["agentchat", "other"])
+        ours = self._directory_plugin(tmp_path, "agentchat", "name: agentchat\nversion: 0.4.0\n")
+        self._directory_plugin(tmp_path, "weather", "name: weather\n")
+        (tmp_path / "plugins" / "broken").mkdir()
+        assert cli._plugin_copies(tmp_path) == ([ours], "0.5.1")
+
+    def test_manifest_shapes_hermes_accepts(self, monkeypatch: Any, tmp_path: Any) -> None:
+        from agentchatme_hermes import cli
+
+        self._entry_points(monkeypatch, [], as_dict=True)  # Python 3.9's entry_points()
+        a = self._directory_plugin(tmp_path, "a-yml", "name: agentchat\n", filename="plugin.yml")
+        b = self._directory_plugin(tmp_path, "b-comment", "name: 'agentchat'  # the integration\n")
+        c = self._directory_plugin(tmp_path, "c-bom", "name: agentchat\n", encoding="utf-8-sig")
+        d = self._directory_plugin(tmp_path, "agentchat", "version: 0.3.0\n")  # no name: the directory's
+        self._directory_plugin(tmp_path, "e-other", "name: agentchat-extra\n")
+        assert cli._plugin_copies(tmp_path) == (sorted([a, b, c, d]), None)
+
+    def test_no_plugins_dir_and_no_entry_point(self, monkeypatch: Any, tmp_path: Any) -> None:
+        from agentchatme_hermes import cli
+
+        self._entry_points(monkeypatch, ["other"])
+        assert cli._plugin_copies(tmp_path) == ([], None)
+
+    def _doctor(self, monkeypatch: Any, capsys: Any, home: Any) -> str:
+        import argparse
+
+        from agentchatme_hermes import cli, profile_scope
+
+        monkeypatch.setattr(profile_scope, "resolve_hermes_home", lambda: home)
+        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: None)
+        cli._dispatch_doctor(argparse.Namespace(fix=False))
+        return str(capsys.readouterr().out)
+
+    def test_doctor_warns_on_two_copies_with_the_fix(self, monkeypatch: Any, capsys: Any, tmp_path: Any) -> None:
+        self._entry_points(monkeypatch, ["agentchat"])
+        self._directory_plugin(tmp_path, "agentchat", "name: agentchat\n")
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "[warn] 2 agentchat plugins in this profile" in out
+        assert "agentchatme-hermes 0.5.1 from pip" in out
+        # Removal also takes agentchat off plugins.enabled; the pip copy needs it back.
+        assert (
+            "`hermes plugins remove agentchat`, then `hermes plugins enable agentchat`" in out
+        )
+        assert "`hermes gateway restart`" in out
+
+    def test_doctor_names_the_copy_hermes_loads(self, monkeypatch: Any, capsys: Any, tmp_path: Any) -> None:
+        self._entry_points(monkeypatch, ["agentchat"])
+        self._directory_plugin(tmp_path, "agentchat", "name: agentchat\n")
+        backup = self._directory_plugin(tmp_path, "agentchat.bak", "name: agentchat\n")
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "[warn] 3 agentchat plugins in this profile" in out
+        assert f"Hermes loads {backup}" in out
+        assert "`hermes plugins remove agentchat` and `hermes plugins remove agentchat.bak`" in out
+
+    def test_two_directory_copies_without_pip_warn(self, monkeypatch: Any, capsys: Any, tmp_path: Any) -> None:
+        self._entry_points(monkeypatch, [])
+        self._directory_plugin(tmp_path, "agentchat", "name: agentchat\n")
+        backup = self._directory_plugin(tmp_path, "agentchat.bak", "name: agentchat\n")
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "[warn] 2 agentchat directory plugins in this profile" in out
+        assert f"Hermes loads {backup}" in out
+
+    def test_doctor_notes_a_directory_only_install(self, monkeypatch: Any, capsys: Any, tmp_path: Any) -> None:
+        self._entry_points(monkeypatch, [])
+        self._directory_plugin(tmp_path, "agentchat", "name: agentchat\n")
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "[ok]   installed as a directory plugin" in out
+        assert "unless installed with --ref" in out
+        assert "agentchat plugins in this profile" not in out
+
+    def test_pip_only_says_nothing_extra(self, monkeypatch: Any, capsys: Any, tmp_path: Any) -> None:
+        self._entry_points(monkeypatch, ["agentchat"])
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "directory plugin" not in out

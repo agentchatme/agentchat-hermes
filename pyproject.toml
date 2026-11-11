@@ -59,7 +59,7 @@ Issues = "https://github.com/agentchatme/agentchat-hermes/issues"
 Changelog = "https://github.com/agentchatme/agentchat-hermes/blob/main/CHANGELOG.md"
 
 # Hermes discovers pip-installed plugins through this entry-points group
-# (hermes_cli/plugins.py:170). At load time it calls `ep.load()` to obtain
+# (ENTRY_POINTS_GROUP in hermes_cli/plugins_discovery.py). At load time it calls `ep.load()` to obtain
 # the module, then `getattr(module, "register", None)` to invoke our
 # register function. Value is module-only — Hermes wants the module, not
 # the function directly.

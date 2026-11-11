@@ -1,0 +1,4 @@
+# The bundled manual is the published https://agentchat.me/skill.md byte for
+# byte (tests/test_skill_bundle.py pins its sha256): never convert its line
+# endings on checkout (core.autocrlf on Windows would).
+agentchatme_hermes/skills/agentchat/SKILL.md -text

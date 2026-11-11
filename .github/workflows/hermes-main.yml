@@ -1,17 +1,33 @@
 name: hermes-main
 
-# The test suite against Hermes Agent's main branch, every night.
+# The test suite against Hermes Agent, every night: its main branch and its
+# latest release.
 #
 # The CI gate (ci.yml) runs without Hermes installed: Hermes is stubbed, so it
 # proves this package, not that Hermes still has what the package imports.
-# This workflow installs hermes-agent from main exactly the way Hermes' own CI
-# does (`uv sync --locked` from its uv.lock, Python 3.14), adds this package
-# to that environment, and runs the whole suite. With Hermes present the
+# This workflow installs hermes-agent exactly the way Hermes' own CI does
+# (`uv sync --locked` from its uv.lock, Python 3.14), adds this package to
+# that environment, and runs the whole suite. With Hermes present the
 # contract tests in tests/test_hermes_contract.py run too: every internal
 # surface the plugin touches (docs/hermes-coupling.md), plus a real AIAgent
 # turn stopped by the time limit and a real ctx.llm call, both against a
-# localhost model stub. A red run means Hermes main changed something the
-# next Hermes release would break here; nothing is published or changed.
+# localhost model stub.
+#
+# Two legs. `main`: a red leg means Hermes main changed something the next
+# Hermes release would break here. `latest release`: the newest hermes-agent
+# release that is neither a draft nor a pre-release, looked up at run time
+# from its GitHub releases — what users run today; a red leg means this
+# package's main fails on it. Nothing is published or changed.
+#
+# Alerting: a red scheduled run opens one issue, or comments on the open one,
+# and the next green scheduled run closes it (.github/scripts/nightly-issue.sh,
+# with the GITHUB_TOKEN; no secret needed). A dispatch reports only with
+# report_issue, to its own "dispatch test" issue, so it never closes the real
+# one. Slack is an extra channel that does nothing until a
+# SLACK_WEBHOOK_WARNING secret exists.
+#
+# If the latest release cannot be looked up, `main` is still tested and the
+# release leg fails, so the night is red rather than empty.
 #
 # Actions are pinned to commits (the version is in the trailing comment), as
 # in publish.yml. setup-uv and the uv version are the ones Hermes' tests.yml
@@ -23,25 +39,79 @@ on:
   workflow_dispatch:
     inputs:
       hermes_ref:
-        description: "hermes-agent branch, tag or commit to test against"
+        description: "hermes-agent branch, tag or commit to test against (empty: main and the latest release)"
         required: false
-        default: main
+        default: ""
+      report_issue:
+        description: "Open, update or close the nightly issue for this run, as a scheduled run does"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: read
 
+# Per event and ref: a dispatch never cancels the scheduled run (and its
+# report), and a dispatch on a branch never cancels one on main.
 concurrency:
-  group: hermes-main
+  group: hermes-main-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  refs:
+    name: Resolve hermes-agent refs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.refs.outputs.matrix }}
+    steps:
+      - name: main and the latest release, or the ref asked for
+        id: refs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED: ${{ inputs.hermes_ref }}
+        run: |
+          set -euo pipefail
+          ref_shape='^[A-Za-z0-9][A-Za-z0-9._/+-]*$'
+          if [ -n "$REQUESTED" ]; then
+            if ! [[ "$REQUESTED" =~ $ref_shape ]]; then
+              echo "::error::hermes_ref must be a branch, tag or commit name, got '$REQUESTED'"
+              exit 1
+            fi
+            matrix=$(jq -cn --arg ref "$REQUESTED" '{include: [{ref: $ref, leg: "requested"}]}')
+          else
+            # An empty ref makes the release leg fail at its first step, so a
+            # failed lookup still tests main and still turns the night red.
+            latest=$(gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name) || latest=""
+            if ! [[ "$latest" =~ $ref_shape ]]; then
+              echo "::warning::hermes-agent's latest release could not be looked up (got '$latest')"
+              latest=""
+            else
+              echo "hermes-agent latest release: $latest"
+            fi
+            matrix=$(jq -cn --arg tag "$latest" \
+              '{include: [{ref: "main", leg: "main"}, {ref: $tag, leg: "latest release"}]}')
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
   suite:
-    name: Suite vs hermes-agent ${{ inputs.hermes_ref || 'main' }}
+    name: Suite vs hermes-agent ${{ matrix.ref || 'unresolved' }} (${{ matrix.leg }})
+    needs: refs
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.refs.outputs.matrix) }}
     env:
-      HERMES_REF: ${{ inputs.hermes_ref || 'main' }}
+      HERMES_REF: ${{ matrix.ref }}
     steps:
+      - name: A ref to test
+        run: |
+          if [ -z "$HERMES_REF" ]; then
+            echo "::error::the latest hermes-agent release could not be looked up (see the refs job)"
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: plugin
@@ -93,15 +163,44 @@ jobs:
             exit 1
           fi
 
+  report:
+    name: Open, update or close the nightly issue
+    needs: [refs, suite]
+    # Also after a failed or timed-out leg; never for a run that was itself
+    # cancelled (a newer run in the concurrency group superseded it).
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || inputs.report_issue) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          EVENT_NAME: ${{ github.event_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          REFS_RESULT: ${{ needs.refs.result }}
+          SUITE_RESULT: ${{ needs.suite.result }}
+        run: bash .github/scripts/nightly-issue.sh
+
   notify-failure:
-    needs: suite
-    if: failure() && github.event_name == 'schedule'
+    needs: [refs, suite]
+    if: ${{ !cancelled() && github.event_name == 'schedule' && (needs.refs.result != 'success' || needs.suite.result != 'success') }}
     runs-on: ubuntu-24.04
     steps:
       - name: Post to Slack
         env:
           WEBHOOK: ${{ secrets.SLACK_WEBHOOK_WARNING }}
-          TEXT: ":warning: *agentchatme-hermes vs hermes-agent main failed* — Hermes main changed something this plugin uses: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT: ":warning: *agentchatme-hermes nightly vs hermes-agent failed* (main or the latest release) — see the nightly issue: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
-          if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped"; exit 0; fi
+          if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped (the nightly issue carries the alert)"; exit 0; fi
           printf '%s' "$TEXT" | jq -Rs '{text: .}' | curl -sS -o /dev/null --max-time 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK" || true

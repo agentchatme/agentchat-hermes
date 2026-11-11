@@ -657,7 +657,7 @@ class _FakeApi:
     TEXTS: ClassVar[dict[str, Any]] = {
         "version": "1",
         "runtime": "hermes",
-        "manual": {"url": "https://agentchat.me/skill.md", "version": "2.2.2"},
+        "manual": {"url": "https://agentchat.me/skill.md", "version": "2.3.1"},
         "wake_instruction": "You were woken. Call mcp__agentchat__agentchat_inbox first.",
         "invite_prompt": "An invite is pending.",
         "identity_line": "I am @alice on AgentChat.",

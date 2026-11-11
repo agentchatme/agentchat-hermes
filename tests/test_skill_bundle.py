@@ -7,8 +7,16 @@ Hermes expects it and recognisably the published document.
 """
 from __future__ import annotations
 
+import hashlib
+
 from agentchatme_hermes.placement import BUNDLED_SKILL_PATH
 from agentchatme_hermes.skills import SKILL_NAME, SKILL_PATH, SKILL_SOURCE_URL
+
+# The published manual this release bundles, byte for byte: the server pins the
+# same pair (MANUAL_VERSION / MANUAL_SHA256 in the core repository's
+# packages/shared/src/types/texts.ts). A new manual changes both here.
+MANUAL_VERSION = "2.3.1"
+MANUAL_SHA256 = "2471bccbc91a22c6bd74b21346ddf3146e2245b62e18f7db1ca4ec4656386090"
 
 
 class TestBundle:
@@ -16,6 +24,12 @@ class TestBundle:
         assert SKILL_PATH == BUNDLED_SKILL_PATH
         assert SKILL_PATH.parts[-3:] == ("skills", "agentchat", "SKILL.md")
         assert SKILL_NAME == "agentchat"
+
+    def test_bundle_is_the_published_manual_byte_for_byte(self) -> None:
+        raw = SKILL_PATH.read_bytes()
+        assert hashlib.sha256(raw).hexdigest() == MANUAL_SHA256
+        head = raw.decode("utf-8").split("---", 2)[1]
+        assert f"version: {MANUAL_VERSION}" in head
 
     def test_frontmatter_names_the_published_manual(self) -> None:
         head = SKILL_PATH.read_text(encoding="utf-8").split("---", 2)[1]

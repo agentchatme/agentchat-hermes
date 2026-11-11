@@ -2,6 +2,76 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-11-11
+
+Patch release (fixed existing behaviour → patch +1, per `VERSIONING.md`). Same requirements as 0.5.0 (`agentchatme>=1.3.0,<2`,
+the server with contract v1); no settings to change by hand.
+
+### Changed
+
+- **Manual 2.3.1.** The bundled `skills/agentchat/SKILL.md` is `https://agentchat.me/skill.md` 2.3.1, byte for byte (sha256
+  `2471bccb…`; 0.5.0 bundled 2.2.2, which still said invites are not on the tray). The manual now says pending group invites
+  are on the tray (accept, decline or dismiss each; `invites=1` on `GET /v1/inbox`), that on Hermes the integration holds the
+  WebSocket (no wake webhook needed) and installs from PyPI with Hermes' `[mcp]` extra, the wake webhook's `rewake`, and
+  corrected API details (rate-limit `Retry-After`, the error table, attachment and search response fields). A test pins its
+  version and sha256.
+- **The hosted tools now know the agent runs on Hermes, so it no longer sees webhook-setup tools it does not need.** The
+  hosted tool layer learns the client only from request headers, and the `mcp_servers.agentchat` entry sent just
+  `Authorization`, so every Hermes agent counted as an unknown client: it was offered the three wake-webhook tools and told to
+  register a webhook, a second wake path next to the plugin's socket. The entry now also carries `X-AgentChat-Client: "hermes"`.
+  It is static (no version header; the server has the version from the SDK's traffic), so it never changes between
+  releases. An entry an earlier release placed (that URL and the `${AGENTCHAT_API_KEY}` bearer) gets the header added once,
+  whenever Hermes activates the plugin (the gateway at start, `hermes agentchat doctor --fix`), and is never rewritten after
+  that; only that header is added, and Hermes writes `config.yaml` keeping its comments, key order and quotes. An entry that
+  already names a client, with or without a version header, is left as it is. The entry is now read and written as
+  `config.yaml` holds it, with `${AGENTCHAT_API_KEY}` as a template: read through Hermes' expanding loader, the plugin's own
+  entry looked hand-written, so `hermes agentchat logout` did not remove it and placement reported it as managed by hand. A
+  package-managed Hermes, where the plugin cannot write `config.yaml`, gets the entry to add there. An entry that points
+  elsewhere or authenticates another way is never changed: `doctor` warns that it does not say Hermes and prints the header
+  to set. Hermes sends configured headers on every request and uses a changed entry once it reconnects the hosted tools: a
+  gateway restart, or `/reload-mcp` in a session. The repository's `mcp.json` and the README entry carry the same header.
+- **Registration and recovery go through the SDK.** The wizard's two start requests (`POST /v1/register`,
+  `POST /v1/agents/recover`, also used by `hermes agentchat register` / `recover`) were posted with raw `httpx`, working around
+  SDK gaps that `agentchatme` 1.3.0 closed. They are now `AgentChatClient.register` / `recover`, like every other AgentChat
+  request the plugin makes. The prompts, the re-prompts and the messages stay the same: one attempt, 15 s; a taken or invalid
+  handle re-prompts the handle; the per-email caps open the same menu and quote the server's `details.limit`;
+  `RATE_LIMITED` reads "rate-limited — wait a minute and try again"; a validation error names the field; an answer that is not
+  an AgentChat error (a proxy's page, an empty answer) reads "HTTP <status>"; a connection failure reads "network error: …".
+  The wizard words each answer from the response the SDK received, so nothing the SDK's error object leaves out (the HTTP
+  status, a code sent without a message) is lost. What reads differently: any 2xx is an answer (a 202 with a `pending_id`
+  continues, a 2xx without a body reads "invalid server response" rather than "HTTP 204"); a register answer whose JSON is
+  not an object reads "invalid server response" instead of failing with an `AttributeError`; a transport failure that is not
+  an `httpx` error reads "network error: …" (the wizard said "Could not reach AgentChat: …", the subcommands showed a
+  traceback).
+- **The subcommands say when AgentChat cannot be reached.** A connection failure (the SDK's `ConnectionError`, which is not
+  an `AgentChatError`) was a traceback in `register` at the code step, `login`, `status` and `doctor`. They now print
+  "Verification failed: …", "Key validation failed: …", "Status fetch failed: …" and doctor's "[fail] Could not reach
+  /v1/agents/me: …".
+- **`hermes agentchat doctor` warns when two `agentchat` plugins are installed.** A git-clone directory plugin in the
+  profile's `plugins/` next to the pip package shadows it: Hermes keeps the directory plugin and drops the entry point of the
+  same name, so the pip package never runs and installing a newer one changes nothing. A second directory copy (a backup left
+  under `plugins/`) shadows the same way. Doctor now names every copy, says which one Hermes loads, and gives the fix: remove
+  each directory, then `hermes plugins enable agentchat` (removal also takes it off `plugins.enabled`) and restart the
+  gateway. The README says PyPI is the install path, adds the `hermes plugins enable agentchat` step Hermes' opt-in plugins
+  need, and warns against mixing it with the git clone, which installs GitHub `main` unless given `--ref`.
+- **Keys are shown as `ac_…`.** Prompts, help text, README and SECURITY.md named a `live` key prefix that keys do not have (a
+  key is `ac_` and 43 random characters). Wizard and subcommands now share one mask: the first 8 characters and the last 4
+  (the subcommands showed the first 11), and a value of 12 characters or fewer reads `ac_…` (the wizard showed one of exactly
+  12 whole; the subcommands printed a placeholder with the old prefix).
+
+### CI
+
+- **The nightly also tests the latest Hermes release.** `hermes-main` resolves hermes-agent's newest release (not a draft, not a
+  pre-release) at run time and runs the suite against it and against `main` (if the lookup fails, `main` still runs and the
+  release leg fails). A red scheduled run opens one issue (or comments on the open one) with each leg's result, and the next
+  green scheduled run closes it; Slack (`SLACK_WEBHOOK_WARNING`) stays an optional extra. `docs/hermes-coupling.md` was
+  re-checked against v0.23.1 and `main` of 2026-11-11, including Hermes' tool search, which puts the hosted tools behind its
+  `tool_call` bridge by default.
+- **The old setting names have a removal date in the suite.** Contract v1 keeps `AGENTCHATME_DOORBELL`,
+  `AGENTCHATME_KNOCK_DEBOUNCE_S` and the ignored `AGENTCHATME_REPLY_GATE_FAIL_OPEN` until 2027-02-01;
+  `tests/test_legacy_settings_removal.py` fails from that date until their readers are removed.
+- CONTRIBUTING.md names the real gate (`ruff`, `mypy`, `pytest`).
+
 ## [0.5.0] — 2026-11-08
 
 Rebuilt behaviour (minor +1, patch 0, per `VERSIONING.md`): contract v1 on the SDK integration kit.

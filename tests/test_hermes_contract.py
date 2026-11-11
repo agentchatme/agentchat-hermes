@@ -1,9 +1,10 @@
 """The Hermes surfaces this plugin depends on, checked against a real Hermes.
 
 Skipped unless Hermes is importable (the unit suite runs without it). The
-scheduled ``hermes-main`` workflow installs hermes-agent from its main branch
-and runs the whole suite with it, so a Hermes change that breaks one of these
-couplings shows within a day instead of at the next release. What each one is
+scheduled ``hermes-main`` workflow installs hermes-agent from its main branch,
+and from its latest release, and runs the whole suite with each, so a Hermes
+change that breaks one of these couplings shows within a day instead of at the
+next release, and a break on the release users run shows too. What each one is
 for, and which public hook would replace it, is ``docs/hermes-coupling.md``.
 
 Nothing here reaches a network service: the model is a localhost stub and
@@ -334,10 +335,56 @@ def test_auxiliary_call_llm_takes_what_the_fallback_passes() -> None:
 
 def test_config_and_provider_helpers() -> None:
     config = _import("hermes_cli.config")
-    for name in ("load_config", "save_config", "get_env_value", "save_env_value"):
+    for name in ("load_config", "save_config", "get_env_value", "save_env_value", "is_managed"):
         assert callable(getattr(config, name, None)), name
-    assert any(callable(getattr(config, n, None)) for n in ("read_user_config_raw", "read_raw_config", "load_config"))
+    # The hosted-tools entry is read as written (load_config expands ${VAR}).
+    assert any(callable(getattr(config, n, None)) for n in ("read_user_config_raw", "read_raw_config"))
     assert "target_model" in _params(_import("hermes_cli.runtime_provider").resolve_runtime_provider)
+
+
+def test_the_hosted_tools_entry_round_trips_through_hermes_config(
+    _hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through Hermes' own reader and saver: an earlier release's entry gains
+    the client header and keeps the keys the user added and the file's
+    comments, the key stays a template in config.yaml with the key loaded, a
+    second pass writes nothing, and logout removes the entry."""
+    from fake_keys import api_key
+
+    from agentchatme_hermes import mcp_registration as reg
+
+    key = api_key("contract_round_trip_value")
+    monkeypatch.setenv("AGENTCHAT_API_KEY", key)
+    config_path = _hermes_home / "config.yaml"
+    config_path.write_text(
+        "# the operator's own note\n"
+        "mcp_servers:\n"
+        "  agentchat:  # hosted tools\n"
+        '    url: "https://api.agentchat.me/mcp"\n'
+        "    headers:\n"
+        '      Authorization: "Bearer ${AGENTCHAT_API_KEY}"\n'
+        "    timeout: 120\n",
+        encoding="utf-8",
+    )
+    config = _import("hermes_cli.config")
+
+    assert reg.inspect_entry_identity() == ("ours", "missing")
+    assert reg.install_entry() == "upgraded"
+    text = config_path.read_text(encoding="utf-8")
+    assert key not in text, "the key must never be written into config.yaml"
+    assert "# the operator's own note" in text and "# hosted tools" in text, "Hermes keeps comments"
+    entry = config.read_user_config_raw()["mcp_servers"]["agentchat"]
+    assert entry["headers"] == {
+        "Authorization": "Bearer ${AGENTCHAT_API_KEY}",
+        "X-AgentChat-Client": "hermes",
+    }
+    assert entry["timeout"] == 120
+    assert reg.inspect_entry_identity() == ("ours", "current")
+    before = config_path.read_bytes()
+    assert reg.install_entry() == "present"
+    assert config_path.read_bytes() == before, "nothing to change, nothing written"
+    assert reg.uninstall_entry() is True
+    assert "agentchat" not in (config.read_user_config_raw().get("mcp_servers") or {})
 
 
 def test_wizard_helpers() -> None:
