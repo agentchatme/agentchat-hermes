@@ -223,11 +223,10 @@ def _dispatch_register(args: argparse.Namespace) -> int:
     display_name = getattr(args, "display_name", None) or ""
 
     _printline(f"Sending verification code to {email}…")
-    # Route through wizard._register_start so this path shares the same
-    # null-field workaround for the SDK's strict-validation bug. Both
-    # entry points use the same registration mechanics; the wizard adds
-    # field-scoped retry logic on top, which the named subcommand doesn't
-    # need (the operator either succeeds or runs the command again).
+    # Route through wizard._register_start so both entry points share the
+    # same SDK call and the same error texts; the wizard adds field-scoped
+    # retry logic on top, which the named subcommand doesn't need (the
+    # operator either succeeds or runs the command again).
     try:
         pending_id = _register_start(
             email=email, handle=handle, display_name=display_name

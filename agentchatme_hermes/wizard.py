@@ -9,10 +9,10 @@ rather than re-engineering UX from scratch.
 
 Internal mechanics are 0.2.0:
 
-* Network calls go through the ``agentchatme`` SDK (not raw ``httpx``),
-  except the two unauthenticated "start" requests (``/v1/register`` and
-  ``/v1/agents/recover``) which the plugin posts itself — see
-  :func:`_register_start` / :func:`_recover_start` for why.
+* Every network call goes through the ``agentchatme`` SDK, the
+  unauthenticated register and recover requests included; the SDK's
+  errors are mapped onto the wizard's own messages
+  (:func:`_register_start`, :func:`_recover_start`).
 * The success paths (register / paste / replace / recover) *place the
   integration* (:mod:`agentchatme_hermes.placement`): the key in the profile
   ``.env`` as ``AGENTCHAT_API_KEY``, the served identity line in
@@ -29,13 +29,14 @@ module is only the no-argument interactive entry.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
 from collections.abc import Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from .client_identity import HERMES_CLIENT_HEADERS, hermes_client_identity
+from .client_identity import hermes_client_identity
 from .config import ENV_API_BASE, ENV_API_KEY, ENV_API_KEY_LEGACY, ENV_HANDLE
 from .placement import (
     clear_api_key,
@@ -45,9 +46,15 @@ from .placement import (
 )
 from .soul_anchor import remove_soul_anchor
 
+if TYPE_CHECKING:
+    from agentchatme import AgentChatError
+
 logger = logging.getLogger(__name__)
 
 _MAX_REGISTER_RETRIES = 3
+# The per-request budget of the two unauthenticated "start" calls
+# (register, recover): one attempt each, never retried by the SDK.
+_START_TIMEOUT_MS = 15_000
 _HANDLE_MIN = 3
 _HANDLE_MAX = 30
 _HANDLE_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
@@ -897,50 +904,49 @@ def _api_base() -> str:
 
 
 def _register_start(*, email: str, handle: str, display_name: str) -> str:
-    """POST /v1/register via raw httpx, omitting null fields.
+    """``POST /v1/register`` through the SDK → the ``pending_id`` for the OTP step.
 
-    Bypasses the SDK's static :meth:`AgentChatClient.register` because that
-    method sends ``description: null`` unconditionally; the server's strict
-    Zod validation rejects nulls with ``Expected string, received null``,
-    and the SDK swallows the helpful ``details.fieldErrors`` into a generic
-    ``Invalid request`` exception message — both of which are SDK bugs to
-    fix in ``agentchatme`` proper, but until that ships we work around in
-    the plugin. Httpx is already a transitive dep via the SDK, so no new
-    package on the dependency closure.
+    :meth:`AgentChatClient.register` sends optional fields only when set
+    (``agentchatme`` 1.3.0, this package's floor), so no ``description`` is
+    sent and an empty display name is passed as ``None`` — absent from the
+    body, not ``""``. One attempt (the SDK never retries a register), with
+    the same 15 s budget the plugin's own post had.
 
-    Returns the ``pending_id`` for the OTP verify step. Maps server error
-    codes onto field hints so the wizard's retry loop re-prompts the
-    correct field.
+    Maps the SDK's errors onto field hints so the wizard's retry loop
+    re-prompts the right field; the messages are the wizard's own (see
+    :func:`_api_error_parts`, :func:`_transport_failure`).
     """
-    import httpx
-
-    body: dict[str, Any] = {"email": email, "handle": handle}
-    if display_name:
-        body["display_name"] = display_name
+    from agentchatme import AgentChatClient, AgentChatError
+    from agentchatme import ConnectionError as SDKConnectionError
 
     try:
-        resp = httpx.post(
-            f"{_api_base()}/v1/register",
-            json=body,
-            headers=HERMES_CLIENT_HEADERS,
-            timeout=15.0,
+        data = AgentChatClient.register(
+            email=email,
+            handle=handle,
+            display_name=display_name or None,
+            base_url=_api_base(),
+            client_identity=hermes_client_identity(),
+            timeout_ms=_START_TIMEOUT_MS,
         )
-    except httpx.HTTPError as exc:
-        raise _RegisterError(f"network error: {exc}") from exc
+    except SDKConnectionError as exc:
+        raise _RegisterError(_transport_failure(exc)) from exc
+    except AgentChatError as exc:
+        raise _register_error(exc) from exc
 
-    if resp.status_code in (200, 201):
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            raise _RegisterError("invalid server response") from exc
-        pending_id = data.get("pending_id")
-        if not isinstance(pending_id, str) or not pending_id:
-            raise _RegisterError("server did not return a pending_id")
-        return pending_id
+    if not isinstance(data, Mapping):
+        raise _RegisterError("invalid server response")
+    pending_id = data.get("pending_id")
+    if not isinstance(pending_id, str) or not pending_id:
+        raise _RegisterError("server did not return a pending_id")
+    return pending_id
 
-    code, message, details = _parse_error_response(resp)
+
+def _register_error(exc: AgentChatError) -> _RegisterError:
+    """The wizard's :class:`_RegisterError` for an SDK ``AgentChatError``
+    raised by :meth:`AgentChatClient.register`."""
+    code, message, details = _api_error_parts(exc)
     if code in {"HANDLE_TAKEN", "INVALID_HANDLE", "RESERVED_HANDLE"}:
-        raise _RegisterError(message or code, field="handle", code=code)
+        return _RegisterError(message or code, field="handle", code=code)
     if code == _LEGACY_EMAIL_TAKEN:
         # A server that still enforces one live agent per email. The
         # user's options are the same as at today's live cap (different
@@ -949,18 +955,14 @@ def _register_start(*, email: str, handle: str, display_name: str) -> str:
         # so the message falls back to the server's own wording.
         code = _EMAIL_LIMIT_REACHED
     if code in _EMAIL_POLICY_CODES:
-        raise _RegisterError(
+        return _RegisterError(
             _email_policy_message(code, message, _limit_from_details(details)),
             field="email",
             code=code,
         )
     if code == "RATE_LIMITED":
-        raise _RegisterError(
-            "rate-limited — wait a minute and try again", code=code
-        )
-    raise _RegisterError(
-        message or code or f"HTTP {resp.status_code}", code=code
-    )
+        return _RegisterError("rate-limited — wait a minute and try again", code=code)
+    return _RegisterError(message or code or f"HTTP {exc.status}", code=code)
 
 
 def _email_policy_message(code: str, server_message: str | None, limit: int | None) -> str:
@@ -1006,30 +1008,28 @@ def _handles_from_details(details: Any) -> list[str]:
     return [handle for handle in raw if isinstance(handle, str) and handle]
 
 
-def _parse_error_response(
-    resp: Any,
+def _api_error_parts(
+    exc: AgentChatError,
 ) -> tuple[str | None, str | None, Mapping[str, Any] | None]:
-    """Pull ``(code, message, details)`` from a JSON error response.
+    """``(code, message, details)`` of an SDK ``AgentChatError``.
 
-    Surfaces ``details.fieldErrors`` when present so the user sees what
-    was actually wrong instead of the generic top-level ``message`` —
-    fixes the "Invalid request" black-box UX the SDK has. ``details`` is
-    returned as-is (or ``None``) so callers can read code-specific keys
-    such as ``limit``.
+    Splices ``details.fieldErrors`` (a validation failure's per-field
+    reasons) onto the message, so the user sees which field broke rather
+    than the bare top-level ``Invalid request``. ``details`` is returned
+    as-is (or ``None``) so callers can read code-specific keys such as
+    ``limit``.
+
+    The SDK builds the error from the response body; a body that is not
+    an AgentChat error (a proxy's HTML page, an empty 502) arrives with a
+    code taken from the HTTP status and the HTTP reason phrase as its
+    message.
     """
-    try:
-        data = resp.json()
-    except ValueError:
-        return None, None, None
-    code = data.get("code") if isinstance(data, dict) else None
-    message = data.get("message") if isinstance(data, dict) else None
-
-    # If validation failed with field-specific errors, splice them onto
-    # the message so the user can see which field broke.
-    details = data.get("details") if isinstance(data, dict) else None
-    if isinstance(details, dict):
+    code = exc.code
+    message: str | None = str(exc)
+    details = exc.details
+    if isinstance(details, Mapping):
         field_errors = details.get("fieldErrors")
-        if isinstance(field_errors, dict) and field_errors:
+        if isinstance(field_errors, Mapping) and field_errors:
             parts = []
             for field, errors in field_errors.items():
                 if isinstance(errors, list) and errors:
@@ -1040,9 +1040,23 @@ def _parse_error_response(
 
     return (
         code if isinstance(code, str) else None,
-        message if isinstance(message, str) else None,
-        details if isinstance(details, dict) else None,
+        message or None,
+        details if isinstance(details, Mapping) else None,
     )
+
+
+def _transport_failure(exc: BaseException) -> str:
+    """The wizard's text for the SDK's ``ConnectionError``: no usable answer.
+
+    The SDK raises it *from* its cause. An ``httpx`` error (DNS, refused,
+    TLS, timeout) reads ``network error: <httpx's text>``; a 2xx body that
+    is not JSON reads ``invalid server response`` — the two texts the
+    plugin's own posts printed.
+    """
+    cause = exc.__cause__
+    if isinstance(cause, json.JSONDecodeError):
+        return "invalid server response"
+    return f"network error: {cause if cause is not None else exc}"
 
 
 def _register_verify(*, pending_id: str, code: str) -> tuple[str, str]:
@@ -1077,16 +1091,13 @@ def _register_verify(*, pending_id: str, code: str) -> tuple[str, str]:
 
 
 def _recover_start(*, email: str, handle: str) -> str:
-    """POST /v1/agents/recover via raw httpx → the ``pending_id`` for the OTP step.
+    """``POST /v1/agents/recover`` through the SDK → the ``pending_id`` for the OTP step.
 
     Always sends ``handle`` alongside ``email``: an email can back several
-    agents, so the server needs both to know which one to re-key. The
-    SDK's static :meth:`AgentChatClient.recover` only grew a ``handle``
-    parameter after this plugin's SDK floor, so the plugin posts the
-    request itself — the same arrangement :func:`_register_start` uses,
-    httpx already being on the dependency closure — instead of raising
-    the floor and breaking installs whose SDK hasn't been upgraded. The
-    verify step's body is unchanged, so it still goes through the SDK.
+    agents, so the server needs both to know which one to re-key
+    (:meth:`AgentChatClient.recover` takes ``handle=`` since ``agentchatme``
+    1.3.0, this package's floor). One attempt, 15 s, like
+    :func:`_register_start`.
 
     The server answers ``200 {pending_id, message}`` for every outcome
     (match, no match, OTP rate-limited, send failure) so that nothing
@@ -1095,37 +1106,41 @@ def _recover_start(*, email: str, handle: str) -> str:
     Pre-policy servers omit ``pending_id`` when nothing matched — that
     is reported as "no code issued" rather than as a transport bug.
     """
-    import httpx
-
-    body: dict[str, Any] = {"email": email, "handle": handle}
+    from agentchatme import AgentChatClient, AgentChatError
+    from agentchatme import ConnectionError as SDKConnectionError
 
     try:
-        resp = httpx.post(
-            f"{_api_base()}/v1/agents/recover",
-            json=body,
-            headers=HERMES_CLIENT_HEADERS,
-            timeout=15.0,
+        data = AgentChatClient.recover(
+            email,
+            handle=handle,
+            base_url=_api_base(),
+            client_identity=hermes_client_identity(),
+            timeout_ms=_START_TIMEOUT_MS,
         )
-    except httpx.HTTPError as exc:
-        raise _RecoverError(f"network error: {exc}") from exc
+    except SDKConnectionError as exc:
+        raise _RecoverError(_transport_failure(exc)) from exc
+    except AgentChatError as exc:
+        raise _recover_error(exc) from exc
 
-    if resp.status_code in (200, 201):
-        try:
-            data = resp.json()
-        except ValueError as exc:
-            raise _RecoverError("invalid server response") from exc
-        pending_id = data.get("pending_id") if isinstance(data, dict) else None
-        if not isinstance(pending_id, str) or not pending_id:
-            raise _RecoverError(
-                "no recovery code was issued (the server returned no pending_id) — "
-                "check the email and @handle and try again"
-            )
-        return pending_id
+    if data is None:
+        # A 2xx with an empty body.
+        raise _RecoverError("invalid server response")
+    pending_id = data.get("pending_id") if isinstance(data, Mapping) else None
+    if not isinstance(pending_id, str) or not pending_id:
+        raise _RecoverError(
+            "no recovery code was issued (the server returned no pending_id) — "
+            "check the email and @handle and try again"
+        )
+    return pending_id
 
-    code, message, _details = _parse_error_response(resp)
+
+def _recover_error(exc: AgentChatError) -> _RecoverError:
+    """The wizard's :class:`_RecoverError` for an SDK ``AgentChatError``
+    raised by :meth:`AgentChatClient.recover`."""
+    code, message, _details = _api_error_parts(exc)
     if code == "RATE_LIMITED":
-        raise _RecoverError("rate-limited — wait a minute and try again", code=code)
-    raise _RecoverError(message or code or f"HTTP {resp.status_code}", code=code)
+        return _RecoverError("rate-limited — wait a minute and try again", code=code)
+    return _RecoverError(message or code or f"HTTP {exc.status}", code=code)
 
 
 def _recover_verify(*, pending_id: str, code: str) -> tuple[str, str]:

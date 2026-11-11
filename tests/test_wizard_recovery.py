@@ -2,19 +2,19 @@
 
 Recovery re-keys an existing agent from its email **and** @handle — an
 email can back several agents, so the handle is sent on every start
-request. Step 1 (``POST /v1/agents/recover``) is posted with ``httpx``
-directly; step 2 goes through ``AgentChatClient.recover_verify``. Both
-are patched here so no network IO happens. The interactive flow takes
-its prompt / print / persist callables as arguments, so it runs outside
-a Hermes process with scripted stand-ins.
+request. Both steps go through the SDK (``AgentChatClient.recover`` and
+``recover_verify``): step 1 is answered by the fake API in ``sdk_wire`` at
+the httpx transport, step 2 by patching the SDK method, so no network IO
+happens. The interactive flow takes its prompt / print / persist callables
+as arguments, so it runs outside a Hermes process with scripted stand-ins.
 """
 from __future__ import annotations
 
 from typing import Any
 
-import httpx
 import pytest
 from fake_keys import api_key
+from sdk_wire import Route, answer, api_error, connect_error, raw, serve
 
 from agentchatme_hermes import wizard
 from agentchatme_hermes.wizard import (
@@ -29,29 +29,9 @@ from agentchatme_hermes.wizard import (
 )
 
 
-class _FakeResponse:
-    def __init__(
-        self, status_code: int, payload: Any = None, *, invalid_json: bool = False
-    ) -> None:
-        self.status_code = status_code
-        self._payload = payload
-        self._invalid_json = invalid_json
-
-    def json(self) -> Any:
-        if self._invalid_json:
-            raise ValueError("not json")
-        return self._payload
-
-
-def _patch_post(monkeypatch: pytest.MonkeyPatch, response: _FakeResponse) -> list[dict[str, Any]]:
-    calls: list[dict[str, Any]] = []
-
-    def fake_post(url: str, *, json: Any = None, headers: Any = None, timeout: Any = None) -> _FakeResponse:
-        calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
-        return response
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-    return calls
+def _patch_post(monkeypatch: pytest.MonkeyPatch, route: Route) -> Any:
+    """Answer ``POST /v1/agents/recover`` with ``route``; returns the wire record."""
+    return serve(monkeypatch, {"/v1/agents/recover": route})
 
 
 class _ScriptedPrompt:
@@ -108,76 +88,105 @@ class TestRecoverStart:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("AGENTCHATME_API_BASE", "https://api.test")
-        calls = _patch_post(monkeypatch, _FakeResponse(200, {"pending_id": "pnd_1", "message": "m"}))
+        wire = _patch_post(monkeypatch, answer(200, {"pending_id": "pnd_1", "message": "m"}))
 
         assert _recover_start(email="a@b.co", handle="alice") == "pnd_1"
 
-        assert len(calls) == 1
-        assert calls[0]["url"] == "https://api.test/v1/agents/recover"
-        assert calls[0]["json"] == {"email": "a@b.co", "handle": "alice"}
-        assert calls[0]["timeout"] == 15.0
+        assert len(wire.requests) == 1
+        request = wire.requests[0]
+        assert request.method == "POST"
+        assert str(request.url) == "https://api.test/v1/agents/recover"
+        assert wire.bodies() == [{"email": "a@b.co", "handle": "alice"}]
+        assert request.extensions["timeout"] == {
+            "connect": 15.0,
+            "read": 15.0,
+            "write": 15.0,
+            "pool": 15.0,
+        }
 
     def test_client_headers_identify_hermes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from agentchatme_hermes._version import __version__
 
-        calls = _patch_post(monkeypatch, _FakeResponse(200, {"pending_id": "pnd_1"}))
+        wire = _patch_post(monkeypatch, answer(200, {"pending_id": "pnd_1"}))
         _recover_start(email="a@b.co", handle="alice")
-        assert calls[0]["headers"] == {
-            "X-AgentChat-Client": "hermes",
-            "X-AgentChat-Client-Version": __version__,
-        }
+        headers = wire.requests[0].headers
+        assert headers["X-AgentChat-Client"] == "hermes"
+        assert headers["X-AgentChat-Client-Version"] == __version__
+        assert "authorization" not in headers
 
     def test_missing_pending_id_reports_no_code_issued(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Pre-policy servers omit pending_id when nothing matched."""
-        _patch_post(monkeypatch, _FakeResponse(200, {"message": "if it exists, a code was sent"}))
+        _patch_post(monkeypatch, answer(200, {"message": "if it exists, a code was sent"}))
+        with pytest.raises(_RecoverError, match="no recovery code was issued"):
+            _recover_start(email="a@b.co", handle="alice")
+
+    def test_non_object_json_reports_no_code_issued(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_post(monkeypatch, answer(200, ["not", "an", "object"]))
         with pytest.raises(_RecoverError, match="no recovery code was issued"):
             _recover_start(email="a@b.co", handle="alice")
 
     def test_invalid_json_body(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _patch_post(monkeypatch, _FakeResponse(200, invalid_json=True))
-        with pytest.raises(_RecoverError, match="invalid server response"):
+        _patch_post(monkeypatch, raw(200, b"<html>not json</html>"))
+        with pytest.raises(_RecoverError) as info:
             _recover_start(email="a@b.co", handle="alice")
+        assert str(info.value) == "invalid server response"
+        assert info.value.code is None
+
+    def test_empty_body(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _patch_post(monkeypatch, raw(200, b"", "application/json"))
+        with pytest.raises(_RecoverError) as info:
+            _recover_start(email="a@b.co", handle="alice")
+        assert str(info.value) == "invalid server response"
 
     def test_rate_limited(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _patch_post(monkeypatch, _FakeResponse(429, {"code": "RATE_LIMITED", "message": "slow down"}))
+        wire = _patch_post(monkeypatch, api_error(429, "RATE_LIMITED", "slow down"))
         with pytest.raises(_RecoverError) as info:
             _recover_start(email="a@b.co", handle="alice")
         assert info.value.code == "RATE_LIMITED"
-        assert "wait a minute" in str(info.value)
+        assert str(info.value) == "rate-limited — wait a minute and try again"
+        assert len(wire.requests) == 1, "one attempt: the wizard owns retries"
+
+    def test_server_error_message_verbatim(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        wire = _patch_post(monkeypatch, api_error(500, "INTERNAL_ERROR", "Internal server error"))
+        with pytest.raises(_RecoverError) as info:
+            _recover_start(email="a@b.co", handle="alice")
+        assert str(info.value) == "Internal server error"
+        assert info.value.code == "INTERNAL_ERROR"
+        assert len(wire.requests) == 1
 
     def test_validation_error_surfaces_field_errors(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         _patch_post(
             monkeypatch,
-            _FakeResponse(
+            api_error(
                 400,
-                {
-                    "code": "VALIDATION_ERROR",
-                    "message": "Invalid request",
-                    "details": {"fieldErrors": {"handle": ["Invalid handle"]}},
-                },
+                "VALIDATION_ERROR",
+                "Invalid request",
+                {"fieldErrors": {"handle": ["Invalid handle"]}},
             ),
         )
         with pytest.raises(_RecoverError) as info:
             _recover_start(email="a@b.co", handle="alice")
         assert info.value.code == "VALIDATION_ERROR"
-        assert "handle: Invalid handle" in str(info.value)
+        assert str(info.value) == "Invalid request (handle: Invalid handle)"
 
-    def test_unknown_error_without_body(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _patch_post(monkeypatch, _FakeResponse(502, invalid_json=True))
-        with pytest.raises(_RecoverError, match="HTTP 502"):
+    def test_error_page_that_is_not_an_api_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A proxy's HTML 502: the SDK names it by the HTTP reason phrase."""
+        _patch_post(monkeypatch, raw(502, b"<html>bad gateway</html>"))
+        with pytest.raises(_RecoverError) as info:
             _recover_start(email="a@b.co", handle="alice")
+        assert str(info.value) == "Bad Gateway"
 
     def test_network_error(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def boom(*_: Any, **__: Any) -> Any:
-            raise httpx.ConnectError("dns")
-
-        monkeypatch.setattr(httpx, "post", boom)
-        with pytest.raises(_RecoverError, match="network error"):
+        wire = _patch_post(monkeypatch, connect_error("dns"))
+        with pytest.raises(_RecoverError) as info:
             _recover_start(email="a@b.co", handle="alice")
+        assert str(info.value) == "network error: dns"
+        assert info.value.code is None
+        assert len(wire.requests) == 1, "one attempt: the SDK never retries a recover"
 
 
 # ─── _recover_verify ───────────────────────────────────────────────────────

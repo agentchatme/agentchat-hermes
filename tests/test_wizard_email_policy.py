@@ -7,54 +7,34 @@ server-side row, so the plugin must quote the number the server sent
 rather than hard-code one, and must keep tolerating the retired
 ``EMAIL_TAKEN`` from servers that have not been upgraded.
 
-``_register_start`` posts with ``httpx`` directly; ``httpx.post`` is
-patched so no network IO happens.
+``_register_start`` registers through the SDK; the fake API in
+``sdk_wire`` answers at the httpx transport, so the SDK's own error
+mapping is what these tests exercise, with no network IO.
 """
 from __future__ import annotations
 
 from typing import Any
 
-import httpx
 import pytest
+from sdk_wire import Route, answer, api_error, serve
 
 from agentchatme_hermes.wizard import (
     _EMAIL_EXHAUSTED,
     _EMAIL_LIMIT_REACHED,
     _EMAIL_POLICY_CODES,
+    _api_error_parts,
     _email_error_recovery,
     _email_policy_message,
     _handles_from_details,
     _limit_from_details,
-    _parse_error_response,
     _register_start,
     _RegisterError,
 )
 
 
-class _FakeResponse:
-    def __init__(
-        self, status_code: int, payload: Any = None, *, invalid_json: bool = False
-    ) -> None:
-        self.status_code = status_code
-        self._payload = payload
-        self._invalid_json = invalid_json
-
-    def json(self) -> Any:
-        if self._invalid_json:
-            raise ValueError("not json")
-        return self._payload
-
-
-def _patch_post(monkeypatch: pytest.MonkeyPatch, response: _FakeResponse) -> list[dict[str, Any]]:
-    """Replace ``httpx.post`` with a stub returning ``response``; records calls."""
-    calls: list[dict[str, Any]] = []
-
-    def fake_post(url: str, *, json: Any = None, headers: Any = None, timeout: Any = None) -> _FakeResponse:
-        calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
-        return response
-
-    monkeypatch.setattr(httpx, "post", fake_post)
-    return calls
+def _patch_post(monkeypatch: pytest.MonkeyPatch, route: Route) -> Any:
+    """Answer ``POST /v1/register`` with ``route``; returns the wire record."""
+    return serve(monkeypatch, {"/v1/register": route})
 
 
 # ─── _register_start: error mapping ────────────────────────────────────────
@@ -64,14 +44,7 @@ class TestRegisterStartEmailPolicy:
     def test_limit_reached_quotes_server_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_post(
             monkeypatch,
-            _FakeResponse(
-                409,
-                {
-                    "code": "EMAIL_LIMIT_REACHED",
-                    "message": "server wording",
-                    "details": {"limit": 7},
-                },
-            ),
+            api_error(409, "EMAIL_LIMIT_REACHED", "server wording", {"limit": 7}),
         )
         with pytest.raises(_RegisterError) as info:
             _register_start(email="a@b.co", handle="alice", display_name="")
@@ -86,14 +59,7 @@ class TestRegisterStartEmailPolicy:
     def test_exhausted_quotes_server_limit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _patch_post(
             monkeypatch,
-            _FakeResponse(
-                409,
-                {
-                    "code": "EMAIL_EXHAUSTED",
-                    "message": "server wording",
-                    "details": {"limit": 42},
-                },
-            ),
+            api_error(409, "EMAIL_EXHAUSTED", "server wording", {"limit": 42}),
         )
         with pytest.raises(_RegisterError) as info:
             _register_start(email="a@b.co", handle="alice", display_name="")
@@ -106,12 +72,7 @@ class TestRegisterStartEmailPolicy:
     def test_missing_limit_falls_back_to_server_message(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        _patch_post(
-            monkeypatch,
-            _FakeResponse(
-                409, {"code": "EMAIL_LIMIT_REACHED", "message": "exact server text"}
-            ),
-        )
+        _patch_post(monkeypatch, api_error(409, "EMAIL_LIMIT_REACHED", "exact server text"))
         with pytest.raises(_RegisterError) as info:
             _register_start(email="a@b.co", handle="alice", display_name="")
         assert str(info.value) == "exact server text"
@@ -124,10 +85,7 @@ class TestRegisterStartEmailPolicy:
         per email). Same user action as the live cap, so it maps onto
         EMAIL_LIMIT_REACHED; no details.limit → server message verbatim."""
         _patch_post(
-            monkeypatch,
-            _FakeResponse(
-                409, {"code": "EMAIL_TAKEN", "message": "This email already has an agent."}
-            ),
+            monkeypatch, api_error(409, "EMAIL_TAKEN", "This email already has an agent.")
         )
         with pytest.raises(_RegisterError) as info:
             _register_start(email="a@b.co", handle="alice", display_name="")
@@ -137,21 +95,18 @@ class TestRegisterStartEmailPolicy:
         assert str(err) == "This email already has an agent."
 
     def test_handle_errors_still_field_scoped(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _patch_post(
-            monkeypatch,
-            _FakeResponse(409, {"code": "HANDLE_TAKEN", "message": "taken"}),
-        )
+        _patch_post(monkeypatch, api_error(409, "HANDLE_TAKEN", "taken"))
         with pytest.raises(_RegisterError) as info:
             _register_start(email="a@b.co", handle="alice", display_name="")
         assert info.value.field == "handle"
         assert info.value.code == "HANDLE_TAKEN"
 
     def test_success_returns_pending_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        calls = _patch_post(monkeypatch, _FakeResponse(200, {"pending_id": "pnd_1"}))
+        wire = _patch_post(monkeypatch, answer(200, {"pending_id": "pnd_1"}))
         assert (
             _register_start(email="a@b.co", handle="alice", display_name="Al") == "pnd_1"
         )
-        assert calls[0]["json"] == {"email": "a@b.co", "handle": "alice", "display_name": "Al"}
+        assert wire.bodies() == [{"email": "a@b.co", "handle": "alice", "display_name": "Al"}]
 
     def test_policy_code_set_is_exactly_the_two_codes(self) -> None:
         assert set(_EMAIL_POLICY_CODES) == {"EMAIL_LIMIT_REACHED", "EMAIL_EXHAUSTED"}
@@ -213,39 +168,66 @@ class TestHandlesFromDetails:
         assert _handles_from_details(details) == expected
 
 
-# ─── _parse_error_response ─────────────────────────────────────────────────
+# ─── _api_error_parts ──────────────────────────────────────────────────────
 
 
-class TestParseErrorResponse:
+def _sdk_error(status: int, body: dict[str, Any]) -> Any:
+    """The exception the SDK raises for this error response."""
+    from agentchatme.errors import create_agentchat_error
+
+    return create_agentchat_error(body, status)
+
+
+class TestApiErrorParts:
     def test_returns_code_message_and_details(self) -> None:
-        code, message, details = _parse_error_response(
-            _FakeResponse(409, {"code": "X", "message": "m", "details": {"limit": 3}})
+        code, message, details = _api_error_parts(
+            _sdk_error(409, {"code": "X", "message": "m", "details": {"limit": 3}})
         )
         assert (code, message) == ("X", "m")
         assert details == {"limit": 3}
 
     def test_field_errors_spliced_into_message(self) -> None:
-        code, message, details = _parse_error_response(
-            _FakeResponse(
+        code, message, details = _api_error_parts(
+            _sdk_error(
                 400,
                 {
                     "code": "VALIDATION_ERROR",
                     "message": "Invalid request",
-                    "details": {"fieldErrors": {"handle": ["too short"]}},
+                    "details": {"fieldErrors": {"handle": ["too short"], "email": ["bad"]}},
                 },
             )
         )
         assert code == "VALIDATION_ERROR"
-        assert message == "Invalid request (handle: too short)"
+        assert message == "Invalid request (handle: too short; email: bad)"
         assert details is not None and "fieldErrors" in details
 
-    def test_invalid_json(self) -> None:
-        assert _parse_error_response(_FakeResponse(500, invalid_json=True)) == (None, None, None)
+    def test_field_errors_without_a_message(self) -> None:
+        _code, message, _details = _api_error_parts(
+            _sdk_error(
+                400,
+                {"code": "VALIDATION_ERROR", "message": "", "details": {"fieldErrors": {"handle": ["x"]}}},
+            )
+        )
+        assert message == "handle: x"
 
-    def test_non_dict_body(self) -> None:
-        assert _parse_error_response(_FakeResponse(500, ["not", "a", "dict"])) == (
-            None,
-            None,
+    def test_empty_or_malformed_field_errors_leave_the_message(self) -> None:
+        for field_errors in ({}, {"handle": []}, {"handle": "not a list"}, ["x"]):
+            _code, message, _details = _api_error_parts(
+                _sdk_error(
+                    400,
+                    {
+                        "code": "VALIDATION_ERROR",
+                        "message": "Invalid request",
+                        "details": {"fieldErrors": field_errors},
+                    },
+                )
+            )
+            assert message == "Invalid request", field_errors
+
+    def test_no_details(self) -> None:
+        assert _api_error_parts(_sdk_error(500, {"code": "INTERNAL_ERROR", "message": "boom"})) == (
+            "INTERNAL_ERROR",
+            "boom",
             None,
         )
 
