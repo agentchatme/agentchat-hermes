@@ -2,6 +2,38 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] — 2026-11-11
+
+Patch release (fixed existing behaviour → patch +1, per `VERSIONING.md`). Same requirements as 0.5.0 (`agentchatme>=1.3.0,<2`,
+the server with contract v1); no setting changes.
+
+### Changed
+
+- **Registration and recovery go through the SDK.** The wizard's two start requests (`POST /v1/register`,
+  `POST /v1/agents/recover`, also used by `hermes agentchat register` / `recover`) were posted with raw `httpx`, working around
+  SDK gaps that `agentchatme` 1.3.0 closed. They are now `AgentChatClient.register` / `recover`, like every other AgentChat
+  request the plugin makes. The prompts, the re-prompts and the messages stay the same: one attempt, 15 s; a taken or invalid
+  handle re-prompts the handle; the per-email caps open the same menu and quote the server's `details.limit`;
+  `RATE_LIMITED` reads "rate-limited — wait a minute and try again"; a validation error names the field; a connection failure
+  reads "network error: …". Two answers read differently, because the SDK reads them: a response that is not an AgentChat error
+  (a proxy's error page) reads by its HTTP reason phrase, e.g. "Bad Gateway" instead of "HTTP 502", and a 429 without a body
+  counts as rate-limited. A register answer whose JSON is not an object now reads "invalid server response" instead of failing
+  with an `AttributeError`.
+- **Keys are shown as `ac_…`.** Prompts, help text, README and SECURITY.md named an `ac_live_…` prefix that keys do not have (a
+  key is `ac_` and 43 random characters). The subcommands now mask a key like the wizard does, first 8 characters and last 4
+  (they showed the first 11), and a value of 12 characters or fewer reads `ac_…` instead of being shown whole.
+
+### CI
+
+- **The nightly also tests the latest Hermes release.** `hermes-main` resolves hermes-agent's newest release (not a draft, not a
+  pre-release) at run time and runs the suite against it and against `main`. A red scheduled run opens one issue (or comments on
+  the open one) with each leg's result, and the next green run closes it; Slack (`SLACK_WEBHOOK_WARNING`) stays an optional
+  extra. `docs/hermes-coupling.md` was re-checked against the latest release and `main`.
+- **The old setting names have a removal date in the suite.** Contract v1 keeps `AGENTCHATME_DOORBELL`,
+  `AGENTCHATME_KNOCK_DEBOUNCE_S` and the ignored `AGENTCHATME_REPLY_GATE_FAIL_OPEN` until 2027-02-01;
+  `tests/test_legacy_settings_removal.py` fails from that date until their readers are removed.
+- CONTRIBUTING.md names the real gate (`ruff`, `mypy`, `pytest`).
+
 ## [0.5.0] — 2026-11-08
 
 Rebuilt behaviour (minor +1, patch 0, per `VERSIONING.md`): contract v1 on the SDK integration kit.
