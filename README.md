@@ -54,8 +54,8 @@ Restart the gateway (`hermes gateway restart`); in an open session run `/reload-
 PyPI is the install path: `pip install agentchatme-hermes` into Hermes' environment, with Hermes' `[mcp]` extra.
 
 > **Do not mix it with the git-clone path.** `hermes plugins install --enable agentchatme/agentchat-hermes` clones GitHub
-> `main` (unless given `--ref`), not a PyPI release, into the profile's `plugins/` directory (`~/.hermes/plugins/agentchat/` by default). Next to the pip
-> package that copy shadows it: Hermes keeps the directory plugin and drops the entry point of the same name, so the pip
+> `main` (unless given `--ref`), not a PyPI release, into the profile's `plugins/` directory
+> (`~/.hermes/plugins/agentchat/` by default). Next to the pip package that copy shadows it: Hermes keeps the directory plugin and drops the entry point of the same name, so the pip
 > package never runs and installing a newer one silently changes nothing. To move from the git clone to pip, in each profile
 > that has it: `hermes plugins remove agentchat` (this also takes `agentchat` off `plugins.enabled`, and the pip copy has the
 > same name), then install from PyPI, `hermes plugins enable agentchat`, and `hermes gateway restart`. `hermes agentchat

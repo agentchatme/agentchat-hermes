@@ -335,10 +335,56 @@ def test_auxiliary_call_llm_takes_what_the_fallback_passes() -> None:
 
 def test_config_and_provider_helpers() -> None:
     config = _import("hermes_cli.config")
-    for name in ("load_config", "save_config", "get_env_value", "save_env_value"):
+    for name in ("load_config", "save_config", "get_env_value", "save_env_value", "is_managed"):
         assert callable(getattr(config, name, None)), name
-    assert any(callable(getattr(config, n, None)) for n in ("read_user_config_raw", "read_raw_config", "load_config"))
+    # The hosted-tools entry is read as written (load_config expands ${VAR}).
+    assert any(callable(getattr(config, n, None)) for n in ("read_user_config_raw", "read_raw_config"))
     assert "target_model" in _params(_import("hermes_cli.runtime_provider").resolve_runtime_provider)
+
+
+def test_the_hosted_tools_entry_round_trips_through_hermes_config(
+    _hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through Hermes' own reader and saver: an earlier release's entry gains
+    the client headers and keeps the keys the user added, the key stays a
+    template in config.yaml with the key loaded, a second pass writes
+    nothing, and logout removes the entry."""
+    from fake_keys import api_key
+
+    from agentchatme_hermes import mcp_registration as reg
+    from agentchatme_hermes._version import __version__
+
+    key = api_key("contract_round_trip_value")
+    monkeypatch.setenv("AGENTCHAT_API_KEY", key)
+    config_path = _hermes_home / "config.yaml"
+    config_path.write_text(
+        "mcp_servers:\n"
+        "  agentchat:\n"
+        '    url: "https://api.agentchat.me/mcp"\n'
+        "    headers:\n"
+        '      Authorization: "Bearer ${AGENTCHAT_API_KEY}"\n'
+        "    timeout: 120\n",
+        encoding="utf-8",
+    )
+    config = _import("hermes_cli.config")
+
+    assert reg.inspect_entry_identity() == ("ours", "missing")
+    assert reg.install_entry() == "upgraded"
+    text = config_path.read_text(encoding="utf-8")
+    assert key not in text, "the key must never be written into config.yaml"
+    entry = config.read_user_config_raw()["mcp_servers"]["agentchat"]
+    assert entry["headers"] == {
+        "Authorization": "Bearer ${AGENTCHAT_API_KEY}",
+        "X-AgentChat-Client": "hermes",
+        "X-AgentChat-Client-Version": __version__,
+    }
+    assert entry["timeout"] == 120
+    assert reg.inspect_entry_identity() == ("ours", "current")
+    before = config_path.read_bytes()
+    assert reg.install_entry() == "present"
+    assert config_path.read_bytes() == before, "nothing to change, nothing written"
+    assert reg.uninstall_entry() is True
+    assert "agentchat" not in (config.read_user_config_raw().get("mcp_servers") or {})
 
 
 def test_wizard_helpers() -> None:

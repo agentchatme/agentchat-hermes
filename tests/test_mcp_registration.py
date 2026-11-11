@@ -324,6 +324,36 @@ class TestHermesBacked:
         assert "mcp_servers" not in fake_hermes.on_disk
         assert reg.uninstall_entry() is False
 
+    def test_two_installs_sharing_a_profile_settle_on_the_newer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Alternating activations by an rc build and its release (same x.y.z)
+        write once, then never again."""
+        from agentchatme_hermes import client_identity
+
+        config: dict[str, Any] = {"mcp_servers": {"agentchat": json.loads(json.dumps(OLD_ENTRY))}}
+        writes = 0
+        for version in ("0.5.2rc1", "0.5.2", "0.5.2rc1", "0.5.2", "0.5.2+local", "0.5.2"):
+            monkeypatch.setattr(client_identity, "__version__", version)
+            if reg.ensure_entry(config) == "upgraded":
+                writes += 1
+        # The rc's first activation, the release's, the local build's; never back.
+        assert writes == 3
+        assert config["mcp_servers"]["agentchat"]["headers"]["X-AgentChat-Client-Version"] == "0.5.2+local"
+
+    @pytest.mark.parametrize(
+        ("older", "newer"),
+        [
+            ("0.5.1", "0.5.2"),
+            ("0.5.2rc1", "0.5.2"),
+            ("0.5.2rc1", "0.5.2rc2"),
+            ("0.5.9", "0.10.0"),
+            ("0.5.2", "0.5.2+local"),
+            ("0.5.2", "0.5.2.post1"),
+        ],
+    )
+    def test_version_order(self, older: str, newer: str) -> None:
+        older_key, newer_key = reg._version_key(older), reg._version_key(newer)
+        assert older_key is not None and newer_key is not None and older_key < newer_key
+
     def test_a_newer_version_is_never_downgraded(self) -> None:
         entry = {
             "url": reg.hosted_mcp_url(),

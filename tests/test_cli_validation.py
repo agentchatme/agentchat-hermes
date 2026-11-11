@@ -369,7 +369,7 @@ class TestDoctorClientHeader:
         out = self._run(monkeypatch, capsys, "user_managed", "missing")
         assert "managed by hand in config.yaml — left alone" in out
         assert "the hand-written mcp_servers.agentchat does not say it is Hermes" in out
-        assert "replace any existing X-AgentChat-Client lines; a key may appear only once" in out
+        assert "replace any existing X-AgentChat-Client lines; a key may appear only once, in any casing" in out
         # The README entry's indent, under `headers:`.
         assert '\n      X-AgentChat-Client: "hermes"\n' in out
         assert f'\n      X-AgentChat-Client-Version: "{__version__}"\n' in out

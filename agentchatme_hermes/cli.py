@@ -524,7 +524,10 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     if directory_copies:
         # Hermes scans plugins/ in sorted order and the later same-named copy wins.
         loaded = directory_copies[-1]
-        clone = "a git clone: GitHub main unless installed with --ref, not a PyPI release"
+        clone = (
+            "a git clone (GitHub main unless installed with --ref) or a copy left there, "
+            "not a PyPI release"
+        )
         listed = ", ".join(str(path) for path in directory_copies)
         removals = " and ".join(f"`hermes plugins remove {path.name}`" for path in directory_copies)
         if pip_version is not None:
@@ -795,8 +798,8 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         else:
             set_headers = (
                 "set these two headers under its `headers:` (replace any existing "
-                "X-AgentChat-Client lines; a key may appear only once), then restart the gateway "
-                "or /reload-mcp:\n" + client_header_lines("      ")
+                "X-AgentChat-Client lines; a key may appear only once, in any casing), then "
+                "restart the gateway or /reload-mcp:\n" + client_header_lines("      ")
             )
             if entry_state == "ours":
                 ok(

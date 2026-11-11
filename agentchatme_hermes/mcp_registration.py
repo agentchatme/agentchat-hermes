@@ -197,16 +197,23 @@ def entry_identity(entry: Any) -> IdentityState:
     theirs = _header(headers, CLIENT_VERSION_HEADER)
     if theirs == ours:
         return "current"
-    ours_t, theirs_t = _release(ours), _release(theirs)
-    if ours_t is not None and theirs_t is not None and theirs_t > ours_t:
+    ours_key, theirs_key = _version_key(ours), _version_key(theirs)
+    if ours_key is not None and theirs_key is not None and theirs_key > ours_key:
         return "current"  # a newer install shares this profile; never downgrade it
     return "stale"
 
 
-def _release(version: Any) -> tuple[int, int, int] | None:
-    """``(major, minor, patch)`` of a version string, else ``None``."""
-    match = re.match(r"^\s*(\d+)\.(\d+)\.(\d+)", version) if isinstance(version, str) else None
-    return (int(match[1]), int(match[2]), int(match[3])) if match else None
+def _version_key(version: Any) -> tuple[int, int, int, int, str] | None:
+    """A total order on version strings, else ``None``: ``x.y.z`` numerically,
+    then pre-releases (``rc1``) below the release and post or local builds
+    (``.post1``, ``+local``) above it, then the suffix as text. Total, so two
+    installs never both see the other as older."""
+    match = re.match(r"^\s*(\d+)\.(\d+)\.(\d+)(.*)$", version) if isinstance(version, str) else None
+    if match is None:
+        return None
+    suffix = match[4].strip()
+    rank = 1 if not suffix else 2 if suffix.startswith(("+", ".post", "post", "-post")) else 0
+    return (int(match[1]), int(match[2]), int(match[3]), rank, suffix)
 
 
 def _set_client_headers(entry: MutableMapping[str, Any]) -> None:
