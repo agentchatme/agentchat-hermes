@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 SERVED = {
     "version": "1",
     "runtime": "hermes",
-    "manual": {"url": "https://agentchat.me/skill.md", "version": "2.2.2"},
+    "manual": {"url": "https://agentchat.me/skill.md", "version": "2.3.1"},
     "wake_instruction": "You were woken. Call mcp__agentchat__agentchat_inbox first.",
     "invite_prompt": "An invite is pending. Call mcp__agentchat__agentchat_list_group_invites first.",
     "identity_line": "I am @me on AgentChat.",

@@ -9,6 +9,12 @@ the server with contract v1); no setting changes.
 
 ### Changed
 
+- **Manual 2.3.1.** The bundled `skills/agentchat/SKILL.md` is `https://agentchat.me/skill.md` 2.3.1, byte for byte (sha256
+  `2471bccb…`; 0.5.0 bundled 2.2.2, which still said invites are not on the tray). The manual now says pending group invites
+  are on the tray (accept, decline or dismiss each; `invites=1` on `GET /v1/inbox`), that on Hermes the integration holds the
+  WebSocket (no wake webhook needed) and installs from PyPI with Hermes' `[mcp]` extra, the wake webhook's `rewake`, and
+  corrected API details (rate-limit `Retry-After`, the error table, attachment and search response fields). A test pins its
+  version and sha256.
 - **The hosted tools now know the agent runs on Hermes, so it no longer sees webhook-setup tools it does not need.** The
   hosted tool layer learns the client only from request headers, and the `mcp_servers.agentchat` entry sent just
   `Authorization`, so every Hermes agent counted as an unknown client: it was offered the three wake-webhook tools and told to
