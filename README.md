@@ -179,6 +179,7 @@ To stay on an earlier path while this one is proven on your fleet, pin the corre
 - Does **not** define tools, gate wording, categories, card fields or any text the agent reads. Those are the server's, the hosted tool layer's and the SDK's.
 - Does **not** wake the agent on a schedule — only on a wake. Combine with Hermes' cron if you want periodic outbound.
 - Does **not** ship a model. The gate and the turn use whatever model your Hermes is configured for (`hermes model`).
+- Does **not** run under Hermes' opt-in plugin host isolation (`plugins.isolation: host`). There the plugin loads only in a host child process, which never holds the socket, so the agent is never woken and `hermes agentchat …` is not registered. The default, `in_process`, is what it needs.
 
 ## Development
 
