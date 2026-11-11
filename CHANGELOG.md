@@ -9,6 +9,17 @@ the server with contract v1); no setting changes.
 
 ### Changed
 
+- **The hosted tools now know the agent runs on Hermes, so it no longer sees webhook-setup tools it does not need.** The
+  hosted tool layer learns the client only from request headers, and the `mcp_servers.agentchat` entry sent just
+  `Authorization`, so every Hermes agent counted as an unknown client: it was offered the three wake-webhook tools and told to
+  register a webhook, a second wake path next to the plugin's socket. The entry now also carries
+  `X-AgentChat-Client: "hermes"` and `X-AgentChat-Client-Version: "<plugin version>"` (the identity the SDK already sends).
+  An entry an earlier release placed (that URL and the `${AGENTCHAT_API_KEY}` bearer) is updated in place when the gateway
+  activates the plugin, or by `hermes agentchat doctor --fix`; only the two headers change, and the version header follows the
+  installed plugin. An entry that points elsewhere or authenticates another way is never changed: `doctor` warns that it does
+  not say Hermes and prints the two lines to add. Hermes sends configured headers on every request and uses a changed entry
+  once it reconnects the hosted tools: a gateway restart, or `/reload-mcp` in a session. The repository's `mcp.json` and the
+  README entry carry the same headers.
 - **Registration and recovery go through the SDK.** The wizard's two start requests (`POST /v1/register`,
   `POST /v1/agents/recover`, also used by `hermes agentchat register` / `recover`) were posted with raw `httpx`, working around
   SDK gaps that `agentchatme` 1.3.0 closed. They are now `AgentChatClient.register` / `recover`, like every other AgentChat

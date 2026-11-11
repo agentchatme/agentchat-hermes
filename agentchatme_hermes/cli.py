@@ -754,23 +754,51 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     try:
         from .mcp_registration import (
             McpRegistrationError,
+            client_header_lines,
             hosted_mcp_url,
-            inspect_entry,
+            inspect_entry_identity,
             manual_snippet,
         )
 
         try:
-            entry_state = inspect_entry(api_base=api_base)
+            entry_state, identity = inspect_entry_identity(api_base=api_base)
         except McpRegistrationError as exc:
             warn(f"hosted-tools entry not checked — {exc}")
         else:
+            add_headers = (
+                "add these lines under its `headers:` and restart the gateway (or /reload-mcp):\n"
+                + client_header_lines("    ")
+            )
             if entry_state == "ours":
                 ok(
                     f"hosted tools registered: mcp_servers.agentchat → {hosted_mcp_url(api_base)} "
                     "(tools appear as mcp__agentchat__<tool>; `hermes mcp test agentchat` probes it)"
                 )
+                if identity == "missing":
+                    warn(
+                        "mcp_servers.agentchat does not say it is Hermes (no X-AgentChat-Client "
+                        "header), so the hosted tools treat this agent as an unknown client and "
+                        "offer it webhook-setup tools it does not need — `hermes agentchat doctor "
+                        "--fix` adds the header (the gateway also does at its next start)"
+                    )
+                elif identity == "stale":
+                    ok(
+                        "client header names another plugin version — `hermes agentchat doctor "
+                        "--fix` refreshes it (the gateway also does at its next start)"
+                    )
+                elif identity == "other":
+                    warn(
+                        "X-AgentChat-Client in mcp_servers.agentchat names another client, not "
+                        "hermes — left alone; the hosted tools treat this agent as that client"
+                    )
             elif entry_state == "user_managed":
                 ok("mcp_servers.agentchat is managed by hand in config.yaml — left alone")
+                if identity != "current" and identity != "stale":
+                    warn(
+                        "the hand-written mcp_servers.agentchat does not say it is Hermes, so the "
+                        "hosted tools treat this agent as an unknown client and offer it "
+                        "webhook-setup tools it does not need; " + add_headers
+                    )
             elif entry_state == "disabled":
                 warn(
                     "mcp_servers.agentchat is disabled in config.yaml — the agent has no "

@@ -176,6 +176,14 @@ def place_mcp(api_base: str) -> PlacementStep:
             "registered the hosted tools as mcp_servers.agentchat in config.yaml "
             "(a running gateway connects it within about a minute; a session on /reload-mcp)",
         )
+    if outcome == "upgraded":
+        return PlacementStep(
+            "mcp",
+            "changed",
+            "set the client headers on mcp_servers.agentchat (X-AgentChat-Client: hermes), so the "
+            "hosted tools know this agent runs on Hermes (used after a gateway restart, or "
+            "/reload-mcp in a session)",
+        )
     if outcome == "present":
         return PlacementStep("mcp", "ok", "hosted tools already registered as mcp_servers.agentchat")
     if outcome == "disabled":

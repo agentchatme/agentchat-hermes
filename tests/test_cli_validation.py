@@ -7,6 +7,8 @@ for low signal — the validators below are the load-bearing logic.
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from fake_keys import api_key
 
@@ -224,7 +226,7 @@ class TestDoctor:
         # check would read this test machine's config.yaml.
         from agentchatme_hermes import kit, mcp_registration
 
-        monkeypatch.setattr(mcp_registration, "inspect_entry", lambda **_kw: "ours")  # type: ignore[attr-defined]
+        monkeypatch.setattr(mcp_registration, "inspect_entry_identity", lambda **_kw: ("ours", "current"))  # type: ignore[attr-defined]
         # The SDK stand-in above has no kit; a clean install has it.
         monkeypatch.setattr(kit, "kit_problem", lambda: None)  # type: ignore[attr-defined]
 
@@ -303,3 +305,73 @@ class TestDoctorHermesMcpClient:
 
         monkeypatch.setattr(importlib, "import_module", fake_import)  # type: ignore[attr-defined]
         assert cli._hermes_mcp_client_importable() is True
+
+
+class TestDoctorClientHeader:
+    """The hosted-tools entry must say it is Hermes (``X-AgentChat-Client``),
+    or the hosted tools treat the agent as an unknown client and offer it the
+    wake-webhook tools a socket integration does not need."""
+
+    @staticmethod
+    def _run(monkeypatch: Any, capsys: Any, state: str, identity: str | None) -> str:
+        import argparse
+        import sys
+        import types as _types
+        from unittest.mock import MagicMock
+
+        from agentchatme_hermes import cli, kit, mcp_registration
+
+        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: (api_key("xyz"), cli._ENV_API_KEY))
+        fake_client = MagicMock()
+        fake_client.get_me.return_value = {"handle": "alice", "status": "active"}
+        fake_sdk = _types.ModuleType("agentchatme")
+        fake_sdk.AgentChatClient = MagicMock(return_value=fake_client)  # type: ignore[attr-defined]
+        fake_sdk.AgentChatClientIdentity = MagicMock  # type: ignore[attr-defined]
+        fake_sdk.AgentChatError = Exception  # type: ignore[attr-defined]
+        fake_sdk.UnauthorizedError = Exception  # type: ignore[attr-defined]
+
+        class _ConnectionError(Exception):
+            pass
+
+        fake_sdk.ConnectionError = _ConnectionError  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "agentchatme", fake_sdk)
+        monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)
+        monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)
+        monkeypatch.setattr(kit, "kit_problem", lambda: None)
+        monkeypatch.setattr(mcp_registration, "inspect_entry_identity", lambda **_kw: (state, identity))
+        cli._dispatch_doctor(argparse.Namespace(fix=False))
+        return str(capsys.readouterr().out)
+
+    def test_current_entry_has_no_header_warning(self, monkeypatch: Any, capsys: Any) -> None:
+        out = self._run(monkeypatch, capsys, "ours", "current")
+        assert "hosted tools registered" in out
+        assert "X-AgentChat-Client" not in out
+
+    def test_entry_from_an_earlier_release_warns_with_the_fix(self, monkeypatch: Any, capsys: Any) -> None:
+        out = self._run(monkeypatch, capsys, "ours", "missing")
+        assert "[warn] mcp_servers.agentchat does not say it is Hermes" in out
+        assert "doctor --fix" in out
+
+    def test_stale_version_is_not_a_warning(self, monkeypatch: Any, capsys: Any) -> None:
+        out = self._run(monkeypatch, capsys, "ours", "stale")
+        assert "client header names another plugin version" in out
+        assert "[warn] mcp_servers.agentchat does not say" not in out
+
+    def test_another_client_name_is_left_alone_and_said(self, monkeypatch: Any, capsys: Any) -> None:
+        out = self._run(monkeypatch, capsys, "ours", "other")
+        assert "names another client, not hermes — left alone" in out
+
+    def test_hand_written_entry_without_the_header_says_what_to_add(
+        self, monkeypatch: Any, capsys: Any
+    ) -> None:
+        from agentchatme_hermes._version import __version__
+
+        out = self._run(monkeypatch, capsys, "user_managed", "missing")
+        assert "managed by hand in config.yaml — left alone" in out
+        assert "the hand-written mcp_servers.agentchat does not say it is Hermes" in out
+        assert '    X-AgentChat-Client: "hermes"' in out
+        assert f'    X-AgentChat-Client-Version: "{__version__}"' in out
+
+    def test_hand_written_entry_with_the_header_is_fine(self, monkeypatch: Any, capsys: Any) -> None:
+        out = self._run(monkeypatch, capsys, "user_managed", "current")
+        assert "does not say it is Hermes" not in out

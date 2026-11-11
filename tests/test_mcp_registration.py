@@ -16,8 +16,13 @@ import pytest
 from fake_keys import PREFIX
 
 from agentchatme_hermes import mcp_registration as reg
+from agentchatme_hermes._version import __version__
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# The entry an earlier release placed: Authorization only.
+OLD_ENTRY = {"url": "https://api.agentchat.me/mcp", "headers": {"Authorization": "Bearer ${AGENTCHAT_API_KEY}"}}
+CLIENT_HEADERS = {"X-AgentChat-Client": "hermes", "X-AgentChat-Client-Version": __version__}
 
 
 class TestEntry:
@@ -25,9 +30,18 @@ class TestEntry:
         entry = reg.server_entry()
         assert entry == {
             "url": "https://api.agentchat.me/mcp",
-            "headers": {"Authorization": "Bearer ${AGENTCHAT_API_KEY}"},
+            "headers": {"Authorization": "Bearer ${AGENTCHAT_API_KEY}", **CLIENT_HEADERS},
         }
         assert PREFIX not in json.dumps(entry)
+
+    def test_client_headers_are_the_sdk_identity(self) -> None:
+        """The same name and version the SDK sends on REST and the socket."""
+        from agentchatme_hermes.client_identity import hermes_client_identity
+
+        identity = hermes_client_identity()
+        headers = reg.server_entry()["headers"]
+        assert headers["X-AgentChat-Client"] == identity.name == "hermes"
+        assert headers["X-AgentChat-Client-Version"] == identity.version == __version__
 
     def test_hosted_url_follows_api_base(self) -> None:
         assert reg.hosted_mcp_url("http://localhost:3000/") == "http://localhost:3000/mcp"
@@ -38,6 +52,8 @@ class TestEntry:
         assert "  agentchat:" in snippet
         assert 'url: "https://api.agentchat.me/mcp"' in snippet
         assert 'Authorization: "Bearer ${AGENTCHAT_API_KEY}"' in snippet
+        assert '      X-AgentChat-Client: "hermes"\n' in snippet
+        assert f'      X-AgentChat-Client-Version: "{__version__}"\n' in snippet
 
 
 class TestDescribeEnsureRemove:
@@ -73,6 +89,80 @@ class TestDescribeEnsureRemove:
         assert reg.describe_entry(config) == "ours"
         assert reg.ensure_entry(config) == "present"
         assert config["mcp_servers"]["agentchat"] == tuned
+
+    def test_an_earlier_release_entry_is_upgraded_in_place(self) -> None:
+        tuned = {**json.loads(json.dumps(OLD_ENTRY)), "trust": "untrusted", "timeout": 120}
+        config: dict[str, Any] = {"mcp_servers": {"agentchat": tuned, "github": {"url": "https://x/mcp"}}}
+        assert reg.describe_entry(config) == "ours"
+        assert reg.entry_identity(tuned) == "missing"
+        assert reg.ensure_entry(config) == "upgraded"
+        entry = config["mcp_servers"]["agentchat"]
+        assert entry == {
+            "url": "https://api.agentchat.me/mcp",
+            "headers": {"Authorization": "Bearer ${AGENTCHAT_API_KEY}", **CLIENT_HEADERS},
+            "trust": "untrusted",
+            "timeout": 120,
+        }
+        assert config["mcp_servers"]["github"] == {"url": "https://x/mcp"}
+        assert reg.ensure_entry(config) == "present", "once current, nothing more to do"
+
+    def test_an_older_version_is_refreshed_whatever_its_casing(self) -> None:
+        entry = {
+            "url": reg.hosted_mcp_url(),
+            "headers": {
+                "authorization": "Bearer ${AGENTCHAT_API_KEY}",
+                "x-agentchat-client": "Hermes",
+                "x-agentchat-client-version": "0.5.0",
+                "X-Extra": "kept",
+            },
+        }
+        config: dict[str, Any] = {"mcp_servers": {"agentchat": entry}}
+        assert reg.entry_identity(entry) == "stale"
+        assert reg.ensure_entry(config) == "upgraded"
+        assert config["mcp_servers"]["agentchat"]["headers"] == {
+            "authorization": "Bearer ${AGENTCHAT_API_KEY}",
+            "X-Extra": "kept",
+            **CLIENT_HEADERS,
+        }
+
+    def test_a_client_header_naming_another_client_is_left_alone(self) -> None:
+        entry = {
+            "url": reg.hosted_mcp_url(),
+            "headers": {"Authorization": "Bearer ${AGENTCHAT_API_KEY}", "X-AgentChat-Client": "my-harness"},
+        }
+        config: dict[str, Any] = {"mcp_servers": {"agentchat": json.loads(json.dumps(entry))}}
+        assert reg.entry_identity(entry) == "other"
+        assert reg.ensure_entry(config) == "present"
+        assert config["mcp_servers"]["agentchat"] == entry
+
+    def test_user_managed_entry_without_the_header_is_not_touched(self) -> None:
+        theirs = {"url": "https://proxy.example/mcp", "headers": {"Authorization": "Bearer ${AGENTCHAT_API_KEY}"}}
+        config: dict[str, Any] = {"mcp_servers": {"agentchat": json.loads(json.dumps(theirs))}}
+        assert reg.describe_entry(config) == "user_managed"
+        assert reg.entry_identity(theirs) == "missing"
+        assert reg.ensure_entry(config) == "user_managed"
+        assert config["mcp_servers"]["agentchat"] == theirs
+
+    def test_disabled_old_entry_is_not_upgraded(self) -> None:
+        entry = {**json.loads(json.dumps(OLD_ENTRY)), "enabled": False}
+        config: dict[str, Any] = {"mcp_servers": {"agentchat": entry}}
+        assert reg.ensure_entry(config) == "disabled"
+        assert "X-AgentChat-Client" not in config["mcp_servers"]["agentchat"]["headers"]
+
+    @pytest.mark.parametrize(
+        ("entry", "expected"),
+        [
+            ({}, "missing"),
+            ({"headers": None}, "missing"),
+            ({"headers": {"X-AgentChat-Client": "  "}}, "missing"),
+            ({"headers": {"X-AgentChat-Client": "hermes"}}, "stale"),
+            ({"headers": {"X-AgentChat-Client": "hermes", "X-AgentChat-Client-Version": __version__}}, "current"),
+            ({"headers": {"X-AgentChat-Client": "openclaw"}}, "other"),
+            ("not a mapping", "missing"),
+        ],
+    )
+    def test_entry_identity(self, entry: Any, expected: str) -> None:
+        assert reg.entry_identity(entry) == expected
 
     def test_env_colon_reference_counts_as_ours(self) -> None:
         entry = {"url": reg.hosted_mcp_url(), "headers": {"authorization": "Bearer ${env:AGENTCHAT_API_KEY}"}}
@@ -134,8 +224,29 @@ class TestHermesBacked:
 
     def test_inspect_reads_the_raw_file(self, fake_hermes: _FakeHermesConfig) -> None:
         assert reg.inspect_entry() == "missing"
+        assert reg.inspect_entry_identity() == ("missing", None)
         reg.install_entry()
         assert reg.inspect_entry() == "ours"
+        assert reg.inspect_entry_identity() == ("ours", "current")
+
+    def test_install_upgrades_an_old_entry_with_one_write(self, fake_hermes: _FakeHermesConfig) -> None:
+        fake_hermes.on_disk = {"model": {"default": "x"}, "mcp_servers": {"agentchat": json.loads(json.dumps(OLD_ENTRY))}}
+        assert reg.inspect_entry_identity() == ("ours", "missing")
+        assert reg.install_entry() == "upgraded"
+        assert len(fake_hermes.saved) == 1
+        assert fake_hermes.on_disk["mcp_servers"]["agentchat"]["headers"] == {
+            "Authorization": "Bearer ${AGENTCHAT_API_KEY}",
+            **CLIENT_HEADERS,
+        }
+        assert reg.install_entry() == "present"
+        assert len(fake_hermes.saved) == 1
+
+    def test_install_never_writes_a_user_managed_entry(self, fake_hermes: _FakeHermesConfig) -> None:
+        theirs = {"url": "https://proxy.example/mcp", "headers": {"Authorization": "Bearer x"}}
+        fake_hermes.on_disk = {"mcp_servers": {"agentchat": theirs}}
+        assert reg.install_entry() == "user_managed"
+        assert fake_hermes.saved == []
+        assert reg.inspect_entry_identity() == ("user_managed", "missing")
 
     def test_uninstall_removes_ours_only(self, fake_hermes: _FakeHermesConfig) -> None:
         reg.install_entry()
@@ -162,7 +273,7 @@ class TestPortableDeclaration:
         assert set(server) <= {"type", "url", "headers"}  # _REMOTE_FIELDS
         assert server["type"] == "streamable-http"
         assert server["url"].startswith("https://")
-        assert server["headers"] == {"Authorization": "Bearer ${AGENTCHAT_API_KEY}"}
+        assert server["headers"] == {"Authorization": "Bearer ${AGENTCHAT_API_KEY}", **CLIENT_HEADERS}
 
     def test_repo_root_mcp_json_is_the_declaration(self) -> None:
         on_disk = json.loads((REPO_ROOT / "mcp.json").read_text(encoding="utf-8"))
@@ -173,3 +284,10 @@ class TestPortableDeclaration:
         native = reg.server_entry()
         assert portable["url"] == native["url"]
         assert portable["headers"] == native["headers"]
+
+    def test_readme_snippet_names_this_version(self) -> None:
+        """The README's hand-written entry carries the version; a release
+        bump must update it (and mcp.json) with the package."""
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        assert '      X-AgentChat-Client: "hermes"\n' in readme
+        assert f'      X-AgentChat-Client-Version: "{__version__}"\n' in readme

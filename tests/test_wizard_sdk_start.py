@@ -690,7 +690,7 @@ class TestOfflineSubcommands:
         monkeypatch.setattr(cli, "_read_saved_key_source", lambda: (_KEY, cli._ENV_API_KEY))
         monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)
         monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)
-        monkeypatch.setattr(mcp_registration, "inspect_entry", lambda **_kw: "ours")
+        monkeypatch.setattr(mcp_registration, "inspect_entry_identity", lambda **_kw: ("ours", "current"))
         monkeypatch.setattr(kit, "kit_problem", lambda: None)
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         out = capsys.readouterr().out
