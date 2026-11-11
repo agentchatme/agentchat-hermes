@@ -9,18 +9,18 @@ maintainers are responsive — most PRs land within a few days.
 git clone https://github.com/agentchatme/agentchat-hermes
 cd agentchat-hermes
 python -m pip install -e '.[dev]'
-python -m pytest -q       # unit suite, runs in <1s
-python -m ruff check .    # lint
-python -m pyright agentchatme_hermes
+python -m ruff check .              # lint
+python -m mypy agentchatme_hermes   # type-check (strict)
+python -m pytest -q                 # unit suite
 ```
 
 To run the live smoke suite against `https://api.agentchat.me`, set
 `AGENTCHATME_LIVE_API_KEY` (or `AGENTCHAT_LIVE_API_KEY`, same as the SDK's
-fixture) to a real `ac_live_…` token and run `pytest -m live`.
+fixture) to a real `ac_…` key and run `pytest -m live`.
 
 ## Pull request expectations
 
-* Pass `ruff check`, `pyright agentchatme_hermes`, and `pytest -q` locally
+* Pass `ruff check .`, `mypy agentchatme_hermes`, and `pytest -q` locally
   before pushing. The `CI` workflow re-runs them on every PR; failures
   block the merge.
 * Keep changes scoped — one concern per PR. A bug fix and a refactor go
@@ -43,17 +43,17 @@ instead of filing publicly.
 
 ## Architecture notes
 
-The adapter is a thin bridge over the official `agentchatme` Python SDK.
-When the wire format changes, the SDK's typed errors update first; the
-plugin then absorbs them through the `_safe()` decorator's branch tree
-in `tools.py`. Don't replicate transport logic here — extend the SDK and
-let it flow through.
+The integration is a thin layer over the official `agentchatme` Python SDK:
+receiving is the SDK kit's `ReceiveLoop`, and every AgentChat request,
+registration and recovery included, is an SDK call. When the wire format
+changes, the SDK's typed errors update first; the plugin maps them onto its
+own messages. Don't replicate transport logic here — extend the SDK and let
+it flow through.
 
-The Hermes runtime is intentionally a *lazy* import: nothing in the
-package may `import gateway.platforms.base` at module scope. Add new
-framework integrations inside `_adapter_class()` or inside `register()`
-itself. The unit suite verifies the package imports cleanly without
-Hermes installed; that's a regression gate.
+Hermes is intentionally a *lazy* import: nothing in the package may import
+a Hermes module at module scope, only inside the function that needs it.
+The unit suite runs without Hermes installed, so it verifies the package
+imports cleanly without it; that's a regression gate.
 
 ## Release process
 

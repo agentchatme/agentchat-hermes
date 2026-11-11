@@ -56,8 +56,9 @@ reporters who want public attribution in the release notes.
 
 * API keys are stored in `~/.hermes/.env` with `0o600` permissions on
   Unix (no-op on Windows — same posture as every other Hermes adapter).
-* The plugin never logs the raw API key. The wizard masks keys to
-  `ac_live_…XXXX` for display.
+* The plugin never logs the raw API key. A key (`ac_` and 43 random
+  characters) is displayed as its first 8 characters and its last 4
+  (`ac_XXXXX…XXXX`).
 * OTP codes are sent only to the AgentChat API over TLS 1.3 and never
   persisted on disk.
 * The plugin uses `hashlib.sha256(key)[:16]` as a non-reversible

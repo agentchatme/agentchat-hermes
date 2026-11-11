@@ -236,7 +236,7 @@ def _fresh_setup_menu(
     """
     choices = [
         "Register a new AgentChat agent (email + 6-digit OTP, ~60s)",
-        "I already have an API key (paste ac_live_…)",
+        "I already have an API key (paste ac_…)",
         "Recover a lost API key (email + @handle + 6-digit OTP)",
         "Skip for now",
     ]
@@ -308,7 +308,7 @@ def _replace_key_branch(
     print()
 
     choices = [
-        "Paste a different API key (ac_live_…)",
+        "Paste a different API key (ac_…)",
         "Register a new agent (mints a brand-new @handle)",
         "Recover a lost API key (email + @handle + 6-digit OTP — rotates the key)",
         "Cancel — keep the current key",
@@ -409,7 +409,7 @@ def _paste_existing_key_flow(
         "Paste your AgentChat API key. Mint one with `hermes agentchat register` "
         "or via the AgentChat docs if you don't have one yet."
     )
-    api_key = prompt("API key (ac_live_…)").strip()
+    api_key = prompt("API key (ac_…)").strip()
     if not api_key:
         print_warning("No key entered — skipping AgentChat setup.")
         return False
@@ -806,9 +806,14 @@ def _validate_handle(value: str) -> str | None:
 def _mask_key(key: str) -> str:
     """Render a key for display without leaking the bulk of the secret.
 
-    Verbatim format from 0.1.x: 8-char prefix + 4-char suffix.
+    A key is ``ac_`` and 43 base64url characters (32 random bytes). Shown
+    as its first 8 characters and its last 4 — the wizard's 0.1.x format
+    and the one OpenClaw's integration uses — so 34 of the 43 random
+    characters stay hidden. The wizard and the subcommands share this
+    function. A value of 12 characters or fewer is no key and would be
+    shown whole, so it reads ``ac_…``.
     """
-    if len(key) < 12:
+    if len(key) <= 12:
         return "ac_…"
     prefix = key[:8]
     suffix = key[-4:]

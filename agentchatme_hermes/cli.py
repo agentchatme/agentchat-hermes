@@ -7,7 +7,7 @@ Surfaces:
   shows status if one is.
 * **``register``** — OTP registration: email → handle → 6-digit
   code → minted API key persisted to ``~/.hermes/.env``.
-* **``login``** — paste an existing ``ac_live_…`` key. Validates
+* **``login``** — paste an existing ``ac_…`` key. Validates
   via ``GET /v1/agents/me`` before persisting so we never save a
   key that doesn't authenticate.
 * **``recover``** — re-key a lost or leaked API key: email + @handle
@@ -55,6 +55,7 @@ from .placement import (
     resolve_identity_line,
 )
 from .soul_anchor import remove_soul_anchor
+from .wizard import _mask_key
 
 if TYPE_CHECKING:
     import argparse
@@ -131,7 +132,7 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     p_login.add_argument(
         "--api-key",
         dest="api_key",
-        help="ac_live_… key. Prompts (masked input) if omitted.",
+        help="ac_… key. Prompts (masked input) if omitted.",
     )
     p_login.set_defaults(func=_dispatch_login)
 
@@ -319,7 +320,7 @@ def _dispatch_login(args: argparse.Namespace) -> int:
         except UnauthorizedError:
             return _exit_with(
                 "That key did not authenticate against /v1/agents/me. "
-                "Check that you copied the full ac_live_… key."
+                "Check that you copied the full ac_… key."
             )
         except AgentChatError as exc:
             return _exit_with(f"Key validation failed: {exc}")
@@ -1203,7 +1204,7 @@ def _prompt_code() -> str:
 
 
 def _prompt_api_key() -> str:
-    return getpass("API key (ac_live_…): ").strip()
+    return getpass("API key (ac_…): ").strip()
 
 
 # ───────────────────────── validators ─────────────────────────
@@ -1365,12 +1366,6 @@ def _print_status(me: dict[str, Any]) -> None:
         _printline(f"  Paused:        {paused_by_owner}  (owner-paused)")
     _printline(f"  Plugin:        agentchatme-hermes {__version__} (integration)")
     _printline("")
-
-
-def _mask_key(key: str) -> str:
-    if len(key) <= 12:
-        return "ac_live_***"
-    return f"{key[:11]}…{key[-4:]}"
 
 
 # ───────────────────────── I/O glue ─────────────────────────
