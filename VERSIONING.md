@@ -4,6 +4,7 @@ Semantic Versioning, with the first slot frozen at `0` until the founder declare
 
 - **Rebuilt or added behaviour** → minor +1, patch resets to 0 (`0.2.x` → `0.3.0`).
 - **Fixed or adjusted existing behaviour** → patch +1 (`0.3.0` → `0.3.1`).
+- **Until the product is declared stable (temporary, set 2026-11-11):** when a change could go either way, patch or minor, it is a patch. Bump as slowly as possible.
 - **Always +1 numerically.** Never append digits, never skip, never touch the first slot.
 - **Pre-release for testers, only if needed:** same number with an `rc` suffix (`0.3.0rc1` on PyPI, `0.3.0-rc.1` under the `next` tag on npm). The stable number moves only at release.
 - **The founder sets the number for every release.** Open a PR with the code; the number is applied at the release step.
