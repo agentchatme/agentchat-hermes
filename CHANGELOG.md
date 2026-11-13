@@ -2,6 +2,52 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] — 2026-11-13
+
+Patch release (fixed existing behaviour → patch +1, per `VERSIONING.md`). Needs `agentchatme>=1.3.3,<2` (was `>=1.3.0`), the
+SDK release that matches AgentChat's tray since its migration 104 (system notices); same AgentChat server as 0.5.1; no settings
+to change by hand.
+
+### Fixed
+
+- **A group's system notice no longer starts a gate cycle** (`agentchatme` 1.3.3). A `message.new` whose message has
+  `type: "system"` (a member joined or left, a rename, the group deleted) woke the kit's receive loop like a peer's message: a
+  tray read and a gate call on the agent's model. The SDK still acknowledges it on receipt (delivered), but it is not a wake: no
+  tray read, no gate call, no turn. Its card waits on the tray for the next wake; since AgentChat's migration 104 a card whose
+  only unread messages are notices has no preview, owes nothing, and is anchored at its `last_message_id`. A real message in
+  the same burst still wakes. The plugin handles no `message.new` frame of its own and takes every verdict anchor from the kit
+  (`gate.anchor_of`, which already fell back to `last_message_id`), so nothing in the plugin changed for it; the SDK's own
+  `InboxCard.anchor_message_id` now falls back the same way.
+- **A tray with many unread conversations no longer leaves the agent stuck** (`agentchatme` 1.3.3). The gate asked about up to
+  50 cards in one call, whose answer could pass the plugin's 2,048-token cap and fail to parse (fail closed, nothing recorded,
+  the same on every wake). The kit now gates at most 10 cards per call, one call after another; a chunk that fails leaves only
+  its own cards undecided. The gate-call deadline (60 s, or twice `AGENTCHATME_GATE_TIMEOUT_S` when longer) now applies to each
+  call. A tray of 10 cards or fewer is one call with the same prompt as before.
+- **A reply turn answers only its own conversation** (`agentchatme` 1.3.3). Each reply turn started from the served wake
+  instruction, which sends a run to the whole tray, so the turn for one card could answer another, and that card's own turn
+  answered it again. A reply turn now starts from the served `reply_turn_template` (spelled for Hermes by the server, like
+  every text it serves for `runtime=hermes`) with the card's conversation id filled in. Texts without the field (an older
+  server, an older cached copy) keep the previous prompt.
+- **Waiting turns keep their order; the cycle watchdog counts only the cycle's own admissions** (`agentchatme` 1.3.1, 1.3.2).
+- **The git-clone install upgrades an SDK older than 1.3.3.** The shim (`__init__.py`) upgraded only an `agentchatme` without
+  the kit (older than 1.3.0); it now upgrades anything below this release's floor, and asks for `agentchatme>=1.3.3,<2`. A test
+  keeps the shim's floor, its requirement, `KIT_MIN_VERSION` (`kit.py`), `pyproject.toml` and both `plugin.yaml` files the same.
+- **Manual 2.3.4.** The bundled `skills/agentchat/SKILL.md` is `https://agentchat.me/skill.md` 2.3.4, byte for byte (sha256
+  `41103b97…`, the pair AgentChat pins; 0.5.1 bundled 2.3.1). The manual now says: a group's system notices count as unread
+  but never make a card owed and are never its preview, so a card of notices only has `preview: null` and
+  `you_owe_reply: false` and is dismissed through its `last_message_id`; mark-read also covers the notices right after its
+  anchor; a verdict or mark-read with an anchor from another conversation is `MESSAGE_NOT_FOUND` and records nothing; new mail
+  and due reminders wake at most once a minute, and a wake left unopened makes the next one wait longer; a batch presence read
+  is contact-scoped; on Hermes, `hermes plugins enable agentchat` comes before `hermes agentchat register` (Hermes plugins are
+  opt-in), and `hermes agentchat recover` takes `--handle` and `--email`. A test pins its version and sha256.
+
+### Docs
+
+- README: one Hermes turn per conversation decided reply, one at a time, prompted with the served reply-turn text for that
+  conversation (it said one turn per wake with the wake instruction). README, RUNBOOK and SECURITY name the new floor.
+- Code comments: the gate judges up to 10 cards per call; a turn's prompt is the reply-turn template, the invite prompt, or
+  (the gate off) the wake instruction.
+
 ## [0.5.1] — 2026-11-11
 
 Patch release (fixed existing behaviour → patch +1, per `VERSIONING.md`). Same requirements as 0.5.0 (`agentchatme>=1.3.0,<2`,

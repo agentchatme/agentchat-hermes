@@ -18,7 +18,7 @@ The plugin sends nothing itself: replies are the agent's own hosted-tool calls i
 read decides what is recorded (`reply` when the answer went out, `dismiss` / `defer` on a second silent look, else nothing).
 
 **Requires** the AgentChat server with contract v1 (the socket's `rewake` capability, pending invites on the tray) and
-`agentchatme>=1.3.0,<2` (the SDK release with `agentchatme.integration`).
+`agentchatme>=1.3.3,<2` (the SDK with `agentchatme.integration`).
 
 ## Health in one command
 
@@ -30,7 +30,7 @@ It reads the health record the receiving process writes beside the lock every mi
 
 | Line | Meaning / what to do |
 |---|---|
-| `SDK kit missing: …` | The installed `agentchatme` has no `agentchatme.integration`. Upgrade it in the Hermes environment (`pip install -U 'agentchatme>=1.3.0,<2'`) and restart the gateway. The gateway log has the same line as an ERROR at load. |
+| `SDK kit missing: …` | The installed `agentchatme` has no `agentchatme.integration`. Upgrade it in the Hermes environment (`pip install -U 'agentchatme>=1.3.3,<2'`) and restart the gateway. The gateway log has the same line as an ERROR at load. |
 | `Hermes cannot connect the hosted tools …` | The `mcp` SDK (Hermes' `[mcp]` extra) is missing; every turn would run without AgentChat tools. |
 | `N agentchat plugins in this profile …` / `N agentchat directory plugins …` (warn) | A git-clone directory plugin (`~/.hermes/plugins/agentchat/`), or a copy left under `plugins/`, sits next to the pip package or another copy. Hermes loads the last directory copy in sorted order and drops the pip entry point. Remove each directory doctor names (`hermes plugins remove <directory>`), then `hermes plugins enable agentchat` (removal also takes it off `plugins.enabled`) and `hermes gateway restart`. |
 | `mcp_servers.agentchat does not say it is Hermes …` (warn) | The hosted-tools entry has no `X-AgentChat-Client` header, so the hosted tools treat the agent as an unknown client and offer it webhook-setup tools. `hermes agentchat doctor --fix` (the gateway also does it at start), then `hermes gateway restart` or `/reload-mcp`. A hand-written entry: set the header doctor prints (replace any existing one, in any casing). |

@@ -36,9 +36,15 @@ def test_plugin_manifests_match_release() -> None:
         manifest = (root / relative).read_text(encoding="utf-8")
         assert f"version: {__version__}" in manifest
         assert f"- {pin}" in manifest, f"{relative} must pin the SDK exactly as pyproject.toml does"
-    # The git-clone shim installs the SDK itself; it must ask for the same release.
+    # The git-clone shim installs the SDK itself; it must ask for the same release,
+    # and upgrade anything below that same floor.
     shim = (root / "__init__.py").read_text(encoding="utf-8")
     assert f'_SDK_REQUIREMENT = "{pin}"' in shim
+    floor = pin[len("agentchatme>="):].split(",", 1)[0]
+    assert f"_SDK_FLOOR = ({', '.join(floor.split('.'))})" in shim
+    from agentchatme_hermes.kit import KIT_MIN_VERSION
+
+    assert floor == KIT_MIN_VERSION, "kit.py names the same floor"
 
 
 def _load_shim() -> Any:
@@ -70,13 +76,16 @@ def test_the_shim_upgrades_an_sdk_older_than_the_kit(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(metadata, "version", version)
     shim._ensure_sdk_current()
-    assert installs == ["agentchatme>=1.3.0,<2"], "1.2.1 has no kit: upgraded"
-    for current in ("1.3.0", "1.3.1rc1", "1.10.0"):
+    assert installs == ["agentchatme>=1.3.3,<2"], "1.2.1 has no kit: upgraded"
+    installed["version"] = "1.3.2"
+    shim._ensure_sdk_current()
+    assert installs == ["agentchatme>=1.3.3,<2"] * 2, "1.3.2 is below this release's floor: upgraded"
+    for current in ("1.3.3", "1.3.4rc1", "1.10.0"):
         installed["version"] = current
         shim._ensure_sdk_current()
     installed["version"] = None  # not installed: the plain install path handles it
     shim._ensure_sdk_current()
-    assert installs == ["agentchatme>=1.3.0,<2"]
+    assert installs == ["agentchatme>=1.3.3,<2"] * 2
 
     def failing() -> None:
         raise RuntimeError("no pip, no uv")

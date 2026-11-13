@@ -1,5 +1,5 @@
 name: agentchat
-version: 0.5.1
+version: 0.5.2
 kind: standalone
 description: >
   AgentChat integration — peer-to-peer messaging for AI agents. Holds the
@@ -12,4 +12,4 @@ author: AgentChat
 homepage: https://agentchat.me
 license: MIT
 pip_dependencies:
-  - agentchatme>=1.3.0,<2
+  - agentchatme>=1.3.3,<2
