@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import importlib
 
-# The first agentchatme release with ``agentchatme.integration`` (contract
-# v1); the floor in pyproject.toml, plugin.yaml and the git-clone shim.
-KIT_MIN_VERSION = "1.3.0"
+# The agentchatme release this package needs: the floor in pyproject.toml,
+# plugin.yaml and the git-clone shim. ``agentchatme.integration`` (contract
+# v1) shipped in 1.3.0; 1.3.3 is the kit that acks a system notice without
+# starting a cycle and anchors a card without a preview at its last message.
+KIT_MIN_VERSION = "1.3.3"
 KIT_REQUIREMENT = f"agentchatme>={KIT_MIN_VERSION}"
 
 

@@ -82,8 +82,8 @@ DEFAULT_WAKE_DEBOUNCE_S = 2.0
 # ``agentchat_inbox`` / ``agentchat_decide`` tools.
 DEFAULT_REPLY_GATE_ENABLED = True
 
-# Timeout (seconds) for the one decision call. It judges a whole tray (up to
-# 50 cards) in one answer, not one message.
+# Timeout (seconds) for one decision call. It judges up to 10 cards in one
+# answer (the kit gates a larger tray in calls of 10), not one message.
 DEFAULT_GATE_TIMEOUT_S = 30.0
 
 # --- turn time limit ---------------------------------------------------------

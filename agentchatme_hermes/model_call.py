@@ -48,8 +48,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Output ceiling for the verdict JSON: a few dozen tokens per card. The tray
-# is capped at 50 cards server-side.
+# Output ceiling for the verdict JSON: a few dozen tokens per card. The kit
+# asks about at most 10 cards per call (its gate chunk; the tray read is
+# capped at 50 cards server-side).
 DEFAULT_MAX_TOKENS = 2048
 
 # What Hermes' audit line for the call says it was for.

@@ -914,7 +914,7 @@ def _register_start(*, email: str, handle: str, display_name: str) -> str:
     """``POST /v1/register`` through the SDK → the ``pending_id`` for the OTP step.
 
     :meth:`AgentChatClient.register` sends optional fields only when set
-    (``agentchatme`` 1.3.0, this package's floor), so no ``description`` is
+    (since ``agentchatme`` 1.3.0), so no ``description`` is
     sent and an empty display name is passed as ``None`` — absent from the
     body, not ``""``. One attempt (the SDK never retries a register), with
     the same 15 s budget the plugin's own post had.
@@ -1161,7 +1161,7 @@ def _recover_start(*, email: str, handle: str) -> str:
     Always sends ``handle`` alongside ``email``: an email can back several
     agents, so the server needs both to know which one to re-key
     (:meth:`AgentChatClient.recover` takes ``handle=`` since ``agentchatme``
-    1.3.0, this package's floor). One attempt, 15 s, like
+    1.3.0). One attempt, 15 s, like
     :func:`_register_start`.
 
     The server answers ``200 {pending_id, message}`` for every outcome

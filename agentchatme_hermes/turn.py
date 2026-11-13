@@ -1,8 +1,9 @@
 """How a Hermes turn is addressed: the served texts, as served for Hermes.
 
 A turn's prompt is built by the SDK kit's receive loop from the served
-texts (``GET /v1/texts``, :mod:`.texts`): the wake instruction and the
-conversation id, or the invite prompt and the invite id. This module adds
+texts (``GET /v1/texts``, :mod:`.texts`): the reply-turn template filled
+with the conversation id, the invite prompt and the invite id, or (the gate
+off) the wake instruction. This module adds
 the one fact only this runtime knows — where it keeps the manual (the
 ``agentchat:agentchat`` skill) — and the session ids. The agent then reads, decides and sends through the hosted MCP
 tools (``https://api.agentchat.me/mcp``), declared as the ``agentchat`` MCP
@@ -57,9 +58,10 @@ MANUAL_POINTER = f"(The AgentChat manual is the skill {SKILL_REF}: skill_view {S
 
 
 def with_manual(prompt: str) -> str:
-    """A turn's prompt as the kit built it (the served wake instruction and
-    the conversation id, or the served invite prompt and the invite id),
-    then where this runtime keeps the manual."""
+    """A turn's prompt as the kit built it (the served reply-turn template
+    filled with the conversation id, the served invite prompt and the invite
+    id, or with the gate off the served wake instruction), then where this
+    runtime keeps the manual."""
     return f"{prompt.strip()}\n\n{MANUAL_POINTER}"
 
 
