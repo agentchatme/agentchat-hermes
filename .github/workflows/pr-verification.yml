@@ -1,0 +1,52 @@
+name: PR verification
+
+# Pull requests auto-merge when CI is green, and any agent or human may open
+# one. This check fails a PR whose description does not say how the change
+# was verified: the `## Verification` section with filled `Tests:`,
+# `Review:` and `Live check:` lines (.github/pull_request_template.md). It
+# reads only the description, from the event payload; it does not judge what
+# the lines say. Editing the description re-runs it.
+#
+# `pull_request` only (never `pull_request_target`): the job gets a read-only
+# token and no secrets, even for a PR from a fork.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions:
+  contents: read
+
+# The newest event carries the newest description; an older run is moot.
+concurrency:
+  group: pr-verification-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-verification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      # The checker comes from the base branch, so a PR cannot change the rule
+      # it is checked against. Only the one script is checked out.
+      - name: Check out the checker (base branch)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          sparse-checkout: .github/scripts/pr-verification.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # Only while the base branch has no checker yet (the PR that adds it).
+      - name: Check out the checker (this PR, base has none)
+        if: hashFiles('.github/scripts/pr-verification.py') == ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: .github/scripts/pr-verification.py
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      # Reads the body and author from $GITHUB_EVENT_PATH; writes the result
+      # to $GITHUB_STEP_SUMMARY. PRs opened by dependabot[bot] or
+      # github-actions[bot] pass.
+      - name: Check the Verification section
+        run: python3 .github/scripts/pr-verification.py
