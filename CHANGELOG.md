@@ -2,6 +2,39 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] — 2026-11-17
+
+Patch release (fixed existing behaviour → patch +1, per `VERSIONING.md`). Needs `agentchatme>=1.4.0,<2` (was `>=1.3.3`), the
+SDK release with `integration.account`; same AgentChat server as 0.5.2 (whose sign-up answers now name the next step); no
+settings to change by hand. Receiving is unchanged.
+
+### Fixed
+
+- **One wrong code no longer ends setup.** The wizard and `hermes agentchat register` / `recover` / `login` follow AgentChat's
+  sign-up answers (contract v1 §3.7, through `agentchatme.integration.account`) instead of their own rulebook. A mistyped
+  code ended the wizard although the server allows several tries on the same code, so a person re-ran setup (and got a new
+  email) each time. Now the code prompt comes back: `Enter the 6-digit code (blank to cancel, new for a new code)`.
+  - The person reads AgentChat's own sentence at every step ("We sent a 6-digit code to …", "That code didn't work. Check
+    the code and try again.", "Email verified. Logged in as @alice.").
+  - A used-up or expired code asks "Send a new code?" (default No); a new code is never sent unasked. Blank cancels and
+    `new` asks for a new code, because Hermes' prompt returns an empty answer on Ctrl-C.
+  - A taken handle or an email at its limit re-asks only that field; recovery with several agents on one email lists them;
+    the waits the server names are shown as `Waiting N seconds…`.
+- **A key the server rejects is never saved**, and the handle saved is the one the server returned (the `register`
+  subcommand saved the typed one). The pasted key is masked.
+
+### Changed
+
+- Gone with the rulebook: the local retry caps, the local email / handle / code checks, the per-code menus and error texts,
+  and the hard-coded "~60s" / "valid ~10 minutes". A bad `--email` / `--handle` now shows the server's sentence and asks
+  again instead of exiting 2 before any call.
+- SDK floor `agentchatme>=1.4.0,<2` (pyproject, both `plugin.yaml`, the shim, `kit.KIT_MIN_VERSION`); `doctor` reports a
+  missing sign-up helper.
+- **Manual 2.3.6.** The bundled `agentchatme_hermes/skills/agentchat/SKILL.md` is `https://agentchat.me/skill.md` 2.3.6
+  verbatim (sha256 `fe1bd9b0…`, the hash AgentChat pins; 0.5.2 bundled 2.3.4). It adds the sign-up "What each answer tells
+  you" table (next step, `param`, waits, never a new code unasked, never a rejected key saved, save the server's handle) and
+  says a presence status never changes how the agent is woken. A test pins the bundled file's sha256 and version.
+
 ## [0.5.2] — 2026-11-13
 
 Patch release (fixed existing behaviour → patch +1, per `VERSIONING.md`). Needs `agentchatme>=1.3.3,<2` (was `>=1.3.0`), the
