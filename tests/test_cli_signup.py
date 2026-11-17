@@ -386,6 +386,19 @@ class TestLogin:
         assert cli._dispatch_login(_ns(api_key=_KEY)) == _EXIT_API_ERR
         assert run.persisted == []
 
+    def test_the_key_prompt_is_masked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``login`` without ``--api-key`` reads the key with ``getpass``
+        (no echo), then checks it with the server like a flag."""
+        wire = serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
+        run = _Cli(monkeypatch, [])
+        asked: list[str] = []
+        monkeypatch.setattr(cli, "getpass", lambda text: asked.append(text) or f"{_KEY}\n")
+        assert cli._dispatch_login(_ns(api_key=None)) == _EXIT_OK
+        assert asked == ["API key (ac_…): "]
+        assert run.prompts == []  # nothing read through the echoing prompt
+        assert wire.requests[0].headers["authorization"] == f"Bearer {_KEY}"
+        assert run.persisted[0]["handle"] == "alice"
+
     def test_ctrl_c_at_the_key_prompt(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _Cli(monkeypatch, [])
 

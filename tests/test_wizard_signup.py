@@ -40,10 +40,13 @@ class _Person:
         self.yes_no = list(yes_no or [])
         self.transcript: list[tuple[str, str]] = []
         self.defaults: list[tuple[str, Any]] = []
+        self.masked: list[str] = []
 
     def prompt(self, question: str, default: Any = None, password: bool = False) -> str:
         self.transcript.append(("prompt", question))
         self.defaults.append((question, default))
+        if password:
+            self.masked.append(question)
         value = self.answers.pop(0)
         if value == "" and default:
             return str(default)
@@ -167,6 +170,7 @@ class TestRegister:
         ]
         assert "Registered as @alice (key ac_wizar…0000)" in capsys.readouterr().out
         assert person.said("warning") == []
+        assert person.masked == []
         assert run.env == {"AGENTCHAT_API_KEY": _KEY, "AGENTCHATME_HANDLE": "alice"}
         assert run.placed == ["alice"]
         assert wire.unexpected == []
@@ -511,6 +515,12 @@ class TestPasteKey:
         run = _Wizard(monkeypatch, _Person([_KEY]))
         assert run.paste() is False
         assert run.env == {}
+
+    def test_the_key_is_typed_masked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
+        person = _Person([_KEY])
+        assert _Wizard(monkeypatch, person).paste() is True
+        assert person.masked == ["API key (ac_…)"]
 
     def test_no_key_entered(self, monkeypatch: pytest.MonkeyPatch) -> None:
         wire = serve(monkeypatch, {})

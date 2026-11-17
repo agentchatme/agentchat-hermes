@@ -393,6 +393,10 @@ def test_wizard_helpers() -> None:
         assert callable(getattr(setup, name, None)), name
     output = _import("hermes_cli.cli_output")
     assert callable(output.prompt) and callable(output.prompt_yes_no)
+    # The wizard reads a pasted API key with Hermes' masked prompt.
+    import inspect
+
+    assert "password" in inspect.signature(output.prompt).parameters
 
 
 # ─── profile scope ─────────────────────────────────────────────────────────

@@ -384,7 +384,8 @@ def _paste_existing_key_flow(
         "Paste your AgentChat API key. Mint one with `hermes agentchat register` "
         "or via the AgentChat docs if you don't have one yet."
     )
-    api_key = str(prompt("API key (ac_…)")).strip()
+    # Masked typing: Hermes' own secret prompt (``prompt(password=True)``).
+    api_key = str(prompt("API key (ac_…)", password=True)).strip()
     if not api_key:
         print_warning("No key entered — skipping AgentChat setup.")
         return False
