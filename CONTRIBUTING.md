@@ -45,10 +45,13 @@ instead of filing publicly.
 
 The integration is a thin layer over the official `agentchatme` Python SDK:
 receiving is the SDK kit's `ReceiveLoop`, and every AgentChat request,
-registration and recovery included, is an SDK call. When the wire format
-changes, the SDK's typed errors update first; the plugin maps them onto its
-own messages. Don't replicate transport logic here — extend the SDK and let
-it flow through.
+registration and recovery included, is an SDK call. Sign-up (register,
+recover, checking a pasted key) runs on the SDK's
+`agentchatme.integration.account`, which follows the server's answer: the
+person reads the server's sentence as it is, and the plugin keeps no attempt
+count, limit, code format or timing of its own (`signup.py` holds only the
+prompts and how a typed line becomes an answer). Don't replicate transport
+or product logic here — extend the SDK and let it flow through.
 
 Hermes is intentionally a *lazy* import: nothing in the package may import
 a Hermes module at module scope, only inside the function that needs it.

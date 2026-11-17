@@ -28,6 +28,7 @@ class Wire:
     """What reached the fake API, in order."""
 
     requests: list[httpx.Request] = field(default_factory=list)
+    responses: list[httpx.Response] = field(default_factory=list)
     unexpected: list[str] = field(default_factory=list)
 
     def calls(self) -> list[tuple[str, str]]:
@@ -35,6 +36,18 @@ class Wire:
 
     def bodies(self) -> list[Any]:
         return [json.loads(request.content) if request.content else None for request in self.requests]
+
+    def messages(self) -> list[str]:
+        """The ``message`` of every JSON answer, in order."""
+        found = []
+        for response in self.responses:
+            try:
+                body = json.loads(response.content)
+            except ValueError:
+                continue
+            if isinstance(body, dict) and isinstance(body.get("message"), str):
+                found.append(body["message"])
+        return found
 
 
 def serve(monkeypatch: pytest.MonkeyPatch, routes: dict[str, Route | list[Route]]) -> Wire:
@@ -57,6 +70,7 @@ def serve(monkeypatch: pytest.MonkeyPatch, routes: dict[str, Route | list[Route]
         answer = route(request)
         if isinstance(answer, BaseException):
             raise answer
+        wire.responses.append(answer)
         return answer
 
     monkeypatch.setattr(httpx.HTTPTransport, "handle_request", handle_request)
