@@ -116,7 +116,11 @@ def _no_rulebook_text(person: _Person, wire: Wire) -> None:
     """Every line the wizard printed that is not the server's own sentence
     names no minutes, tries, limits or code format."""
     server = set(wire.messages())
-    own = [text for kind, text in person.transcript if kind != "prompt" and text not in server]
+    own = [
+        text
+        for kind, text in person.transcript
+        if kind != "prompt" and text not in server and not text.startswith("Waiting ")
+    ]
     own += [text for kind, text in person.transcript if kind == "prompt"]
     for text in own:
         for word in ("minute", "second", "attempt", "tries", "limit", "~60", "valid ~", "digits"):
@@ -231,10 +235,12 @@ class TestRegister:
                 sw.REGISTER_VERIFY: sw.registered("alice", _KEY),
             },
         )
-        run = _Wizard(monkeypatch, _Person(["a@b.co", "alice", "", "new", "123456"]))
+        person = _Person(["a@b.co", "alice", "", "new", "123456"])
+        run = _Wizard(monkeypatch, person)
         assert run.register() is True
         assert len(run.waits) == 1
         assert 29 < run.waits[0] <= 30
+        assert ("info", "Waiting 30 seconds…") in person.transcript
 
     def test_blank_at_the_code_prompt_cancels(self, monkeypatch: pytest.MonkeyPatch) -> None:
         wire = serve(monkeypatch, {sw.REGISTER: sw.code_sent()})
@@ -335,7 +341,8 @@ class TestRegister:
         run = _Wizard(monkeypatch, person)
         assert run.register() is True
         assert run.waits == [5.0]
-        assert ("info", "You can request a new code in 5 seconds.") in person.transcript
+        said = person.transcript.index(("info", "You can request a new code in 5 seconds."))
+        assert person.transcript[said + 1] == ("info", "Waiting 5 seconds…")
         assert wire.calls()[:2] == [("POST", sw.REGISTER), ("POST", sw.REGISTER)]
 
     def test_unreachable_saves_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:

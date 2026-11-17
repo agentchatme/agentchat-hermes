@@ -9,8 +9,9 @@ code format or timing of its own.
 
 What is Hermes's, and lives here: the labels it asks with, how a typed line
 becomes an answer (blank cancels; ``new`` at the code prompt asks for a new
-code), the line that lists the handles an email backs, and the client
-identity and API base every call carries. The wizard (:mod:`.wizard`) and the
+code), the line that lists the handles an email backs, the line shown while
+a wait the server named is sat out, and the client identity and API base
+every call carries. The wizard (:mod:`.wizard`) and the
 subcommands (:mod:`.cli`) read lines their own way and share the rest.
 
 The SDK is imported inside the functions: ``hermes agentchat doctor`` must
@@ -19,6 +20,7 @@ still load, and say so, when it is missing.
 from __future__ import annotations
 
 import importlib
+import math
 import time
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
@@ -61,8 +63,8 @@ def sdk_problem() -> str | None:
         importlib.import_module("agentchatme.integration.account")
     except ImportError:
         return (
-            f"Sign-up needs {KIT_REQUIREMENT}; the installed agentchatme is "
-            f"{installed_sdk_version()}. Upgrade it in the Hermes environment "
+            f"Sign-up needs {KIT_REQUIREMENT} (installed agentchatme: "
+            f"{installed_sdk_version()}). Upgrade it in the Hermes environment "
             f"(pip install -U '{KIT_REQUIREMENT}') and run this again."
         )
     return None
@@ -118,8 +120,15 @@ def new_code_answer(yes: bool) -> AccountAnswer:
     return AccountAnswer("new_code" if yes else "cancel")
 
 
+def waiting_line(seconds: float) -> str:
+    """What the person reads while the helper sits out a wait the server
+    named (a short ``retry_after_s``, or what is left of ``resend_after_s``
+    before a new code may be sent)."""
+    whole = max(1, math.ceil(seconds))
+    return f"Waiting {whole} second{'' if whole == 1 else 's'}…"
+
+
 def _pause(seconds: float) -> None:
-    """The waits the helper sits out (the server's message says how long)."""
     time.sleep(seconds)
 
 
@@ -134,9 +143,15 @@ def run(
     """The whole sign-up conversation for ``kind``, on the SDK helper.
 
     ``input`` holds what is known up front (email, handle, display name); the
-    helper asks only for what is missing or what the server names. Raises
-    ``agentchatme.ConnectionError`` when the server cannot be reached."""
+    helper asks only for what is missing or what the server names. ``show``
+    gets the server's sentences, and a line before each wait the helper sits
+    out. Raises ``agentchatme.ConnectionError`` when the server cannot be
+    reached."""
     from agentchatme.integration import account
+
+    def sleep(seconds: float) -> None:
+        show(waiting_line(seconds))
+        _pause(seconds)
 
     return account.run(
         kind=kind,
@@ -144,7 +159,7 @@ def run(
         show=show,
         input=input,
         labels=LABELS[kind],
-        sleep=lambda seconds: _pause(seconds),
+        sleep=sleep,
         client_identity=hermes_client_identity(),
         api_base=api_base,
     )

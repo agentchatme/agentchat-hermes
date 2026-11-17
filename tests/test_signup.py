@@ -66,6 +66,15 @@ class TestPrompts:
         assert signup.new_code_answer(False) == AccountAnswer("cancel")
 
 
+class TestWaitingLine:
+    @pytest.mark.parametrize(
+        ("seconds", "line"),
+        [(0.2, "Waiting 1 second…"), (1.0, "Waiting 1 second…"), (29.4, "Waiting 30 seconds…"), (60, "Waiting 60 seconds…")],
+    )
+    def test_whole_seconds_rounded_up(self, seconds: float, line: str) -> None:
+        assert signup.waiting_line(seconds) == line
+
+
 class TestSavedCredentials:
     def test_done_gives_the_key_and_the_server_handle(self) -> None:
         result = RunResult(outcome="done", api_key="k", handle="alice")
