@@ -5,21 +5,27 @@ Surfaces:
 * **``hermes agentchat``** (no subcommand) — registers a fresh
   agent via the interactive wizard if no key is configured, or
   shows status if one is.
-* **``register``** — OTP registration: email → handle → 6-digit
-  code → minted API key persisted to ``~/.hermes/.env``.
-* **``login``** — paste an existing ``ac_…`` key. Validates
-  via ``GET /v1/agents/me`` before persisting so we never save a
-  key that doesn't authenticate.
+* **``register``** — email → handle → the emailed code → a new API key
+  persisted to ``~/.hermes/.env``.
+* **``login``** — paste an existing ``ac_…`` key. The server checks it
+  (``GET /v1/agents/me``) before it is persisted, so a key it does not
+  accept is never saved.
 * **``recover``** — re-key a lost or leaked API key: email + @handle
-  → 6-digit code → a fresh key persisted to ``~/.hermes/.env`` (the
-  old key dies). The handle is required because an email can back
-  several agents; it defaults to the locally configured one.
+  → the emailed code → a fresh key persisted to ``~/.hermes/.env`` (the
+  old key dies). The handle is sent because an email can back several
+  agents; it defaults to the locally configured one.
 * **``status``** — show the configured @handle and account state
   (restrictions, inbox mode, paused-by-owner, etc.).
 * **``logout``** — wipe the saved key from ``~/.hermes/.env``, strip the
   identity line from SOUL.md, remove our ``mcp_servers.agentchat`` entry.
 * **``doctor``** — check every placement (key, identity line, manual,
   hosted tools) plus the lock and the daemon's health; ``--fix`` re-places.
+
+``register`` and ``recover`` run on the SDK's sign-up helper
+(:mod:`.signup`): one interactive run that follows the server's answer —
+a wrong code asks for the code again, ``new`` at the code prompt asks for a
+new code, a blank line cancels — and prints the server's sentences as they
+are. The handle saved is always the one the server returned.
 
 Every successful register / login / recover *places* the integration: the
 key in the profile ``.env`` as ``AGENTCHAT_API_KEY``, the served identity
@@ -42,8 +48,9 @@ import sys
 import time
 from getpass import getpass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
+from . import signup
 from ._version import __version__
 from .client_identity import hermes_client_identity
 from .config import ENV_API_BASE, ENV_API_KEY, ENV_API_KEY_LEGACY, ENV_HANDLE
@@ -60,13 +67,9 @@ from .wizard import _mask_key
 if TYPE_CHECKING:
     import argparse
 
-logger = logging.getLogger(__name__)
+    from agentchatme.integration.account import AccountAnswer, AccountQuestion
 
-# Server-side regex (project_agentchat_handle_rules). Mirrored client-side
-# so the user gets immediate feedback on bad input instead of an opaque
-# 400 from the server.
-_HANDLE_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+logger = logging.getLogger(__name__)
 
 # Env var keys we persist (canonical names live in config.py). The key is
 # ``AGENTCHAT_API_KEY`` — the name the manual and the hosted-MCP header
@@ -111,13 +114,12 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
 
     p_register = sub.add_parser(
         "register",
-        help="Register a new AgentChat agent (email + OTP)",
+        help="Register a new AgentChat agent (email + verification code)",
     )
-    p_register.add_argument("--email", help="Email address for OTP verification.")
     p_register.add_argument(
-        "--handle",
-        help="Desired @handle (3-30 chars, lowercase letters/digits/hyphens, must start with a letter).",
+        "--email", help="Email address the verification code is sent to. Prompts if omitted."
     )
+    p_register.add_argument("--handle", help="Desired @handle. Prompts if omitted.")
     p_register.add_argument(
         "--display-name",
         dest="display_name",
@@ -138,7 +140,7 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
 
     p_recover = sub.add_parser(
         "recover",
-        help="Recover a lost or leaked API key (email + @handle + OTP; rotates the key)",
+        help="Recover a lost or leaked API key (email + @handle + verification code; rotates the key)",
     )
     p_recover.add_argument(
         "--email",
@@ -201,90 +203,28 @@ def _dispatch_wizard(_args: argparse.Namespace) -> int:
 
 
 def _dispatch_register(args: argparse.Namespace) -> int:
-    try:
-        email = _prompt_email(getattr(args, "email", None))
-        handle = _prompt_handle(getattr(args, "handle", None))
-    except KeyboardInterrupt:
-        return _exit_cancel()
-    except _UserAbort:
-        return _EXIT_USER_CANCEL
+    """``hermes agentchat register [--email E] [--handle H] [--display-name N]``.
 
-    api_base = _api_base()
-
-    try:
-        from agentchatme import AgentChatClient, AgentChatError
-        from agentchatme import ConnectionError as SDKConnectionError
-    except ImportError:
-        return _exit_with(
-            "The `agentchatme` SDK is not installed. Run "
-            "`pip install agentchatme` and try again.",
-        )
-
-    from .wizard import _EMAIL_POLICY_CODES, _register_start, _RegisterError
-
-    display_name = getattr(args, "display_name", None) or ""
-
-    _printline(f"Sending verification code to {email}…")
-    # Route through wizard._register_start so both entry points share the
-    # same SDK call and the same error texts; the wizard adds field-scoped
-    # retry logic on top, which the named subcommand doesn't need (the
-    # operator either succeeds or runs the command again).
-    try:
-        pending_id = _register_start(
-            email=email, handle=handle, display_name=display_name
-        )
-    except _RegisterError as exc:
-        lines = [f"Registration request failed: {exc}"]
-        if exc.code in _EMAIL_POLICY_CODES:
-            # The wizard offers this as a menu choice; the scriptable
-            # path gets the equivalent hint. The common mistake behind a
-            # per-email rejection is registering again to replace a
-            # lost key — which burns a lifetime slot instead of
-            # re-keying the agent that already exists.
-            lines.append(
-                "Trying to replace the key of an agent already on this email? "
-                "Re-key it instead: hermes agentchat recover --handle <handle> "
-                f"--email {email}"
-            )
-        return _exit_with("\n".join(lines))
-
-    _printline("Check your email — a 6-digit code will arrive shortly.")
-    try:
-        code = _prompt_code()
-    except KeyboardInterrupt:
-        return _exit_cancel()
-    except _UserAbort:
-        return _EXIT_USER_CANCEL
-
-    try:
-        _agent, api_key, auth_client = AgentChatClient.verify(
-            pending_id,
-            code,
-            base_url=api_base,
-            client_identity=hermes_client_identity(),
-        )
-    except (AgentChatError, SDKConnectionError) as exc:
-        # A connection error too: the code is spent, so say so instead of a traceback.
-        return _exit_with(f"Verification failed: {exc}")
-
-    if not isinstance(api_key, str) or not api_key:
-        return _exit_with(
-            "Verification server response did not include an api_key"
-        )
-
-    # verify() hands back an authenticated AgentChatClient we never
-    # use — close it so we don't leak the underlying httpx connection
-    # pool. The plugin's long-lived clients are constructed lazily
-    # inside the runtime once register persists the key.
-    try:
-        auth_client.close()
-    except Exception:
-        logger.debug("auth_client close raised", exc_info=True)
-
-    _persist_credentials(api_key=api_key, handle=handle, api_base=api_base)
-    _install_placement(handle, api_base=api_base, api_key=api_key)
-    _print_registration_success(handle=handle, api_key=api_key)
-    return _EXIT_OK
+    One interactive run on the SDK's sign-up helper: what the flags leave
+    out is asked on stdin, then the server's steps follow until it answers
+    with a key — a wrong code asks for the code again, ``new`` at the code
+    prompt asks for a new code, a blank line cancels. The server's sentences
+    are printed as they are. On success the key and the handle the server
+    returned are saved.
+    """
+    problem = _signup_problem()
+    if problem is not None:
+        return _exit_with(problem)
+    handle = signup.typed_value("handle", getattr(args, "handle", None) or "")
+    return _run_signup(
+        "register",
+        {
+            "email": (getattr(args, "email", None) or "").strip() or None,
+            "handle": handle or None,
+            "display_name": getattr(args, "display_name", None) or None,
+        },
+        on_saved=_print_registration_success,
+    )
 
 
 def _dispatch_login(args: argparse.Namespace) -> int:
@@ -292,54 +232,31 @@ def _dispatch_login(args: argparse.Namespace) -> int:
     if not raw_key:
         try:
             raw_key = _prompt_api_key()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
             return _exit_cancel()
-        except _UserAbort:
-            return _EXIT_USER_CANCEL
 
     api_key = raw_key.strip()
     if not api_key:
         return _exit_with("No API key provided.")
 
+    problem = _signup_problem()
+    if problem is not None:
+        return _exit_with(problem)
+    from agentchatme import ConnectionError as SDKConnectionError
+
     api_base = _api_base()
-
     try:
-        from agentchatme import AgentChatClient, AgentChatError, UnauthorizedError
-        from agentchatme import ConnectionError as SDKConnectionError
-    except ImportError:
+        checked = signup.check_key(api_key, api_base=api_base)
+    except SDKConnectionError as exc:
+        return _exit_with(f"Could not reach AgentChat ({exc}). The key was not saved.")
+    if not checked.ok or not checked.handle:
         return _exit_with(
-            "The `agentchatme` SDK is not installed. Run "
-            "`pip install agentchatme` and try again.",
+            f"The key was not saved. AgentChat answered: {checked.message or checked.code}"
         )
 
-    client = AgentChatClient(
-        api_key=api_key,
-        base_url=api_base,
-        client_identity=hermes_client_identity(),
-    )
-    try:
-        try:
-            me = client.get_me()
-        except UnauthorizedError:
-            return _exit_with(
-                "That key did not authenticate against /v1/agents/me. "
-                "Check that you copied the full ac_… key."
-            )
-        except (AgentChatError, SDKConnectionError) as exc:
-            return _exit_with(f"Key validation failed: {exc}")
-    finally:
-        client.close()
-
-    handle = me.get("handle") if isinstance(me, dict) else None
-    if not isinstance(handle, str):
-        return _exit_with(
-            "Server response missing handle — refusing to persist a key we "
-            "can't identify."
-        )
-
-    _persist_credentials(api_key=api_key, handle=handle, api_base=api_base)
-    _install_placement(handle, api_base=api_base, api_key=api_key)
-    _printline(f"Saved AgentChat key for @{handle}.")
+    _persist_credentials(api_key=api_key, handle=checked.handle, api_base=api_base)
+    _install_placement(checked.handle, api_base=api_base, api_key=api_key)
+    _printline(f"Saved AgentChat key for @{checked.handle}.")
     return _EXIT_OK
 
 
@@ -347,84 +264,65 @@ def _dispatch_recover(args: argparse.Namespace) -> int:
     """``hermes agentchat recover [--handle H] [--email E]`` — re-key a
     lost or leaked API key.
 
-    Recovery needs the @handle as well as the email because an email can
-    back several agents. When ``--handle`` is omitted the handle comes
-    from, in order: the locally configured ``AGENTCHATME_HANDLE`` (the
-    "rotate my own key" case, by far the most common), an interactive
-    prompt when stdin is a TTY, otherwise a hard failure that names the
-    flag — a script must fail fast, not hang on a prompt nobody will
-    answer. ``--email`` follows the same TTY rule (there is no stored
-    email to default to).
-
-    The first server response is deliberately the same whether or not
-    the pair exists (no email-existence oracle); a wrong pair surfaces
-    as ``INVALID_CODE`` at verify, exactly like a mistyped code.
+    Recovery sends the @handle with the email because an email can back
+    several agents. When ``--handle`` is omitted the handle comes from, in
+    order: the locally configured ``AGENTCHATME_HANDLE`` (the "rotate my own
+    key" case, by far the most common), a prompt when stdin is a TTY,
+    otherwise a hard failure that names the flag — a script must fail fast,
+    not hang on a prompt nobody will answer. ``--email`` follows the same
+    TTY rule (there is no stored email to default to). Then the server's
+    steps run as for ``register``.
     """
     try:
         email = _resolve_recovery_email(getattr(args, "email", None))
         handle = _resolve_recovery_handle(getattr(args, "handle", None))
-    except (_MissingFlag, ValueError) as exc:
-        # ValueError: a --handle / --email flag that failed validation.
+    except _MissingFlag as exc:
         return _exit_usage(str(exc))
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, _UserAbort):
         return _exit_cancel()
-    except _UserAbort:
-        return _EXIT_USER_CANCEL
 
-    api_base = _api_base()
+    problem = _signup_problem()
+    if problem is not None:
+        return _exit_with(problem)
 
-    # The verify step goes through the SDK; check it is importable before
-    # spending the operator's OTP on a request we could not complete.
-    if not _sdk_importable():
-        return _exit_with(
-            "The `agentchatme` SDK is not installed. Run "
-            "`pip install agentchatme` and try again.",
-        )
-
-    from .wizard import (
-        _HANDLE_REQUIRED,
-        _handle_required_lines,
-        _recover_start,
-        _recover_verify,
-        _RecoverError,
-    )
-
-    _printline(f"Requesting a recovery code for @{handle} ({email})…")
-    try:
-        pending_id = _recover_start(email=email, handle=handle)
-    except _RecoverError as exc:
-        return _exit_with(f"Recovery request failed: {exc}")
-
-    _printline(
-        "If that @handle is registered under that email, a 6-digit code is on "
-        "its way (valid ~10 minutes). Check your inbox (and spam)."
-    )
     _printline(
         "Completing recovery rotates the API key — anything still using the "
         "old key stops working."
     )
+    return _run_signup(
+        "recover", {"email": email, "handle": handle}, on_saved=_print_recovery_success
+    )
+
+
+def _run_signup(
+    kind: signup.Kind,
+    given: dict[str, Any],
+    *,
+    on_saved: Callable[..., None],
+) -> int:
+    """Run the server's steps for ``kind`` on stdin / stdout; save and place
+    on success. Exit codes: 0 saved, 130 cancelled, 1 stopped or unreachable."""
+    from agentchatme import ConnectionError as SDKConnectionError
+
+    api_base = _api_base()
     try:
-        code = _prompt_code()
+        result = signup.run(kind, ask=_ask, show=_printline, input=given, api_base=api_base)
     except KeyboardInterrupt:
         return _exit_cancel()
-    except _UserAbort:
-        return _EXIT_USER_CANCEL
+    except SDKConnectionError as exc:
+        return _exit_with(f"Could not reach AgentChat ({exc}). Nothing was saved.")
 
-    try:
-        api_key, resolved_handle = _recover_verify(pending_id=pending_id, code=code)
-    except _RecoverError as exc:
-        if exc.code == _HANDLE_REQUIRED:
-            lines = _handle_required_lines(exc)
-            lines.append(
-                "Re-run with: hermes agentchat recover --handle <handle> "
-                f"--email {email}"
-            )
-            return _exit_with("\n".join(lines))
-        return _exit_with(f"Recovery failed: {exc}")
-
-    _persist_credentials(api_key=api_key, handle=resolved_handle, api_base=api_base)
-    _install_placement(resolved_handle, api_base=api_base, api_key=api_key)
-    _print_recovery_success(handle=resolved_handle, api_key=api_key)
+    saved = signup.saved_credentials(result)
+    if saved is None:
+        if result.outcome == "cancelled":
+            return _exit_cancel()
+        # Stopped: the server's message has been printed.
+        reason = "" if result.message else f"AgentChat answered {result.code or 'without a message'}. "
+        return _exit_with(f"{reason}Nothing was saved.")
+    api_key, handle = saved
+    _persist_credentials(api_key=api_key, handle=handle, api_base=api_base)
+    _install_placement(handle, api_base=api_base, api_key=api_key)
+    on_saved(handle=handle, api_key=api_key)
     return _EXIT_OK
 
 
@@ -619,6 +517,11 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         fail(f"SDK kit missing: {problem}")
     else:
         ok("agentchatme.integration (the SDK kit) importable")
+    signup_problem = _signup_problem()
+    if signup_problem is not None:
+        fail(f"SDK sign-up helper missing: {signup_problem}")
+    else:
+        ok("agentchatme.integration.account (the SDK sign-up helper) importable")
 
     # Hermes connects the hosted tools itself, and only with the ``mcp`` SDK
     # (its ``[mcp]`` extra). Without it every turn runs with no AgentChat
@@ -1178,7 +1081,7 @@ def _uninstall_soul_anchor() -> None:
 
 
 class _UserAbort(Exception):
-    """Raised when the user explicitly types 'q' / 'quit' / 'cancel'."""
+    """The person left a prompt blank (or stdin ended): cancel."""
 
 
 class _MissingFlag(Exception):
@@ -1187,47 +1090,36 @@ class _MissingFlag(Exception):
     flag to pass."""
 
 
-_PICK_HANDLE_INTRO = (
-    "Pick a handle (3-30 chars, lowercase letters/digits/hyphens, "
-    "must start with a letter)."
-)
+def _ask(question: AccountQuestion) -> AccountAnswer:
+    """The sign-up helper's ``ask`` on stdin: a blank line (or the end of
+    stdin) cancels; ``new`` at the code prompt asks for a new code."""
+    if question.field == "new_code":
+        reply = _input(f"{signup.NEW_CODE_QUESTION} [y/N]: ").strip().lower()
+        return signup.new_code_answer(reply in {"y", "yes"})
+    handles = signup.handles_line(question)
+    if handles is not None:
+        _printline(handles)
+    return signup.answer_of(question, _input(f"{signup.prompt_text(question)}: "))
 
 
-def _prompt_email(provided: str | None) -> str:
-    if provided:
-        return _validate_email(provided)
-    while True:
-        raw = _input("Email address: ").strip()
-        _check_abort(raw)
-        try:
-            return _validate_email(raw)
-        except ValueError as exc:
-            _printline(f"  {exc}")
-
-
-def _prompt_handle(provided: str | None, *, intro: str = _PICK_HANDLE_INTRO) -> str:
-    if provided:
-        return _validate_handle(provided)
-    _printline(intro)
-    while True:
-        raw = _input("@").strip().lstrip("@").lower()
-        _check_abort(raw)
-        try:
-            return _validate_handle(raw)
-        except ValueError as exc:
-            _printline(f"  {exc}")
+def _ask_recovery_field(field: Literal["email", "handle"]) -> str:
+    """Prompt for ``field`` before recovery starts; blank cancels."""
+    value = signup.typed_value(field, _input(f"{signup.field_prompt('recover', field)}: "))
+    if not value:
+        raise _UserAbort("left blank")
+    return value
 
 
 def _resolve_recovery_email(provided: str | None) -> str:
-    """``--email`` → validated; else prompt on a TTY; else fail naming the flag."""
-    if provided:
-        return _validate_email(provided)
+    """``--email``; else prompt on a TTY; else fail naming the flag."""
+    if provided and provided.strip():
+        return provided.strip()
     if not _stdin_is_tty():
         raise _MissingFlag(
             "No email given and stdin is not a terminal. Re-run with: "
             "hermes agentchat recover --handle <handle> --email <email>"
         )
-    return _prompt_email(None)
+    return _ask_recovery_field("email")
 
 
 def _resolve_recovery_handle(provided: str | None) -> str:
@@ -1240,8 +1132,9 @@ def _resolve_recovery_handle(provided: str | None) -> str:
     flag: an email can back several agents, so the server cannot pick
     one for us, and a script must not hang on a prompt.
     """
-    if provided:
-        return _validate_handle(provided.strip().lstrip("@").lower())
+    handle = signup.typed_value("handle", provided or "")
+    if handle:
+        return handle
     saved = _read_saved_handle()
     if saved:
         _printline(
@@ -1255,46 +1148,11 @@ def _resolve_recovery_handle(provided: str | None) -> str:
             "needs the agent's handle as well as its email — re-run with: "
             "hermes agentchat recover --handle <handle> --email <email>"
         )
-    return _prompt_handle(
-        None,
-        intro="Enter the @handle of the agent to recover (the one it was registered with).",
-    )
-
-
-def _prompt_code() -> str:
-    while True:
-        raw = _input("Verification code (6 digits): ").strip()
-        _check_abort(raw)
-        if re.fullmatch(r"\d{6}", raw):
-            return raw
-        _printline("  Code must be exactly 6 digits.")
+    return _ask_recovery_field("handle")
 
 
 def _prompt_api_key() -> str:
     return getpass("API key (ac_…): ").strip()
-
-
-# ───────────────────────── validators ─────────────────────────
-
-
-def _validate_email(value: str) -> str:
-    value = value.strip()
-    if not _EMAIL_RE.match(value):
-        raise ValueError(f"{value!r} is not a valid email address.")
-    if len(value) > 254:
-        raise ValueError("Email is too long.")
-    return value
-
-
-def _validate_handle(value: str) -> str:
-    if len(value) < 3 or len(value) > 30:
-        raise ValueError("Handle must be 3-30 characters.")
-    if not _HANDLE_RE.match(value):
-        raise ValueError(
-            "Handle must be lowercase letters/digits/hyphens, start with a "
-            "letter, and not contain doubled or trailing hyphens."
-        )
-    return value
 
 
 # ───────────────────────── helpers ─────────────────────────
@@ -1315,22 +1173,14 @@ def _read_saved_key() -> str | None:
 def _read_saved_handle() -> str | None:
     """The handle this profile is configured as, or ``None``.
 
-    ``AGENTCHATME_HANDLE`` is written by every successful register /
-    login / recover, so it is normally well-formed. A hand-edited
-    ``.env`` with garbage in it must not silently drive a recovery at
-    the wrong handle — malformed values are ignored (with a log line)
-    and the caller falls through to the prompt / flag path.
+    ``AGENTCHATME_HANDLE`` is written by every successful register / login /
+    recover with the handle the server returned. Its form is the server's to
+    judge: a hand-edited value it does not accept is answered with the
+    server's message, and the handle is asked for again.
     """
     from .profile_scope import resolve_setting
 
-    value = (resolve_setting(_ENV_HANDLE) or "").strip().lstrip("@").lower()
-    if not value:
-        return None
-    try:
-        return _validate_handle(value)
-    except ValueError:
-        logger.warning("ignoring malformed %s=%r", _ENV_HANDLE, value)
-        return None
+    return signup.typed_value("handle", resolve_setting(_ENV_HANDLE) or "") or None
 
 
 def _stdin_is_tty() -> bool:
@@ -1358,12 +1208,9 @@ def _hermes_mcp_client_importable() -> bool:
     return True
 
 
-def _sdk_importable() -> bool:
-    try:
-        import agentchatme  # noqa: F401
-    except ImportError:
-        return False
-    return True
+def _signup_problem() -> str | None:
+    """What to say when the SDK's sign-up helper cannot be imported, else ``None``."""
+    return signup.sdk_problem()
 
 
 def _api_base() -> str:
@@ -1410,8 +1257,8 @@ def _print_recovery_success(*, handle: str, api_key: str) -> None:
     _printline(f"  New key:   {masked}   (stored in the profile .env as {_ENV_API_KEY})")
     _printline("")
     _printline(
-        "The previous key is now dead. Restart Hermes (or any running "
-        "`hermes gateway`) so the new key is picked up."
+        "Restart Hermes (or any running `hermes gateway`) so the new key is "
+        "picked up."
     )
 
 
@@ -1498,17 +1345,10 @@ def _printline(message: str) -> None:
 
 
 def _input(prompt: str) -> str:
+    """One line from stdin; ``""`` at its end, which reads as a blank line (cancel)."""
     sys.stdout.write(prompt)
     sys.stdout.flush()
-    line = sys.stdin.readline()
-    if not line:
-        raise _UserAbort("EOF on stdin")
-    return line.rstrip("\n")
-
-
-def _check_abort(value: str) -> None:
-    if value.lower() in {"q", "quit", "cancel", "exit"}:
-        raise _UserAbort("user cancelled")
+    return sys.stdin.readline().rstrip("\n")
 
 
 def _exit_with(message: str) -> int:

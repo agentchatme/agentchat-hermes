@@ -13,7 +13,7 @@ from agentchatme_hermes.client_identity import hermes_client_identity
 
 def test_hermes_identity_name_and_version() -> None:
     # The headers the SDK derives from it are asserted on the wire in
-    # tests/test_wizard_sdk_start.py.
+    # tests/test_wizard_signup.py.
     identity = hermes_client_identity()
 
     assert identity.name == "hermes"
@@ -48,7 +48,7 @@ def test_plugin_manifests_match_release() -> None:
 
 
 def _load_shim() -> Any:
-    """The git-clone shim as Hermes loads it (with agentchatme 1.3+ installed
+    """The git-clone shim as Hermes loads it (with agentchatme 1.4+ installed
     its bootstrap is a no-op)."""
     import importlib.util
 
@@ -76,16 +76,16 @@ def test_the_shim_upgrades_an_sdk_older_than_the_kit(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(metadata, "version", version)
     shim._ensure_sdk_current()
-    assert installs == ["agentchatme>=1.3.3,<2"], "1.2.1 has no kit: upgraded"
-    installed["version"] = "1.3.2"
+    assert installs == ["agentchatme>=1.4.0,<2"], "1.2.1 has no kit: upgraded"
+    installed["version"] = "1.3.3"
     shim._ensure_sdk_current()
-    assert installs == ["agentchatme>=1.3.3,<2"] * 2, "1.3.2 is below this release's floor: upgraded"
-    for current in ("1.3.3", "1.3.4rc1", "1.10.0"):
+    assert installs == ["agentchatme>=1.4.0,<2"] * 2, "1.3.3 has no sign-up helper: upgraded"
+    for current in ("1.4.0", "1.4.1rc1", "1.10.0"):
         installed["version"] = current
         shim._ensure_sdk_current()
     installed["version"] = None  # not installed: the plain install path handles it
     shim._ensure_sdk_current()
-    assert installs == ["agentchatme>=1.3.3,<2"] * 2
+    assert installs == ["agentchatme>=1.4.0,<2"] * 2
 
     def failing() -> None:
         raise RuntimeError("no pip, no uv")

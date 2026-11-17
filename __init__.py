@@ -40,10 +40,11 @@ logger = logging.getLogger(__name__)
 # Pinned to match pyproject.toml's dependency declaration (a test keeps the
 # two identical): the git-clone path installs the SDK from here. The plugin
 # needs the SDK's integration kit (agentchatme.integration, since 1.3.0), and
-# this release the kit as of 1.3.3 (a system notice is not a wake; a card
-# without a preview is anchored at its last message).
-_SDK_REQUIREMENT = "agentchatme>=1.3.3,<2"
-_SDK_FLOOR = (1, 3, 3)
+# this release the kit as of 1.4.0: the receive loop of 1.3.3 (a system notice
+# is not a wake; a card without a preview is anchored at its last message) and
+# the sign-up helper (agentchatme.integration.account) the setup runs on.
+_SDK_REQUIREMENT = "agentchatme>=1.4.0,<2"
+_SDK_FLOOR = (1, 4, 0)
 
 
 def _installed_sdk_version() -> tuple[int, ...] | None:

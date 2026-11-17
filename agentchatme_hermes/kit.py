@@ -12,8 +12,10 @@ import importlib
 # The agentchatme release this package needs: the floor in pyproject.toml,
 # plugin.yaml and the git-clone shim. ``agentchatme.integration`` (contract
 # v1) shipped in 1.3.0; 1.3.3 is the kit that acks a system notice without
-# starting a cycle and anchors a card without a preview at its last message.
-KIT_MIN_VERSION = "1.3.3"
+# starting a cycle and anchors a card without a preview at its last message;
+# 1.4.0 adds ``agentchatme.integration.account``, the sign-up helper the
+# wizard and the register / login / recover subcommands run on.
+KIT_MIN_VERSION = "1.4.0"
 KIT_REQUIREMENT = f"agentchatme>={KIT_MIN_VERSION}"
 
 
