@@ -108,6 +108,7 @@ profile — `hermes profile create` copies `.env`, so the new profile silently b
   Hermes and says whether it does.
 - **Never on a command line.** `login` reads the key from a masked prompt, `--api-key-file PATH` or stdin
   (`--api-key -`). `--api-key <key>` still works and warns: a command line is readable by every user of the machine.
+  A file you wrote only to hand the key over is yours to delete afterwards; the plugin never changes it.
 - **One key, one identity.** If the shell (or a service's environment) exports an `AGENTCHAT_API_KEY` that is not the
   saved key, or the profile `.env` holds a different one, the plugin starts nothing for the profile and says why; a
   `.env` key that another profile on the machine already holds (a copy from before this release) is refused the same way.

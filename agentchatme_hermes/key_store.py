@@ -48,7 +48,6 @@ import logging
 import os
 import secrets
 import stat
-import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -62,6 +61,10 @@ STORE_VERSION = 1
 
 _FILE_MODE = 0o600
 _DIR_MODE = 0o700
+# POSIX file modes and owners mean something; on Windows they do not (every
+# file reads 0o666 whatever was asked). A constant rather than a platform
+# check inline, so the type checker on each platform sees both branches.
+_POSIX = os.name != "nt"
 
 StoreStatus = Literal["missing", "ok", "moved", "copied", "unsafe", "unreadable"]
 
@@ -166,7 +169,7 @@ def _ownership_problem(path: Path, st: os.stat_result) -> str | None:
         return f"{path} is a symbolic link; the key file must be a regular file"
     if not stat.S_ISREG(st.st_mode):
         return f"{path} is not a regular file"
-    if sys.platform == "win32":
+    if not _POSIX:
         return None
     getuid = getattr(os, "getuid", None)
     if callable(getuid) and st.st_uid != getuid():
@@ -177,7 +180,7 @@ def _ownership_problem(path: Path, st: os.stat_result) -> str | None:
 
 
 def _is_loose(st: os.stat_result) -> bool:
-    return sys.platform != "win32" and bool(st.st_mode & 0o044)
+    return _POSIX and bool(st.st_mode & 0o044)
 
 
 def _parse(path: Path) -> StoredKey | str:
@@ -241,7 +244,7 @@ def write_store(home: Path, *, api_key: str, handle: str, api_base: str) -> Path
     path = store_path(home)
     try:
         directory.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        if sys.platform != "win32":
+        if _POSIX:
             os.chmod(directory, _DIR_MODE)
     except OSError as exc:
         raise KeyStoreError(f"cannot create {directory}: {exc.strerror or exc}") from exc
@@ -276,7 +279,7 @@ def write_store(home: Path, *, api_key: str, handle: str, api_base: str) -> Path
 
 
 def _fsync_dir(directory: Path) -> None:
-    if sys.platform == "win32":
+    if not _POSIX:
         return
     try:
         fd = os.open(directory, os.O_RDONLY)
@@ -292,7 +295,7 @@ def _fsync_dir(directory: Path) -> None:
 
 def tighten(home: Path) -> bool:
     """Make an existing key file ``0600`` and its directory ``0700``. ``True`` when changed."""
-    if sys.platform == "win32":
+    if not _POSIX:
         return False
     path = store_path(home)
     changed = False
