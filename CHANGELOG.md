@@ -4,6 +4,10 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+## [0.5.4] — 2026-11-18
+
+Fixed existing behaviour, so patch +1 (`VERSIONING.md`). Upgrading a git-pinned install: `hermes plugins install agentchatme/agentchat-hermes --force --ref v0.5.4` (a plain `--force` reinstalls the pinned commit).
+
 Not released yet; the version number is set at release (`VERSIONING.md`). Same AgentChat server and SDK floor
 (`agentchatme>=1.4.0,<2`). Keeping the key out of the agent's commands needs Hermes v0.23.2 or later; everything else
 works on the Hermes versions 0.5.3 supports. Upgrading breaks nothing; `hermes agentchat doctor --fix` (or the next
