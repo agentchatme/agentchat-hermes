@@ -9,7 +9,9 @@ the headers and reload rules again on v0.23.1 and main, 2026-11-11):
 
 * ``mcp_servers.<name>`` in the profile's ``config.yaml`` declares a remote
   MCP server (``url`` + ``headers``). ``${VAR}`` in ``headers`` resolves at
-  connect time from the profile's ``.env`` (``hermes_cli/config.py``
+  connect time from the profile's secrets — its ``.env`` and its secret
+  sources; this plugin's source supplies ``AGENTCHAT_API_KEY`` from the key
+  file (:mod:`.key_source`) — (``hermes_cli/config.py``
   ``_env_ref_lookup``; docs *reference/mcp-config-reference*), and an unset
   variable fails the connect closed with the variable named in the server's
   status. Every configured header is sent on each request, unchanged
@@ -43,8 +45,8 @@ the headers and reload rules again on v0.23.1 and main, 2026-11-11):
 The entry is read, changed and saved as written: ``read_user_config_raw()``
 → change ``mcp_servers`` → ``save_config()``, Hermes' own write-back round
 trip (``load_config()`` would expand ``${AGENTCHAT_API_KEY}`` from the
-``.env`` first). ``${AGENTCHAT_API_KEY}`` stays a template on disk and the
-key never lands in ``config.yaml``.
+profile's secrets first). ``${AGENTCHAT_API_KEY}`` stays a template on disk
+and the key never lands in ``config.yaml``.
 
 An entry with this URL and the ``${AGENTCHAT_API_KEY}`` bearer is the
 plugin's (an earlier release's, or the documented snippet copied by hand;
@@ -249,7 +251,7 @@ def _hermes_config_io() -> tuple[ConfigLoader, ConfigSaver, Callable[[], bool]]:
     "is this install managed" check.
 
     Ownership is decided on the file as written. ``load_config()`` expands
-    ``${AGENTCHAT_API_KEY}`` from the profile's ``.env``, which every running
+    ``${AGENTCHAT_API_KEY}`` from the profile's secrets, which every running
     Hermes has loaded, so read through it our own entry carries a literal
     key and looks hand-written. ``read_user_config_raw()`` is Hermes' reader
     for exactly this write-back round trip, and ``save_config()`` keeps the

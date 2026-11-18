@@ -17,6 +17,7 @@ import importlib
 import importlib.util
 import inspect
 import json
+import os
 import threading
 import time
 import warnings
@@ -385,6 +386,138 @@ def test_the_hosted_tools_entry_round_trips_through_hermes_config(
     assert config_path.read_bytes() == before, "nothing to change, nothing written"
     assert reg.uninstall_entry() is True
     assert "agentchat" not in (config.read_user_config_raw().get("mcp_servers") or {})
+
+
+# ─── the key: out of the agent's reach, still in the hosted tools' ─────────
+
+
+_SECRETS_BLOCK = "secrets:\n  agentchat:\n    enabled: true\n    api_key_env: AGENTCHAT_API_KEY\n"
+
+
+@pytest.fixture
+def _source_registry() -> Iterator[Any]:
+    """Hermes' secret-source registry, emptied again after the test."""
+    registry = _import("agent.secret_sources.registry")
+    env_loader = _import("hermes_cli.env_loader")
+    try:
+        yield registry
+    finally:
+        registry._reset_registry_for_tests()
+        env_loader.reset_secret_source_cache()
+
+
+def test_the_key_source_is_a_hermes_secret_source(_source_registry: Any) -> None:
+    from agentchatme_hermes import key_source
+
+    base = _import("agent.secret_sources.base")
+    source = key_source.build_key_source()
+    assert isinstance(source, base.SecretSource)
+    assert source.api_version == base.SECRET_SOURCE_API_VERSION
+    assert _source_registry.register_source(source) is True
+    assert callable(getattr(_import("hermes_cli.plugins").PluginContext, "register_secret_source", None))
+    assert key_source.source_supported() is True
+
+
+def test_each_profile_gets_its_own_key_through_hermes_orchestrator(
+    _hermes_home: Path, _source_registry: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``apply_all`` per profile home, the way a multiplexed gateway hydrates
+    each served profile: profile b's hosted tools get b's key, never a's, and
+    the saved key beats a stale value already in the environment."""
+    from fake_keys import api_key
+
+    from agentchatme_hermes import key_source, key_store
+    from agentchatme_hermes.profile_scope import profile_context
+
+    constants = _import("hermes_constants")
+    other = _hermes_home / "profiles" / "b"
+    keys = {_hermes_home: api_key("contract_profile_a"), other: api_key("contract_profile_b")}
+    for home, key in keys.items():
+        key_store.write_store(home, api_key=key, handle="x", api_base="https://api.agentchat.me")
+        scope = constants.hermes_home_key(home)
+        assert _source_registry.register_source(key_source.build_key_source(), scope=scope) is True
+    for home, key in keys.items():
+        environ = {"AGENTCHAT_API_KEY": api_key("stale_or_exported")}
+        with profile_context(home):
+            report = _source_registry.apply_all({"agentchat": key_source.secrets_section()}, home, environ=environ)
+        assert environ["AGENTCHAT_API_KEY"] == key, home
+        assert [s.name for s in report.sources] == ["agentchat"]
+
+
+def test_the_startup_path_puts_the_key_where_the_tools_header_reads_it(
+    _hermes_home: Path, _source_registry: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the key only in the key file (none in .env), Hermes' own dotenv
+    load applies the source and ``Bearer ${AGENTCHAT_API_KEY}`` resolves."""
+    from fake_keys import api_key
+
+    from agentchatme_hermes import key_source, key_store
+
+    key = api_key("contract_startup_value")
+    # Recorded, so the value Hermes publishes into os.environ is removed afterwards.
+    monkeypatch.setenv("AGENTCHAT_API_KEY", "")
+    monkeypatch.delenv("AGENTCHAT_API_KEY")
+    (_hermes_home / "config.yaml").write_text(_SECRETS_BLOCK, encoding="utf-8")
+    key_store.write_store(_hermes_home, api_key=key, handle="x", api_base="https://api.agentchat.me")
+    constants = _import("hermes_constants")
+    _source_registry.register_source(key_source.build_key_source(), scope=constants.hermes_home_key(_hermes_home))
+    env_loader = _import("hermes_cli.env_loader")
+    env_loader.reset_secret_source_cache(_hermes_home)
+    env_loader.load_hermes_dotenv(hermes_home=_hermes_home)
+    assert _import("hermes_cli.config")._expand_env_vars("Bearer ${AGENTCHAT_API_KEY}") == f"Bearer {key}"
+    assert not (_hermes_home / ".env").exists() or key not in (_hermes_home / ".env").read_text(encoding="utf-8")
+
+
+def test_hermes_keeps_the_key_out_of_the_agents_commands(
+    _hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reply turn's shell had AGENTCHAT_API_KEY in its environment (0.5.3).
+    With ``secrets.agentchat`` in config.yaml, Hermes' child-environment
+    builder drops it (terminal, background processes, script runners) and a
+    skill cannot ask for it back; without the block it is passed through."""
+    from fake_keys import api_key
+
+    from agentchatme_hermes import cli
+
+    local = _import("tools.environments.local")
+    passthrough = _import("tools.env_passthrough")
+    probe = api_key("contract_child_env_value")
+    monkeypatch.setenv("AGENTCHAT_API_KEY", probe)
+    config_path = _hermes_home / "config.yaml"
+
+    config_path.write_text("model:\n  default: stub\n", encoding="utf-8")
+    assert local.build_subprocess_env().get("AGENTCHAT_API_KEY") == probe, "without the block: the leak"
+    assert cli._hermes_strips_key_from_commands() is False
+
+    config_path.write_text(_SECRETS_BLOCK, encoding="utf-8")
+    assert "AGENTCHAT_API_KEY" not in local.build_subprocess_env()
+    assert "AGENTCHAT_API_KEY" not in local._sanitize_subprocess_env(dict(os.environ))
+    assert passthrough.register_env_passthrough(["AGENTCHAT_API_KEY"]) == ["AGENTCHAT_API_KEY"], "refused"
+    assert cli._hermes_strips_key_from_commands() is True
+
+
+def test_the_secrets_block_round_trips_through_hermes_config(_hermes_home: Path) -> None:
+    from agentchatme_hermes import secrets_registration as reg
+
+    config_path = _hermes_home / "config.yaml"
+    config_path.write_text("# mine\nsecrets:\n  bitwarden:\n    enabled: false\n", encoding="utf-8")
+    assert reg.inspect_block() == "missing"
+    assert reg.install_block() == "added"
+    text = config_path.read_text(encoding="utf-8")
+    assert "# mine" in text and "bitwarden" in text
+    assert reg.inspect_block() == "ours" and reg.inspect_source_enabled() is True
+    assert reg.install_block() == "present"
+    assert reg.uninstall_block() is True
+    assert "agentchat" not in (_import("hermes_cli.config").read_user_config_raw().get("secrets") or {})
+
+
+def test_hermes_records_which_source_supplied_a_variable() -> None:
+    """``secret_source_label`` (public): how the plugin tells its own earlier
+    write from an exported key."""
+    assert callable(_import("agent.secret_scope").secret_source_label)
+    assert callable(_import("hermes_constants").get_process_hermes_home)
+    config = _import("hermes_cli.config")
+    assert callable(config.remove_env_value) and callable(config.get_env_path)
 
 
 def test_wizard_helpers() -> None:

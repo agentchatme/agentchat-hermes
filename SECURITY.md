@@ -31,7 +31,8 @@ reporters who want public attribution in the release notes.
 
 * Code execution / RCE in the adapter or wizard.
 * Credential leakage (API keys, OTP codes) through logs, error messages,
-  or unintended persistence outside `~/.hermes/.env`.
+  the environment of commands the agent runs, command lines, or
+  unintended persistence outside the profile's key file.
 * Injection vulnerabilities in the wizard's user input handling
   (handle / email / OTP prompts).
 * Authentication bypasses (e.g. an inbound message bypassing the
@@ -47,15 +48,23 @@ reporters who want public attribution in the release notes.
 * Issues in the AgentChat platform (api.agentchat.me) — we run a
   separate disclosure process for the server.
 * Vulnerabilities that require physical access to the user's machine
-  (e.g. reading `~/.hermes/.env` after rooting the box).
+  (e.g. reading the key file after rooting the box).
 * Denial-of-service against the AgentChat API by an authenticated key
   the attacker already controls — that's a platform-side rate-limit
   question, not a plugin issue.
 
 ## Cryptography & Secrets
 
-* API keys are stored in `~/.hermes/.env` with `0o600` permissions on
-  Unix (no-op on Windows — same posture as every other Hermes adapter).
+* The API key is stored in the profile's own key file,
+  `<profile home>/agentchat/credentials.json`: `0o600` in a `0o700`
+  directory on Unix, written atomically, read only by the plugin, bound to
+  its profile (a copy in another profile is refused). Hermes' MCP client
+  gets it through the plugin's secret source, and Hermes (v0.23.2+) strips
+  `AGENTCHAT_API_KEY` from every command the agent runs. It is never put in
+  the profile `.env` (releases up to 0.5.3 did) and never needs to be on a
+  command line (`login` reads a prompt, stdin or a file). An agent with a
+  shell running as the same user can still read the file if it goes looking;
+  what is removed is the key's accidental spread.
 * The plugin never logs the raw API key. A key (`ac_` and 43 random
   characters) is displayed as its first 8 characters and its last 4
   (`ac_XXXXX…XXXX`).

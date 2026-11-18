@@ -8,12 +8,19 @@ environment of whichever profile launched the gateway. Changing a value
 after Hermes has started has no effect — the user must restart Hermes
 (the same constraint every other Hermes plugin has, by design).
 
-Variable names
-──────────────
-The key is ``AGENTCHAT_API_KEY`` — the name the published manual and the
-hosted-MCP declaration use (``Bearer ${AGENTCHAT_API_KEY}``). The pre-v3
-name ``AGENTCHATME_API_KEY`` is still honoured as a fallback and mirrored
-on first activation. Behaviour knobs keep their ``AGENTCHATME_`` prefix.
+The key
+───────
+The key lives in this profile's AgentChat key file
+(``<profile home>/agentchat/credentials.json``, :mod:`.key_store`), read
+only by this plugin; Hermes' MCP client gets it as ``AGENTCHAT_API_KEY``
+through the plugin's secret source (:mod:`.key_source`). A profile set up
+before 0.6 still has it in the profile ``.env`` as ``AGENTCHAT_API_KEY`` (or
+the pre-v3 ``AGENTCHATME_API_KEY``): that is read as a fallback until
+``hermes agentchat doctor --fix`` (or a login) moves it. :func:`resolve_key`
+also refuses a key this profile must not act as — a copy of another
+profile's, or an ``AGENTCHAT_API_KEY`` that disagrees with the saved key —
+with a sentence that says what to do. Behaviour knobs keep their
+``AGENTCHATME_`` prefix and are read as before.
 
 Two knobs were renamed with the words (integration, wake); the old
 spellings keep working and win nothing — the new name is read first, the
@@ -30,11 +37,20 @@ accepted, ignored, and logged once.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse, urlunparse
 
-from .profile_scope import account_fingerprint, resolve_hermes_home, resolve_setting
+from . import key_store, profile_scope
+from .profile_scope import (
+    account_fingerprint,
+    dotenv_value,
+    hermes_root_of,
+    profile_label,
+    resolve_hermes_home,
+    resolve_setting,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -102,22 +118,48 @@ class ConfigError(RuntimeError):
     """Raised when configuration is malformed."""
 
 
+class KeyRefused(ConfigError):
+    """This profile holds a key it must not act as; the message says what to do."""
+
+
+# Where the key came from (``Config.api_key_source``, ``KeyResolution.source``):
+# the key file, or the name of the variable it was read from.
+KEY_SOURCE_STORE = "key file"
+
+# ``AGENTCHAT_API_KEY`` as this process's environment had it when the plugin
+# was first imported: before Hermes re-pulls the plugin's secret source after
+# discovery (which overwrites it with the saved key), so an exported key that
+# disagrees with the saved one is still seen, and refused, for the process's
+# whole life — not only until the first re-pull.
+_PROCESS_ENV_AT_IMPORT: dict[str, str | None] = {}
+
+
+def _snapshot_process_env() -> None:
+    for name in (ENV_API_KEY, ENV_API_KEY_LEGACY):
+        _PROCESS_ENV_AT_IMPORT.setdefault(name, os.environ.get(name))
+
+
+def reset_process_env_snapshot_for_tests() -> None:
+    _PROCESS_ENV_AT_IMPORT.clear()
+    _snapshot_process_env()
+
+
 @dataclass(frozen=True)
 class Config:
     """Resolved plugin configuration.
 
     All fields are required and validated at construction. Use
-    :func:`load_config` to construct from the profile's settings — it
-    returns ``None`` when no API key is set, which lets the plugin
+    :func:`load_config` to construct from the profile's key and settings —
+    it returns ``None`` when the profile has no key, which lets the plugin
     register the CLI wizard even before the user has set up an account.
     """
 
     api_key: str
     api_base: str
     ws_url: str
-    # Which variable the key came from (``AGENTCHAT_API_KEY`` or the legacy
-    # name). Drives the one-time mirror at activation and ``doctor``.
-    api_key_source: str = ENV_API_KEY
+    # Where the key came from: ``KEY_SOURCE_STORE`` (the key file) or the
+    # variable it was read from (a profile not moved to the key file yet).
+    api_key_source: str = KEY_SOURCE_STORE
     integration: str = DEFAULT_INTEGRATION
     wake_debounce_s: float = DEFAULT_WAKE_DEBOUNCE_S
     reply_gate_enabled: bool = DEFAULT_REPLY_GATE_ENABLED
@@ -166,26 +208,236 @@ def _setting_compat(name: str, legacy_name: str) -> tuple[str, str]:
     return "", name
 
 
-def resolve_api_key() -> tuple[str, str] | None:
-    """``(key, variable name)`` for the current profile, or ``None`` when unset.
+def _env_api_key(home: Path) -> tuple[str, str, str] | None:
+    """``(key, variable name, where)`` for a profile not moved to the key file yet.
 
-    ``AGENTCHAT_API_KEY`` wins; ``AGENTCHATME_API_KEY`` is the fallback for
-    profiles configured before v3.
+    ``home``'s own ``.env`` file first (``where`` = ``".env"``), then the
+    profile's settings as Hermes resolves them for the running profile (its
+    secret scope, the process environment: ``"environment"``), as every
+    release before 0.6 read the key.
     """
+    env_file = home / ".env"
+    for name in (ENV_API_KEY, ENV_API_KEY_LEGACY):
+        value = (dotenv_value(env_file, name) or "").strip()
+        if value:
+            return value, name, ".env"
     for name in (ENV_API_KEY, ENV_API_KEY_LEGACY):
         value = _setting(name)
         if value:
-            return value, name
+            where = ".env" if (dotenv_value(env_file, name) or "").strip() == value else "environment"
+            return value, name, where
     return None
+
+
+@dataclass(frozen=True)
+class KeyResolution:
+    """Which key this profile acts as, where it is, and what is wrong with it."""
+
+    # The key to use; ``None`` when there is none or it is refused.
+    api_key: str | None
+    # ``KEY_SOURCE_STORE``, ``ENV_API_KEY``, ``ENV_API_KEY_LEGACY``, or ``""``.
+    source: str
+    store: key_store.StoreRead
+    # A plain sentence when the key must not be used here (copied, conflicting, unsafe).
+    refusal: str | None = None
+    # Warnings that do not stop it (another profile holds it too, a leftover .env copy).
+    notes: tuple[str, ...] = ()
+    # The key this profile holds, refused or not (doctor, logout). Never shown.
+    held_key: str | None = None
+    # For a key read from the settings: ``".env"`` (the profile's file) or ``"environment"``.
+    env_location: str = ""
+
+
+def cli_prefix(home: Path) -> str:
+    """``hermes agentchat`` spelled for ``home``'s profile (``hermes -p NAME agentchat``)."""
+    label = profile_label(home)
+    return "hermes agentchat" if label == "default" else f"hermes -p {label} agentchat"
+
+
+def resolve_key(home: Path | None = None) -> KeyResolution:
+    """Which key ``home``'s profile acts as. Never raises.
+
+    1. The key file, when it belongs to this profile (or was moved here). A
+       copy of another profile's key file is refused. Any other value of
+       ``AGENTCHAT_API_KEY`` this profile sees — a line in its ``.env``, or the
+       process environment as it was when the plugin loaded (an export, a
+       service's ``Environment=``) — that disagrees with it is refused: the
+       saved key decides which agent this is, and a second key is never
+       quietly preferred or ignored.
+    2. Else the settings (``.env``, then the environment), as before 0.6. A
+       ``.env`` key that another profile on this machine saved in its key
+       file, or that the default profile holds, is a copy made by ``hermes
+       profile create`` (which copies ``.env``): refused.
+    """
+    home = Path(home) if home is not None else profile_scope.resolve_hermes_home()
+    cmd = cli_prefix(home)
+    store = key_store.read_store(home)
+
+    if store.status in ("unsafe", "unreadable"):
+        return KeyResolution(
+            None,
+            KEY_SOURCE_STORE,
+            store,
+            refusal=f"{store.detail}. Fix or remove it, then run `{cmd} login`.",
+        )
+    if store.status == "copied" and store.key is not None:
+        origin = store.origin_home or home
+        return KeyResolution(
+            None,
+            KEY_SOURCE_STORE,
+            store,
+            refusal=(
+                f"This profile's AgentChat key file ({store.path}) is a copy of profile "
+                f"{profile_label(origin)}'s ({origin}). One key is one agent, and profile "
+                f"{profile_label(origin)} is that agent. Run `{cmd} logout` to remove the copy from "
+                f"this profile (profile {profile_label(origin)} keeps its key), then `{cmd} register` "
+                "to give this profile its own agent."
+            ),
+            held_key=store.key.api_key,
+        )
+    if store.usable and store.key is not None:
+        return _resolve_from_store(home, store, cmd)
+
+    found = _env_api_key(home)
+    if found is None:
+        return KeyResolution(None, "", store)
+    value, name, location = found
+    root = hermes_root_of(home)
+    holders = key_store.other_holders(
+        home, value, root=root, env_names=(ENV_API_KEY, ENV_API_KEY_LEGACY)
+    )
+    claimed = [h for h in holders if h.where == "key file"]
+    root_holds = not key_store.same_home(home, root) and any(
+        key_store.same_home(h.home, root) for h in holders
+    )
+    if location == ".env" and (claimed or root_holds):
+        owner = claimed[0].home if claimed else root
+        owner_cmd = cli_prefix(owner)
+        return KeyResolution(
+            None,
+            name,
+            store,
+            refusal=(
+                f"This profile's .env holds the same AgentChat key as profile {profile_label(owner)} "
+                f"({owner}) — `hermes profile create` copies .env into new profiles. One key is one "
+                f"agent, and profile {profile_label(owner)} is that agent. Run `{cmd} logout` to "
+                f"remove the copy from this profile (profile {profile_label(owner)} keeps its key), "
+                f"then `{cmd} register` to give this profile its own agent. If this profile should "
+                f"be that agent instead, run `{owner_cmd} logout` first."
+            ),
+            held_key=value,
+            env_location=location,
+        )
+    notes = tuple(
+        f"profile {profile_label(h.home)} ({h.home}) also holds this key in its {h.where}: "
+        "the two profiles are one AgentChat agent"
+        for h in holders
+    )
+    return KeyResolution(value, name, store, notes=notes, held_key=value, env_location=location)
+
+
+def _resolve_from_store(home: Path, store: key_store.StoreRead, cmd: str) -> KeyResolution:
+    assert store.key is not None
+    key = store.key.api_key
+    env_file = home / ".env"
+    conflicts: list[str] = []
+    leftovers: list[str] = []
+    for name in (ENV_API_KEY, ENV_API_KEY_LEGACY):
+        in_file = (dotenv_value(env_file, name) or "").strip()
+        if in_file and in_file != key:
+            conflicts.append(f"{name} in {env_file}")
+        elif in_file:
+            leftovers.append(name)
+        exported = _process_env_value(home, name)
+        if exported and exported != key and exported != in_file:
+            conflicts.append(f"{name} in this process's environment (exported in the shell or set by the service)")
+    if conflicts:
+        handle = f" (@{store.key.handle})" if store.key.handle else ""
+        return KeyResolution(
+            None,
+            KEY_SOURCE_STORE,
+            store,
+            refusal=(
+                f"{' and '.join(conflicts)} is not the key this profile saved in {store.path}"
+                f"{handle}. The saved key decides which agent this profile is, and another key is "
+                f"never used in its place: remove or unset the other one, or save it for this "
+                f"profile instead with `{cmd} login --api-key-file <file>`."
+            ),
+            held_key=key,
+        )
+    notes: list[str] = []
+    if leftovers:
+        notes.append(
+            f"the profile .env still holds a copy of the key ({', '.join(leftovers)}): "
+            f"`{cmd} doctor --fix` removes it"
+        )
+    if store.status == "moved":
+        notes.append(
+            f"the key file was saved for {store.origin_home}, which no longer holds it (the profile "
+            f"was renamed or moved): `{cmd} doctor --fix` records this profile in it"
+        )
+    root = hermes_root_of(home)
+    for holder in key_store.other_holders(
+        home, key, root=root, env_names=(ENV_API_KEY, ENV_API_KEY_LEGACY)
+    ):
+        notes.append(
+            f"profile {profile_label(holder.home)} ({holder.home}) also holds this key in its "
+            f"{holder.where}: the two profiles are one AgentChat agent"
+        )
+    return KeyResolution(key, KEY_SOURCE_STORE, store, notes=tuple(notes), held_key=key)
+
+
+def _process_env_value(home: Path, name: str) -> str:
+    """``name`` in the process environment as the plugin first saw it — for the process's own profile.
+
+    A profile a multiplexed gateway serves for another home is not the
+    process's own; the launch profile's environment says nothing about it.
+    """
+    if not _is_process_home(home):
+        return ""
+    _snapshot_process_env()
+    value = (_PROCESS_ENV_AT_IMPORT.get(name) or "").strip()
+    if not value:
+        return ""
+    from .key_source import supplied_by_us
+
+    current = (os.environ.get(name) or "").strip()
+    if current == value and supplied_by_us(name):
+        return ""  # our own source's value from an earlier load in this process
+    return value
+
+
+def _is_process_home(home: Path) -> bool:
+    try:
+        from hermes_constants import (  # type: ignore[import-not-found]
+            get_process_hermes_home,
+        )
+    except Exception:
+        raw = os.environ.get("HERMES_HOME", "").strip()
+        process_home = Path(raw).expanduser() if raw else Path.home() / ".hermes"
+    else:
+        try:
+            process_home = Path(get_process_hermes_home())
+        except Exception:
+            return True
+    return key_store.same_home(process_home, home)
+
+
+def resolve_api_key(home: Path | None = None) -> tuple[str, str] | None:
+    """``(key, source)`` for the current profile, or ``None`` when there is none or it is refused."""
+    resolved = resolve_key(home)
+    if resolved.api_key is None:
+        return None
+    return resolved.api_key, resolved.source
 
 
 def load_config(*, hermes_home: Path | None = None) -> Config | None:
     """Build a :class:`Config` for the current (or given) Hermes profile.
 
-    Returns ``None`` when no API key is set for that profile — the plugin
-    runs in *CLI-only* mode (the wizard is reachable, nothing connects).
-    Once the wizard persists a key the gateway's activation watcher picks
-    it up without a restart.
+    Returns ``None`` when the profile has no key — the plugin runs in
+    *CLI-only* mode (the wizard is reachable, nothing connects). Once the
+    wizard saves a key the gateway's activation watcher picks it up without
+    a restart.
 
     Args:
         hermes_home: the profile home to bind the configuration to.
@@ -194,16 +446,22 @@ def load_config(*, hermes_home: Path | None = None) -> Config | None:
             running.
 
     Raises:
+        KeyRefused: the profile holds a key it must not act as (see
+            :func:`resolve_key`); the message says what to do.
         ConfigError: when a value is present but malformed (e.g.,
             ``AGENTCHATME_API_BASE`` is not a valid URL, or a numeric
             knob is not parseable).
     """
-    resolved = resolve_api_key()
-    if resolved is None:
+    home = hermes_home if hermes_home is not None else profile_scope.resolve_hermes_home()
+    resolution = resolve_key(home)
+    if resolution.refusal is not None:
+        raise KeyRefused(resolution.refusal)
+    if resolution.api_key is None:
         return None
-    api_key, api_key_source = resolved
+    api_key, api_key_source = resolution.api_key, resolution.source
 
-    api_base_raw = _setting(ENV_API_BASE, DEFAULT_API_BASE) or DEFAULT_API_BASE
+    stored_base = resolution.store.key.api_base if resolution.store.key is not None else ""
+    api_base_raw = _setting(ENV_API_BASE) or stored_base or DEFAULT_API_BASE
     api_base = _normalize_url(api_base_raw, scheme_allowed=("http", "https"))
     if api_base is None:
         raise ConfigError(f"{ENV_API_BASE}={api_base_raw!r} is not a valid http(s) URL")
@@ -249,7 +507,7 @@ def load_config(*, hermes_home: Path | None = None) -> Config | None:
         gate_timeout_s=gate_timeout_s,
         turn_idle_s=turn_idle_s,
         turn_max_s=turn_max_s,
-        hermes_home=hermes_home if hermes_home is not None else resolve_hermes_home(),
+        hermes_home=home,
         lock_dir=lock_dir,
         state_dir=state_dir,
     )
@@ -355,3 +613,6 @@ def _parse_bool_env(name: str, default: bool) -> bool:
         f"{name}={raw!r} is not a boolean (use one of: "
         f"{', '.join(sorted(_TRUE_TOKENS | _FALSE_TOKENS))})"
     )
+
+
+_snapshot_process_env()

@@ -2,6 +2,58 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Not released yet; the version number is set at release (`VERSIONING.md`). Same AgentChat server and SDK floor
+(`agentchatme>=1.4.0,<2`). Keeping the key out of the agent's commands needs Hermes v0.23.2 or later; everything else
+works on the Hermes versions 0.5.3 supports. Upgrading breaks nothing; `hermes agentchat doctor --fix` (or the next
+login) moves the key out of `.env`.
+
+### Security
+
+- **The API key is out of the agent's reach.** Up to 0.5.3 the key lived in the profile `.env` as `AGENTCHAT_API_KEY`.
+  Hermes loads `.env` into its process environment, so the key was in the environment of every command a reply turn
+  ran: a turn started by a stranger's message curl'd attachments with `Bearer $AGENTCHAT_API_KEY`, wrote a script reading
+  `os.environ["AGENTCHAT_API_KEY"]`, and Hermes' terminal snapshots (`cache/scratch/hermes-snap-*.sh`) kept
+  `declare -x AGENTCHAT_API_KEY=…` (found testing on a real Hermes box). Now:
+  - The key is in this profile's own key file, `<profile home>/agentchat/credentials.json` (`0600` in a `0700`
+    directory, written atomically and read back), read only by the plugin. Register, login, recover and the wizard write
+    it there; nothing writes the key into `.env` any more (the pre-v3 key name is no longer mirrored into `.env` either).
+  - Hermes' MCP client gets it for the hosted tools through the plugin's **secret source** `agentchat` (Hermes' public
+    plugin API, `ctx.register_secret_source`), turned on by `secrets.agentchat` in `config.yaml`, which the plugin places
+    at activation, login and `doctor --fix`. The source supplies `AGENTCHAT_API_KEY` from the profile's own key file only;
+    under a multiplexed gateway each profile's tools act as that profile's agent.
+  - The same block names `AGENTCHAT_API_KEY` as a credential (`api_key_env`), so Hermes (v0.23.2+) strips it from every
+    command the agent runs — terminal, background processes, `execute_code`, its terminal snapshots — and refuses it as
+    an `env_passthrough` name. Placed for a profile whose key is still in `.env` too, so the leak stops at the gateway's
+    next start, before anything is moved.
+- **The key never needs to be on a command line.** `hermes agentchat login` reads it from a masked prompt, from
+  stdin (`--api-key -`, or a pipe with no option) or from a file (`--api-key-file PATH`). `--api-key <key>` still works
+  and prints why it should not be used (other users of the machine can read a command line). No text the plugin prints
+  puts a key on a command line.
+- **A new profile is not silently the same agent.** `hermes profile create` copied the default
+  profile's `.env` — key included — into every new profile, and the plugin adopted it (placed the other agent's identity
+  line, said "All checks passed"). The key file is not copied by `create` / `--clone`. A `--clone-all` copy of it names
+  the profile it belongs to and is refused; a `.env` key that another profile holds (a copy made before this release) is
+  refused in the copy. Refused means: no socket, no turn, nothing placed, one error line, and `status` / `doctor` say
+  which profile is that agent and the command to fix it (`hermes -p <name> agentchat logout` removes only the copy).
+- **One exported variable no longer decides the identity.** An `AGENTCHAT_API_KEY` exported in the shell (or set by a
+  service) that is not the profile's saved key, or a different key left in the profile `.env`, is refused with a plain
+  sentence; the saved key wins for the hosted tools.
+
+### Changed
+
+- `doctor` reports where the key is (key file, profile `.env`, process environment), file modes, a copied or moved key
+  file, other profiles holding the same key, whether `secrets.agentchat` is in place, and asks Hermes whether it strips
+  `AGENTCHAT_API_KEY` from the agent's commands. `doctor --fix` moves a `.env` key into the key file (only the line
+  holding that key is removed, after the key file is written and read back), records a moved profile, tightens modes.
+- `status` shows where the key is; `logout` removes the key file and any key line from the profile `.env`, and our
+  `secrets.agentchat` entry.
+- `AGENTCHATME_HANDLE` is no longer written; the handle is in the key file (an existing line is still read for
+  `recover`).
+- If Hermes cannot read the key file for the hosted tools (no secret sources, or a managed `config.yaml`), the key is
+  saved in the profile `.env` as before and the command says why — a key the server just issued is never dropped.
+
 ## [0.5.3] — 2026-11-17
 
 Patch release (fixed existing behaviour → patch +1, per `VERSIONING.md`). Needs `agentchatme>=1.4.0,<2` (was `>=1.3.3`), the
