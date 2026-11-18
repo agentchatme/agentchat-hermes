@@ -8,6 +8,7 @@ from __future__ import annotations
 from typing import Any
 
 from fake_keys import api_key
+from key_files import save_key
 
 
 class TestArgparseWiring:
@@ -84,8 +85,8 @@ class TestArgparseWiring:
 class TestDoctor:
     """End-to-end doctor on a clean / broken config.
 
-    We intercept ``_read_saved_key`` so tests don't depend on the
-    runner's actual env, and stub the SDK so no network IO happens.
+    The key is set up in the test's own profile home (or the variable is
+    cleared), and the SDK is stubbed so no network IO happens.
     """
 
     def test_doctor_reports_missing_key(
@@ -95,13 +96,14 @@ class TestDoctor:
 
         from agentchatme_hermes import cli
 
-        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: None)  # type: ignore[attr-defined]
-        # Doctor short-circuits after the env-var check when no key,
-        # so SDK import doesn't need to be stubbed.
+        # No key file, no AGENTCHAT_API_KEY: the profile has no key. Doctor
+        # short-circuits after the key check, so the SDK needs no stub.
+        monkeypatch.delenv("AGENTCHAT_API_KEY", raising=False)  # type: ignore[attr-defined]
+        monkeypatch.delenv("AGENTCHATME_API_KEY", raising=False)  # type: ignore[attr-defined]
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         captured = capsys.readouterr()  # type: ignore[attr-defined]
         assert rc >= 1
-        assert "AGENTCHAT_API_KEY not set" in captured.out
+        assert "[fail] no AgentChat key in this profile" in captured.out
 
     def test_doctor_returns_zero_on_clean_config(
         self, monkeypatch: object, capsys: object
@@ -111,9 +113,7 @@ class TestDoctor:
 
         from agentchatme_hermes import cli
 
-        monkeypatch.setattr(  # type: ignore[attr-defined]
-            cli, "_read_saved_key_source", lambda: (api_key("xyz"), cli._ENV_API_KEY)
-        )
+        save_key(api_key("xyz"))
 
         fake_client = MagicMock()
         fake_client.get_me.return_value = {
@@ -151,12 +151,20 @@ class TestDoctor:
         from agentchatme_hermes import kit, mcp_registration
 
         monkeypatch.setattr(mcp_registration, "inspect_entry_identity", lambda **_kw: ("ours", "current"))  # type: ignore[attr-defined]
+        # ...and the key source (secrets.agentchat), in a Hermes that has secret sources.
+        from agentchatme_hermes import key_source, secrets_registration
+
+        monkeypatch.setattr(secrets_registration, "inspect_block", lambda: "ours")  # type: ignore[attr-defined]
+        monkeypatch.setattr(key_source, "source_supported", lambda: True)  # type: ignore[attr-defined]
         # The SDK stand-in above has no kit; a clean install has it.
         monkeypatch.setattr(kit, "kit_problem", lambda: None)  # type: ignore[attr-defined]
 
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         captured = capsys.readouterr()  # type: ignore[attr-defined]
         assert "Authenticated as @alice" in captured.out
+        assert "[ok]   key saved in " in captured.out
+        assert "[ok]   secrets.agentchat in config.yaml" in captured.out
+        assert api_key("xyz") not in captured.out
         assert "[ok]   Hermes MCP client importable" in captured.out
         assert "manual bundled" in captured.out
         # Exit code reflects failures only (warnings allowed). Plausible
@@ -173,9 +181,8 @@ class TestDoctor:
 
         from agentchatme_hermes import cli
 
-        monkeypatch.setattr(  # type: ignore[attr-defined]
-            cli, "_read_saved_key_source", lambda: (api_key("xyz"), cli._ENV_API_KEY_LEGACY)
-        )
+        monkeypatch.delenv("AGENTCHAT_API_KEY", raising=False)  # type: ignore[attr-defined]
+        monkeypatch.setenv("AGENTCHATME_API_KEY", api_key("xyz"))  # type: ignore[attr-defined]
         import sys
 
         monkeypatch.setitem(sys.modules, "agentchatme", None)  # type: ignore[attr-defined]
@@ -194,7 +201,8 @@ class TestDoctorHermesMcpClient:
 
         from agentchatme_hermes import cli
 
-        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: None)  # type: ignore[attr-defined]
+        monkeypatch.delenv("AGENTCHAT_API_KEY", raising=False)  # type: ignore[attr-defined]
+        monkeypatch.delenv("AGENTCHATME_API_KEY", raising=False)  # type: ignore[attr-defined]
         monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: importable)  # type: ignore[attr-defined]
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         return rc, capsys.readouterr().out  # type: ignore[attr-defined]
@@ -244,7 +252,7 @@ class TestDoctorClientHeader:
 
         from agentchatme_hermes import cli, kit, mcp_registration
 
-        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: (api_key("xyz"), cli._ENV_API_KEY))
+        save_key(api_key("xyz"))
         fake_client = MagicMock()
         fake_client.get_me.return_value = {"handle": "alice", "status": "active"}
         fake_sdk = _types.ModuleType("agentchatme")
@@ -363,7 +371,8 @@ class TestDoctorTwoPlugins:
         from agentchatme_hermes import cli, profile_scope
 
         monkeypatch.setattr(profile_scope, "resolve_hermes_home", lambda: home)
-        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: None)
+        monkeypatch.delenv("AGENTCHAT_API_KEY", raising=False)
+        monkeypatch.delenv("AGENTCHATME_API_KEY", raising=False)
         cli._dispatch_doctor(argparse.Namespace(fix=False))
         return str(capsys.readouterr().out)
 

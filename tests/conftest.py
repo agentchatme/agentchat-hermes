@@ -8,8 +8,8 @@ local (AF_UNIX) sockets stay open for local fake servers.
 
 The home guard: every test runs with ``HOME`` / ``USERPROFILE`` /
 ``HERMES_HOME`` pointing at its own temporary directory, so nothing the
-plugin writes by default (the health record, the leader locks, ``.env``,
-``SOUL.md``) can land in the real home of whoever runs the suite — on a
+plugin writes by default (the health record, the leader locks, the key
+file, ``.env``, ``SOUL.md``) can land in the real home of whoever runs the suite — on a
 Hermes box, that is the live agent's.
 
 The thread guard: a test that leaves one of the plugin's threads
@@ -104,6 +104,19 @@ def _home_guard(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.Mo
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
+
+
+@pytest.fixture(autouse=True)
+def _process_env_snapshot() -> Iterator[None]:
+    """The plugin remembers ``AGENTCHAT_API_KEY`` as the process environment
+    had it when the plugin loaded (so an exported key that disagrees with the
+    saved one stays refused after Hermes rewrites the variable). Each test
+    starts from its own environment, never the runner's shell."""
+    from agentchatme_hermes import config
+
+    config._PROCESS_ENV_AT_IMPORT.clear()
+    yield
+    config._PROCESS_ENV_AT_IMPORT.clear()
 
 
 _THREAD_GRACE_S = 2.0

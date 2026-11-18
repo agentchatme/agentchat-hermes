@@ -6,20 +6,24 @@ Surfaces:
   agent via the interactive wizard if no key is configured, or
   shows status if one is.
 * **``register``** — email → handle → the emailed code → a new API key
-  persisted to ``~/.hermes/.env``.
-* **``login``** — paste an existing ``ac_…`` key. The server checks it
-  (``GET /v1/agents/me``) before it is persisted, so a key it does not
-  accept is never saved.
+  saved in this profile's key file (``<profile>/agentchat/credentials.json``).
+* **``login``** — an existing ``ac_…`` key from a masked prompt, stdin
+  (``--api-key -``, or a pipe) or a file (``--api-key-file PATH``), never
+  needed on the command line. The server checks it (``GET /v1/agents/me``)
+  before it is saved, so a key it does not accept is never saved.
 * **``recover``** — re-key a lost or leaked API key: email + @handle
-  → the emailed code → a fresh key persisted to ``~/.hermes/.env`` (the
-  old key dies). The handle is sent because an email can back several
-  agents; it defaults to the locally configured one.
+  → the emailed code → a fresh key saved in the key file (the old key
+  dies). The handle is sent because an email can back several agents; it
+  defaults to the locally configured one.
 * **``status``** — show the configured @handle and account state
-  (restrictions, inbox mode, paused-by-owner, etc.).
-* **``logout``** — wipe the saved key from ``~/.hermes/.env``, strip the
-  identity line from SOUL.md, remove our ``mcp_servers.agentchat`` entry.
+  (restrictions, inbox mode, paused-by-owner, etc.) and where the key is.
+* **``logout``** — remove the key file and any key line from the profile
+  ``.env``, strip the identity line from SOUL.md, remove our
+  ``secrets.agentchat`` and ``mcp_servers.agentchat`` entries.
 * **``doctor``** — check every placement (key, identity line, manual,
-  hosted tools) plus the lock and the daemon's health; ``--fix`` re-places.
+  the key source, hosted tools) plus the lock and the daemon's health;
+  ``--fix`` re-places, and moves a key still in the profile ``.env`` into
+  the key file.
 
 ``register`` and ``recover`` run on the SDK's sign-up helper
 (:mod:`.signup`): one interactive run that follows the server's answer —
@@ -28,17 +32,16 @@ new code, a blank line cancels — and prints the server's sentences as they
 are. The handle saved is always the one the server returned.
 
 Every successful register / login / recover *places* the integration: the
-key in the profile ``.env`` as ``AGENTCHAT_API_KEY``, the served identity
-line in SOUL.md, and the hosted MCP server in ``config.yaml`` — see
-:mod:`.placement`.
+key in this profile's key file, the served identity line in SOUL.md, the
+key source (``secrets.agentchat``) and the hosted MCP server
+(``mcp_servers.agentchat``) in ``config.yaml`` — see :mod:`.placement`.
 
 The wizard is the only path users need. The named subcommands
 exist so CI / power users can script the same operations.
 
-Persistence: every successful flow writes through Hermes's
-``save_env_value`` (``hermes_cli/config.py``), which mirrors the
-gateway and auth flows so users get one well-known location for
-their secrets.
+Saving: :mod:`.credentials` writes the key file (owner-only, atomic, read
+back) and only then removes the key line from the profile ``.env``, where
+releases up to 0.5.3 kept it.
 """
 from __future__ import annotations
 
@@ -50,14 +53,22 @@ from getpass import getpass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
-from . import signup
+from . import credentials, key_store, signup
 from ._version import __version__
 from .client_identity import hermes_client_identity
-from .config import ENV_API_BASE, ENV_API_KEY, ENV_API_KEY_LEGACY, ENV_HANDLE
+from .config import (
+    ENV_API_BASE,
+    ENV_API_KEY,
+    ENV_API_KEY_LEGACY,
+    ENV_HANDLE,
+    KEY_SOURCE_STORE,
+    KeyResolution,
+    cli_prefix,
+    resolve_key,
+    shared_note,
+)
 from .placement import (
     PlacementStep,
-    clear_api_key,
-    persist_api_key,
     place_identity_and_tools,
     resolve_identity_line,
 )
@@ -71,10 +82,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Env var keys we persist (canonical names live in config.py). The key is
-# ``AGENTCHAT_API_KEY`` — the name the manual and the hosted-MCP header
-# use; ``AGENTCHATME_API_KEY`` is read as a fallback and kept in step while
-# it exists.
+# Variable names (canonical names live in config.py). The key itself is in
+# the key file; ``AGENTCHAT_API_KEY`` is the name Hermes' MCP client gets it
+# under, and the name a profile set up before 0.6 still has in its ``.env``.
 _ENV_API_KEY = ENV_API_KEY
 _ENV_API_KEY_LEGACY = ENV_API_KEY_LEGACY
 _ENV_HANDLE = ENV_HANDLE
@@ -101,8 +111,8 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     parser.description = (
         "Manage your AgentChat identity. With no subcommand, launches "
         "the interactive register/status wizard. The named subcommands "
-        "are scriptable equivalents. Configuration is persisted to "
-        "~/.hermes/.env."
+        "are scriptable equivalents. The key is saved in this profile's "
+        "key file (<profile>/agentchat/credentials.json, readable by you only)."
     )
     parser.set_defaults(func=_dispatch_wizard)
 
@@ -129,12 +139,28 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
 
     p_login = sub.add_parser(
         "login",
-        help="Paste an existing AgentChat API key",
+        help="Save an existing AgentChat API key (masked prompt, stdin or a file)",
+        description=(
+            "Save an existing ac_… key for this profile. With no option: a masked prompt in a "
+            "terminal, else one line from stdin. The key never needs to be on the command line, "
+            "where other users of this machine can read it."
+        ),
     )
-    p_login.add_argument(
+    key_input = p_login.add_mutually_exclusive_group()
+    key_input.add_argument(
+        "--api-key-file",
+        dest="api_key_file",
+        metavar="PATH",
+        help="Read the key from PATH (its first non-empty line); '-' reads stdin.",
+    )
+    key_input.add_argument(
         "--api-key",
         dest="api_key",
-        help="ac_… key. Prompts (masked input) if omitted.",
+        metavar="-",
+        help=(
+            "'-' reads the key from stdin. Passing the key itself still works but is deprecated: "
+            "a command line is readable by every user of this machine (ps)."
+        ),
     )
     p_login.set_defaults(func=_dispatch_login)
 
@@ -164,7 +190,7 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
 
     p_logout = sub.add_parser(
         "logout",
-        help="Clear the saved AgentChat key from ~/.hermes/.env",
+        help="Remove this profile's AgentChat key (the key file and any .env line)",
     )
     p_logout.set_defaults(func=_dispatch_logout)
 
@@ -176,8 +202,9 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
         "--fix",
         action="store_true",
         help=(
-            "Re-place what is missing or outdated: the identity line in SOUL.md and the "
-            "hosted-tools entry in config.yaml (never touches a hand-managed entry)."
+            "Re-place what is missing or outdated: the identity line in SOUL.md, the key source "
+            "and the hosted-tools entry in config.yaml (never touches a hand-managed entry), and "
+            "move a key still in the profile .env into the key file."
         ),
     )
     p_doctor.set_defaults(func=_dispatch_doctor)
@@ -228,12 +255,22 @@ def _dispatch_register(args: argparse.Namespace) -> int:
 
 
 def _dispatch_login(args: argparse.Namespace) -> int:
-    raw_key = getattr(args, "api_key", None)
-    if not raw_key:
-        try:
-            raw_key = _prompt_api_key()
-        except (KeyboardInterrupt, EOFError):
-            return _exit_cancel()
+    """``hermes agentchat login [--api-key-file PATH | --api-key -]``.
+
+    Where the key comes from, never the command line unless the caller
+    insists: ``--api-key-file PATH`` (``-`` = stdin), ``--api-key -``
+    (stdin), or with neither a masked prompt in a terminal and one line of
+    stdin otherwise (``… | hermes agentchat login``). ``--api-key <key>``
+    still works and says why it should not be used.
+    """
+    try:
+        raw_key = _login_key_input(
+            key_file=getattr(args, "api_key_file", None), flag=getattr(args, "api_key", None)
+        )
+    except (KeyboardInterrupt, EOFError):
+        return _exit_cancel()
+    except _KeyInputError as exc:
+        return _exit_with(str(exc))
 
     api_key = raw_key.strip()
     if not api_key:
@@ -254,10 +291,66 @@ def _dispatch_login(args: argparse.Namespace) -> int:
             f"The key was not saved. AgentChat answered: {checked.message or checked.code}"
         )
 
-    _persist_credentials(api_key=api_key, handle=checked.handle, api_base=api_base)
+    if not _persist_credentials(api_key=api_key, handle=checked.handle, api_base=api_base):
+        return _EXIT_API_ERR
     _install_placement(checked.handle, api_base=api_base, api_key=api_key)
     _printline(f"Saved AgentChat key for @{checked.handle}.")
+    _printline(_RESTART_HINT)
     return _EXIT_OK
+
+
+class _KeyInputError(Exception):
+    """The key could not be read from where the caller said it is."""
+
+
+_ARGV_KEY_WARNING = (
+    "Warning: --api-key <key> puts the key on the command line, where every user of this "
+    "machine can read it (ps). It still works for now; use instead\n"
+    "  hermes agentchat login --api-key-file <path>\n"
+    "  <command that prints the key> | hermes agentchat login --api-key -\n"
+    "or run `hermes agentchat login` and paste it at the masked prompt."
+)
+
+
+def _login_key_input(*, key_file: str | None, flag: str | None) -> str:
+    """The key ``login`` was given, from wherever it was given. Never echoed."""
+    if key_file is not None:
+        if key_file == "-":
+            return _read_key_stdin()
+        return _read_key_file(key_file)
+    if flag == "-":
+        return _read_key_stdin()
+    if flag:
+        sys.stderr.write(_ARGV_KEY_WARNING + "\n")
+        sys.stderr.flush()
+        return flag
+    if _stdin_is_tty():
+        return _prompt_api_key()
+    return _read_key_stdin()
+
+
+def _read_key_stdin() -> str:
+    """One line of stdin (a pipe, a redirect); its end with nothing on it is no key.
+
+    A terminal is read without echo, like the prompt.
+    """
+    if _stdin_is_tty():
+        return _prompt_api_key()
+    line = sys.stdin.readline() if sys.stdin is not None else ""
+    return line.strip()
+
+
+def _read_key_file(raw_path: str) -> str:
+    """The first non-empty line of the file at ``raw_path``."""
+    path = Path(raw_path).expanduser()
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except OSError as exc:
+        raise _KeyInputError(f"Could not read the key from {path}: {exc.strerror or exc}") from exc
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    raise _KeyInputError(f"{path} holds no key.")
 
 
 def _dispatch_recover(args: argparse.Namespace) -> int:
@@ -320,14 +413,18 @@ def _run_signup(
         reason = "" if result.message else f"AgentChat answered {result.code or 'without a message'}. "
         return _exit_with(f"{reason}Nothing was saved.")
     api_key, handle = saved
-    _persist_credentials(api_key=api_key, handle=handle, api_base=api_base)
+    if not _persist_credentials(api_key=api_key, handle=handle, api_base=api_base):
+        return _EXIT_API_ERR
     _install_placement(handle, api_base=api_base, api_key=api_key)
     on_saved(handle=handle, api_key=api_key)
     return _EXIT_OK
 
 
 def _dispatch_status(_args: argparse.Namespace) -> int:
-    saved_key = _read_saved_key()
+    resolution = resolve_key()
+    if resolution.refusal is not None:
+        return _exit_with(resolution.refusal)
+    saved_key = resolution.api_key
     if not saved_key:
         _printline(
             "No AgentChat key configured. Run `hermes agentchat register` "
@@ -363,8 +460,26 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
     finally:
         client.close()
 
-    _print_status(me)
+    _print_status(me, resolution)
     return _EXIT_OK
+
+
+def _key_location_line(resolution: KeyResolution) -> str:
+    """Where this profile's key is, in one line (never the key)."""
+    key = resolution.api_key or ""
+    if resolution.source == KEY_SOURCE_STORE:
+        return f"{_mask_key(key)} in {resolution.store.path} (readable by you only)"
+    cmd = cli_prefix(resolution.store.path.parent.parent)
+    if resolution.env_location == ".env":
+        return (
+            f"{_mask_key(key)} in the profile .env ({resolution.source}) — where the agent's shell "
+            f"can read it and new profiles copy it; `{cmd} doctor --fix` moves it to "
+            f"{resolution.store.path}"
+        )
+    return (
+        f"{_mask_key(key)} from this process's environment ({resolution.source}); "
+        f"`{cmd} login --api-key-file <file>` saves it in {resolution.store.path} instead"
+    )
 
 
 def _dispatch_doctor(args: argparse.Namespace) -> int:
@@ -459,30 +574,10 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             )
             break
 
-    saved = _read_saved_key_source()
-    saved_key = saved[0] if saved else None
-    if saved is not None:
-        key, source = saved
-        if source == _ENV_API_KEY:
-            ok(f"{_ENV_API_KEY} set ({_mask_key(key)})")
-        else:
-            warn(
-                f"key found only under the pre-v3 name {source} ({_mask_key(key)}) — the "
-                f"hosted tools authenticate with ${{{_ENV_API_KEY}}}; the gateway mirrors "
-                f"it at activation, or run `hermes agentchat login` to write {_ENV_API_KEY}"
-            )
-        legacy = (resolve_setting(_ENV_API_KEY_LEGACY) or "").strip()
-        canonical = (resolve_setting(_ENV_API_KEY) or "").strip()
-        if legacy and canonical and legacy != canonical:
-            fail(
-                f"{_ENV_API_KEY} and {_ENV_API_KEY_LEGACY} hold different keys — the plugin "
-                f"uses {_ENV_API_KEY}; remove or fix the other"
-            )
-    else:
-        fail(
-            f"{_ENV_API_KEY} not set — run "
-            "`hermes agentchat register` or `hermes agentchat login`"
-        )
+    resolution = resolve_key(hermes_home)
+    saved_key = resolution.api_key
+    cmd = cli_prefix(hermes_home)
+    _doctor_key_checks(resolution, cmd=cmd, ok=ok, warn=warn, fail=fail)
 
     api_base = _api_base()
     if api_base == _DEFAULT_API_BASE:
@@ -490,14 +585,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     else:
         ok(f"API base: {api_base} (overridden via AGENTCHATME_API_BASE)")
 
-    saved_handle = (resolve_setting(_ENV_HANDLE) or "").strip()
+    saved_handle = _read_saved_handle()
     if saved_handle:
         ok(f"Local handle hint: @{saved_handle}")
-    else:
-        warn(
-            "AGENTCHATME_HANDLE not set (informational — the runtime "
-            "resolves the handle from /v1/agents/me at startup)"
-        )
 
     try:
         from agentchatme import AgentChatClient, AgentChatError, UnauthorizedError
@@ -620,6 +710,10 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         client.close()
 
     if getattr(args, "fix", False) and authenticated_handle is not None:
+        for level, line in _fix_key(
+            resolution, handle=authenticated_handle, api_base=api_base, home=hermes_home
+        ):
+            {"ok": ok, "warn": warn, "fail": fail}[level](line)
         for step in place_identity_and_tools(
             handle=authenticated_handle, identity_line=identity_line, api_base=api_base
         ):
@@ -684,6 +778,8 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         ok("manual bundled as the agentchat:agentchat skill (https://agentchat.me/skill.md)")
     else:
         fail(f"bundled manual missing at {BUNDLED_SKILL_PATH} — reinstall agentchatme-hermes")
+
+    _doctor_secrets_checks(resolution, cmd=cmd, ok=ok, warn=warn, fail=fail)
 
     try:
         from .mcp_registration import (
@@ -938,6 +1034,195 @@ def _doctor_finalize(failures: int, warnings_count: int) -> int:
     return failures
 
 
+def _doctor_key_checks(
+    resolution: KeyResolution,
+    *,
+    cmd: str,
+    ok: Callable[[str], None],
+    warn: Callable[[str], None],
+    fail: Callable[[str], None],
+) -> None:
+    """Where this profile's key is, and whether this profile may act as it."""
+    store = resolution.store
+    if resolution.refusal is not None:
+        fail(resolution.refusal)
+    elif resolution.source == KEY_SOURCE_STORE and resolution.api_key:
+        ok(f"key saved in {store.path} ({_mask_key(resolution.api_key)}, readable by you only)"
+           if not store.loose_mode else
+           f"key saved in {store.path} ({_mask_key(resolution.api_key)})")
+        if store.loose_mode:
+            warn(f"{store.path} can be read by its group or others — `{cmd} doctor --fix` makes it "
+                 "readable by you only")
+    elif resolution.api_key:
+        masked = _mask_key(resolution.api_key)
+        if resolution.env_location == ".env":
+            warn(
+                f"key in the profile .env as {resolution.source} ({masked}) — the agent's shell can "
+                "read it there, and `hermes profile create` copies it into every new profile; "
+                f"`{cmd} doctor --fix` moves it to {store.path}"
+            )
+        else:
+            warn(
+                f"key from this process's environment as {resolution.source} ({masked}) — set by "
+                f"the shell or the service; `{cmd} login --api-key-file <file>` saves it in "
+                f"{store.path}, then remove it from the environment"
+            )
+        if resolution.source == _ENV_API_KEY_LEGACY:
+            warn(
+                f"key found only under the pre-v3 name {_ENV_API_KEY_LEGACY} — the gateway copies "
+                f"it into {store.path} at activation; `{cmd} doctor --fix` moves it"
+            )
+    else:
+        fail(f"no AgentChat key in this profile — run `{cmd} register` or `{cmd} login`")
+    for note in resolution.notes:
+        warn(note)
+    for holder in resolution.shared_with:
+        fail(shared_note(holder))
+    if resolution.held_key:
+        snapshots = _snapshots_holding_the_key(store.path.parent.parent)
+        if snapshots:
+            warn(
+                f"{len(snapshots)} Hermes terminal snapshot(s) in {snapshots[0].parent} still hold "
+                f"{_ENV_API_KEY} from before it was kept out of the agent's commands — delete them "
+                f"(`rm {snapshots[0].parent}/hermes-snap-*.sh`); the agent's commands could read the "
+                f"key then, so consider `{cmd} recover` to rotate it"
+            )
+
+
+def _snapshots_holding_the_key(home: Path) -> list[Path]:
+    """Hermes' terminal env snapshots (``cache/scratch/hermes-snap-*.sh``) that export the key.
+
+    Hermes wrote the agent's shell environment there; up to 0.5.3 that
+    included ``AGENTCHAT_API_KEY``. Only the variable's name is looked for.
+    """
+    found: list[Path] = []
+    try:
+        candidates = sorted((home / "cache" / "scratch").glob("hermes-snap-*.sh"))
+    except OSError:
+        return found
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if f"{_ENV_API_KEY}=" in text or f"{_ENV_API_KEY_LEGACY}=" in text:
+            found.append(path)
+    return found
+
+
+def _doctor_secrets_checks(
+    resolution: KeyResolution,
+    *,
+    cmd: str,
+    ok: Callable[[str], None],
+    warn: Callable[[str], None],
+    fail: Callable[[str], None],
+) -> None:
+    """``secrets.agentchat`` (the key source, and the key kept out of the agent's commands)."""
+    from .key_source import source_supported
+    from .mcp_registration import McpRegistrationError
+    from .secrets_registration import inspect_block, manual_snippet
+
+    has_key = resolution.api_key is not None
+    in_store = resolution.source == KEY_SOURCE_STORE and has_key
+    if has_key and not source_supported():
+        (fail if in_store else warn)(
+            "this Hermes has no secret-source support (agent.secret_sources), so the hosted tools "
+            "cannot read the key file — upgrade Hermes"
+        )
+    try:
+        state = inspect_block()
+    except McpRegistrationError as exc:
+        warn(f"secrets.agentchat not checked — {exc}")
+        return
+    if state == "ours":
+        ok("secrets.agentchat in config.yaml: Hermes reads the key from the key file for the hosted "
+           "tools and is told to keep AGENTCHAT_API_KEY out of the agent's commands")
+    elif state == "disabled":
+        (fail if in_store else warn)(
+            "secrets.agentchat is disabled in config.yaml — the hosted tools cannot read the key file"
+        )
+    elif state == "user_managed":
+        warn("secrets.agentchat in config.yaml is written by hand and is not the plugin's — left "
+             "alone; the plugin's is:\n" + manual_snippet())
+    elif has_key:
+        (fail if in_store else warn)(
+            "secrets.agentchat missing from config.yaml — the hosted tools cannot read the key file "
+            f"and the agent's commands can read AGENTCHAT_API_KEY; `{cmd} doctor --fix` places it"
+        )
+    if not has_key:
+        return
+    stripped = _hermes_strips_key_from_commands()
+    if stripped is True:
+        ok("Hermes strips AGENTCHAT_API_KEY from the commands the agent runs (checked)")
+    elif stripped is False:
+        warn(
+            "this Hermes does not strip AGENTCHAT_API_KEY from the commands the agent runs: the key "
+            "is in their environment. Needs Hermes v0.23.2 or later with secrets.agentchat in "
+            "config.yaml"
+        )
+
+
+def _hermes_strips_key_from_commands() -> bool | None:
+    """Would Hermes drop ``AGENTCHAT_API_KEY`` from a command the agent runs, for this profile?
+
+    Asks Hermes' own child-environment policy (``tools.environments.
+    local_env_policy._is_provider_env_blocklisted``: what its terminal,
+    background-process and snapshot paths consult). ``None`` when this Hermes
+    has no such policy to ask.
+    """
+    try:
+        from tools.environments.local_env_policy import _is_provider_env_blocklisted
+    except Exception:
+        return None
+    try:
+        return bool(_is_provider_env_blocklisted(_ENV_API_KEY))
+    except Exception:
+        logger.debug("doctor: Hermes' env policy raised", exc_info=True)
+        return None
+
+
+def _fix_key(
+    resolution: KeyResolution, *, handle: str, api_base: str, home: Path
+) -> list[tuple[str, str]]:
+    """``doctor --fix`` for the key: move it out of ``.env``, record this profile, tighten modes."""
+    lines: list[tuple[str, str]] = []
+    if resolution.refusal is not None or not resolution.api_key:
+        return lines
+    store = resolution.store
+    if resolution.source == KEY_SOURCE_STORE:
+        try:
+            if store.status == "moved":
+                key_store.write_store(
+                    home, api_key=resolution.api_key, handle=handle, api_base=api_base
+                )
+                lines.append(("ok", f"fix: {store.path} now records this profile"))
+            elif store.loose_mode and key_store.tighten(home):
+                lines.append(("ok", f"fix: {store.path} made readable by you only"))
+        except key_store.KeyStoreError as exc:
+            lines.append(("fail", f"fix: key file not updated — {exc}"))
+        removed = credentials.remove_env_key_lines(home, only_value=resolution.api_key)
+        if removed:
+            lines.append(("ok", f"fix: removed the old copy of the key from the profile .env ({', '.join(removed)})"))
+        return lines
+    if resolution.env_location != ".env":
+        return lines  # an exported key: the plugin cannot unset the shell's or the service's
+    ready, why = credentials.key_bridge()
+    if not ready:
+        lines.append(("fail", f"fix: the key stays in the profile .env — {why}"))
+        return lines
+    moved = credentials.move_env_key(handle=handle, api_base=api_base, home=home)
+    if moved.moved:
+        lines.append((
+            "ok",
+            f"fix: moved the key from the profile .env to {moved.path} (readable by you only); "
+            "restart the gateway (and any open Hermes session) so the hosted tools read it there",
+        ))
+    else:
+        lines.append(("fail", f"fix: key not moved — {moved.detail}"))
+    return lines
+
+
 def _other_gateway_running() -> bool:
     """Best-effort: is a *different* ``hermes gateway`` process alive?
 
@@ -972,26 +1257,40 @@ def _other_gateway_running() -> bool:
 
 
 def _dispatch_logout(_args: argparse.Namespace) -> int:
-    if not _read_saved_key():
+    """Remove this profile's AgentChat key — the key file and any ``.env`` line — and our placements.
+
+    Only this profile: a copy of the key another profile holds is that
+    profile's and stays.
+    """
+    from .profile_scope import resolve_hermes_home
+
+    home = resolve_hermes_home()
+    resolution = resolve_key(home)
+    has_file = resolution.store.status != "missing"
+    if not has_file and resolution.held_key is None and credentials.env_file_key(home) is None:
         _printline("No AgentChat key was configured. Nothing to clear.")
         return _EXIT_OK
-
     try:
-        from hermes_cli.config import save_env_value
-    except ImportError:
-        return _exit_with(
-            "Cannot reach Hermes' env-config helper — is this running "
-            "inside a Hermes install?"
-        )
-
-    clear_api_key(save_env_value)
-    save_env_value(_ENV_HANDLE, "")
+        removed_file, removed_lines = credentials.clear_credentials(home)
+    except key_store.KeyStoreError as exc:
+        return _exit_with(f"The key was not removed: {exc}")
     _uninstall_soul_anchor()
+    _uninstall_secrets_registration()
     _uninstall_mcp_registration()
+    where = []
+    if removed_file:
+        where.append(str(resolution.store.path))
+    if removed_lines:
+        where.append(f"the profile .env ({', '.join(removed_lines)})")
     _printline(
-        "AgentChat key cleared from the profile .env. Your account on the "
-        "server is unchanged."
+        f"AgentChat key removed from this profile ({' and '.join(where) or 'nothing was left'}). "
+        "Your account on the server is unchanged."
     )
+    if resolution.held_key and resolution.env_location == "environment":
+        _printline(
+            f"{_ENV_API_KEY} is still set in this process's environment (the shell or the "
+            "service): unset it there too."
+        )
     return _EXIT_OK
 
 
@@ -1038,6 +1337,25 @@ def _doctor_identity_texts(
     if texts is None:
         return None, None
     return render_identity_line(texts), render_identity_line_template(texts)
+
+
+def _uninstall_secrets_registration() -> None:
+    """Remove our ``secrets.agentchat`` block (a hand-written one is left alone)."""
+    try:
+        from .mcp_registration import McpRegistrationError
+        from .secrets_registration import uninstall_block
+
+        removed = uninstall_block()
+    except McpRegistrationError as exc:
+        sys.stderr.write(f"Warning: could not remove secrets.agentchat from config.yaml ({exc}).\n")
+        sys.stderr.flush()
+        return
+    except Exception as exc:
+        sys.stderr.write(f"Warning: Hermes refused the config.yaml write ({exc}).\n")
+        sys.stderr.flush()
+        return
+    if removed:
+        _printline("Key source secrets.agentchat removed from config.yaml")
 
 
 def _uninstall_mcp_registration() -> None:
@@ -1144,7 +1462,7 @@ def _resolve_recovery_handle(provided: str | None) -> str:
         return saved
     if not _stdin_is_tty():
         raise _MissingFlag(
-            "No @handle given and none is saved in ~/.hermes/.env. Recovery "
+            "No @handle given and none is saved for this profile. Recovery "
             "needs the agent's handle as well as its email — re-run with: "
             "hermes agentchat recover --handle <handle> --email <email>"
         )
@@ -1158,29 +1476,19 @@ def _prompt_api_key() -> str:
 # ───────────────────────── helpers ─────────────────────────
 
 
-def _read_saved_key_source() -> tuple[str, str] | None:
-    """``(key, variable name)`` — canonical name first, legacy name as fallback."""
-    from .config import resolve_api_key
-
-    return resolve_api_key()
-
-
-def _read_saved_key() -> str | None:
-    resolved = _read_saved_key_source()
-    return resolved[0] if resolved else None
-
-
 def _read_saved_handle() -> str | None:
     """The handle this profile is configured as, or ``None``.
 
-    ``AGENTCHATME_HANDLE`` is written by every successful register / login /
-    recover with the handle the server returned. Its form is the server's to
-    judge: a hand-edited value it does not accept is answered with the
-    server's message, and the handle is asked for again.
+    The key file holds the handle the server returned at register / login /
+    recover; a profile set up before 0.6 has it as ``AGENTCHATME_HANDLE``.
+    Its form is the server's to judge: a hand-edited value it does not accept
+    is answered with the server's message, and the handle is asked for again.
     """
-    from .profile_scope import resolve_setting
+    from .profile_scope import resolve_hermes_home, resolve_setting
 
-    return signup.typed_value("handle", resolve_setting(_ENV_HANDLE) or "") or None
+    read = key_store.read_store(resolve_hermes_home())
+    stored = read.key.handle if read.usable and read.key is not None else ""
+    return signup.typed_value("handle", stored or resolve_setting(_ENV_HANDLE) or "") or None
 
 
 def _stdin_is_tty() -> bool:
@@ -1220,49 +1528,93 @@ def _api_base() -> str:
     return raw.rstrip("/") if raw else _DEFAULT_API_BASE
 
 
-def _persist_credentials(*, api_key: str, handle: str, api_base: str) -> None:
-    """Write through Hermes's env-config so subsequent processes see it.
+_RESTART_HINT = (
+    "Restart the gateway (`hermes gateway restart`) and any open Hermes session so they use the "
+    "key: a running Hermes keeps the key it started with for the AgentChat tools."
+)
 
-    The key lands under ``AGENTCHAT_API_KEY`` (the name the hosted-MCP header
-    references); a pre-v3 ``AGENTCHATME_API_KEY`` line is kept in step so a
-    downgrade still finds the key.
+# Where the last successful save put the key, for the success lines.
+_last_saved_path: Path | None = None
+
+
+def _persist_credentials(*, api_key: str, handle: str, api_base: str) -> bool:
+    """Save the key in this profile's key file; ``False`` (said on stderr) when it is saved nowhere.
+
+    The key file is written and read back first; only then is any key line
+    removed from the profile ``.env``. When the key file cannot be written,
+    the key is kept in the profile ``.env`` instead (a key the server just
+    issued exists nowhere else) and that is said.
     """
-    from hermes_cli.config import get_env_value, save_env_value
+    global _last_saved_path
+    ready, why = credentials.key_bridge()
+    try:
+        outcome = credentials.save_credentials(
+            api_key=api_key, handle=handle, api_base=api_base, use_key_file=ready, not_ready=why
+        )
+    except key_store.KeyStoreError as exc:
+        _exit_with(f"The key was not saved: {exc}")
+        return False
+    _last_saved_path = outcome.path
+    if outcome.tools_need_block:
+        from .secrets_registration import manual_snippet
 
-    persist_api_key(save_env_value, api_key=api_key, get_env_value=get_env_value)
-    save_env_value(_ENV_HANDLE, handle)
+        sys.stderr.write(
+            f"Warning: {outcome.fallback_reason}. Add this to the profile's config.yaml so the "
+            "AgentChat tools can read it:\n" + manual_snippet()
+        )
+        sys.stderr.flush()
+    elif outcome.fallback_reason is not None:
+        sys.stderr.write(
+            f"Warning: the key was saved in the profile .env as {_ENV_API_KEY}, not in the key "
+            f"file: {outcome.fallback_reason}. Fix that, then run `hermes agentchat doctor --fix` "
+            "to move it.\n"
+        )
+        sys.stderr.flush()
+    elif outcome.env_lines_removed:
+        _printline(
+            f"Moved out of the profile .env: {', '.join(outcome.env_lines_removed)} "
+            "(the key is now only in the key file)."
+        )
+    for holder in resolve_key().shared_with:
+        sys.stderr.write(f"Warning: {shared_note(holder)}.\n")
+        sys.stderr.flush()
     # Only persist the API base when the user overrode the default —
-    # leaves the default unchanged for everyone else.
+    # leaves the default unchanged for everyone else. It is not a secret.
     if api_base != _DEFAULT_API_BASE:
-        save_env_value(_ENV_API_BASE, api_base)
+        try:
+            from hermes_cli.config import save_env_value
+
+            save_env_value(_ENV_API_BASE, api_base)
+        except ImportError:
+            logger.debug("hermes_cli.config not importable; AGENTCHATME_API_BASE not saved")
+    return True
+
+
+def _saved_where() -> str:
+    if _last_saved_path is None:
+        return f"saved in the profile .env as {_ENV_API_KEY}"
+    return f"saved in {_last_saved_path}, readable by you only"
 
 
 def _print_registration_success(*, handle: str, api_key: str) -> None:
     masked = _mask_key(api_key)
     _printline("")
     _printline(f"  Registered @{handle}")
-    _printline(f"  Key:   {masked}   (stored in the profile .env as {_ENV_API_KEY})")
+    _printline(f"  Key:   {masked}   ({_saved_where()})")
     _printline("")
-    _printline(
-        "Restart Hermes (or any running `hermes gateway`) so the new key "
-        "is picked up; in an open session run /reload-mcp so the AgentChat "
-        "tools connect. Then your agent is on the network."
-    )
+    _printline(f"{_RESTART_HINT} Then your agent is on the network.")
 
 
 def _print_recovery_success(*, handle: str, api_key: str) -> None:
     masked = _mask_key(api_key)
     _printline("")
     _printline(f"  Recovered @{handle}")
-    _printline(f"  New key:   {masked}   (stored in the profile .env as {_ENV_API_KEY})")
+    _printline(f"  New key:   {masked}   ({_saved_where()})")
     _printline("")
-    _printline(
-        "Restart Hermes (or any running `hermes gateway`) so the new key is "
-        "picked up."
-    )
+    _printline(_RESTART_HINT)
 
 
-def _print_status(me: dict[str, Any]) -> None:
+def _print_status(me: dict[str, Any], resolution: KeyResolution | None = None) -> None:
     handle = me.get("handle", "unknown")
     status = me.get("status", "unknown")
     settings = me.get("settings") or {}
@@ -1279,6 +1631,10 @@ def _print_status(me: dict[str, Any]) -> None:
     if paused_by_owner != "none":
         _printline(f"  Paused:        {paused_by_owner}  (owner-paused)")
     _printline(f"  Plugin:        agentchatme-hermes {__version__} (integration)")
+    if resolution is not None:
+        _printline(f"  Key:           {_key_location_line(resolution)}")
+        for note in (*resolution.notes, *(shared_note(h) for h in resolution.shared_with)):
+            _printline(f"  Note:          {note}")
     _printline("")
 
 

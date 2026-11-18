@@ -17,12 +17,14 @@ What the wizard owns:
 * the menus (register / paste a key / recover / skip, and the edit menu of a
   configured profile);
 * prompting, through Hermes' ``prompt`` / ``prompt_yes_no``;
-* saving: the key in the profile ``.env`` as ``AGENTCHAT_API_KEY`` and the
-  handle the server returned (never the one typed), then *placing the
-  integration* (:mod:`agentchatme_hermes.placement`): the served identity line
-  in ``SOUL.md`` and the hosted MCP server in ``config.yaml``;
-* logout: the key cleared, the identity line stripped, our
-  ``mcp_servers.agentchat`` entry removed.
+* saving: the key and the handle the server returned (never the one typed)
+  in this profile's key file (:mod:`agentchatme_hermes.credentials`; never the
+  profile ``.env``), then *placing the integration*
+  (:mod:`agentchatme_hermes.placement`): the served identity line in
+  ``SOUL.md``, the key source and the hosted MCP server in ``config.yaml``;
+* logout: the key file and any ``.env`` key line removed, the identity line
+  stripped, our ``secrets.agentchat`` and ``mcp_servers.agentchat`` entries
+  removed.
 
 The non-interactive ``hermes agentchat <register|login|recover|status|logout>``
 subcommands stay in ``cli.py``. This module is only the no-argument
@@ -34,14 +36,13 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any, Literal
 
-from . import signup
-from .config import ENV_API_BASE, ENV_API_KEY, ENV_API_KEY_LEGACY, ENV_HANDLE
+from . import credentials, key_store, signup
+from .config import ENV_API_BASE, ENV_HANDLE, resolve_key
 from .placement import (
-    clear_api_key,
-    persist_api_key,
     place_identity_and_tools,
     resolve_identity_line,
 )
+from .profile_scope import resolve_hermes_home
 from .soul_anchor import remove_soul_anchor
 
 if TYPE_CHECKING:
@@ -95,11 +96,16 @@ def _interactive_setup_body() -> None:
     print_header("AgentChat")
     print()
 
-    existing_key = (
-        (get_env_value(ENV_API_KEY) or "").strip()
-        or (get_env_value(ENV_API_KEY_LEGACY) or "").strip()
+    resolution = resolve_key()
+    existing_key = resolution.api_key or resolution.held_key or ""
+    stored = resolution.store.key
+    existing_handle = (
+        (stored.handle if stored is not None else "")
+        or (get_env_value(ENV_HANDLE) or "").strip().lstrip("@")
     )
-    existing_handle = (get_env_value(ENV_HANDLE) or "").strip().lstrip("@")
+    if resolution.refusal is not None:
+        print_warning(resolution.refusal)
+        print()
 
     if existing_key:
         _edit_menu(
@@ -274,8 +280,8 @@ def _replace_key_branch(
     """
     print()
     print_info(
-        "Replacing the saved API key. The current key will be overwritten "
-        "in ~/.hermes/.env."
+        "Replacing the saved API key. The current key will be replaced "
+        "in this profile's key file."
     )
     print()
 
@@ -333,16 +339,27 @@ def _logout_flow(
     """
     print()
     if not prompt_yes_no(
-        f"Clear {ENV_API_KEY} and {ENV_HANDLE} from the profile .env? "
-        "Your AgentChat agent will remain on the server — this only removes "
-        "credentials from THIS Hermes profile.",
+        f"Remove the AgentChat key ({key_store.store_path(resolve_hermes_home())}) "
+        "from this profile? Your AgentChat agent will remain on the server — this "
+        "only removes its key from THIS Hermes profile.",
         False,
     ):
         print_info("Cancelled. Existing credentials retained.")
         return
 
-    clear_api_key(save_env_value)
-    save_env_value(ENV_HANDLE, "")
+    try:
+        credentials.clear_credentials()
+    except key_store.KeyStoreError as exc:
+        print_info(f"The key was not removed: {exc}")
+        return
+
+    try:
+        from .secrets_registration import uninstall_block
+
+        if uninstall_block():
+            _step("Key source secrets.agentchat removed from config.yaml")
+    except Exception as exc:
+        logger.warning("logout: secrets.agentchat removal failed: %s", exc)
 
     # Strip the SOUL.md identity line so the agent loses its AgentChat
     # awareness across all contexts. Idempotent — no-op when absent.
@@ -405,8 +422,8 @@ def _paste_existing_key_flow(
         print_warning(f"The key was not saved. AgentChat answered: {checked.message or checked.code}")
         return False
 
-    _save_key(save_env_value, api_key)
-    save_env_value(ENV_HANDLE, checked.handle)
+    if not _save_key(api_key, checked.handle, print_warning):
+        return False
     _step(f"Key validated — you are @{checked.handle}")
     _place_or_warn(checked.handle, api_key, print_warning)
     return True
@@ -450,8 +467,8 @@ def _register_new_agent_flow(
         return False
     api_key, server_handle = saved
 
-    _save_key(save_env_value, api_key)
-    save_env_value(ENV_HANDLE, server_handle)
+    if not _save_key(api_key, server_handle, print_warning):
+        return False
     _step(f"Registered as @{server_handle} (key {_mask_key(api_key)})")
     _place_or_warn(server_handle, api_key, print_warning)
     return True
@@ -504,8 +521,8 @@ def _recover_lost_key_flow(
         return False
     api_key, server_handle = saved
 
-    _save_key(save_env_value, api_key)
-    save_env_value(ENV_HANDLE, server_handle)
+    if not _save_key(api_key, server_handle, print_warning):
+        return False
     _step(f"Recovered @{server_handle} (new key {_mask_key(api_key)})")
     _place_or_warn(server_handle, api_key, print_warning)
     return True
@@ -612,13 +629,29 @@ def _mask_key(key: str) -> str:
 # ─── placement ─────────────────────────────────────────────────────────────
 
 
-def _save_key(save_env_value: Any, api_key: str) -> None:
-    """Persist the key as ``AGENTCHAT_API_KEY`` (legacy name kept in step when present)."""
+def _save_key(api_key: str, handle: str, print_warning: Any) -> bool:
+    """Save the key and the handle in this profile's key file (:mod:`.credentials`).
+
+    ``False`` when the key is saved nowhere (said). When the key file cannot
+    be written, the key is kept in the profile ``.env`` instead and that is
+    said: a key the server just issued must not be lost.
+    """
+    ready, why = credentials.key_bridge()
     try:
-        from hermes_cli.setup import get_env_value
-    except ImportError:
-        get_env_value = None
-    persist_api_key(save_env_value, api_key=api_key, get_env_value=get_env_value)
+        outcome = credentials.save_credentials(
+            api_key=api_key, handle=handle, api_base=_api_base(), use_key_file=ready, not_ready=why
+        )
+    except key_store.KeyStoreError as exc:
+        print_warning(f"The key was not saved: {exc}")
+        return False
+    if outcome.fallback_reason is not None:
+        print_warning(
+            f"The key was saved in the profile .env, not in the key file: {outcome.fallback_reason}. "
+            "Fix that, then run `hermes agentchat doctor --fix`."
+        )
+    elif outcome.path is not None:
+        _step(f"Key saved in {outcome.path} (readable by you only)")
+    return True
 
 
 def _place_or_warn(handle: str, api_key: str, print_warning: Any) -> None:

@@ -344,34 +344,55 @@ class TestReconcileSoulAnchor:
         assert soul.read_text(encoding="utf-8") == before
 
 
-class TestReconcileKeyName:
-    def test_legacy_only_profile_gets_the_canonical_name(
-        self, monkeypatch: pytest.MonkeyPatch
+class TestReconcileKeyStore:
+    """At activation the key file is kept in shape; ``.env`` is never written."""
+
+    def _config(self, home: Path, key: str, source: str) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            hermes_home=home, api_key=key, api_key_source=source, api_base="https://api.agentchat.me"
+        )
+
+    def test_a_legacy_only_profile_gets_its_key_into_the_key_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import types
-        from types import SimpleNamespace
+        from agentchatme_hermes import _register, key_source, key_store
+        from agentchatme_hermes.config import ENV_API_KEY_LEGACY
 
-        from agentchatme_hermes import _register
-        from agentchatme_hermes.config import ENV_API_KEY, ENV_API_KEY_LEGACY
+        monkeypatch.setattr(key_source, "source_supported", lambda: True)
 
-        env = {ENV_API_KEY_LEGACY: api_key("old")}
-        module = types.ModuleType("hermes_cli.config")
-        module.get_env_value = env.get  # type: ignore[attr-defined]
-        module.save_env_value = env.__setitem__  # type: ignore[attr-defined]
-        monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
-        monkeypatch.setitem(sys.modules, "hermes_cli.config", module)
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        env = home / ".env"
+        env.write_text(f"{ENV_API_KEY_LEGACY}={api_key('old')}\n", encoding="utf-8")
+        _register._reconcile_key_store(self._config(home, api_key("old"), ENV_API_KEY_LEGACY))
+        read = key_store.read_store(home)
+        assert read.usable and read.key is not None and read.key.api_key == api_key("old")
+        # Not mirrored into .env any more (0.5.3 wrote AGENTCHAT_API_KEY there).
+        assert env.read_text(encoding="utf-8") == f"{ENV_API_KEY_LEGACY}={api_key('old')}\n"
 
-        _register._reconcile_key_name(SimpleNamespace(api_key_source=ENV_API_KEY_LEGACY))
-        assert env[ENV_API_KEY] == api_key("old")
-
-    def test_canonical_profile_is_untouched(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from types import SimpleNamespace
-
-        from agentchatme_hermes import _register
+    def test_a_dotenv_key_is_left_where_it_is(self, tmp_path: Path) -> None:
+        from agentchatme_hermes import _register, key_store
         from agentchatme_hermes.config import ENV_API_KEY
 
-        monkeypatch.setitem(sys.modules, "hermes_cli", None)  # would raise if imported
-        _register._reconcile_key_name(SimpleNamespace(api_key_source=ENV_API_KEY))
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        _register._reconcile_key_store(self._config(home, api_key("k"), ENV_API_KEY))
+        assert key_store.read_store(home).status == "missing", "moved by doctor --fix or login only"
+
+    def test_a_moved_key_file_records_this_profile(self, tmp_path: Path) -> None:
+        from agentchatme_hermes import _register, key_store
+        from agentchatme_hermes.config import KEY_SOURCE_STORE
+
+        old_home, home = tmp_path / "old", tmp_path / "new"
+        key_store.write_store(old_home, api_key=api_key("k"), handle="alice", api_base="https://a.test")
+        home.mkdir()
+        key_store.store_dir(old_home).rename(key_store.store_dir(home))  # a rename, not a copy
+        assert key_store.read_store(home).status == "moved"
+        _register._reconcile_key_store(self._config(home, api_key("k"), KEY_SOURCE_STORE))
+        read = key_store.read_store(home)
+        assert read.status == "ok" and read.key is not None and read.key.handle == "alice"
 
 
 class TestReconcileMcpRegistration:
@@ -461,7 +482,8 @@ class TestActivationWatcher:
         runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path)
         monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
-        monkeypatch.setattr(_register, "_reconcile_key_name", lambda cfg: None)
+        monkeypatch.setattr(_register, "_reconcile_key_store", lambda cfg: None)
+        monkeypatch.setattr(_register, "_reconcile_secrets_block", lambda rt: None)
         monkeypatch.setattr(_register, "_reconcile_mcp_registration", lambda rt: None)
 
         watcher = self._watcher(tmp_path)
@@ -489,7 +511,8 @@ class TestActivationWatcher:
             _register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: outcomes.pop(0)
         )
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
-        monkeypatch.setattr(_register, "_reconcile_key_name", lambda cfg: None)
+        monkeypatch.setattr(_register, "_reconcile_key_store", lambda cfg: None)
+        monkeypatch.setattr(_register, "_reconcile_secrets_block", lambda rt: None)
         monkeypatch.setattr(_register, "_reconcile_mcp_registration", lambda rt: None)
 
         watcher = self._watcher(tmp_path)
@@ -560,7 +583,8 @@ class TestUnload:
         )
         monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
-        monkeypatch.setattr(_register, "_reconcile_key_name", lambda cfg: None)
+        monkeypatch.setattr(_register, "_reconcile_key_store", lambda cfg: None)
+        monkeypatch.setattr(_register, "_reconcile_secrets_block", lambda rt: None)
         monkeypatch.setattr(_register, "_reconcile_mcp_registration", lambda rt: None)
 
     def test_unload_stops_the_runtime_and_forgets_it(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -693,7 +717,65 @@ class TestWithoutTheKit:
         from agentchatme_hermes.kit import KIT_REQUIREMENT
 
         monkeypatch.setitem(sys.modules, "agentchatme.integration", None)
-        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: None)
+        monkeypatch.delenv("AGENTCHAT_API_KEY", raising=False)
+        monkeypatch.delenv("AGENTCHATME_API_KEY", raising=False)
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         out = capsys.readouterr().out
         assert rc >= 1 and "SDK kit missing" in out and KIT_REQUIREMENT in out
+
+
+class TestKeyReachesTheHostedToolsOnly:
+    """The key file reaches Hermes' MCP client through the plugin's secret
+    source, registered in every Hermes process (gateway, CLI session, cron);
+    the profile's ``config.yaml`` gets ``secrets.agentchat`` at activation,
+    which also tells Hermes to keep ``AGENTCHAT_API_KEY`` out of the agent's
+    commands — for a profile still keeping the key in ``.env`` too."""
+
+    def test_register_hands_hermes_the_key_source(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from hermes_doubles import install_secret_source_base
+
+        from agentchatme_hermes import _register
+
+        install_secret_source_base(monkeypatch)
+        monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
+        monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: None)
+        sources: list[Any] = []
+
+        class _Ctx(_UnloadCtx):
+            def register_secret_source(self, source: Any) -> bool:
+                sources.append(source)
+                return True
+
+        for argv in (["hermes", "chat"], ["hermes", "agentchat", "doctor"]):
+            monkeypatch.setattr(sys, "argv", argv)
+            _register.register(_Ctx())
+        assert [s.name for s in sources] == ["agentchat", "agentchat"]
+
+    def test_activation_places_the_block_before_the_tools(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register, placement
+
+        order: list[str] = []
+        runtime = SimpleNamespace(
+            identity=SimpleNamespace(handle="ops"),
+            hermes_home=tmp_path,
+            config=SimpleNamespace(api_base="https://api.agentchat.me"),
+        )
+        monkeypatch.setattr(
+            _register, "load_config", lambda *, hermes_home=None: SimpleNamespace(api_base="https://api.agentchat.me")
+        )
+        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)
+        monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
+        monkeypatch.setattr(_register, "_reconcile_key_store", lambda cfg: None)
+        monkeypatch.setattr(
+            placement, "place_secrets", lambda: order.append("secrets") or placement.PlacementStep("secrets", "ok", "")
+        )
+        monkeypatch.setattr(
+            placement, "place_mcp", lambda api_base: order.append("mcp") or placement.PlacementStep("mcp", "ok", "")
+        )
+        watcher = _register.ActivationWatcher(hermes_home=tmp_path, profile="default", gateway_mode=True)
+        assert watcher.try_activate() == "active"
+        assert order == ["secrets", "mcp"]

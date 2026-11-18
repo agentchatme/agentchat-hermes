@@ -387,6 +387,11 @@ def _environ_value(name: str) -> str | None:
     return value if value is not None else None
 
 
+def dotenv_value(path: Path, name: str) -> str | None:
+    """``name``'s value in the dotenv file at ``path`` (``None`` when unset or unreadable)."""
+    return _dotenv_value(path, name)
+
+
 def _dotenv_value(path: Path, name: str) -> str | None:
     """Minimal ``KEY=VALUE`` reader for one key of a dotenv file.
 

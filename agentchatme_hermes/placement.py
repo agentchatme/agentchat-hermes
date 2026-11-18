@@ -1,9 +1,13 @@
-"""Placement: the four things the integration puts where Hermes loads them.
+"""Placement: what the integration puts where Hermes loads it.
 
-1. **The key** — the profile's ``.env`` as ``AGENTCHAT_API_KEY``, the name
-   the manual and the MCP declaration use (``Bearer ${AGENTCHAT_API_KEY}``).
-   The pre-v3 name ``AGENTCHATME_API_KEY`` is still read, and is kept in
-   step while it exists so a downgrade keeps working.
+1. **The key** — this profile's AgentChat key file
+   (``<profile home>/agentchat/credentials.json``, owner-only), written by
+   :mod:`.credentials` at register / login / recover; never the profile
+   ``.env`` (:mod:`.key_store` says why). Hermes' MCP client gets it as
+   ``AGENTCHAT_API_KEY`` through the plugin's secret source, which
+   ``secrets.agentchat`` in ``config.yaml`` turns on; the same block tells
+   Hermes to keep that variable out of every command the agent runs
+   (:mod:`.secrets_registration`, :mod:`.key_source`).
 2. **The identity line** — the served ``identity_line`` (``GET /v1/texts``,
    served spelled for Hermes) into ``SOUL.md`` (:mod:`.soul_anchor`),
    the file Hermes loads into every turn. Nothing is placed when the texts
@@ -12,7 +16,9 @@
 3. **The manual** — ``https://agentchat.me/skill.md`` verbatim, bundled as
    the ``agentchat:agentchat`` skill. Nothing to write; verified present.
 4. **The tools** — ``mcp_servers.agentchat`` in the profile's
-   ``config.yaml`` (:mod:`.mcp_registration`).
+   ``config.yaml`` (:mod:`.mcp_registration`), with
+   ``Authorization: "Bearer ${AGENTCHAT_API_KEY}"`` as a template: the key
+   never lands in ``config.yaml``.
 
 Every placer is idempotent and reports what it did; the wizard prints the
 report, the activation path logs it, ``doctor --fix`` runs it again.
@@ -22,10 +28,8 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
 
 from .client_identity import hermes_client_identity
-from .config import ENV_API_KEY, ENV_API_KEY_LEGACY
 from .mcp_registration import McpRegistrationError, install_entry
 from .profile_scope import resolve_hermes_home
 from .soul_anchor import AnchorError, normalize_handle, write_soul_anchor
@@ -34,9 +38,6 @@ from .texts import load_texts
 from .turn import identity_line as render_identity_line
 
 logger = logging.getLogger(__name__)
-
-EnvWriter = Callable[[str, str], None]
-EnvReader = Callable[[str], Optional[str]]
 
 BUNDLED_SKILL_PATH = Path(__file__).parent / "skills" / "agentchat" / "SKILL.md"
 
@@ -48,7 +49,7 @@ TEXTS_UNAVAILABLE_DETAIL = (
 
 @dataclass(frozen=True)
 class PlacementStep:
-    """One placement outcome: ``name`` ∈ anchor | skill | mcp; ``status`` ∈ ok | changed | skipped | failed."""
+    """One placement outcome: ``name`` ∈ anchor | skill | secrets | mcp; ``status`` ∈ ok | changed | skipped | failed."""
 
     name: str
     status: str
@@ -57,49 +58,6 @@ class PlacementStep:
     @property
     def failed(self) -> bool:
         return self.status == "failed"
-
-
-# ─── the key ───────────────────────────────────────────────────────────────
-
-
-def persist_api_key(
-    save_env_value: EnvWriter, *, api_key: str, get_env_value: EnvReader | None = None
-) -> list[str]:
-    """Write the key under its canonical name; keep the legacy name in step while present.
-
-    Returns the variable names written.
-    """
-    save_env_value(ENV_API_KEY, api_key)
-    written = [ENV_API_KEY]
-    legacy_present = bool((get_env_value(ENV_API_KEY_LEGACY) or "").strip()) if get_env_value else False
-    if legacy_present:
-        save_env_value(ENV_API_KEY_LEGACY, api_key)
-        written.append(ENV_API_KEY_LEGACY)
-    return written
-
-
-def clear_api_key(save_env_value: EnvWriter) -> None:
-    """Blank both names (Hermes' ``save_env_value`` keeps the line, empties the value)."""
-    save_env_value(ENV_API_KEY, "")
-    save_env_value(ENV_API_KEY_LEGACY, "")
-
-
-def migrate_legacy_key(save_env_value: EnvWriter, get_env_value: EnvReader) -> bool:
-    """Copy ``AGENTCHATME_API_KEY`` to ``AGENTCHAT_API_KEY`` when only the legacy name is set.
-
-    The hosted MCP header is ``Bearer ${AGENTCHAT_API_KEY}``; without this an
-    upgraded install would authenticate the socket and fail the tools.
-    Returns ``True`` when a value was written.
-    """
-    canonical = (get_env_value(ENV_API_KEY) or "").strip()
-    if canonical:
-        return False
-    legacy = (get_env_value(ENV_API_KEY_LEGACY) or "").strip()
-    if not legacy:
-        return False
-    save_env_value(ENV_API_KEY, legacy)
-    logger.info("placement: mirrored %s into %s in the profile .env", ENV_API_KEY_LEGACY, ENV_API_KEY)
-    return True
 
 
 # ─── the served identity line ──────────────────────────────────────────────
@@ -162,6 +120,38 @@ def check_skill(path: Path = BUNDLED_SKILL_PATH) -> PlacementStep:
     return PlacementStep("skill", "ok", f"manual bundled as the agentchat:agentchat skill ({path.name})")
 
 
+def place_secrets() -> PlacementStep:
+    """``secrets.agentchat``: the key source on, ``AGENTCHAT_API_KEY`` kept out of the agent's commands."""
+    from .secrets_registration import install_block
+
+    try:
+        outcome = install_block()
+    except McpRegistrationError as exc:
+        return PlacementStep("secrets", "failed", str(exc))
+    except Exception as exc:  # Hermes' config layer raised something of its own
+        return PlacementStep("secrets", "failed", f"Hermes refused the config.yaml write: {exc}")
+    if outcome in ("added", "completed"):
+        return PlacementStep(
+            "secrets",
+            "changed",
+            "added secrets.agentchat to config.yaml: Hermes reads the key from this profile's key "
+            "file for the hosted tools and keeps AGENTCHAT_API_KEY out of every command the agent "
+            "runs (used from the next start of the gateway and of any open Hermes session)",
+        )
+    if outcome == "present":
+        return PlacementStep("secrets", "ok", "secrets.agentchat present in config.yaml")
+    if outcome == "disabled":
+        return PlacementStep(
+            "secrets",
+            "skipped",
+            "secrets.agentchat is disabled in config.yaml — left alone; the hosted tools cannot "
+            "read the key file",
+        )
+    return PlacementStep(
+        "secrets", "skipped", "secrets.agentchat is managed by hand in config.yaml — left alone"
+    )
+
+
 def place_mcp(api_base: str) -> PlacementStep:
     try:
         outcome = install_entry(api_base=api_base)
@@ -200,9 +190,10 @@ def place_identity_and_tools(
     api_base: str,
     soul_path: Path | None = None,
 ) -> list[PlacementStep]:
-    """Anchor, skill, tools — in that order. Never raises."""
+    """Anchor, skill, the key source, tools — in that order (the tools' entry needs the key source). Never raises."""
     return [
         place_anchor(handle=handle, identity_line=identity_line, soul_path=soul_path),
         check_skill(),
+        place_secrets(),
         place_mcp(api_base),
     ]

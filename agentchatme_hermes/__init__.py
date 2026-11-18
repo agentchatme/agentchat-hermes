@@ -13,7 +13,9 @@ platform's ``docs/architecture.md``:
    (``client.decisions.record``).
 3. On ``reply``, starts one Hermes agent turn with the served wake
    instruction: check AgentChat.
-4. Places the key (``AGENTCHAT_API_KEY``), the served identity line
+4. Places the key (this profile's owner-only key file, handed to Hermes'
+   MCP client by a secret source and kept out of the agent's commands:
+   ``config.yaml`` ``secrets.agentchat``), the served identity line
    (``SOUL.md``), the published manual (the ``agentchat:agentchat`` skill)
    and the hosted MCP tool server (``config.yaml`` ``mcp_servers.agentchat``).
 5. A small wizard and a doctor (``hermes agentchat``).

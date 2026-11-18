@@ -1,4 +1,7 @@
-"""Tests for ``agentchatme_hermes.placement`` — the key, the identity line, the manual, the tools."""
+"""Tests for ``agentchatme_hermes.placement`` — the identity line, the manual, the key source, the tools.
+
+The key itself is :mod:`agentchatme_hermes.credentials` (``test_credentials.py``).
+"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
@@ -8,61 +11,12 @@ from agentchatme.types import Texts
 from fake_keys import PREFIX, api_key
 
 from agentchatme_hermes import placement
-from agentchatme_hermes.config import ENV_API_KEY, ENV_API_KEY_LEGACY
 from agentchatme_hermes.soul_anchor import read_anchor_handle
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 LINE = "I am @alice on AgentChat (api.agentchat.me). Peers reach me there."
-
-
-class _Env:
-    def __init__(self, **values: str) -> None:
-        self.values = dict(values)
-        self.writes: list[tuple[str, str]] = []
-
-    def save(self, key: str, value: str) -> None:
-        self.writes.append((key, value))
-        self.values[key] = value
-
-    def get(self, key: str) -> str | None:
-        return self.values.get(key)
-
-
-class TestKey:
-    def test_persist_writes_the_canonical_name_only_when_no_legacy(self) -> None:
-        env = _Env()
-        written = placement.persist_api_key(env.save, api_key=api_key("1"), get_env_value=env.get)
-        assert written == [ENV_API_KEY]
-        assert env.values == {ENV_API_KEY: api_key("1")}
-
-    def test_persist_keeps_a_legacy_line_in_step(self) -> None:
-        env = _Env(**{ENV_API_KEY_LEGACY: api_key("old")})
-        written = placement.persist_api_key(env.save, api_key=api_key("new"), get_env_value=env.get)
-        assert written == [ENV_API_KEY, ENV_API_KEY_LEGACY]
-        assert env.values[ENV_API_KEY] == api_key("new")
-        assert env.values[ENV_API_KEY_LEGACY] == api_key("new")
-
-    def test_persist_without_reader_writes_canonical_only(self) -> None:
-        env = _Env()
-        assert placement.persist_api_key(env.save, api_key="k") == [ENV_API_KEY]
-
-    def test_clear_blanks_both_names(self) -> None:
-        env = _Env()
-        placement.clear_api_key(env.save)
-        assert env.values == {ENV_API_KEY: "", ENV_API_KEY_LEGACY: ""}
-
-    def test_migrate_mirrors_legacy_once(self) -> None:
-        env = _Env(**{ENV_API_KEY_LEGACY: api_key("old")})
-        assert placement.migrate_legacy_key(env.save, env.get) is True
-        assert env.values[ENV_API_KEY] == api_key("old")
-        assert placement.migrate_legacy_key(env.save, env.get) is False, "canonical now present"
-
-    def test_migrate_is_a_noop_without_a_legacy_value(self) -> None:
-        env = _Env()
-        assert placement.migrate_legacy_key(env.save, env.get) is False
-        assert env.writes == []
 
 
 class TestAnchorAndSkill:
@@ -177,20 +131,70 @@ class TestMcpStep:
     def test_place_all_runs_every_step_and_never_raises(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        from agentchatme_hermes import secrets_registration
+
         monkeypatch.setattr(placement, "install_entry", lambda *, api_base: "added")
+        monkeypatch.setattr(secrets_registration, "install_block", lambda: "added")
         steps = placement.place_identity_and_tools(
             handle="alice",
             identity_line=LINE,
             api_base="https://api.example.test",
             soul_path=tmp_path / "SOUL.md",
         )
-        assert [s.name for s in steps] == ["anchor", "skill", "mcp"]
+        # The key source before the tools' entry, which authenticates through it.
+        assert [s.name for s in steps] == ["anchor", "skill", "secrets", "mcp"]
         assert not any(s.failed for s in steps)
+
+
+class TestSecretsStep:
+    @pytest.mark.parametrize(
+        ("outcome", "status"),
+        [
+            ("added", "changed"),
+            ("completed", "changed"),
+            ("present", "ok"),
+            ("disabled", "skipped"),
+            ("user_managed", "skipped"),
+        ],
+    )
+    def test_outcomes_map_to_statuses(
+        self, monkeypatch: pytest.MonkeyPatch, outcome: str, status: str
+    ) -> None:
+        from agentchatme_hermes import secrets_registration
+
+        monkeypatch.setattr(secrets_registration, "install_block", lambda: outcome)
+        step = placement.place_secrets()
+        assert step.name == "secrets" and step.status == status
+
+    def test_added_says_what_it_does(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import secrets_registration
+
+        monkeypatch.setattr(secrets_registration, "install_block", lambda: "added")
+        detail = placement.place_secrets().detail
+        assert "keeps AGENTCHAT_API_KEY out of every command the agent runs" in detail
+
+    def test_a_refused_write_is_a_failed_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import secrets_registration
+
+        def boom() -> str:
+            raise placement.McpRegistrationError("managed install")
+
+        monkeypatch.setattr(secrets_registration, "install_block", boom)
+        step = placement.place_secrets()
+        assert step.failed and "managed install" in step.detail
+
+    def test_without_hermes_it_fails_with_the_block_to_add(self) -> None:
+        step = placement.place_secrets()  # no Hermes in the unit suite
+        if step.failed:
+            assert "secrets:\n  agentchat:\n    enabled: true\n    api_key_env: AGENTCHAT_API_KEY\n" in step.detail
 
 
 class TestNothingSecretLeaks:
     def test_steps_never_carry_the_key(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from agentchatme_hermes import secrets_registration
+
         monkeypatch.setattr(placement, "install_entry", lambda *, api_base: "added")
+        monkeypatch.setattr(secrets_registration, "install_block", lambda: "added")
         steps: list[Any] = placement.place_identity_and_tools(
             handle="alice",
             identity_line=LINE,

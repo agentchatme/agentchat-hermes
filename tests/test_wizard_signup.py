@@ -16,9 +16,10 @@ from typing import TYPE_CHECKING, Any
 
 import signup_wire as sw
 from fake_keys import api_key
+from key_files import saved
 from sdk_wire import Wire, answer, api_error, connect_error, serve
 
-from agentchatme_hermes import signup, wizard
+from agentchatme_hermes import credentials, signup, wizard
 from agentchatme_hermes._version import __version__
 
 if TYPE_CHECKING:
@@ -83,9 +84,17 @@ class _Wizard:
             lambda *, handle, identity_line, api_base, soul_path=None: self.placed.append(handle) or [],
         )
         monkeypatch.setattr(signup, "_pause", self.waits.append)
+        # A Hermes whose MCP client reads the key file (secret sources, secrets.agentchat).
+        monkeypatch.setattr(credentials, "key_bridge", lambda: (True, ""))
 
     def save_env_value(self, key: str, value: str) -> None:
         self.env[key] = value
+
+    @property
+    def saved(self) -> tuple[str, str] | None:
+        """``(key, handle)`` in this profile's key file — never the ``.env``."""
+        record = saved()
+        return (record.api_key, record.handle) if record is not None else None
 
     def _common(self) -> dict[str, Any]:
         p = self.person
@@ -171,7 +180,8 @@ class TestRegister:
         assert "Registered as @alice (key ac_wizar…0000)" in capsys.readouterr().out
         assert person.said("warning") == []
         assert person.masked == []
-        assert run.env == {"AGENTCHAT_API_KEY": _KEY, "AGENTCHATME_HANDLE": "alice"}
+        assert run.env == {}, "nothing written to the profile .env"
+        assert run.saved == (_KEY, "alice")
         assert run.placed == ["alice"]
         assert wire.unexpected == []
         _no_rulebook_text(person, wire)
@@ -192,7 +202,8 @@ class TestRegister:
         )
         run = _Wizard(monkeypatch, _Person(["a@b.co", "@Alice", "", "123456"]))
         assert run.register() is True
-        assert run.env["AGENTCHATME_HANDLE"] == "alice-x"
+        assert run.saved is not None and run.saved[1] == "alice-x"
+        assert run.env == {}
         assert run.placed == ["alice-x"]
 
     def test_the_request_carries_hermes_and_the_display_name(
@@ -254,6 +265,7 @@ class TestRegister:
         assert wire.calls() == [("POST", sw.REGISTER)]
         assert person.said("info")[-1] == "Cancelled. Nothing was saved."
         assert run.env == {}
+        assert run.saved is None, "nothing saved in the key file either"
 
     def test_too_many_wrong_codes_offers_a_new_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
         wire = serve(
@@ -282,6 +294,7 @@ class TestRegister:
         assert ("info", sw.EXPIRED_CODE) in person.transcript
         assert wire.calls() == [("POST", sw.REGISTER), ("POST", sw.REGISTER_VERIFY)]
         assert run.env == {}
+        assert run.saved is None, "nothing saved in the key file either"
 
     def test_a_taken_handle_asks_for_another_handle(self, monkeypatch: pytest.MonkeyPatch) -> None:
         wire = serve(
@@ -297,7 +310,8 @@ class TestRegister:
         assert [body.get("handle") for body in wire.bodies()[:2]] == ["alice", "alice-2"]
         taken = person.transcript.index(("info", "The handle @alice is taken. Try another."))
         assert person.transcript[taken + 1] == ("prompt", _HANDLE_PROMPT)
-        assert run.env["AGENTCHATME_HANDLE"] == "alice-2"
+        assert run.saved is not None and run.saved[1] == "alice-2"
+        assert run.env == {}
 
     def test_the_email_limit_asks_for_another_email(self, monkeypatch: pytest.MonkeyPatch) -> None:
         wire = serve(
@@ -330,6 +344,7 @@ class TestRegister:
         assert person.said("info")[-1] == sw.NOT_SENT
         assert person.said("warning") == ["Nothing was saved."]
         assert run.env == {}
+        assert run.saved is None, "nothing saved in the key file either"
 
     def test_a_short_wait_is_sat_out_then_the_call_repeated(
         self, monkeypatch: pytest.MonkeyPatch
@@ -356,6 +371,7 @@ class TestRegister:
         assert run.register() is False
         assert person.said("warning") == ["Could not reach AgentChat (dns). Nothing was saved."]
         assert run.env == {}
+        assert run.saved is None, "nothing saved in the key file either"
 
     def test_blank_email_cancels_before_any_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
         wire = serve(monkeypatch, {})
@@ -384,7 +400,8 @@ class TestRegister:
         assert run.register() is True
         assert _codes(wire) == ["111111", "123456"]
         assert ("info", "Invalid or expired code") in person.transcript
-        assert run.env == {"AGENTCHAT_API_KEY": _KEY, "AGENTCHATME_HANDLE": "alice"}
+        assert run.env == {}, "nothing written to the profile .env"
+        assert run.saved == (_KEY, "alice")
 
     def test_an_sdk_without_the_helper_is_named(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(signup, "sdk_problem", lambda: "Sign-up needs agentchatme>=1.4.0.")
@@ -422,7 +439,8 @@ class TestRecover:
             "@handle of the agent to recover (blank to cancel)",
         ]
         assert ("info", sw.sent_text("recover")) in person.transcript
-        assert run.env == {"AGENTCHAT_API_KEY": _KEY, "AGENTCHATME_HANDLE": "alice"}
+        assert run.env == {}, "nothing written to the profile .env"
+        assert run.saved == (_KEY, "alice")
         _no_rulebook_text(person, wire)
 
     def test_the_configured_handle_is_the_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -468,7 +486,8 @@ class TestRecover:
             ("info", "Agents registered with this email: @alice, @alice-2"),
             ("prompt", "@handle of the agent to recover (blank to cancel)"),
         ]
-        assert run.env["AGENTCHATME_HANDLE"] == "alice-2"
+        assert run.saved is not None and run.saved[1] == "alice-2"
+        assert run.env == {}
 
     def test_blank_handle_cancels(self, monkeypatch: pytest.MonkeyPatch) -> None:
         wire = serve(monkeypatch, {})
@@ -489,6 +508,7 @@ class TestPasteKey:
         assert wire.calls() == [("GET", sw.ME)]
         assert person.said("warning") == ["The key was not saved. AgentChat answered: Invalid API key"]
         assert run.env == {}
+        assert run.saved is None, "nothing saved in the key file either"
         assert run.placed == []
 
     def test_an_accepted_key_is_saved_with_the_server_handle(
@@ -499,7 +519,8 @@ class TestPasteKey:
         assert run.paste() is True
         assert wire.requests[0].headers["authorization"] == f"Bearer {_KEY}"
         assert wire.requests[0].headers["X-AgentChat-Client"] == "hermes"
-        assert run.env == {"AGENTCHAT_API_KEY": _KEY, "AGENTCHATME_HANDLE": "alice"}
+        assert run.env == {}, "nothing written to the profile .env"
+        assert run.saved == (_KEY, "alice")
         assert run.placed == ["alice"]
 
     def test_unreachable_saves_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -509,12 +530,14 @@ class TestPasteKey:
         assert run.paste() is False
         assert person.said("warning") == ["Could not reach AgentChat (dns). The key was not saved."]
         assert run.env == {}
+        assert run.saved is None, "nothing saved in the key file either"
 
     def test_a_server_error_saves_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         serve(monkeypatch, {sw.ME: api_error(503, "INTERNAL_ERROR", "Service unavailable")})
         run = _Wizard(monkeypatch, _Person([_KEY]))
         assert run.paste() is False
         assert run.env == {}
+        assert run.saved is None, "nothing saved in the key file either"
 
     def test_the_key_is_typed_masked(self, monkeypatch: pytest.MonkeyPatch) -> None:
         serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})

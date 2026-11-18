@@ -10,11 +10,13 @@ TTY-ness is forced so the suite behaves the same under a terminal and CI.
 from __future__ import annotations
 
 import argparse
+import sys
 from typing import Any
 
 import pytest
 import signup_wire as sw
 from fake_keys import api_key
+from key_files import save_key
 from sdk_wire import Wire, answer, api_error, connect_error, serve
 
 from agentchatme_hermes import cli, signup
@@ -46,7 +48,8 @@ class _Cli:
             "_persist_credentials",
             lambda *, api_key, handle, api_base: self.persisted.append(
                 {"api_key": api_key, "handle": handle, "api_base": api_base}
-            ),
+            )
+            or True,
         )
         monkeypatch.setattr(
             cli, "_install_placement", lambda handle, *, api_base, api_key: self.placed.append(handle) or []
@@ -387,10 +390,11 @@ class TestLogin:
         assert run.persisted == []
 
     def test_the_key_prompt_is_masked(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """``login`` without ``--api-key`` reads the key with ``getpass``
-        (no echo), then checks it with the server like a flag."""
+        """``login`` in a terminal without an option reads the key with
+        ``getpass`` (no echo), then checks it with the server like a flag."""
         wire = serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
         run = _Cli(monkeypatch, [])
+        monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
         asked: list[str] = []
         monkeypatch.setattr(cli, "getpass", lambda text: asked.append(text) or f"{_KEY}\n")
         assert cli._dispatch_login(_ns(api_key=None)) == _EXIT_OK
@@ -401,12 +405,131 @@ class TestLogin:
 
     def test_ctrl_c_at_the_key_prompt(self, monkeypatch: pytest.MonkeyPatch) -> None:
         _Cli(monkeypatch, [])
+        monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
 
         def interrupt() -> str:
             raise KeyboardInterrupt
 
         monkeypatch.setattr(cli, "_prompt_api_key", interrupt)
         assert cli._dispatch_login(_ns(api_key=None)) == _EXIT_USER_CANCEL
+
+
+class TestLoginKeyNeverOnTheCommandLine:
+    """``login --api-key <key>`` was the only scriptable way in, so the
+    key sat on argv (readable by every user of the box). It can now come
+    from stdin or a file, the documented ways never put it on argv, and the
+    old flag still works but says why it should not be used."""
+
+    def _stdin(self, monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+        import io
+
+        monkeypatch.setattr(sys, "stdin", io.StringIO(text))
+
+    def test_a_pipe_with_no_option(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        wire = serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
+        run = _Cli(monkeypatch, [])
+        self._stdin(monkeypatch, f"{_KEY}\n")
+        assert cli._dispatch_login(_ns(api_key=None, api_key_file=None)) == _EXIT_OK
+        assert wire.requests[0].headers["authorization"] == f"Bearer {_KEY}"
+        assert run.persisted[0]["api_key"] == _KEY
+        captured = capsys.readouterr()
+        assert _KEY not in captured.out + captured.err
+        assert "Warning" not in captured.err
+
+    def test_api_key_dash_reads_stdin(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
+        run = _Cli(monkeypatch, [])
+        self._stdin(monkeypatch, f"  {_KEY}  \n")
+        assert cli._dispatch_login(_ns(api_key="-", api_key_file=None)) == _EXIT_OK
+        assert run.persisted[0]["api_key"] == _KEY
+        assert "Warning" not in capsys.readouterr().err
+
+    def test_api_key_file(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any, capsys: pytest.CaptureFixture[str]) -> None:
+        serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
+        run = _Cli(monkeypatch, [])
+        key_file = tmp_path / "key.txt"
+        key_file.write_text(f"\n{_KEY}\nsomething else\n", encoding="utf-8")
+        assert cli._dispatch_login(_ns(api_key=None, api_key_file=str(key_file))) == _EXIT_OK
+        assert run.persisted[0]["api_key"] == _KEY
+        assert key_file.exists(), "the caller's file is left as it is"
+        captured = capsys.readouterr()
+        assert _KEY not in captured.out + captured.err
+
+    def test_api_key_dash_at_a_terminal_does_not_echo(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
+        run = _Cli(monkeypatch, [])
+        monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
+        asked: list[str] = []
+        monkeypatch.setattr(cli, "getpass", lambda text: asked.append(text) or _KEY)
+        assert cli._dispatch_login(_ns(api_key="-", api_key_file=None)) == _EXIT_OK
+        assert asked == ["API key (ac_…): "] and run.persisted[0]["api_key"] == _KEY
+
+    def test_api_key_file_dash_reads_stdin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
+        run = _Cli(monkeypatch, [])
+        self._stdin(monkeypatch, f"{_KEY}\n")
+        assert cli._dispatch_login(_ns(api_key=None, api_key_file="-")) == _EXIT_OK
+        assert run.persisted[0]["api_key"] == _KEY
+
+    def test_a_missing_or_empty_file_saves_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        wire = serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
+        run = _Cli(monkeypatch, [])
+        assert cli._dispatch_login(_ns(api_key=None, api_key_file=str(tmp_path / "nope"))) == _EXIT_API_ERR
+        assert "Could not read the key from" in capsys.readouterr().err
+        empty = tmp_path / "empty"
+        empty.write_text("\n  \n", encoding="utf-8")
+        assert cli._dispatch_login(_ns(api_key=None, api_key_file=str(empty))) == _EXIT_API_ERR
+        assert "holds no key" in capsys.readouterr().err
+        assert wire.calls() == []
+        assert run.persisted == []
+
+    def test_an_empty_pipe_is_no_key(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        wire = serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
+        run = _Cli(monkeypatch, [])
+        self._stdin(monkeypatch, "")
+        assert cli._dispatch_login(_ns(api_key=None, api_key_file=None)) == _EXIT_API_ERR
+        assert "No API key provided." in capsys.readouterr().err
+        assert wire.calls() == [] and run.persisted == []
+
+    def test_the_key_on_argv_still_works_and_warns(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
+        run = _Cli(monkeypatch, [])
+        assert cli._dispatch_login(_ns(api_key=_KEY, api_key_file=None)) == _EXIT_OK
+        assert run.persisted[0]["api_key"] == _KEY
+        captured = capsys.readouterr()
+        assert "--api-key <key> puts the key on the command line" in captured.err
+        assert "hermes agentchat login --api-key-file <path>" in captured.err
+        assert _KEY not in captured.out + captured.err
+
+    def test_no_printed_next_step_puts_a_key_on_a_command_line(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """What ``login`` prints after a save names no ``--api-key <key>`` recipe."""
+        serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
+        _Cli(monkeypatch, [])
+        self._stdin(monkeypatch, f"{_KEY}\n")
+        assert cli._dispatch_login(_ns(api_key="-", api_key_file=None)) == _EXIT_OK
+        captured = capsys.readouterr()
+        assert "--api-key " not in captured.out
+        assert "ac_" not in captured.out.replace(_KEY[:8], "")
+
+    def test_the_two_options_exclude_each_other(self) -> None:
+        import argparse
+
+        parser = argparse.ArgumentParser()
+        cli.setup_argparse(parser)
+        args = parser.parse_args(["login", "--api-key-file", "/k"])
+        assert args.api_key_file == "/k" and args.api_key is None
+        args = parser.parse_args(["login", "--api-key", "-"])
+        assert args.api_key == "-"
+        with pytest.raises(SystemExit):
+            parser.parse_args(["login", "--api-key", "-", "--api-key-file", "/k"])
 
 
 # ─── the other subcommands, offline ────────────────────────────────────────
@@ -444,7 +567,7 @@ class TestOfflineSubcommands:
     def test_status(
         self, monkeypatch: pytest.MonkeyPatch, _offline: Wire, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        monkeypatch.setattr(cli, "_read_saved_key", lambda: _KEY)
+        save_key(_KEY)
         rc = cli._dispatch_status(_ns())
         assert rc == _EXIT_API_ERR
         assert "Status fetch failed: dns" in capsys.readouterr().err
@@ -454,7 +577,7 @@ class TestOfflineSubcommands:
     ) -> None:
         from agentchatme_hermes import kit, mcp_registration
 
-        monkeypatch.setattr(cli, "_read_saved_key_source", lambda: (_KEY, cli._ENV_API_KEY))
+        save_key(_KEY)
         monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)
         monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)
         monkeypatch.setattr(mcp_registration, "inspect_entry_identity", lambda **_kw: ("ours", "current"))
