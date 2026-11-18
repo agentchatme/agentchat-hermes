@@ -136,7 +136,7 @@ def place_secrets() -> PlacementStep:
             "changed",
             "added secrets.agentchat to config.yaml: Hermes reads the key from this profile's key "
             "file for the hosted tools and keeps AGENTCHAT_API_KEY out of every command the agent "
-            "runs (used from the next gateway restart, or /reload-mcp in a session)",
+            "runs (used from the next start of the gateway and of any open Hermes session)",
         )
     if outcome == "present":
         return PlacementStep("secrets", "ok", "secrets.agentchat present in config.yaml")

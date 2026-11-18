@@ -80,15 +80,33 @@ class TestTheSource:
         assert source.fetch(ENABLED, root).secrets == {ENV_API_KEY: api_key("one")}  # type: ignore[union-attr]
         assert source.fetch(ENABLED, he2).secrets == {ENV_API_KEY: api_key("two")}  # type: ignore[union-attr]
 
-    def test_a_copied_key_file_supplies_nothing(self, hermes_base: types.ModuleType, tmp_path: Path) -> None:
+    def test_a_copied_key_file_gets_no_key(self, hermes_base: types.ModuleType, tmp_path: Path) -> None:
         root = tmp_path / ".hermes"
         clone = root / "profiles" / "he2"
         _save(root, api_key("one"))
         clone.mkdir(parents=True)
         shutil.copytree(key_store.store_dir(root), key_store.store_dir(clone))
         result = key_source.build_key_source().fetch(ENABLED, clone)  # type: ignore[union-attr]
-        assert result.secrets == {}
-        assert result.error_kind is _ErrorKind.REF_INVALID and "copy of profile default" in str(result.error)
+        assert result.ok and result.secrets == {ENV_API_KEY: ""}
+        assert "copy of profile default's" in result.warnings[0]
+
+    def test_a_dotenv_copy_is_masked_so_the_tools_do_not_act_as_the_other_agent(
+        self, hermes_base: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A profile created from the default one holds its key in .env: the
+        hosted tools there would authenticate as the default's agent. The
+        source supplies the variable empty, over the copy (override_existing)."""
+        root = tmp_path / ".hermes"
+        new = root / "profiles" / "t5tmp"
+        new.mkdir(parents=True)
+        (root / ".env").write_text(f"{ENV_API_KEY}={api_key('one')}\n", encoding="utf-8")
+        (new / ".env").write_text(f"{ENV_API_KEY}={api_key('one')}\n", encoding="utf-8")
+        source = key_source.build_key_source()
+        monkeypatch.setenv("HERMES_HOME", str(new))
+        assert source.is_enabled(ENABLED) is True  # type: ignore[union-attr]
+        assert source.fetch(ENABLED, new).secrets == {ENV_API_KEY: ""}  # type: ignore[union-attr]
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        assert source.is_enabled(ENABLED) is False, "the original keeps its .env key"  # type: ignore[union-attr]
 
     def test_no_key_file_is_not_configured(self, hermes_base: types.ModuleType, tmp_path: Path) -> None:
         result = key_source.build_key_source().fetch(ENABLED, tmp_path / "empty")  # type: ignore[union-attr]
@@ -112,7 +130,7 @@ class TestTheSource:
         clone.mkdir(parents=True)
         shutil.copytree(key_store.store_dir(root), key_store.store_dir(clone))
         result = key_source.build_key_source().fetch(ENABLED, clone)  # type: ignore[union-attr]
-        assert api_key("secret_value") not in str(result.error)
+        assert api_key("secret_value") not in str(result.error) + " ".join(result.warnings)
 
     def test_enabled_only_by_the_block_and_a_usable_key_file(
         self, hermes_base: types.ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

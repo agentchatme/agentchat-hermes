@@ -457,6 +457,15 @@ class TestLoginKeyNeverOnTheCommandLine:
         captured = capsys.readouterr()
         assert _KEY not in captured.out + captured.err
 
+    def test_api_key_dash_at_a_terminal_does_not_echo(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
+        run = _Cli(monkeypatch, [])
+        monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
+        asked: list[str] = []
+        monkeypatch.setattr(cli, "getpass", lambda text: asked.append(text) or _KEY)
+        assert cli._dispatch_login(_ns(api_key="-", api_key_file=None)) == _EXIT_OK
+        assert asked == ["API key (ac_…): "] and run.persisted[0]["api_key"] == _KEY
+
     def test_api_key_file_dash_reads_stdin(self, monkeypatch: pytest.MonkeyPatch) -> None:
         serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice"})})
         run = _Cli(monkeypatch, [])

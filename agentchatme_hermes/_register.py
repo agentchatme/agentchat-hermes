@@ -265,6 +265,10 @@ class ActivationWatcher:
         # the cache) answered, later when the first fetch succeeds — and
         # again whenever the served line changes.
         self._refusal = None
+        for note in getattr(config, "key_notes", ()):
+            # Not refused, not silent: the same agent in two profiles (or a
+            # leftover copy of the key) is said where the operator looks.
+            logger.warning("agentchat plugin: profile=%s — %s", self._profile, note)
         _reconcile_soul_anchor_when_texts_arrive(runtime)
         _reconcile_key_store(config)
         _reconcile_secrets_block(runtime)
@@ -605,6 +609,16 @@ def _reconcile_key_store(config: Any) -> None:
         if source == ENV_API_KEY_LEGACY:
             from .key_source import source_supported
 
+            if getattr(config, "key_notes", ()):
+                # Another profile holds this key too: copying it into this
+                # profile's key file would make this one the agent. Said, not done.
+                logger.warning(
+                    "agentchat plugin: only the pre-v3 name %s is set, and another profile holds the "
+                    "same key — not copied into this profile's key file; see `%s doctor`",
+                    ENV_API_KEY_LEGACY,
+                    cmd,
+                )
+                return
             if not source_supported():
                 logger.warning(
                     "agentchat plugin: only the pre-v3 name %s is set and this Hermes has no "

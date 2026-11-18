@@ -33,10 +33,15 @@ login) moves the key out of `.env`.
   puts a key on a command line.
 - **A new profile is not silently the same agent.** `hermes profile create` copied the default
   profile's `.env` — key included — into every new profile, and the plugin adopted it (placed the other agent's identity
-  line, said "All checks passed"). The key file is not copied by `create` / `--clone`. A `--clone-all` copy of it names
-  the profile it belongs to and is refused; a `.env` key that another profile holds (a copy made before this release) is
-  refused in the copy. Refused means: no socket, no turn, nothing placed, one error line, and `status` / `doctor` say
-  which profile is that agent and the command to fix it (`hermes -p <name> agentchat logout` removes only the copy).
+  line, said "All checks passed"). The key file is not copied by `create` / `--clone`. A profile whose key is certainly
+  a copy is refused: a `--clone-all` copy of the key file (it names the profile it belongs to), a `.env` key another
+  profile saved in its key file, or a `.env` key the default profile holds in a profile never set up as an agent (a
+  plain `profile create`). Refused means: no socket, no turn, nothing placed, one error line, `status` / `doctor` say
+  which profile is that agent and the command to fix it (`hermes -p <name> agentchat logout` removes only the copy), and
+  the key source hands that profile's hosted tools an empty key over the copy, so they cannot act as the other agent.
+  Two profiles both set up with one key before this release (a `--clone`) keep working as before; the gateway log,
+  `status` and `doctor` (a `[fail]` line) say they are one agent and how to separate them, and `doctor --fix` will not
+  move a key another profile also holds.
 - **One exported variable no longer decides the identity.** An `AGENTCHAT_API_KEY` exported in the shell (or set by a
   service) that is not the profile's saved key, or a different key left in the profile `.env`, is refused with a plain
   sentence; the saved key wins for the hosted tools.
@@ -52,7 +57,14 @@ login) moves the key out of `.env`.
 - `AGENTCHATME_HANDLE` is no longer written; the handle is in the key file (an existing line is still read for
   `recover`).
 - If Hermes cannot read the key file for the hosted tools (no secret sources, or a managed `config.yaml`), the key is
-  saved in the profile `.env` as before and the command says why — a key the server just issued is never dropped.
+  saved in the profile `.env` as before (read back; the old key file is removed so the two cannot disagree) and the
+  command says why. Where `.env` cannot be written either (a managed install), the key goes to the key file and the
+  command prints the `secrets.agentchat` block to add — a key the server just issued is never dropped.
+- `login --api-key -` at a terminal reads the key without echo. After a login, register or recover, restart the
+  gateway and any open Hermes session: a running Hermes keeps the key it started with for the hosted tools
+  (`/reload-mcp` no longer picks up a replaced key).
+- `doctor` points out Hermes terminal snapshots (`cache/scratch/hermes-snap-*.sh`) that still hold the key from before,
+  and suggests `recover` to rotate a key the agent's commands could read.
 
 ## [0.5.3] — 2026-11-17
 

@@ -444,6 +444,30 @@ def test_each_profile_gets_its_own_key_through_hermes_orchestrator(
         assert [s.name for s in report.sources] == ["agentchat"]
 
 
+def test_a_cloned_profiles_tools_get_no_key_not_the_originals(
+    _hermes_home: Path, _source_registry: Any
+) -> None:
+    """A profile whose .env holds a copy of the default profile's key (made by
+    ``profile create``): through Hermes' orchestrator the variable comes out
+    empty, so its hosted tools cannot act as the default profile's agent."""
+    from fake_keys import api_key
+
+    from agentchatme_hermes import key_source
+    from agentchatme_hermes.profile_scope import profile_context
+
+    key = api_key("contract_copied_value")
+    (_hermes_home / ".env").write_text(f"AGENTCHAT_API_KEY={key}\n", encoding="utf-8")
+    clone = _hermes_home / "profiles" / "t5tmp"
+    clone.mkdir(parents=True)
+    (clone / ".env").write_text(f"AGENTCHAT_API_KEY={key}\n", encoding="utf-8")
+    scope = _import("hermes_constants").hermes_home_key(clone)
+    assert _source_registry.register_source(key_source.build_key_source(), scope=scope) is True
+    environ = {"AGENTCHAT_API_KEY": key}  # the copy, loaded from the clone's .env
+    with profile_context(clone):
+        _source_registry.apply_all({"agentchat": key_source.secrets_section()}, clone, environ=environ)
+    assert environ["AGENTCHAT_API_KEY"] == ""
+
+
 def test_the_startup_path_puts_the_key_where_the_tools_header_reads_it(
     _hermes_home: Path, _source_registry: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

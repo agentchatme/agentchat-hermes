@@ -31,8 +31,9 @@ BASE = "https://api.agentchat.me"
 class _HermesEnv:
     """``hermes_cli.config``'s ``.env`` helpers on the profile's real ``.env`` file."""
 
-    def __init__(self, home: Path) -> None:
+    def __init__(self, home: Path, *, managed: bool = False) -> None:
         self.home = home
+        self.managed = managed
         self.saved: list[tuple[str, str]] = []
         self.removed: list[str] = []
 
@@ -47,14 +48,22 @@ class _HermesEnv:
         monkeypatch.setitem(sys.modules, "hermes_cli.config", module)
 
     def save(self, name: str, value: str) -> None:
+        """Like Hermes: the name's line is replaced (or added); a managed
+        install refuses without raising."""
         self.saved.append((name, value))
+        if self.managed:
+            return
         env = self.home / ".env"
         self.home.mkdir(parents=True, exist_ok=True)
+        if env.exists():
+            credentials.remove_env_lines(env, (name,))
         text = env.read_text(encoding="utf-8") if env.exists() else ""
         env.write_text(text + f"{name}={value}\n", encoding="utf-8")
 
     def remove(self, name: str) -> bool:
         self.removed.append(name)
+        if self.managed:
+            return False
         return credentials.remove_env_lines(self.home / ".env", (name,))
 
 
@@ -131,12 +140,34 @@ class TestMove:
         assert env.read_text(encoding="utf-8") == "X=1\n"
         assert saved(home).handle == "alice"  # type: ignore[union-attr]
 
-    def test_only_the_line_holding_the_moved_key_goes(self, tmp_path: Path) -> None:
+    def test_two_different_keys_in_dotenv_move_nothing(self, tmp_path: Path) -> None:
+        """Moving one would leave the other behind as a disagreeing key: the
+        profile would be refused right after the fix."""
         home = tmp_path / ".hermes"
-        env = _env(home, f"AGENTCHAT_API_KEY={api_key('k')}\nAGENTCHATME_API_KEY={api_key('other')}\n")
+        text = f"AGENTCHAT_API_KEY={api_key('k')}\nAGENTCHATME_API_KEY={api_key('other')}\n"
+        env = _env(home, text)
         moved = credentials.move_env_key(handle="a", api_base=BASE, home=home)
-        assert moved.env_lines_removed == ("AGENTCHAT_API_KEY",)
-        assert env.read_text(encoding="utf-8") == f"AGENTCHATME_API_KEY={api_key('other')}\n"
+        assert not moved.moved and "more than one AgentChat key" in moved.detail
+        assert env.read_text(encoding="utf-8") == text
+        assert key_store.read_store(home).status == "missing"
+
+    def test_a_name_given_twice_moves_nothing(self, tmp_path: Path) -> None:
+        home = tmp_path / ".hermes"
+        text = f"AGENTCHAT_API_KEY={api_key('k')}\nAGENTCHAT_API_KEY={api_key('later')}\n"
+        _env(home, text)
+        assert not credentials.move_env_key(handle="a", api_base=BASE, home=home).moved
+
+    def test_a_key_another_profile_holds_is_not_claimed(self, tmp_path: Path) -> None:
+        """Whichever profile ran doctor --fix first would become the agent and
+        the other a refused copy: the move is refused and says what to do."""
+        root = tmp_path / ".hermes"
+        a, b = root / "profiles" / "a", root / "profiles" / "b"
+        _env(a, f"AGENTCHAT_API_KEY={api_key('shared')}\n")
+        _env(b, f"AGENTCHAT_API_KEY={api_key('shared')}\n")
+        moved = credentials.move_env_key(handle="a", api_base=BASE, home=b)
+        assert not moved.moved
+        assert "profile a, in its .env" in moved.detail and "hermes -p a agentchat logout" in moved.detail
+        assert key_store.read_store(b).status == "missing"
 
     def test_nothing_to_move(self, tmp_path: Path) -> None:
         moved = credentials.move_env_key(handle="a", api_base=BASE, home=tmp_path)
@@ -153,6 +184,54 @@ class TestMove:
         moved = credentials.move_env_key(handle="a", api_base=BASE, home=home)
         assert not moved.moved and "stays in the profile .env" in moved.detail
         assert env.read_text(encoding="utf-8") == f"AGENTCHAT_API_KEY={api_key('k')}\n"
+
+
+class TestTheFallbackNeverDropsOrSplitsTheKey:
+    def test_falling_back_to_dotenv_removes_the_old_key_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A login (or recover) while Hermes cannot read the key file: the new
+        key goes to .env, and the old key file — another key — goes, so the
+        profile is not refused for the two disagreeing."""
+        from agentchatme_hermes import config
+
+        home = tmp_path / ".hermes"
+        key_store.write_store(home, api_key=api_key("old"), handle="a", api_base=BASE)
+        _HermesEnv(home).install(monkeypatch)
+        outcome = credentials.save_credentials(
+            api_key=api_key("new"), handle="a", api_base=BASE, home=home, use_key_file=False, not_ready="x"
+        )
+        assert outcome.path is None and outcome.fallback_reason == "x"
+        assert key_store.read_store(home).status == "missing"
+        resolved = config.resolve_key(home)
+        assert (resolved.api_key, resolved.refusal) == (api_key("new"), None)
+
+    def test_a_managed_dotenv_keeps_the_key_in_the_key_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Hermes refuses .env writes on a managed install without raising: the
+        key must not be reported saved there and lost."""
+        home = tmp_path / ".hermes"
+        hermes = _HermesEnv(home, managed=True)
+        hermes.install(monkeypatch)
+        outcome = credentials.save_credentials(
+            api_key=api_key("new"), handle="a", api_base=BASE, home=home, use_key_file=False,
+            not_ready="the managed config has no secrets.agentchat",
+        )
+        assert outcome.tools_need_block and outcome.path == key_store.store_path(home)
+        assert "managed config" in str(outcome.fallback_reason)
+        assert saved(home).api_key == api_key("new")  # type: ignore[union-attr]
+
+    def test_saved_nowhere_is_an_error(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        home = tmp_path / ".hermes"
+        _HermesEnv(home, managed=True).install(monkeypatch)
+
+        def no_disk(*_a: Any, **_k: Any) -> Path:
+            raise key_store.KeyStoreError("read-only file system")
+
+        monkeypatch.setattr(key_store, "write_store", no_disk)
+        with pytest.raises(key_store.KeyStoreError, match="saved neither"):
+            credentials.save_credentials(api_key=api_key("new"), handle="a", api_base=BASE, home=home)
 
 
 class TestClear:

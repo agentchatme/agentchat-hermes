@@ -26,6 +26,7 @@ class ErrorKind(str, Enum):
 @dataclass
 class FetchResult:
     secrets: dict[str, str] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
     error: str | None = None
     error_kind: ErrorKind | None = None
 

@@ -17,7 +17,10 @@ Hermes' public plugin API).
   profile home, and under a multiplexed gateway Hermes keeps each profile's
   values in that profile's own scope, out of the shared process environment.
   ``override_existing`` is on, so a stale ``.env`` line or an exported
-  variable never decides which agent the tools act as.
+  variable never decides which agent the tools act as. A profile whose key
+  is a copy of another profile's (``config.copy_owner``: a cloned profile)
+  gets the variable *empty*, over the copy in its ``.env``, so its hosted
+  tools fail closed instead of acting as the other agent.
 * The same ``secrets.agentchat`` block carries ``api_key_env:
   AGENTCHAT_API_KEY``. Hermes reads a ``*_key_env`` field anywhere in a
   profile's ``config.yaml`` (outside ``mcp_servers``) as naming a credential,
@@ -31,9 +34,11 @@ Hermes' public plugin API).
 Timing (Hermes' own, documented): sources resolve at process start, before
 plugins register; right after plugin discovery Hermes re-pulls every enabled
 plugin source, so the discovering process — gateway, CLI session, cron —
-gets the key. A key saved after that (``hermes agentchat login`` while a
-gateway runs) reaches the hosted tools at the next restart, or at
-``/reload-mcp`` in a session when no other source is configured.
+gets the key. Hermes then keeps the value for the process's life (a fetched
+home is not fetched again; a ``.env`` reload re-applies it), so a key saved
+or replaced after that (``hermes agentchat login`` / ``recover`` while a
+gateway or a session runs) reaches the hosted tools when that process
+restarts.
 """
 from __future__ import annotations
 
@@ -42,7 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from . import key_store
-from .config import ENV_API_KEY
+from .config import ENV_API_KEY, copy_owner
 from .profile_scope import profile_label, resolve_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -90,13 +95,15 @@ def build_key_source() -> Any | None:
 
         def is_enabled(self, cfg: Any) -> bool:
             # Enabled by ``secrets.agentchat.enabled: true`` and only while this
-            # profile has a key file it may use: with none, Hermes does not
-            # count a fetch for the profile, so a key saved later is picked up
-            # by the next reload instead of waiting for a restart.
+            # profile has something to say: a key file it may use, or a key
+            # that is a copy of another profile's (masked, see ``fetch``). With
+            # neither, Hermes does not count a fetch for the profile, so a key
+            # saved later is picked up by the next reload.
             if not (isinstance(cfg, dict) and cfg.get("enabled") is True):
                 return False
             try:
-                return key_store.read_store(resolve_hermes_home()).usable
+                home = resolve_hermes_home()
+                return key_store.read_store(home).usable or copy_owner(home) is not None
             except Exception:
                 return False
 
@@ -107,6 +114,19 @@ def build_key_source() -> Any | None:
                 read = key_store.read_store(home)
                 if read.usable and read.key is not None:
                     result.secrets = {ENV_API_KEY: read.key.api_key}
+                    return result
+                owner = copy_owner(home)
+                if owner is not None:
+                    # This profile holds a copy of another profile's key (a
+                    # cloned profile). Its hosted tools must not act as that
+                    # agent: the variable is supplied empty, over the copy in
+                    # its .env, so the tools fail closed until the copy is
+                    # logged out. The plugin itself refuses to run there.
+                    result.secrets = {ENV_API_KEY: ""}
+                    result.warnings.append(
+                        f"profile {profile_label(home)} holds a copy of profile "
+                        f"{profile_label(owner)}'s AgentChat key; its AgentChat tools get no key"
+                    )
                     return result
                 if read.status == "missing":
                     result.error = (

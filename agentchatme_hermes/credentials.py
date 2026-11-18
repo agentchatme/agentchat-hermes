@@ -38,12 +38,17 @@ ENV_KEY_NAMES = (ENV_API_KEY, ENV_API_KEY_LEGACY)
 
 @dataclass(frozen=True)
 class SaveOutcome:
-    # The key file written; ``None`` when it could not be and the key went to ``.env``.
+    # The key file written; ``None`` when the key went to ``.env`` instead.
     path: Path | None
     # ``.env`` lines removed after the key file was written.
     env_lines_removed: tuple[str, ...] = ()
-    # Why the key file could not be written (the key is then in ``.env``).
+    # Why the key is not where it should be: in ``.env`` (``path`` is
+    # ``None``), or in the key file although Hermes cannot read it for the
+    # hosted tools yet (``tools_need_block``).
     fallback_reason: str | None = None
+    # The key is in the key file, but ``secrets.agentchat`` must be added (by
+    # hand: a managed config) before the hosted tools can read it.
+    tools_need_block: bool = False
 
 
 def key_bridge() -> tuple[bool, str]:
@@ -85,38 +90,64 @@ def save_credentials(
     use_key_file: bool = True,
     not_ready: str = "",
 ) -> SaveOutcome:
-    """Save a key the server accepted (or just issued) for this profile.
+    """Save a key the server accepted (or just issued) for this profile. Never drops it.
 
-    ``use_key_file=False`` (from :func:`key_bridge`): Hermes could not read
-    the key file for the hosted tools, so the key goes to the profile
-    ``.env`` as before, and ``not_ready`` says why.
+    * The key file, when Hermes can read it for the hosted tools
+      (``use_key_file``, from :func:`key_bridge`): written and read back, then
+      any key line in the profile ``.env`` is removed.
+    * Otherwise, or when the key file cannot be written: the profile ``.env``
+      as before, checked by reading it back (Hermes refuses ``.env`` writes on
+      a managed install without raising), and the old key file — another
+      key now — is removed so the two cannot disagree.
+    * When ``.env`` refuses the write too: the key file after all (a key in a
+      file the tools cannot read yet beats a key saved nowhere), and the
+      caller says ``secrets.agentchat`` must be added by hand.
 
     Raises:
-        key_store.KeyStoreError: neither the key file nor the ``.env``
-            fallback could be written (outside Hermes only).
+        key_store.KeyStoreError: the key could be saved nowhere.
     """
     home = home if home is not None else profile_scope.resolve_hermes_home()
-    if not use_key_file:
-        _save_env_fallback(api_key)
-        return SaveOutcome(None, (), not_ready or "the hosted tools could not read the key file")
+    reason = not_ready or "the hosted tools could not read the key file"
+    if use_key_file:
+        try:
+            path = key_store.write_store(home, api_key=api_key, handle=handle, api_base=api_base)
+        except key_store.KeyStoreError as exc:
+            reason = str(exc)
+        else:
+            return SaveOutcome(path, remove_env_key_lines(home), None)
+    if _save_env_fallback(api_key, home):
+        try:
+            key_store.delete_store(home)
+        except key_store.KeyStoreError as exc:
+            reason = f"{reason}; the old key file could not be removed ({exc}) — remove it by hand"
+        logger.warning("credentials: key saved in the profile .env (%s)", reason)
+        return SaveOutcome(None, (), reason)
     try:
         path = key_store.write_store(home, api_key=api_key, handle=handle, api_base=api_base)
     except key_store.KeyStoreError as exc:
-        _save_env_fallback(api_key)
-        logger.warning("credentials: key file not written (%s); key saved in the profile .env", exc)
-        return SaveOutcome(None, (), str(exc))
-    removed = remove_env_key_lines(home)
-    return SaveOutcome(path, removed, None)
+        raise key_store.KeyStoreError(
+            f"the key could be saved neither in the profile .env nor in the key file ({exc})"
+        ) from exc
+    return SaveOutcome(
+        path,
+        remove_env_key_lines(home),
+        f"the profile .env could not be written, so the key is in the key file, but {reason}",
+        tools_need_block=True,
+    )
 
 
-def _save_env_fallback(api_key: str) -> None:
+def _save_env_fallback(api_key: str, home: Path) -> bool:
+    """Write the key to the profile ``.env`` with Hermes' writer; ``True`` when it is there."""
     try:
         from hermes_cli.config import save_env_value
-    except ImportError as exc:
-        raise key_store.KeyStoreError(
-            "the key file could not be written and Hermes' .env helper is not importable"
-        ) from exc
-    save_env_value(ENV_API_KEY, api_key)
+    except ImportError:
+        return False
+    try:
+        save_env_value(ENV_API_KEY, api_key)
+    except Exception:
+        logger.warning("credentials: Hermes refused the .env write", exc_info=True)
+        return False
+    return env_values(Path(home) / ".env", ENV_API_KEY) == [api_key]
 
 
 @dataclass(frozen=True)
@@ -137,13 +168,68 @@ def env_file_key(home: Path) -> tuple[str, str] | None:
     return None
 
 
+def env_values(env_file: Path, name: str) -> list[str]:
+    """Every value ``name`` is given in the dotenv file (a name may repeat), in order."""
+    try:
+        text = env_file.read_text(encoding="utf-8-sig")
+    except OSError:
+        return []
+    values: list[str] = []
+    for line in text.splitlines():
+        if _line_key(line) != name:
+            continue
+        values.append(_line_value(line))
+    return values
+
+
+def _line_value(line: str) -> str:
+    stripped = line.strip()
+    if stripped.startswith("export "):
+        stripped = stripped[len("export ") :].lstrip()
+    value = stripped.partition("=")[2].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        return value[1:-1]
+    return value.split(" #", 1)[0].strip()
+
+
 def move_env_key(*, handle: str, api_base: str, home: Path | None = None) -> MoveOutcome:
-    """Move the profile ``.env``'s key into the key file (``doctor --fix``)."""
+    """Move the profile ``.env``'s key into the key file (``doctor --fix``).
+
+    Moves nothing when it is not certain which key is this profile's: the
+    ``.env`` gives it several values (both names, or one name twice), or
+    another profile on this machine holds the same key — moving it would
+    make this profile that agent and the other one a refused copy.
+    """
+    from .config import cli_prefix
+    from .profile_scope import hermes_root_of, profile_label
+
     home = home if home is not None else profile_scope.resolve_hermes_home()
     found = env_file_key(home)
     if found is None:
         return MoveOutcome(False, detail="no key in the profile .env")
     api_key, _name = found
+    env_file = Path(home) / ".env"
+    values = {v.strip() for name in ENV_KEY_NAMES for v in env_values(env_file, name) if v.strip()}
+    if len(values) > 1:
+        return MoveOutcome(
+            False,
+            detail=(
+                "the profile .env holds more than one AgentChat key (AGENTCHAT_API_KEY and "
+                "AGENTCHATME_API_KEY, or a name given twice): remove the wrong lines first"
+            ),
+        )
+    holders = key_store.other_holders(home, api_key, root=hermes_root_of(home), env_names=ENV_KEY_NAMES)
+    if holders:
+        others = ", ".join(f"profile {profile_label(h.home)}, in its {h.where}" for h in holders)
+        return MoveOutcome(
+            False,
+            detail=(
+                f"another profile holds the same key ({others}): one key is one agent, and moving "
+                "it would make this profile that agent. Run `"
+                + "` / `".join(f"{cli_prefix(h.home)} logout" for h in holders)
+                + "` in the profile that should not be it, then run this again"
+            ),
+        )
     try:
         path = key_store.write_store(home, api_key=api_key, handle=handle, api_base=api_base)
     except key_store.KeyStoreError as exc:
@@ -175,11 +261,13 @@ def remove_env_key_lines(
     removed is logged and the caller's doctor run shows it again.
     """
     env_file = Path(home) / ".env"
+    # With ``only_value``, a name goes only when every line of it holds that
+    # value: Hermes' remover takes every line of the name at once.
     targets = tuple(
         name
         for name in names
         if _defines(env_file, name)
-        and (only_value is None or (dotenv_value(env_file, name) or "").strip() == only_value)
+        and (only_value is None or all(v.strip() == only_value for v in env_values(env_file, name)))
     )
     if not targets:
         return ()

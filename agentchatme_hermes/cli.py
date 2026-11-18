@@ -65,6 +65,7 @@ from .config import (
     KeyResolution,
     cli_prefix,
     resolve_key,
+    shared_note,
 )
 from .placement import (
     PlacementStep,
@@ -329,7 +330,12 @@ def _login_key_input(*, key_file: str | None, flag: str | None) -> str:
 
 
 def _read_key_stdin() -> str:
-    """One line of stdin (a pipe, a redirect); its end with nothing on it is no key."""
+    """One line of stdin (a pipe, a redirect); its end with nothing on it is no key.
+
+    A terminal is read without echo, like the prompt.
+    """
+    if _stdin_is_tty():
+        return _prompt_api_key()
     line = sys.stdin.readline() if sys.stdin is not None else ""
     return line.strip()
 
@@ -1070,6 +1076,38 @@ def _doctor_key_checks(
         fail(f"no AgentChat key in this profile — run `{cmd} register` or `{cmd} login`")
     for note in resolution.notes:
         warn(note)
+    for holder in resolution.shared_with:
+        fail(shared_note(holder))
+    if resolution.held_key:
+        snapshots = _snapshots_holding_the_key(store.path.parent.parent)
+        if snapshots:
+            warn(
+                f"{len(snapshots)} Hermes terminal snapshot(s) in {snapshots[0].parent} still hold "
+                f"{_ENV_API_KEY} from before it was kept out of the agent's commands — delete them "
+                f"(`rm {snapshots[0].parent}/hermes-snap-*.sh`); the agent's commands could read the "
+                f"key then, so consider `{cmd} recover` to rotate it"
+            )
+
+
+def _snapshots_holding_the_key(home: Path) -> list[Path]:
+    """Hermes' terminal env snapshots (``cache/scratch/hermes-snap-*.sh``) that export the key.
+
+    Hermes wrote the agent's shell environment there; up to 0.5.3 that
+    included ``AGENTCHAT_API_KEY``. Only the variable's name is looked for.
+    """
+    found: list[Path] = []
+    try:
+        candidates = sorted((home / "cache" / "scratch").glob("hermes-snap-*.sh"))
+    except OSError:
+        return found
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if f"{_ENV_API_KEY}=" in text or f"{_ENV_API_KEY_LEGACY}=" in text:
+            found.append(path)
+    return found
 
 
 def _doctor_secrets_checks(
@@ -1491,8 +1529,8 @@ def _api_base() -> str:
 
 
 _RESTART_HINT = (
-    "Restart the gateway (`hermes gateway restart`) so it uses the key; in an open session run "
-    "/reload-mcp so the AgentChat tools connect."
+    "Restart the gateway (`hermes gateway restart`) and any open Hermes session so they use the "
+    "key: a running Hermes keeps the key it started with for the AgentChat tools."
 )
 
 # Where the last successful save put the key, for the success lines.
@@ -1517,7 +1555,15 @@ def _persist_credentials(*, api_key: str, handle: str, api_base: str) -> bool:
         _exit_with(f"The key was not saved: {exc}")
         return False
     _last_saved_path = outcome.path
-    if outcome.fallback_reason is not None:
+    if outcome.tools_need_block:
+        from .secrets_registration import manual_snippet
+
+        sys.stderr.write(
+            f"Warning: {outcome.fallback_reason}. Add this to the profile's config.yaml so the "
+            "AgentChat tools can read it:\n" + manual_snippet()
+        )
+        sys.stderr.flush()
+    elif outcome.fallback_reason is not None:
         sys.stderr.write(
             f"Warning: the key was saved in the profile .env as {_ENV_API_KEY}, not in the key "
             f"file: {outcome.fallback_reason}. Fix that, then run `hermes agentchat doctor --fix` "
@@ -1529,6 +1575,9 @@ def _persist_credentials(*, api_key: str, handle: str, api_base: str) -> bool:
             f"Moved out of the profile .env: {', '.join(outcome.env_lines_removed)} "
             "(the key is now only in the key file)."
         )
+    for holder in resolve_key().shared_with:
+        sys.stderr.write(f"Warning: {shared_note(holder)}.\n")
+        sys.stderr.flush()
     # Only persist the API base when the user overrode the default —
     # leaves the default unchanged for everyone else. It is not a secret.
     if api_base != _DEFAULT_API_BASE:
@@ -1584,7 +1633,7 @@ def _print_status(me: dict[str, Any], resolution: KeyResolution | None = None) -
     _printline(f"  Plugin:        agentchatme-hermes {__version__} (integration)")
     if resolution is not None:
         _printline(f"  Key:           {_key_location_line(resolution)}")
-        for note in resolution.notes:
+        for note in (*resolution.notes, *(shared_note(h) for h in resolution.shared_with)):
             _printline(f"  Note:          {note}")
     _printline("")
 

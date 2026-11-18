@@ -123,7 +123,8 @@ class TestAnotherKeyIsNeverQuietlyUsed:
         saved key; the export the plugin saw at load is still the user's."""
         save_key(ONE)
         monkeypatch.setenv(ENV_API_KEY, TWO)
-        assert resolve_key().refusal is not None  # the plugin loads: the export is seen
+        config._snapshot_process_env()  # the plugin is imported
+        assert resolve_key().refusal is not None
         monkeypatch.setenv(ENV_API_KEY, ONE)  # the source's override_existing write-back
         assert resolve_key().refusal is not None, "the 30 s re-check does not quietly accept it"
 
@@ -146,6 +147,23 @@ class TestAnotherKeyIsNeverQuietlyUsed:
         save_key(TWO, home=he2)
         monkeypatch.setenv(ENV_API_KEY, ONE)  # the launch profile's
         assert resolve_key(he2).refusal is None
+
+
+class TestTheEnvironmentSnapshot:
+    def test_a_value_hermes_loaded_from_dotenv_is_not_an_export(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The gateway started with a key in the profile .env (Hermes loads it into
+        the environment). The user then moves to a new key: the old value still
+        in the environment is not "exported in the shell", and fixing it takes
+        effect without a restart."""
+        root = profile_home()
+        _env(root, f"{ENV_API_KEY}={ONE}\n")
+        monkeypatch.setenv(ENV_API_KEY, ONE)  # Hermes' dotenv load at process start
+        config._snapshot_process_env()  # the plugin is imported
+        assert resolve_key(root).api_key == ONE
+        (root / ".env").write_text("", encoding="utf-8")  # login with another key removed it
+        save_key(TWO)
+        resolved = resolve_key(root)
+        assert (resolved.api_key, resolved.refusal) == (TWO, None)
 
 
 class TestCopiesAreNotAdopted:
@@ -182,7 +200,7 @@ class TestCopiesAreNotAdopted:
         assert "hermes agentchat logout" in resolved.refusal, "or the other way round"
         root_resolved = resolve_key(root)
         assert root_resolved.api_key == ONE and root_resolved.refusal is None
-        assert any("profile he2" in note for note in root_resolved.notes), "said in the original too"
+        assert [h.home for h in root_resolved.shared_with] == [clone], "said in the original too"
 
     def test_a_dotenv_key_another_profile_saved_in_its_key_file_is_refused(self) -> None:
         he1, he2 = _profile("he1"), _profile("he2")
@@ -192,12 +210,64 @@ class TestCopiesAreNotAdopted:
         assert resolved.refusal is not None and "profile he1" in resolved.refusal
 
     def test_two_named_profiles_sharing_a_dotenv_key_are_told(self) -> None:
+        """Before 0.6 nothing tells which of two set-up profiles is the one in
+        use: both keep working as before, and it is said (doctor fails on it)."""
         he1, he2 = _profile("he1"), _profile("he2")
         _env(he1, f"{ENV_API_KEY}={ONE}\n")
         _env(he2, f"{ENV_API_KEY}={ONE}\n")
         resolved = resolve_key(he2)
-        assert resolved.api_key == ONE
-        assert resolved.notes and "profile he1" in resolved.notes[0] and "one AgentChat agent" in resolved.notes[0]
+        assert resolved.api_key == ONE and resolved.refusal is None
+        assert [h.home for h in resolved.shared_with] == [he1]
+        note = config.shared_note(resolved.shared_with[0])
+        assert "profile he1" in note and "one AgentChat agent" in note and "hermes -p he1 agentchat logout" in note
+        cfg = load_config(hermes_home=he2)
+        assert cfg is not None and any("profile he1" in n for n in cfg.key_notes), "logged at activation"
+
+    def test_a_dormant_default_does_not_take_a_set_up_named_profile_offline(self) -> None:
+        """The default profile still holds the key in .env from long ago; the
+        named profile is the one that was set up (identity line placed): it
+        keeps working, with the sharing said."""
+        root = profile_home()
+        _env(root, f"{ENV_API_KEY}={ONE}\n")
+        ops = _profile("ops")
+        _env(ops, f"{ENV_API_KEY}={ONE}\n")
+        (ops / "SOUL.md").write_text("<!-- agentchat:start -->\nI am @ops\n<!-- agentchat:end -->\n", encoding="utf-8")
+        resolved = resolve_key(ops)
+        assert resolved.api_key == ONE and resolved.refusal is None
+        assert [h.home for h in resolved.shared_with] == [root]
+
+    def test_a_clone_with_the_tools_entry_is_shared_not_refused(self) -> None:
+        root = profile_home()
+        _env(root, f"{ENV_API_KEY}={ONE}\n")
+        (root / "config.yaml").write_text(
+            'mcp_servers:\n  agentchat:\n    headers:\n      Authorization: "Bearer ${AGENTCHAT_API_KEY}"\n',
+            encoding="utf-8",
+        )
+        clone = _hermes_profile_create(root, "he2")  # --clone: .env and config.yaml
+        resolved = resolve_key(clone)
+        assert resolved.refusal is None and [h.home for h in resolved.shared_with] == [root]
+
+
+class TestSharedActivation:
+    def test_the_sharing_is_logged_at_activation(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register
+
+        he1, he2 = _profile("he1"), _profile("he2")
+        _env(he1, f"{ENV_API_KEY}={ONE}\n")
+        _env(he2, f"{ENV_API_KEY}={ONE}\n")
+        runtime = SimpleNamespace(identity=SimpleNamespace(handle="x"), hermes_home=he2)
+        monkeypatch.setattr(_register, "_try_start_runtime", lambda *a, **k: runtime)
+        for name in ("_reconcile_soul_anchor", "_reconcile_key_store", "_reconcile_secrets_block", "_reconcile_mcp_registration"):
+            monkeypatch.setattr(_register, name, lambda *_a: None)
+        watcher = _register.ActivationWatcher(hermes_home=he2, profile="he2", gateway_mode=True)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
+            assert watcher.try_activate() == "active"
+        assert any("profile he1" in r.getMessage() for r in caplog.records if r.levelno == logging.WARNING)
 
 
 class TestRefusedActivation:
@@ -238,6 +308,27 @@ class TestStatusAndDoctorSayItIsAnotherProfilesAgent:
         assert cli._dispatch_status(argparse.Namespace()) == 1
         err = capsys.readouterr().err
         assert "copy of profile default's" in err and ONE not in err
+
+    def test_doctor_fails_on_a_shared_key_and_flags_old_snapshots(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root = profile_home()
+        ops = _profile("ops")
+        save_key(ONE, home=ops)
+        _env(root, f"{ENV_API_KEY}={ONE}\n")
+        scratch = ops / "cache" / "scratch"
+        scratch.mkdir(parents=True)
+        (scratch / "hermes-snap-abc.sh").write_text(f"declare -x {ENV_API_KEY}={ONE}\n", encoding="utf-8")
+        (scratch / "hermes-snap-def.sh").write_text("declare -x PATH=/bin\n", encoding="utf-8")
+        self._in(monkeypatch, ops)
+        monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)
+        monkeypatch.setitem(sys.modules, "agentchatme", None)  # stop after the key checks
+        rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
+        out = capsys.readouterr().out
+        assert rc >= 1
+        assert "[fail] profile default (" in out and "the two profiles are one AgentChat agent" in out
+        assert "[warn] 1 Hermes terminal snapshot(s)" in out and "recover` to rotate it" in out
+        assert ONE not in out
 
     def test_doctor(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
         root = profile_home()
