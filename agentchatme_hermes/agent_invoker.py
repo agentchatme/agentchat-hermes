@@ -69,6 +69,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from agentchatme.integration import (
+    AgentChatCallCount,
     Readiness,
     RunEnd,
     TrackedTurn,
@@ -98,6 +99,7 @@ from .model_call import (
     GateCallCancelled,
     GateLoop,
     build_call_model,
+    is_timeout,
 )
 from .profile_scope import (
     ProfileScopeError,
@@ -321,7 +323,17 @@ class AgentInvoker:
         (:mod:`.model_call`)."""
         if self._stopped.is_set():
             raise GateCallCancelled("stopping")
-        return self._complete(prompt, cancel=cancel, timeout_s=self._gate_timeout_s)
+        try:
+            return self._complete(prompt, cancel=cancel, timeout_s=self._gate_timeout_s)
+        except Exception as exc:
+            # The request's own timeout (``AGENTCHATME_GATE_TIMEOUT_S``) comes
+            # before the kit's gate-call deadline; raised as ``TimeoutError``
+            # the kit counts it timed out, as its own deadline: a slow model
+            # is a timeout, never a failure the runtime check could pin on
+            # the conversation (could not process).
+            if is_timeout(exc) and not isinstance(exc, TimeoutError):
+                raise TimeoutError(f"the gate call timed out ({type(exc).__name__}: {exc})") from exc
+            raise
 
     async def check_runtime(self) -> Readiness:
         """The kit's runtime check (could not process): does the agent's
@@ -335,9 +347,12 @@ class AgentInvoker:
         through the gate's own path (:meth:`_complete`: the same ``ctx.llm``
         or auxiliary client, the profile's scope), with
         :data:`~.model_call.RUNTIME_CHECK_PROMPT` (no AgentChat or peer
-        content), a few tokens and a 45 s bound. The answer is discarded; any
-        non-empty one passes. A raised call, the bound or an empty answer is
-        ``ready=False`` with a reason that never carries model output. Runs
+        content), the gate's output cap (a model that reasons first needs the
+        room) and a 45 s bound. The answer is discarded; any non-empty one
+        passes. A raised call, the bound or an empty answer is
+        ``ready=False`` with a reason that never carries model output; so is
+        a turn model that cannot be resolved from the profile's config (the
+        turns' own path; :meth:`_turn_runtime_problem`). Runs
         on a worker thread; when the loop stops waiting (its own bound, or
         :meth:`~agentchatme.integration.ReceiveLoop.stop`) the request is
         cancelled where Hermes can (as the gate's)."""
@@ -350,6 +365,14 @@ class AgentInvoker:
     def _runtime_check(self, cancel: threading.Event) -> Readiness:
         if self._stopped.is_set():
             return Readiness(ready=False, reason="stopping")
+        # The turns' own model: a turn runs on the model resolved from the
+        # profile's config; when that falls back (no config helpers, the
+        # provider unresolved) every turn fails while the gate's ``ctx.llm``
+        # may still answer, so the check fails too.
+        problem = self._turn_runtime_problem()
+        if problem is not None:
+            logger.info("AgentInvoker: runtime check failed — %s", problem)
+            return Readiness(ready=False, reason=problem)
         try:
             answer = self._complete(
                 RUNTIME_CHECK_PROMPT,
@@ -479,7 +502,7 @@ class AgentInvoker:
         if report.status == "completed":
             return RunEnd(status="completed")
         # At the turn's own time limit: a could-not-process report says ``timed_out``.
-        return RunEnd(status="failed", detail=report.detail, timed_out=report.status == "timeout")
+        return RunEnd(status="failed", detail=report.detail, timed_out=report.timed_out)
 
     # -- turns --------------------------------------------------------------------
 
@@ -532,7 +555,14 @@ class AgentInvoker:
                 return
             turn.reported = True
             if report is None:
-                end = TurnEnd(status="failed", detail=f"not started: {reason}")
+                # Never ran: no AgentChat call, so the kit knows it never
+                # looked (not this conversation's failure; could not process
+                # reports nothing for it).
+                end = TurnEnd(
+                    status="failed",
+                    agentchat_calls=AgentChatCallCount(made=0, failed=0),
+                    detail=f"not started: {reason}",
+                )
             elif report.status == "timeout" and not turn.thread_done:
                 # Overran and still running: from the loop's entry to ours, in
                 # one step with no await in between, so no cycle sees the
@@ -554,7 +584,10 @@ class AgentInvoker:
                 # ``timed_out``). (Not ``report.turn_end()``: the thread's end
                 # callback runs a moment before the report's ``finished`` is set.)
                 end = TurnEnd(
-                    status="failed", agentchat_calls=report.calls, detail=report.detail, timed_out=True
+                    status="failed",
+                    agentchat_calls=report.calls,
+                    detail=report.detail,
+                    timed_out=report.timed_out,
                 )
             else:
                 end = report.turn_end()
@@ -867,14 +900,27 @@ class AgentInvoker:
         main_runtime.update(runtime_kwargs)
         return main_runtime
 
+    def _turn_runtime_problem(self) -> str | None:
+        """Why a turn could not run on the profile's own model (its config
+        cannot be read or its provider cannot be resolved, so a turn would
+        fall back to a default model with no credentials), or ``None``."""
+        _model, _kwargs, problem = self._resolve_turn_runtime()
+        return problem
+
     def _resolve_model_and_runtime(self) -> tuple[str, dict[str, Any]]:
+        model, runtime_kwargs, _problem = self._resolve_turn_runtime()
+        return model, runtime_kwargs
+
+    def _resolve_turn_runtime(self) -> tuple[str, dict[str, Any], str | None]:
         """Pull the user's default model + provider creds from Hermes config.
 
         Hermes' ``config.yaml`` has a NESTED ``model:`` block (``default``,
         ``provider``, ``model``), so ``cfg["model"]`` is a dict, not a string;
         :func:`_coerce_model_string` extracts a clean name. Passing the dict
         through once crashed deep inside Hermes three releases late — the
-        exception was swallowed by a thread pool.
+        exception was swallowed by a thread pool. The third value says why it
+        fell back to :data:`_FALLBACK_MODEL` with no credentials (``None``
+        when the profile's own model and provider were resolved).
         """
         try:
             from hermes_cli.config import load_config
@@ -885,7 +931,7 @@ class AgentInvoker:
                 "provider creds",
                 _FALLBACK_MODEL,
             )
-            return _FALLBACK_MODEL, {}
+            return _FALLBACK_MODEL, {}, "Hermes' config helpers are unavailable: a turn has no model of its own"
 
         try:
             cfg = load_config()
@@ -896,14 +942,14 @@ class AgentInvoker:
                 "AgentInvoker: resolve_runtime_provider failed, falling back to model=%s",
                 _FALLBACK_MODEL,
             )
-            return _FALLBACK_MODEL, {}
+            return _FALLBACK_MODEL, {}, "the profile's model or provider could not be resolved for a turn"
 
         runtime_kwargs: dict[str, Any] = {}
         for key in ("api_key", "base_url", "provider", "api_mode"):
             value = runtime.get(key)
             if value is not None:
                 runtime_kwargs[key] = value
-        return model, runtime_kwargs
+        return model, runtime_kwargs, None
 
 
 # ─── pure helpers ───────────────────────────────────────────────────────────

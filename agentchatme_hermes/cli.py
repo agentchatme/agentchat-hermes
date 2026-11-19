@@ -1685,26 +1685,38 @@ def _paused_lines(section: dict[str, Any], *, now: float) -> list[str]:
         end = pause_end(until)
         if end is not None and end <= now:
             continue
-        lines.append(f"{conversation_id} paused until {until} (could not process; a 24 h mute that ends on its own)")
+        lines.append(f"{conversation_id} paused until {until} (could not process; the mute ends on its own)")
     return lines
+
+
+# A failed report or a stopped split this recent makes doctor's counts line a
+# warning; older ones are history (the counts still show them).
+_RECENT_TROUBLE_S = 3600.0
 
 
 def _describe_could_not_process(worker: Any, *, now: float) -> list[tuple[str, str]]:
     """``(ok|warn, line)`` pairs for doctor: the kit's counts once anything
-    was reported or checked (a warning when a report failed, the gate's
-    split stopped, or more runtime checks failed than passed), and a warning
-    per paused conversation. Nothing when the record has no such section."""
+    was reported or checked (a warning when, within the last hour, a report
+    failed or the gate's split stopped, or when the last runtime check
+    failed), and a warning per paused conversation. Nothing when the record
+    has no such section."""
     section = _could_not_process_section(worker)
     if section is None:
         return []
     out: list[tuple[str, str]] = []
     summary = _could_not_process_summary(section)
+    last_check = section.get("last_runtime_check")
+    check_failed = isinstance(last_check, dict) and last_check.get("ok") is False
+    if check_failed and isinstance(last_check, dict):
+        detail = last_check.get("detail")
+        summary += f"; the last runtime check failed{f' ({detail})' if detail else ''}"
+
+    def recent(name: str) -> bool:
+        at = section.get(name)
+        return isinstance(at, (int, float)) and not isinstance(at, bool) and now - float(at) <= _RECENT_TROUBLE_S
+
     if summary != "nothing reported":
-        attention = (
-            _count(section, "failure_report_errors") > 0
-            or _count(section, "splits_stopped") > 0
-            or _count(section, "runtime_checks_failed") > _count(section, "runtime_checks_ok")
-        )
+        attention = check_failed or recent("last_report_error_at") or recent("last_split_stopped_at")
         out.append(("warn" if attention else "ok", f"Could not process (since the receive loop started): {summary}"))
     for line in _paused_lines(section, now=now):
         out.append(("warn", f"Conversation {line}"))

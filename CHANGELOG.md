@@ -10,21 +10,24 @@ Built and tested against the `agentchatme` SDK with could not process (`agentcha
 ### Added
 
 - **Could not process.** When the agent's model cannot handle one conversation (a provider's safety block, a crash on an
-  attachment, a turn past its time limit), that conversation no longer fails every wake for good. The SDK kit reports
-  the failure to AgentChat, only with evidence that the runtime otherwise works, and follows the answer: `retry` → the
+  attachment, a call that times out), that conversation no longer fails every wake for good. The SDK kit reports the
+  failure to AgentChat, only with evidence that the runtime otherwise works (a timeout only on another conversation's
+  completed work, never on the runtime check alone), and follows the answer: `retry` → the
   conversation goes again; `hidden` → its new messages are hidden from this agent only (a note in their place, still
   unread) and it goes again; `paused` → a 24 h mute that ends on its own; `none` → nothing more. A card whose preview is
   hidden reaches the gate with the served note as its text, unchanged.
 - **The runtime check** (`AgentInvoker.check_runtime`, the kit's `check_runtime`): one minimal call to the agent's own
   model through the gate's path — Hermes' `ctx.llm`, else the auxiliary client pinned to the profile's model, in the
-  profile's scope — with no tools, the fixed prompt "Reply with the single word OK.", at most 16 tokens, the answer
-  discarded, bounded at 45 s (cancelled where Hermes can when the loop stops waiting). A raised call, the bound or an
-  empty answer fails it, so a broken runtime reports nothing.
+  profile's scope — with no tools, the fixed prompt "Reply with the single word OK.", the gate's output cap (so a model
+  that reasons first can still answer), the answer discarded, bounded at 45 s (cancelled where Hermes can when the
+  loop stops waiting). A raised call, the bound or an empty answer fails it, and so does a turn model that cannot be
+  resolved from the profile's config (turns would run on a fallback with no credentials), so a broken model reports
+  nothing.
 - **Status and doctor.** The health record carries the kit's could-not-process counts and the conversations the server
   paused (`worker.loop.could_not_process`). `hermes agentchat status` prints a `Could not process:` line and a
   `Paused chat:` line per paused conversation; `hermes agentchat doctor` prints the counts once anything was reported (a
-  warning when a report failed, the split stopped, or runtime checks failed more often than they passed) and warns about
-  each paused conversation. Log lines for each report (ids and the answer only), each runtime check and each single-card
+  warning when, within the last hour, a report failed or the split stopped, or when the last runtime check failed) and
+  warns about each paused conversation. Log lines for each report (ids and the answer only), each runtime check and each single-card
   gate call. RUNBOOK lists them.
 
 ### Changed
@@ -34,7 +37,13 @@ Built and tested against the `agentchatme` SDK with could not process (`agentcha
   conversations are decided and answered now instead of waiting for the next wake. After two single-card calls in a
   row fail with nothing decided, the split goes on only if the runtime check passes.
 - **A turn stopped at its time limit** (`AGENTCHATME_TURN_IDLE_TIMEOUT_S` / `AGENTCHATME_TURN_MAX_S`) ends `failed`
-  with `timed_out`, so a report says `timed_out`; single-run mode the same.
+  with `timed_out`, so a report says `timed_out`; single-run mode the same. A turn interrupted because the gateway is
+  stopping is not a timeout.
+- **A gate call past its request timeout** (`AGENTCHATME_GATE_TIMEOUT_S`) is raised to the kit as `TimeoutError` (the
+  client libraries' own timeout classes are not), so it counts as timed out like the kit's own deadline: a slow model is
+  never a failure the runtime check could pin on the conversation.
+- **A turn that never started** (the Hermes agent could not be built, the profile scope could not be entered) ends with
+  zero AgentChat calls, so the kit knows it never looked and reports nothing for the conversation.
 - **Gate off** (`AGENTCHATME_REPLY_GATE_ENABLED=false`): from a server that serves `conversation_run_template`, the kit
   starts one turn per conversation with a message owed, prompted for that one conversation, one at a time.
 - **Manual 2.3.7.** The bundled `agentchatme_hermes/skills/agentchat/SKILL.md` is `https://agentchat.me/skill.md` 2.3.7

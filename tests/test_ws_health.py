@@ -160,15 +160,23 @@ def test_doctor_lines_for_could_not_process() -> None:
     )
     assert _describe_could_not_process(counts, now=now) == [
         ("ok", "Could not process (since the receive loop started): 2 reported (retry 1, paused 1), 1 re-run, runtime checks 1 ok"),
-        ("warn", "Conversation conv_bad paused until 2027-02-01T08:00:00.000Z (could not process; a 24 h mute that ends on its own)"),
+        ("warn", "Conversation conv_bad paused until 2027-02-01T08:00:00.000Z (could not process; the mute ends on its own)"),
     ]
-    trouble = worker(failure_report_errors=1, runtime_checks_failed=2, splits_stopped=1)
-    assert _describe_could_not_process(trouble, now=now) == [
-        ("warn", "Could not process (since the receive loop started): 1 report error, runtime checks 2 failed, gate split stopped 1 time"),
+    old = worker(failure_report_errors=1, splits_stopped=1, last_report_error_at=now - 7200, last_split_stopped_at=now - 7200)
+    assert _describe_could_not_process(old, now=now) == [
+        ("ok", "Could not process (since the receive loop started): 1 report error, gate split stopped 1 time"),
+    ], "trouble two hours ago is history"
+    recent = worker(failure_report_errors=1, last_report_error_at=now - 60)
+    assert _describe_could_not_process(recent, now=now)[0][0] == "warn"
+    failing = worker(failures_waiting=1, runtime_checks_failed=2, last_runtime_check={"at": now - 5, "ok": False, "detail": "the model answered with no text"})
+    assert _describe_could_not_process(failing, now=now) == [
+        ("warn", "Could not process (since the receive loop started): 1 waiting for evidence, runtime checks 2 failed; the last runtime check failed (the model answered with no text)"),
     ]
     assert _could_not_process_summary({}) == "nothing reported"
     assert pause_end("2027-01-15T08:00:00.000Z") == pause_end("2027-01-15T08:00:00+00:00")
     assert pause_end("not a time") is None and pause_end(None) is None and pause_end("2027-01-15T08:00:00") is None
+    # As Postgres sends it: trailing fraction zeros dropped (Python 3.9 / 3.10 read only 3 or 6 digits).
+    assert pause_end("2026-11-20T23:13:48.12345+00:00") == pause_end("2026-11-20T23:13:48.123450Z")
 
 
 def test_status_shows_could_not_process_from_this_accounts_health_record(capsys: pytest.CaptureFixture[str]) -> None:
@@ -198,7 +206,7 @@ def test_status_shows_could_not_process_from_this_accounts_health_record(capsys:
     cli._print_status({"handle": "me", "status": "active"}, worker=found)
     out = capsys.readouterr().out
     assert "  Could not process: 1 reported (paused 1)" in out
-    assert "  Paused chat:   conv_bad paused until 2099-01-01T00:00:00.000Z (could not process; a 24 h mute that ends on its own)" in out
+    assert "  Paused chat:   conv_bad paused until 2099-01-01T00:00:00.000Z (could not process; the mute ends on its own)" in out
     cli._print_status({"handle": "me", "status": "active"}, worker={"state": "idle", "loop": {}})
     assert "Could not process" not in capsys.readouterr().out, "a record from an older release"
     write_ws_health(handle="me", state="connected", path=health_path_for(lock), worker=worker, now=time.time() - 3600)

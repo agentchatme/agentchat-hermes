@@ -246,10 +246,15 @@ def pause_end(value: Any) -> float | None:
     seconds; ``None`` when unreadable."""
     if not isinstance(value, str) or not value:
         return None
+    import re
     from datetime import datetime
 
+    text = value.strip().replace("Z", "+00:00")
+    # Python 3.9 / 3.10 read only 3 or 6 fraction digits; Postgres drops
+    # trailing zeros (``.12345+00:00``): pad or cut to 6.
+    text = re.sub(r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), text, count=1)
     try:
-        moment = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        moment = datetime.fromisoformat(text)
     except ValueError:
         return None
     if moment.tzinfo is None:

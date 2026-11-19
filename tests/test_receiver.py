@@ -159,6 +159,16 @@ class TestCouldNotProcess:
         receiver._on_event(self._report("conv_bad", "retry"))
         assert receiver.worker_status()["loop"]["could_not_process"]["paused"] == [], "it went again: no longer paused"
 
+    def test_recent_trouble_is_timed_for_doctor(self, tmp_path: Path) -> None:
+        receiver = _receiver(tmp_path)
+        before = time.time()
+        receiver._on_event(self._report("conv_x", "none", error="503 upstream"))
+        receiver._on_event({"type": "runtime_check", "ok": False, "detail": "the model answered with no text"})
+        receiver._on_event({"type": "cycle", "summary": SimpleNamespace(outcome="decided", split_stopped=True, failure=None)})
+        section = receiver.worker_status()["loop"]["could_not_process"]
+        assert section["last_report_error_at"] >= before and section["last_split_stopped_at"] >= before
+        assert section["last_runtime_check"]["ok"] is False and section["last_runtime_check"]["detail"] == "the model answered with no text"
+
     def test_the_kits_counts_go_to_the_health_record_and_survive_a_restart(self, tmp_path: Path) -> None:
         receiver = _receiver(tmp_path)
         counters = {

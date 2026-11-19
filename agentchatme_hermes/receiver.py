@@ -234,8 +234,14 @@ class Receiver:
         # with their ``paused_until``; kept across a stack restart (the pause
         # is the server's and ends on its own), dropped once it has ended.
         self._paused: dict[str, str] = {}
+        # Written on the loop's thread (events), read from the health
+        # writers' threads (``worker_status``).
+        self._paused_lock = threading.Lock()
         # The last loop's could-not-process counts (its ``status().counters``).
         self._could_not_process: dict[str, Any] = {}
+        # When a report last failed, when the gate's split last stopped (epoch
+        # s), and the last runtime check: doctor warns on recent trouble only.
+        self._trouble: dict[str, Any] = {}
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -319,6 +325,7 @@ class Receiver:
         loop_status["recent_cycles"] = list(self._recent_cycles)
         loop_status["could_not_process"] = {
             **self._could_not_process,
+            **self._trouble,
             "paused": self._paused_conversations(),
         }
         if self._restarting:
@@ -614,6 +621,8 @@ class Receiver:
                 getattr(summary, "held_by_turns", 0),
                 f" failure={getattr(summary, 'failure', None)!r}" if getattr(summary, "failure", None) else "",
             )
+            if getattr(summary, "split_stopped", False) is True:
+                self._trouble["last_split_stopped_at"] = time.time()
             self._refresh_health()
         elif kind in ("turn_outcome", "invite_outcome"):
             outcome = event.get("outcome")
@@ -642,6 +651,12 @@ class Receiver:
                 "passed" if event.get("ok") else "failed",
                 f" ({event['detail']})" if event.get("detail") else "",
             )
+            detail = event.get("detail")
+            self._trouble["last_runtime_check"] = {
+                "at": time.time(),
+                "ok": event.get("ok") is True,
+                "detail": None if detail is None else str(detail)[:_FAILURE_TEXT_MAX],
+            }
         elif kind == "processing_failure":
             self._note_processing_failure(event)
         elif kind == "error":
@@ -660,6 +675,7 @@ class Receiver:
         paused_until = event.get("paused_until")
         error = event.get("error")
         if error:
+            self._trouble["last_report_error_at"] = time.time()
             logger.warning(
                 "Receiver: could not process — the report for conv=%s (%s %s) failed: %s; "
                 "nothing more is done for it (the server re-wakes)",
@@ -687,24 +703,26 @@ class Receiver:
             )
         if not isinstance(conversation_id, str) or not conversation_id or error:
             return
-        if action == "paused" and isinstance(paused_until, str) and paused_until:
-            self._paused.pop(conversation_id, None)
-            self._paused[conversation_id] = paused_until
-            while len(self._paused) > _PAUSED_KEPT:
-                self._paused.pop(next(iter(self._paused)))
-        else:
-            self._paused.pop(conversation_id, None)
+        with self._paused_lock:
+            if action == "paused" and isinstance(paused_until, str) and paused_until:
+                self._paused.pop(conversation_id, None)
+                self._paused[conversation_id] = paused_until
+                while len(self._paused) > _PAUSED_KEPT:
+                    self._paused.pop(next(iter(self._paused)))
+            else:
+                self._paused.pop(conversation_id, None)
 
     def _paused_conversations(self, *, now: float | None = None) -> list[dict[str, str]]:
         """The conversations still paused, soonest end first; ended ones are dropped."""
         moment = time.time() if now is None else now
         live: list[tuple[float, str, str]] = []
-        for conversation_id, until in list(self._paused.items()):
-            end = pause_end(until)
-            if end is not None and end <= moment:
-                self._paused.pop(conversation_id, None)
-                continue
-            live.append((end if end is not None else float("inf"), conversation_id, until))
+        with self._paused_lock:
+            for conversation_id, until in list(self._paused.items()):
+                end = pause_end(until)
+                if end is not None and end <= moment:
+                    del self._paused[conversation_id]
+                    continue
+                live.append((end if end is not None else float("inf"), conversation_id, until))
         return [{"conversation_id": cid, "until": until} for _end, cid, until in sorted(live)]
 
     # -- health ----------------------------------------------------------------

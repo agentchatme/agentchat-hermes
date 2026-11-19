@@ -156,6 +156,14 @@ def test_turn_that_ignores_the_interrupt_ends_later() -> None:
     assert ended == ["end"], "the end callback comes with the real end, once"
 
 
+def test_a_turn_stopped_because_the_integration_stops_is_not_a_timeout() -> None:
+    stopped = threading.Event()
+    stopped.set()
+    report = run_turn(_Agent(block=True), "go", session_id="s", limits=FAST, stopped=stopped)
+    assert report.status == "timeout" and report.detail == "stopping"
+    assert report.timed_out is False and report.turn_end().timed_out is False
+
+
 def test_a_normal_turn_calls_the_end_callback_before_returning() -> None:
     ended: list[str] = []
     report = run_turn(_Agent(), "go", session_id="s", limits=FAST, on_finished=lambda: ended.append("end"))

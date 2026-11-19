@@ -69,8 +69,12 @@ RUNTIME_CHECK_PURPOSE = "agentchat runtime check"
 # Its bound (the request's own timeout); the kit's ceiling for a check is
 # its gate-call deadline (60 s or more).
 RUNTIME_CHECK_TIMEOUT_S = 45.0
-# A one-word answer: a few tokens, never more.
-RUNTIME_CHECK_MAX_TOKENS = 16
+# The gate's own output cap. A one-word answer uses a few tokens; a model that
+# reasons first (the call sets no reasoning option, so the provider's default
+# applies) needs room, or it answers with no text — or, with thinking on, a
+# provider refuses a cap below its thinking budget — and the check fails while
+# the gate works.
+RUNTIME_CHECK_MAX_TOKENS = DEFAULT_MAX_TOKENS
 
 # How often a cancellable call looks at its cancel event.
 _CANCEL_POLL_S = 0.05
@@ -247,6 +251,16 @@ def build_call_model(
         return content_of(response)
 
     return call_model
+
+
+def is_timeout(exc: BaseException) -> bool:
+    """Whether ``exc`` is a request timing out: Python's own timeout errors,
+    or a client library's timeout class (``openai.APITimeoutError``,
+    ``httpx.TimeoutException`` / ``ReadTimeout``, ``requests``' ``Timeout``
+    and the like, which do not derive from :class:`TimeoutError`)."""
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, concurrent.futures.TimeoutError)):
+        return True
+    return any("Timeout" in cls.__name__ for cls in type(exc).__mro__)
 
 
 def content_of(response: Any) -> str:

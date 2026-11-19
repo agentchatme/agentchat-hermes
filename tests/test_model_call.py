@@ -170,7 +170,8 @@ class TestHostLlm:
         assert call(RUNTIME_CHECK_PROMPT) == "OK"
         assert RUNTIME_CHECK_PROMPT == "Reply with the single word OK." and RUNTIME_CHECK_TIMEOUT_S == 45.0
         assert seen["messages"] == [{"role": "user", "content": RUNTIME_CHECK_PROMPT}]
-        assert seen["purpose"] == "agentchat runtime check" and seen["max_tokens"] == 16 and seen["timeout"] == 45.0
+        assert seen["purpose"] == "agentchat runtime check" and seen["timeout"] == 45.0
+        assert seen["max_tokens"] == RUNTIME_CHECK_MAX_TOKENS == DEFAULT_MAX_TOKENS, "the gate's cap: a reasoning model needs room"
         assert not (_TOOL_KWARGS & set(seen))
 
 
@@ -337,3 +338,20 @@ def test_host_llm_accessor_is_static_and_lazy() -> None:
     assert accessor is not None and reads == [], "the property is not read at register time"
     assert accessor() == "facade" and reads == ["llm"]
     assert host_llm_accessor(SimpleNamespace()) is None, "an older Hermes: no ctx.llm"
+
+
+def test_is_timeout_knows_pythons_and_the_client_libraries_timeouts() -> None:
+    import concurrent.futures
+
+    from agentchatme_hermes.model_call import is_timeout
+
+    class APITimeoutError(Exception):
+        pass
+
+    class ReadTimeout(OSError):
+        pass
+
+    for exc in (TimeoutError("t"), asyncio.TimeoutError(), concurrent.futures.TimeoutError(), APITimeoutError("t"), ReadTimeout("t")):
+        assert is_timeout(exc), exc
+    for exc in (RuntimeError("401"), GateCallCancelled("stopping"), ValueError("bad json")):
+        assert not is_timeout(exc), exc

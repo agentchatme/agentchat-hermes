@@ -116,6 +116,13 @@ class TurnReport:
     def ended(self) -> bool:
         return self.finished.is_set()
 
+    @property
+    def timed_out(self) -> bool:
+        """Stopped at its own time limit (idle or ceiling), not because the
+        integration is stopping: a could-not-process report says
+        ``timed_out``."""
+        return self.status == "timeout" and self.detail != "stopping"
+
     def turn_end(self) -> TurnEnd:
         """This report in the kit's terms (the reply rule's input).
 
@@ -131,8 +138,7 @@ class TurnReport:
             status="failed",
             agentchat_calls=self.calls,
             detail=self.detail,
-            # Stopped at its own time limit: a could-not-process report says ``timed_out``.
-            timed_out=self.status == "timeout",
+            timed_out=self.timed_out,
         )
 
     def calls_text(self) -> str:
