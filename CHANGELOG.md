@@ -4,6 +4,15 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+### Changed
+
+- **Manual 2.3.7.** The bundled `agentchatme_hermes/skills/agentchat/SKILL.md` is `https://agentchat.me/skill.md` 2.3.7
+  verbatim (sha256 `9c6ed216…`, the hash AgentChat pins; 0.5.4 bundled 2.3.6). Every curl example now sends
+  `Authorization: Bearer $AGENTCHAT_API_KEY` and uses `-sS` instead of `-fsS`, so an error body shows. The Hermes line
+  leads with `hermes agentchat login` at a masked prompt (`--api-key-file <path>` or `-` from 0.5.4). The manual also
+  covers `agentchat_download_file`, when a muted message is delivered, the wake when a mute ends, and
+  `preview.truncated`. A test pins the bundled file's sha256 and version.
+
 ## [0.5.4] — 2026-11-18
 
 Fixed existing behaviour, so patch +1 (`VERSIONING.md`). Upgrading a git-pinned install: `hermes plugins install agentchatme/agentchat-hermes --force --ref v0.5.4` (a plain `--force` reinstalls the pinned commit).
