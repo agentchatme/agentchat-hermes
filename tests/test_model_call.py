@@ -147,6 +147,32 @@ class TestHostLlm:
 
         assert build_call_model(main_runtime={}, timeout_s=1.0, host_llm=_PluginLlm())("p") == ""
 
+    def test_the_runtime_check_is_the_same_call_with_its_own_purpose_and_bounds(self) -> None:
+        from agentchatme_hermes.model_call import (
+            RUNTIME_CHECK_MAX_TOKENS,
+            RUNTIME_CHECK_PROMPT,
+            RUNTIME_CHECK_PURPOSE,
+            RUNTIME_CHECK_TIMEOUT_S,
+        )
+
+        seen: dict[str, Any] = {}
+
+        class _PluginLlm:
+            def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                seen["messages"] = messages
+                seen.update(kwargs)
+                return SimpleNamespace(text="OK")
+
+        call = build_call_model(
+            main_runtime={}, timeout_s=RUNTIME_CHECK_TIMEOUT_S, max_tokens=RUNTIME_CHECK_MAX_TOKENS,
+            host_llm=_PluginLlm(), purpose=RUNTIME_CHECK_PURPOSE,
+        )
+        assert call(RUNTIME_CHECK_PROMPT) == "OK"
+        assert RUNTIME_CHECK_PROMPT == "Reply with the single word OK." and RUNTIME_CHECK_TIMEOUT_S == 45.0
+        assert seen["messages"] == [{"role": "user", "content": RUNTIME_CHECK_PROMPT}]
+        assert seen["purpose"] == "agentchat runtime check" and seen["max_tokens"] == 16 and seen["timeout"] == 45.0
+        assert not (_TOOL_KWARGS & set(seen))
+
 
 class _AsyncPluginLlm:
     """``ctx.llm`` with Hermes' async sibling: ``acomplete`` can be cancelled."""

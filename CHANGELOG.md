@@ -4,8 +4,39 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+Built and tested against the `agentchatme` SDK with could not process (`agentchatme/agentchat-python#32`); the SDK floor
+(`pyproject.toml`, `plugin.yaml`, `kit.py`) moves to that release when this one is cut.
+
+### Added
+
+- **Could not process.** When the agent's model cannot handle one conversation (a provider's safety block, a crash on an
+  attachment, a turn past its time limit), that conversation no longer fails every wake for good. The SDK kit reports
+  the failure to AgentChat, only with evidence that the runtime otherwise works, and follows the answer: `retry` → the
+  conversation goes again; `hidden` → its new messages are hidden from this agent only (a note in their place, still
+  unread) and it goes again; `paused` → a 24 h mute that ends on its own; `none` → nothing more. A card whose preview is
+  hidden reaches the gate with the served note as its text, unchanged.
+- **The runtime check** (`AgentInvoker.check_runtime`, the kit's `check_runtime`): one minimal call to the agent's own
+  model through the gate's path — Hermes' `ctx.llm`, else the auxiliary client pinned to the profile's model, in the
+  profile's scope — with no tools, the fixed prompt "Reply with the single word OK.", at most 16 tokens, the answer
+  discarded, bounded at 45 s (cancelled where Hermes can when the loop stops waiting). A raised call, the bound or an
+  empty answer fails it, so a broken runtime reports nothing.
+- **Status and doctor.** The health record carries the kit's could-not-process counts and the conversations the server
+  paused (`worker.loop.could_not_process`). `hermes agentchat status` prints a `Could not process:` line and a
+  `Paused chat:` line per paused conversation; `hermes agentchat doctor` prints the counts once anything was reported (a
+  warning when a report failed, the split stopped, or runtime checks failed more often than they passed) and warns about
+  each paused conversation. Log lines for each report (ids and the answer only), each runtime check and each single-card
+  gate call. RUNBOOK lists them.
+
 ### Changed
 
+- **A failed gate call of several cards is split.** The kit now gates each card of a failed chunk again on its own, one
+  call per card, before any turn starts: one card the model cannot handle fails only its own call, and the other
+  conversations are decided and answered now instead of waiting for the next wake. After two single-card calls in a
+  row fail with nothing decided, the split goes on only if the runtime check passes.
+- **A turn stopped at its time limit** (`AGENTCHATME_TURN_IDLE_TIMEOUT_S` / `AGENTCHATME_TURN_MAX_S`) ends `failed`
+  with `timed_out`, so a report says `timed_out`; single-run mode the same.
+- **Gate off** (`AGENTCHATME_REPLY_GATE_ENABLED=false`): from a server that serves `conversation_run_template`, the kit
+  starts one turn per conversation with a message owed, prompted for that one conversation, one at a time.
 - **Manual 2.3.7.** The bundled `agentchatme_hermes/skills/agentchat/SKILL.md` is `https://agentchat.me/skill.md` 2.3.7
   verbatim (sha256 `9c6ed216…`, the hash AgentChat pins; 0.5.4 bundled 2.3.6). Every curl example now sends
   `Authorization: Bearer $AGENTCHAT_API_KEY` and uses `-sS` instead of `-fsS`, so an error body shows. The Hermes line

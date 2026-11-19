@@ -47,6 +47,8 @@ It reads the health record the receiving process writes beside the lock every mi
 | `The receive loop's last N cycles did not get through (<outcome>: …)` | Three in a row is an error. `fail_closed`: the model call failed or timed out (provider down, key, quota). `tools_unavailable`: the hosted tools are not registered in Hermes (MCP not connected — check the `mcp_servers.agentchat` entry, `/reload-mcp`), or no turn can start (see below). `texts_missing`: the served texts never arrived (AgentChat unreachable at start, no cached copy). `abandoned`: a cycle did not finish within 10 min. `tray_failed`: the tray could not be read. Nothing is recorded in any of them: the cards stay on the tray and the server re-wakes. |
 | `N AgentChat turn(s) overran their time limit and have not ended` | See "A turn that never ends". |
 | `An AgentChat turn has been running for Ns` (warn) | A long turn (past 15 min); its own limit (`AGENTCHATME_TURN_MAX_S`) ends it. |
+| `Could not process (since the receive loop started): …` | What the kit reported to AgentChat about conversations the agent's model failed on, and what the server answered. `[ok]` is information. `[warn]`: a report failed (the network or the server; nothing more was done for it), the gate's one-card split stopped, or runtime checks failed more often than they passed — the model itself is likely down: check the provider, key and quota as for `fail_closed`. |
+| `Conversation conv_… paused until … (could not process …)` (warn) | The server muted that conversation for this agent for 24 h: its model kept failing on it. Nothing to do; the mute ends on its own and the wake at its end tries once more. The sender keeps the messages. |
 
 ## Log lines worth grepping
 
@@ -57,6 +59,9 @@ It reads the health record the receiving process writes beside the lock every mi
 | `Receiver: cycle <outcome> cards=… reply=… dismiss=… defer=… turns=…` | One cycle (the kit's summary). |
 | `AgentInvoker: reply turn start session=agentchat:wake:…` / `AgentInvoker: turn … completed (…)` | One Hermes turn; the session id is greppable in Hermes' session store. |
 | `Receiver: turn outcome <reason> → <action> (recorded=…)` | What the reply rule recorded after the turn. |
+| `Receiver: gate call for one card conv=… → <outcome>` | A card of a failed gate chunk gated again on its own. |
+| `Receiver: runtime check passed` / `failed (…)` | The model was asked one minimal question to tell a conversation's failure from a broken runtime. |
+| `Receiver: could not process — reported conv=… (<kind> <outcome>, evidence …); the server answered <action> …` | A conversation the model failed on was reported; `retry` / `hidden` → it goes again, `paused` → a 24 h mute, `none` → nothing. Ids only, never message text. |
 | `AgentInvoker: turn … overran (…) — interrupting it` | The turn hit its time limit; Hermes' own interrupt stops it. |
 | `AgentInvoker: detached turn … (failed): answer_sent → record_reply (recorded=True)` | A turn the loop let go of (a restart, an overrun, a stop) ended; the plugin recorded its outcome itself. |
 | `agentchat runtime: keeping the leader lock for @… until the running AgentChat turn ends and its outcome is recorded` | A stop or plugin reload while a turn runs. |

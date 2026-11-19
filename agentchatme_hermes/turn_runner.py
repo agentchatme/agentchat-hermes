@@ -120,13 +120,20 @@ class TurnReport:
         """This report in the kit's terms (the reply rule's input).
 
         A turn that overran and has not ended is ``still_running``: it keeps
-        its conversation. One the interrupt stopped is ``failed``.
+        its conversation. One the interrupt stopped is ``failed`` with
+        ``timed_out``.
         """
         if self.status == "completed":
             return TurnEnd(status="completed", agentchat_calls=self.calls, detail=self.detail)
         if self.status == "timeout" and not self.ended:
             return TurnEnd(status="still_running", detail=self.detail)
-        return TurnEnd(status="failed", agentchat_calls=self.calls, detail=self.detail)
+        return TurnEnd(
+            status="failed",
+            agentchat_calls=self.calls,
+            detail=self.detail,
+            # Stopped at its own time limit: a could-not-process report says ``timed_out``.
+            timed_out=self.status == "timeout",
+        )
 
     def calls_text(self) -> str:
         if self.calls is None:

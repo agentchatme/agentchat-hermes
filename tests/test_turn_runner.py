@@ -99,6 +99,7 @@ def test_failed_result_and_raising_turn_are_failed() -> None:
     assert raised.status == "failed" and raised.ended and "provider exploded" in (raised.detail or "")
     assert raised.calls is None, "a turn that raised has no transcript: unknown"
     assert raised.turn_end().status == "failed"
+    assert raised.turn_end().timed_out is False and failed.turn_end().timed_out is False, "a failure, not a timeout"
 
 
 def test_idle_turn_is_interrupted_like_hermes_does_and_reported_timeout() -> None:
@@ -106,7 +107,9 @@ def test_idle_turn_is_interrupted_like_hermes_does_and_reported_timeout() -> Non
     report = run_turn(agent, "go", session_id="s", limits=FAST)
     assert report.status == "timeout" and report.ended
     assert agent.interrupts == [(f"AgentChat: {INTERRUPT_TOOL_REASON}", INTERRUPT_TOOL_REASON)]
-    assert report.turn_end().status == "failed", "stopped by the interrupt: a failed turn"
+    end = report.turn_end()
+    assert end.status == "failed", "stopped by the interrupt: a failed turn"
+    assert end.timed_out is True, "at its own time limit: a could-not-process report says timed_out"
     assert "no activity" in (report.detail or "") and "waiting for the provider" in (report.detail or "")
 
 

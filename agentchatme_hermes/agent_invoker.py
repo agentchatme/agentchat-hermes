@@ -11,6 +11,12 @@ hosts it. This module is what only Hermes can say, as the loop's callbacks:
   the agent's own model: Hermes' ``ctx.llm`` (else its auxiliary client
   pinned to the profile's model), inside the profile's runtime scope;
   cancelled when the loop stops waiting, where Hermes can (:mod:`.model_call`).
+* :meth:`AgentInvoker.check_runtime` — the kit's runtime check (could not
+  process): does the agent's model answer right now? One minimal completion
+  through the gate's own path (the same ``ctx.llm`` or auxiliary client, the
+  same profile scope, no tools, a fixed prompt with no AgentChat or peer
+  content, a few tokens, 45 s), its answer discarded; never a login or
+  version check.
 * :meth:`AgentInvoker.readiness` — are the hosted ``mcp__agentchat__*``
   tools registered in Hermes; a turn without them cannot look. Holds up to
   30 s (:mod:`.hosted_tools`).
@@ -82,7 +88,17 @@ from .config import (
     DEFAULT_TURN_MAX_S,
 )
 from .hosted_tools import wait_for_hosted_tools
-from .model_call import GateCallCancelled, GateLoop, build_call_model
+from .model_call import (
+    DEFAULT_MAX_TOKENS,
+    GATE_CALL_PURPOSE,
+    RUNTIME_CHECK_MAX_TOKENS,
+    RUNTIME_CHECK_PROMPT,
+    RUNTIME_CHECK_PURPOSE,
+    RUNTIME_CHECK_TIMEOUT_S,
+    GateCallCancelled,
+    GateLoop,
+    build_call_model,
+)
 from .profile_scope import (
     ProfileScopeError,
     profile_context,
@@ -305,13 +321,74 @@ class AgentInvoker:
         (:mod:`.model_call`)."""
         if self._stopped.is_set():
             raise GateCallCancelled("stopping")
+        return self._complete(prompt, cancel=cancel, timeout_s=self._gate_timeout_s)
+
+    async def check_runtime(self) -> Readiness:
+        """The kit's runtime check (could not process): does the agent's
+        model answer right now?
+
+        Asked before a failed gate call or turn is reported as that
+        conversation's when no other conversation's work completed since
+        (``runtime_check`` evidence), and to decide whether the gate's
+        one-card split goes on. A pass during a provider outage would blame
+        the conversation for the outage, so this is a real call to the model,
+        through the gate's own path (:meth:`_complete`: the same ``ctx.llm``
+        or auxiliary client, the profile's scope), with
+        :data:`~.model_call.RUNTIME_CHECK_PROMPT` (no AgentChat or peer
+        content), a few tokens and a 45 s bound. The answer is discarded; any
+        non-empty one passes. A raised call, the bound or an empty answer is
+        ``ready=False`` with a reason that never carries model output. Runs
+        on a worker thread; when the loop stops waiting (its own bound, or
+        :meth:`~agentchatme.integration.ReceiveLoop.stop`) the request is
+        cancelled where Hermes can (as the gate's)."""
+        cancel = threading.Event()
+        try:
+            return await asyncio.to_thread(self._runtime_check, cancel)
+        finally:
+            cancel.set()
+
+    def _runtime_check(self, cancel: threading.Event) -> Readiness:
+        if self._stopped.is_set():
+            return Readiness(ready=False, reason="stopping")
+        try:
+            answer = self._complete(
+                RUNTIME_CHECK_PROMPT,
+                cancel=cancel,
+                timeout_s=RUNTIME_CHECK_TIMEOUT_S,
+                max_tokens=RUNTIME_CHECK_MAX_TOKENS,
+                purpose=RUNTIME_CHECK_PURPOSE,
+            )
+        except Exception as exc:
+            reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+            logger.info("AgentInvoker: runtime check failed — %s", reason)
+            return Readiness(ready=False, reason=reason)
+        if not answer.strip():
+            logger.info("AgentInvoker: runtime check failed — the model answered with no text")
+            return Readiness(ready=False, reason="the model answered with no text")
+        return Readiness(ready=True)
+
+    def _complete(
+        self,
+        prompt: str,
+        *,
+        cancel: threading.Event | None,
+        timeout_s: float,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        purpose: str = GATE_CALL_PURPOSE,
+    ) -> str:
+        """One tool-less completion on the agent's own model, in the
+        profile's scope: Hermes' ``ctx.llm``, else its auxiliary client
+        pinned to the profile's model (:func:`~.model_call.build_call_model`).
+        The gate call and the runtime check both go through here."""
         with self._scope():
             host_llm = self._host_llm_facade()
             model_call = build_call_model(
                 main_runtime=self._gate_runtime() if host_llm is None else {},
-                timeout_s=self._gate_timeout_s,
+                timeout_s=timeout_s,
+                max_tokens=max_tokens,
                 host_llm=host_llm,
                 gate_loop=self._gate_loop,
+                purpose=purpose,
             )
             return model_call(prompt, cancel=cancel)
 
@@ -377,9 +454,12 @@ class AgentInvoker:
         return TurnAdmission(started=True, done=turn.done)
 
     def start_run(self, request: RunRequest) -> RunEnd:
-        """Single-run mode (the gate off): one turn that reads the tray and
-        records its own verdicts. Runs in a worker thread until the turn
-        ends or overruns; never a second while the first's thread lives."""
+        """Single-run mode (the gate off): one turn that records its own
+        verdicts — for one conversation (a conversation run, from texts with
+        ``conversation_run_template``), for the pending invites, or, from an
+        older server, for the whole tray. Runs in a worker thread until the
+        turn ends or overruns; never a second while the first's thread
+        lives."""
         previous = self._run_finished
         if previous is not None and not previous.is_set():
             return RunEnd(status="not_started", detail="the previous run is still running")
@@ -398,7 +478,8 @@ class AgentInvoker:
         self.runs += 1
         if report.status == "completed":
             return RunEnd(status="completed")
-        return RunEnd(status="failed", detail=report.detail)
+        # At the turn's own time limit: a could-not-process report says ``timed_out``.
+        return RunEnd(status="failed", detail=report.detail, timed_out=report.status == "timeout")
 
     # -- turns --------------------------------------------------------------------
 
@@ -468,10 +549,13 @@ class AgentInvoker:
                     detail=f"overran ({report.detail}); its thread is still running",
                 )
             elif report.status == "timeout":
-                # Overran, and its thread has ended since: a failed turn. (Not
-                # ``report.turn_end()``: the thread's end callback runs a moment
-                # before the report's ``finished`` is set.)
-                end = TurnEnd(status="failed", agentchat_calls=report.calls, detail=report.detail)
+                # Overran, and its thread has ended since: a failed turn, at the
+                # runtime's own time limit (a could-not-process report says
+                # ``timed_out``). (Not ``report.turn_end()``: the thread's end
+                # callback runs a moment before the report's ``finished`` is set.)
+                end = TurnEnd(
+                    status="failed", agentchat_calls=report.calls, detail=report.detail, timed_out=True
+                )
             else:
                 end = report.turn_end()
             finished = turn.thread_done and not turn.detached

@@ -131,6 +131,68 @@ class TestEvents:
         assert receiver._last_error == "tray 503"
 
 
+class TestCouldNotProcess:
+    """The kit's could-not-process counts and the server's pauses, in the
+    health record (``worker.loop.could_not_process``) that status and doctor
+    read; the report logged with ids and the answer only."""
+
+    @staticmethod
+    def _report(conversation_id: str, action: str, paused_until: str | None = None, error: str | None = None) -> dict[str, Any]:
+        return {
+            "type": "processing_failure", "kind": "turn", "conversation_id": conversation_id,
+            "through_message_id": "msg_9", "outcome": "failed", "evidence": "other_run_completed",
+            "action": action, "attempts": 2, "hidden_message_ids": [], "paused_until": paused_until, "error": error,
+        }
+
+    def test_a_paused_answer_is_kept_until_it_ends_and_another_answer_drops_it(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+        receiver = _receiver(tmp_path)
+        future = "2099-01-01T00:00:00.000Z"
+        with caplog.at_level(logging.INFO, logger="agentchatme_hermes.receiver"):
+            receiver._on_event(self._report("conv_bad", "paused", future))
+            receiver._on_event(self._report("conv_old", "paused", "2020-01-01T00:00:00.000Z"))
+            receiver._on_event(self._report("conv_x", "paused", future, error="503 upstream"))
+        paused = receiver.worker_status()["loop"]["could_not_process"]["paused"]
+        assert paused == [{"conversation_id": "conv_bad", "until": future}], "an ended pause and a failed report are not shown"
+        text = " ".join(r.getMessage() for r in caplog.records)
+        assert "could not process — reported conv=conv_bad" in text and f"until {future}" in text
+        assert "the report for conv=conv_x" in text and "503 upstream" in text
+        receiver._on_event(self._report("conv_bad", "retry"))
+        assert receiver.worker_status()["loop"]["could_not_process"]["paused"] == [], "it went again: no longer paused"
+
+    def test_the_kits_counts_go_to_the_health_record_and_survive_a_restart(self, tmp_path: Path) -> None:
+        receiver = _receiver(tmp_path)
+        counters = {
+            "processing_failures": 3, "failures_reported": 2, "failure_report_errors": 1, "failures_waiting": 1,
+            "reruns": 1, "runtime_checks_ok": 1, "runtime_checks_failed": 0, "gate_splits": 1,
+            "split_calls_ok": 1, "split_calls_failed": 1, "splits_stopped": 0,
+            "failure_actions": {"retry": 1, "hidden": 1}, "turns_active": 0,
+        }
+        receiver._receive_loop = SimpleNamespace(  # type: ignore[assignment]
+            status=lambda: SimpleNamespace(last_cycle=None, recent_cycles=[], counters=counters, coalescer={"state": "idle"}, socket=None)
+        )
+        section = receiver.worker_status()["loop"]["could_not_process"]
+        assert section["failures_reported"] == 2 and section["failure_actions"] == {"retry": 1, "hidden": 1}
+        assert section["split_calls_failed"] == 1 and section["paused"] == []
+        assert "turns_active" not in section
+        receiver._receive_loop = None
+        assert receiver.worker_status()["loop"]["could_not_process"]["failures_reported"] == 2, "kept across a restart"
+
+    def test_the_runtime_check_reaches_the_loop(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import agentchatme
+
+        monkeypatch.setattr(agentchatme, "AsyncAgentChatClient", _AsyncApi)
+        passed = _deadlines(monkeypatch)
+        inv = AgentInvoker(config=SimpleNamespace(), identity=AgentIdentity(handle="me"), runtime=SimpleNamespace())
+        receiver = _receiver(tmp_path, inv)
+        _offline(receiver, monkeypatch)
+        receiver.start()
+        try:
+            assert _until(lambda: receiver._receive_loop is not None)
+        finally:
+            receiver.stop()
+        assert passed["check_runtime"] == inv.check_runtime
+
+
 class TestSupervision:
     def test_a_crashed_loop_is_rebuilt_and_the_health_record_says_so(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         board = HealthBoard(handle="me", path=tmp_path / "ws.health.json")
