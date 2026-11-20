@@ -297,6 +297,7 @@ def _invoker(monkeypatch: pytest.MonkeyPatch, agent: Any = None, *, config: Any 
     inv._limits = FAST
     monkeypatch.setattr(inv, "_ensure_hermes_resolved", lambda: None)
     monkeypatch.setattr(inv, "_resolve_model_and_runtime", lambda: ("m", {"provider": "p"}))
+    monkeypatch.setattr(inv, "_turn_runtime_problem", lambda: None)
     if agent is not None:
         monkeypatch.setattr(inv, "_build_agent", lambda _sid: agent)
     # Hermes has the hosted tools registered unless a test says otherwise.
@@ -450,6 +451,112 @@ class TestCallModel:
         assert sum("ctx.llm" in r.getMessage() for r in caplog.records) == 1
 
 
+# ─── check_runtime (could not process) ─────────────────────────────────────
+
+_TOOL_KWARGS = {"tools", "tool_choice", "functions", "function_call", "tool_schemas", "parallel_tool_calls"}
+
+
+class TestCheckRuntime:
+    """The kit's runtime check: one minimal completion through the gate's
+    own path, never a login or version check; its answer is discarded."""
+
+    async def test_one_minimal_call_on_ctx_llm_like_the_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[dict[str, Any]] = []
+
+        class _PluginLlm:
+            def complete(self, messages: list[dict[str, Any]], **kwargs: Any) -> Any:
+                calls.append({"messages": messages, **kwargs})
+                return SimpleNamespace(text="OK")
+
+        inv = _invoker(monkeypatch, host_llm=_PluginLlm)
+        ready = await inv.check_runtime()
+        assert ready.ready is True
+        assert len(calls) == 1
+        call = calls[0]
+        assert call["messages"] == [{"role": "user", "content": "Reply with the single word OK."}]
+        assert call["max_tokens"] == 2048, "the gate's cap: a model that reasons first needs room"
+        assert call["timeout"] == 45.0 and call["temperature"] == 0.0
+        assert call["purpose"] == "agentchat runtime check"
+        assert not (_TOOL_KWARGS & set(call)), "no tools"
+        assert not ({"provider", "model", "agent_id", "profile"} & set(call)), "the profile's own model, as the gate"
+
+    async def test_the_fallback_is_the_gates_auxiliary_client_on_the_profiles_model(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: list[dict[str, Any]] = []
+        prompts: list[str] = []
+
+        def fake_build_call_model(**kw: Any) -> Any:
+            seen.append(kw)
+
+            def call(prompt: str, **_: Any) -> str:
+                prompts.append(prompt)
+                return "Sure, OK."
+
+            return call
+
+        inv = _invoker(monkeypatch)
+        monkeypatch.setattr(invoker_module, "build_call_model", fake_build_call_model)
+        assert (await inv.check_runtime()).ready is True, "any answer passes; it is discarded"
+        assert seen[0]["host_llm"] is None and seen[0]["main_runtime"] == {"model": "m", "provider": "p"}
+        assert seen[0]["timeout_s"] == 45.0 and seen[0]["max_tokens"] == 2048
+        assert seen[0]["purpose"] == "agentchat runtime check"
+        assert seen[0]["gate_loop"] is inv._gate_loop, "the gate's own loop"
+        assert prompts == ["Reply with the single word OK."]
+
+    @pytest.mark.parametrize(
+        ("answer", "reason"),
+        [("   ", "the model answered with no text"), (RuntimeError("401 credentials rejected"), "RuntimeError: 401 credentials rejected")],
+    )
+    async def test_an_empty_answer_or_a_raised_call_fails_it(self, monkeypatch: pytest.MonkeyPatch, answer: Any, reason: str) -> None:
+        def call(prompt: str, **_: Any) -> str:
+            if isinstance(answer, Exception):
+                raise answer
+            return str(answer)
+
+        inv = _invoker(monkeypatch)
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: call)
+        ready = await inv.check_runtime()
+        assert ready.ready is False and ready.reason == reason
+
+    async def test_a_turn_model_that_cannot_be_resolved_fails_it_without_a_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Turns run on the model resolved from the profile's config; when
+        that falls back (no credentials), every turn fails while ctx.llm may
+        still answer, so the check must not pass."""
+
+        def never(**_kw: Any) -> Any:
+            raise AssertionError("no model call when the turns' own model cannot be resolved")
+
+        inv = AgentInvoker(config=SimpleNamespace(), identity=AgentIdentity(handle="me"), runtime=SimpleNamespace(hermes_home=None))
+        monkeypatch.setattr(invoker_module, "build_call_model", never)
+        ready = await inv.check_runtime()  # outside Hermes: its config helpers do not import
+        assert ready.ready is False and ready.reason == "Hermes' config helpers are unavailable: a turn has no model of its own"
+        monkeypatch.setattr(inv, "_resolve_turn_runtime", lambda: ("claude-sonnet-4-6", {}, "the profile's model or provider could not be resolved for a turn"))
+        assert (await inv.check_runtime()).reason == "the profile's model or provider could not be resolved for a turn"
+
+    async def test_a_stopped_invoker_makes_no_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def never(**_kw: Any) -> Any:
+            raise AssertionError("no call once stopping")
+
+        inv = _invoker(monkeypatch)
+        monkeypatch.setattr(invoker_module, "build_call_model", never)
+        inv.stop()
+        ready = await inv.check_runtime()
+        assert ready.ready is False and ready.reason == "stopping"
+
+    async def test_when_the_loop_stops_waiting_the_call_is_told_to_stop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        told: list[bool] = []
+
+        def wedged(prompt: str, *, cancel: threading.Event | None = None) -> str:
+            assert cancel is not None, "the check hands the call a cancel handle, like the gate's"
+            told.append(cancel.wait(5.0))
+            return "OK"
+
+        inv = _invoker(monkeypatch)
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: wedged)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(inv.check_runtime(), 0.1)
+        assert await _until(lambda: told == [True])
+
+
 # ─── readiness ─────────────────────────────────────────────────────────────
 
 
@@ -499,12 +606,14 @@ class TestStartTurn:
         inv = _invoker(monkeypatch, _Agent(raises=RuntimeError("provider exploded")))
         end = await _run(inv, _reply_request())
         assert end.status == "failed" and "provider exploded" in (end.detail or "")
+        assert end.timed_out is False
 
     async def test_an_agent_that_cannot_be_built_is_a_turn_not_started(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv = _invoker(monkeypatch)
         monkeypatch.setattr(inv, "_build_agent", lambda _sid: None)
         end = await _run(inv, _reply_request())
         assert end.status == "failed" and (end.detail or "").startswith("not started")
+        assert end.agentchat_calls is not None and end.agentchat_calls.made == 0, "it never looked"
         assert inv.tracker.size == 0
 
     async def test_a_scope_that_cannot_be_entered_runs_nothing(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -522,6 +631,7 @@ class TestStartTurn:
         inv._limits = turn_runner_module.TurnLimits(idle_s=0.05, max_s=5.0, grace_s=2.0, poll_s=0.01)
         end = await _run(inv, _reply_request())
         assert end.status == "failed" and agent.interrupts == [turn_runner_module.INTERRUPT_TOOL_REASON]
+        assert end.timed_out is True, "at its own time limit: a could-not-process report says timed_out"
         assert inv.tracker.size == 0 and inv.hung_turns == 0
 
     async def test_a_stuck_turn_frees_the_slot_and_keeps_its_conversation(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -618,6 +728,17 @@ class TestStartRun:
         end = _invoker(monkeypatch, agent).start_run(self._request())
         assert end.status == "completed" and agent.prompts[0].endswith(MANUAL_POINTER)
 
+    def test_a_failed_run_is_not_a_timeout(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        end = _invoker(monkeypatch, _Agent(raises=RuntimeError("provider refused"))).start_run(self._request())
+        assert end.status == "failed" and end.timed_out is False
+
+    def test_a_conversation_run_is_started_with_the_kits_prompt(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        agent = _Agent()
+        prompt = "AgentChat started this run for ONE conversation: conv_a."
+        request = RunRequest(prompt=prompt, texts=TEXTS, cards=1, invites=0, stopping=asyncio.Event(), conversation_id="conv_a")
+        assert _invoker(monkeypatch, agent).start_run(request).status == "completed"
+        assert agent.prompts[0].startswith(prompt) and agent.prompts[0].endswith(MANUAL_POINTER)
+
     def test_a_run_not_started(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv = _invoker(monkeypatch)
         monkeypatch.setattr(inv, "_build_agent", lambda _sid: None)
@@ -628,6 +749,7 @@ class TestStartRun:
         inv = _invoker(monkeypatch, agent)
         first = inv.start_run(self._request())
         assert first.status == "failed", "overran"
+        assert first.timed_out is True, "at its own time limit: a could-not-process report says timed_out"
         second = inv.start_run(self._request())
         assert second.status == "not_started" and "still running" in (second.detail or "")
         agent.release.set()
@@ -880,6 +1002,182 @@ class TestThroughTheReceiveLoop:
         stuck.release.set()
         assert await _until(lambda: not inv.tracker.conversation_running("conv_a"))
         await loop.stop()
+
+
+class _ReportingServer(_Server):
+    """The server with the could-not-process route: records each report and
+    answers from ``answers`` in order (``none`` once they run out). A card in
+    ``hidden`` reads as the server serves a hidden preview: the note as its
+    text, ``could_not_process: true``."""
+
+    def __init__(self, answers: list[dict[str, Any]] | None = None) -> None:
+        super().__init__()
+        self.reports: list[dict[str, Any]] = []
+        self.answers = list(answers or [])
+        self.hidden: dict[str, str] = {}
+        self.conversations = SimpleNamespace(report_processing_failure=self._report)
+
+    async def _tray(self, **kw: Any) -> dict[str, Any]:
+        tray = await super()._tray(**kw)
+        for card in tray["conversations"]:
+            note = self.hidden.get(card["conversation_id"])
+            if note is not None:
+                card["preview"] = {**card["preview"], "text": note, "could_not_process": True}
+        return tray
+
+    async def _report(self, conversation_id: str, **kwargs: Any) -> dict[str, Any]:
+        self.reports.append({"conversation_id": conversation_id, **kwargs})
+        if self.answers:
+            return self.answers.pop(0)
+        return {"action": "none", "attempts": len(self.reports), "hidden_message_ids": [], "paused_until": None}
+
+
+def _poison_gate(server: _Server, prompts: list[str], *, poison: str = "conv_bad") -> Any:
+    """The gate's model: it cannot process any prompt that holds ``poison``'s
+    card (a provider refusal); otherwise it answers like ``_gate_answer``. The
+    runtime check's fixed prompt is answered too: the model works."""
+    answer = _gate_answer(server)
+
+    def call_model(prompt: str, **kw: Any) -> str:
+        prompts.append(prompt)
+        if prompt == "Reply with the single word OK.":
+            return "OK"
+        if f'"conversation_id":"{poison}"' in prompt.replace(" ", ""):
+            raise RuntimeError("API Error: the provider refused this request")
+        return str(answer(prompt, **kw))
+
+    return call_model
+
+
+class TestCouldNotProcessThroughTheLoop:
+    """The kit splits a failed gate chunk and reports a card that fails on
+    its own; this runtime supplies the runtime check through the gate's path."""
+
+    async def test_a_failed_chunk_is_split_and_the_card_that_fails_alone_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        server = _ReportingServer(answers=[{"action": "retry", "attempts": 1, "hidden_message_ids": [], "paused_until": None}])
+        server.unread = {"conv_bad": "msg_bad", "conv_ok": "msg_ok"}
+        agent = _Agent()
+        agent.on_run = lambda: server.answered.__setitem__("conv_ok", "msg_ok")
+        inv = _invoker(monkeypatch, agent)
+        prompts: list[str] = []
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: _poison_gate(server, prompts))
+        events: list[dict[str, Any]] = []
+        loop = _loop(inv, server, on_event=events.append, check_runtime=inv.check_runtime)
+        await loop.start()
+        loop.wake()
+        # The innocent peer is answered in the same cycle.
+        assert await _until(lambda: ("conv_ok", "reply", "msg_ok") in server.recorded)
+        assert await _until(lambda: bool(server.reports))
+        await loop.stop()
+        both = [p for p in prompts if "conv_bad" in p and "conv_ok" in p]
+        assert len(both) == 1, "one chunk call for both cards, then one call per card"
+        assert any("conv_ok" in p and "conv_bad" not in p for p in prompts)
+        assert server.reports[0] == {
+            "conversation_id": "conv_bad",
+            "through_message_id": "msg_bad",
+            "outcome": "failed",
+            "evidence": "other_run_completed",
+        }
+        assert not any("conv_bad" in p for p in agent.prompts), "no turn for the card the model cannot process"
+        assert any(e["type"] == "gate_card" and e["conversation_id"] == "conv_ok" and e["outcome"] == "decided" for e in events)
+
+    async def test_alone_on_the_tray_it_is_reported_once_the_runtime_check_passes_and_the_pause_is_told(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        until = "2026-11-21T10:00:00.000Z"
+        server = _ReportingServer(answers=[
+            {"action": "retry", "attempts": 1, "hidden_message_ids": [], "paused_until": None},
+            {"action": "paused", "attempts": 2, "hidden_message_ids": [], "paused_until": until},
+        ])
+        server.unread = {"conv_bad": "msg_bad"}
+        inv = _invoker(monkeypatch, _Agent())
+        prompts: list[str] = []
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: _poison_gate(server, prompts))
+        events: list[dict[str, Any]] = []
+        loop = _loop(inv, server, on_event=events.append, check_runtime=inv.check_runtime)
+        await loop.start()
+        loop.wake()
+        assert await _until(lambda: len(server.reports) >= 2, timeout=10.0)
+        await loop.idle()
+        await loop.stop()
+        assert "Reply with the single word OK." in prompts, "the check went through the gate's own call"
+        assert server.reports[0]["evidence"] == "runtime_check" and server.reports[0]["through_message_id"] == "msg_bad"
+        reports = [e for e in events if e["type"] == "processing_failure"]
+        assert [e["action"] for e in reports][:2] == ["retry", "paused"]
+        assert reports[1]["paused_until"] == until and reports[1]["conversation_id"] == "conv_bad"
+        assert any(e["type"] == "runtime_check" and e["ok"] is True for e in events)
+
+    async def test_a_turn_that_never_started_is_never_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The Hermes agent cannot be built (a runtime-wide breakage): the
+        turn fails without looking, so even with the runtime check passing
+        nothing is reported for the conversation."""
+        server = _ReportingServer(answers=[{"action": "retry", "attempts": 1, "hidden_message_ids": [], "paused_until": None}])
+        server.unread = {"conv_a": "msg_a"}
+        inv = _invoker(monkeypatch)
+        monkeypatch.setattr(inv, "_build_agent", lambda _sid: None)
+        prompts: list[str] = []
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: _poison_gate(server, prompts, poison="none"))
+        events: list[dict[str, Any]] = []
+        loop = _loop(inv, server, on_event=events.append, check_runtime=inv.check_runtime)
+        await loop.start()
+        loop.wake()
+        assert await _until(lambda: any(e["type"] == "turn_outcome" for e in events))
+        await loop.idle()
+        await loop.stop()
+        assert server.reports == []
+
+    async def test_a_provider_timeout_on_the_gate_is_a_timeout_never_reported_on_the_check_alone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The gate's own request timeout comes before the kit's deadline;
+        raised as TimeoutError the kit counts it timed out, which needs
+        another conversation's completion, not the runtime check."""
+
+        class APITimeoutError(Exception):
+            """As openai / anthropic clients name it (not a TimeoutError)."""
+
+        server = _ReportingServer()
+        server.unread = {"conv_slow": "msg_slow"}
+        inv = _invoker(monkeypatch, _Agent())
+
+        def slow_model(prompt: str, **_: Any) -> str:
+            if prompt == "Reply with the single word OK.":
+                return "OK"
+            raise APITimeoutError("Request timed out.")
+
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: slow_model)
+        with pytest.raises(TimeoutError):
+            inv.call_model("the gate prompt")
+        events: list[dict[str, Any]] = []
+        loop = _loop(inv, server, on_event=events.append, check_runtime=inv.check_runtime)
+        await loop.start()
+        loop.wake()
+        assert await _until(lambda: any(e["type"] == "cycle" for e in events))
+        await loop.idle()
+        await loop.stop()
+        assert server.reports == []
+        assert not any(e["type"] == "runtime_check" for e in events), "a timeout never asks the check"
+
+    async def test_a_hidden_preview_reaches_the_gate_as_the_served_note(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import json
+
+        note = "[Hidden from you: this message from @peer could not be processed on your side, so it is not shown. You can ask @peer to rephrase or resend it.]"
+        server = _ReportingServer()
+        server.unread = {"conv_a": "msg_a"}
+        server.hidden = {"conv_a": note}
+        agent = _Agent()
+        agent.on_run = lambda: server.answered.__setitem__("conv_a", "msg_a")
+        inv = _invoker(monkeypatch, agent)
+        prompts: list[str] = []
+        monkeypatch.setattr(invoker_module, "build_call_model", lambda **kw: _poison_gate(server, prompts, poison="none"))
+        loop = _loop(inv, server)
+        await loop.start()
+        loop.wake()
+        assert await _until(lambda: server.recorded == [("conv_a", "reply", "msg_a")])
+        await loop.stop()
+        gate = prompts[0]
+        assert json.dumps(note) in gate, "the note as served, untouched"
+        assert '"could_not_process":true' in gate.replace(" ", "")
+        assert TEXTS.gate_call_preamble and gate.startswith(TEXTS.gate_call_preamble)
+        assert TEXTS.gate_call_answer_format and gate.endswith(TEXTS.gate_call_answer_format)
+        assert "Card 1 of 1" in gate
+        assert "conversation_id: conv_a" in agent.prompts[0], "the turn is for that one conversation"
 
 
 class _SyncServer:

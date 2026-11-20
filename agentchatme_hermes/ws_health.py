@@ -240,6 +240,28 @@ def health_age_seconds(health: WSHealth, *, now: float | None = None) -> float:
     return max(0.0, timestamp - float(health["updated_at"]))
 
 
+def pause_end(value: Any) -> float | None:
+    """A paused conversation's ``until`` (``worker.loop.could_not_process.
+    paused[].until``: the server's ``paused_until``, ISO 8601) as epoch
+    seconds; ``None`` when unreadable."""
+    if not isinstance(value, str) or not value:
+        return None
+    import re
+    from datetime import datetime
+
+    text = value.strip().replace("Z", "+00:00")
+    # Python 3.9 / 3.10 read only 3 or 6 fraction digits; Postgres drops
+    # trailing zeros (``.12345+00:00``): pad or cut to 6.
+    text = re.sub(r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), text, count=1)
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        return None
+    return moment.timestamp()
+
+
 def bad_cycle_run(recent: Any) -> tuple[int, dict[str, Any] | None]:
     """How many of the newest cycles in ``recent`` (the health record's
     ``worker.loop.recent_cycles``, oldest first) were bad in a row, and the

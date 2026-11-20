@@ -460,7 +460,7 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
     finally:
         client.close()
 
-    _print_status(me, resolution)
+    _print_status(me, resolution, worker=_health_worker(api_base, saved_key))
     return _EXIT_OK
 
 
@@ -920,6 +920,8 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                 worker_report = _describe_worker(health.get("worker"), now=time.time())
                 if worker_report is not None:
                     level, text = worker_report
+                    {"ok": ok, "warn": warn, "fail": fail}[level](text)
+                for level, text in _describe_could_not_process(health.get("worker"), now=time.time()):
                     {"ok": ok, "warn": warn, "fail": fail}[level](text)
         elif state == "free":
             warn(
@@ -1614,7 +1616,142 @@ def _print_recovery_success(*, handle: str, api_key: str) -> None:
     _printline(_RESTART_HINT)
 
 
-def _print_status(me: dict[str, Any], resolution: KeyResolution | None = None) -> None:
+def _could_not_process_section(worker: Any) -> dict[str, Any] | None:
+    """The health record's ``worker.loop.could_not_process`` (the kit's
+    counts and the paused conversations), or ``None`` when the record has
+    none (written by a release before could not process)."""
+    if not isinstance(worker, dict):
+        return None
+    loop = worker.get("loop")
+    section = loop.get("could_not_process") if isinstance(loop, dict) else None
+    return section if isinstance(section, dict) else None
+
+
+def _count(section: dict[str, Any], name: str) -> int:
+    value = section.get(name)
+    return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _could_not_process_summary(section: dict[str, Any]) -> str:
+    """One line of the kit's could-not-process counts since the receive loop
+    started: ``2 reported (retry 1, hidden 1), 1 re-run, runtime checks 1 ok``;
+    ``nothing reported`` when every count is zero."""
+    parts: list[str] = []
+    actions_raw = section.get("failure_actions")
+    actions = actions_raw if isinstance(actions_raw, dict) else {}
+    answered = ", ".join(
+        f"{name} {actions[name]}"
+        for name in ("retry", "hidden", "paused", "none")
+        if isinstance(actions.get(name), int) and actions[name] > 0
+    )
+    reported = _count(section, "failures_reported")
+    if reported:
+        parts.append(f"{reported} reported" + (f" ({answered})" if answered else ""))
+    errors = _count(section, "failure_report_errors")
+    if errors:
+        parts.append(f"{errors} report error{'s' if errors != 1 else ''}")
+    reruns = _count(section, "reruns")
+    if reruns:
+        parts.append(f"{reruns} re-run{'s' if reruns != 1 else ''}")
+    waiting = _count(section, "failures_waiting")
+    if waiting:
+        parts.append(f"{waiting} waiting for evidence")
+    checks_ok, checks_failed = _count(section, "runtime_checks_ok"), _count(section, "runtime_checks_failed")
+    if checks_ok or checks_failed:
+        parts.append(
+            "runtime checks " + ", ".join(
+                text for n, text in ((checks_ok, f"{checks_ok} ok"), (checks_failed, f"{checks_failed} failed")) if n
+            )
+        )
+    stopped = _count(section, "splits_stopped")
+    if stopped:
+        parts.append(f"gate split stopped {stopped} time{'s' if stopped != 1 else ''}")
+    return ", ".join(parts) if parts else "nothing reported"
+
+
+def _paused_lines(section: dict[str, Any], *, now: float) -> list[str]:
+    """One line per conversation the server paused for this agent whose
+    pause has not ended."""
+    from .ws_health import pause_end
+
+    paused = section.get("paused")
+    lines: list[str] = []
+    for entry in paused if isinstance(paused, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        conversation_id, until = entry.get("conversation_id"), entry.get("until")
+        if not isinstance(conversation_id, str) or not isinstance(until, str):
+            continue
+        end = pause_end(until)
+        if end is not None and end <= now:
+            continue
+        lines.append(f"{conversation_id} paused until {until} (could not process; the mute ends on its own)")
+    return lines
+
+
+# A failed report or a stopped split this recent makes doctor's counts line a
+# warning; older ones are history (the counts still show them).
+_RECENT_TROUBLE_S = 3600.0
+
+
+def _describe_could_not_process(worker: Any, *, now: float) -> list[tuple[str, str]]:
+    """``(ok|warn, line)`` pairs for doctor: the kit's counts once anything
+    was reported or checked (a warning when, within the last hour, a report
+    failed or the gate's split stopped, or when the last runtime check
+    failed), and a warning per paused conversation. Nothing when the record
+    has no such section."""
+    section = _could_not_process_section(worker)
+    if section is None:
+        return []
+    out: list[tuple[str, str]] = []
+    summary = _could_not_process_summary(section)
+    last_check = section.get("last_runtime_check")
+    check_failed = isinstance(last_check, dict) and last_check.get("ok") is False
+    if check_failed and isinstance(last_check, dict):
+        detail = last_check.get("detail")
+        summary += f"; the last runtime check failed{f' ({detail})' if detail else ''}"
+
+    def recent(name: str) -> bool:
+        at = section.get(name)
+        return isinstance(at, (int, float)) and not isinstance(at, bool) and now - float(at) <= _RECENT_TROUBLE_S
+
+    if summary != "nothing reported":
+        attention = check_failed or recent("last_report_error_at") or recent("last_split_stopped_at")
+        out.append(("warn" if attention else "ok", f"Could not process (since the receive loop started): {summary}"))
+    for line in _paused_lines(section, now=now):
+        out.append(("warn", f"Conversation {line}"))
+    return out
+
+
+def _health_worker(api_base: str, api_key: str) -> Any:
+    """The health record's ``worker`` section for this profile's account
+    (what the running gateway last wrote), or ``None``. Never raises:
+    status prints what it can."""
+    try:
+        from .leader_lock import lock_path_for
+        from .profile_scope import account_fingerprint, resolve_hermes_home, resolve_setting
+        from .ws_health import (
+            HEALTH_STALE_AFTER_SECONDS,
+            health_age_seconds,
+            health_path_for,
+            read_ws_health,
+        )
+
+        lock_dir_raw = (resolve_setting("AGENTCHATME_LOCK_DIR") or "").strip()
+        lock_path = lock_path_for(
+            hermes_home=resolve_hermes_home(),
+            account_fingerprint=account_fingerprint(api_base, api_key),
+            lock_dir=Path(lock_dir_raw).expanduser() if lock_dir_raw else None,
+        )
+        health = read_ws_health(health_path_for(lock_path))
+        if health is None or health_age_seconds(health) > HEALTH_STALE_AFTER_SECONDS:
+            return None
+        return health.get("worker")
+    except Exception:
+        return None
+
+
+def _print_status(me: dict[str, Any], resolution: KeyResolution | None = None, *, worker: Any = None) -> None:
     handle = me.get("handle", "unknown")
     status = me.get("status", "unknown")
     settings = me.get("settings") or {}
@@ -1635,6 +1772,13 @@ def _print_status(me: dict[str, Any], resolution: KeyResolution | None = None) -
         _printline(f"  Key:           {_key_location_line(resolution)}")
         for note in (*resolution.notes, *(shared_note(h) for h in resolution.shared_with)):
             _printline(f"  Note:          {note}")
+    # Could not process, from the running gateway's health record (absent
+    # when no gateway receives for this account, or from an older release).
+    section = _could_not_process_section(worker)
+    if section is not None:
+        _printline(f"  Could not process: {_could_not_process_summary(section)}")
+        for line in _paused_lines(section, now=time.time()):
+            _printline(f"  Paused chat:   {line}")
     _printline("")
 
 

@@ -692,6 +692,25 @@ class TestWithoutTheKit:
         assert ctx.register_cli_command.called, "`hermes agentchat doctor` stays reachable"
         assert ctx.register_skill.called
 
+    def test_a_kit_without_could_not_process_is_a_problem(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An agentchatme older than 1.5.0 has the kit but its ReceiveLoop
+        takes no check_runtime: the receiver could not start, so it is
+        reported like a missing kit."""
+        import agentchatme.integration as integration
+
+        from agentchatme_hermes.kit import KIT_REQUIREMENT, kit_problem
+
+        assert kit_problem() is None, "the installed kit has could not process"
+
+        class OldReceiveLoop:
+            def __init__(self, client: object, texts: object, mode: str, *, call_model: object = None) -> None:
+                pass
+
+        monkeypatch.setattr(integration, "ReceiveLoop", OldReceiveLoop)
+        problem = kit_problem()
+        assert problem is not None and "without could not process" in problem and KIT_REQUIREMENT in problem
+        assert KIT_REQUIREMENT == "agentchatme>=1.5.0"
+
     def test_the_plugin_and_its_cli_import_without_the_kit(self) -> None:
         import os
         import subprocess

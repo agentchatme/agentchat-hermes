@@ -13,7 +13,18 @@ account (the leader-lock holder). On it:
   (single-run mode when the gate is switched off): wakes, one cycle per
   burst, the tray with its invites, the gate call, one turn at a time, the
   D5 rule after each turn, D5 pacing, no retry ladder (the server re-wakes).
-  The Hermes side — the model call, the turn — is :mod:`.agent_invoker`.
+  The Hermes side — the model call, the turn, the runtime check — is
+  :mod:`.agent_invoker`.
+
+Could not process: a failed gate chunk is gated again one card per call,
+and a conversation whose own gate call or turn failed is reported to
+AgentChat (only with evidence that the runtime otherwise works: another
+conversation's work completed since, or the invoker's runtime check
+passed); the kit does what the server answers (``retry``, ``hidden``,
+``paused``, ``none``). The kit's counts and the conversations the server
+paused (from its ``processing_failure`` events, until ``paused_until``) go
+to the health record under ``worker.loop.could_not_process``; ``hermes
+agentchat status`` and ``doctor`` show them.
 
 Supervision: if the loop's main coroutine dies the whole stack is rebuilt
 after a backoff (1 s doubling to 60 s, reset after a stable minute). A socket
@@ -48,7 +59,7 @@ from agentchatme import gate
 from .client_identity import hermes_client_identity
 from .profile_scope import profile_context
 from .turn import MCP_SERVER_NAME
-from .ws_health import WSHealthState, write_ws_health
+from .ws_health import WSHealthState, pause_end, write_ws_health
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -78,6 +89,42 @@ TextsFactory = Callable[[Any], "TextsCache"]
 # a run of bad ones; ``ws_health.BAD_CYCLE_OUTCOMES``), each failure text cut.
 _RECENT_CYCLES_KEPT = 20
 _FAILURE_TEXT_MAX = 200
+
+# Could not process: the kit's counters the health record carries (its
+# ``status().counters``), and the most paused conversations kept.
+_COULD_NOT_PROCESS_COUNTERS = (
+    "processing_failures",
+    "failures_reported",
+    "failure_report_errors",
+    "failures_waiting",
+    "reruns",
+    "runtime_checks_ok",
+    "runtime_checks_failed",
+    "gate_splits",
+    "split_calls_ok",
+    "split_calls_failed",
+    "splits_stopped",
+)
+_PAUSED_KEPT = 50
+
+
+def _could_not_process_counts(counters: Any) -> dict[str, Any]:
+    """The could-not-process part of the kit's ``status().counters``: the
+    counts (absent ones are 0) and ``failure_actions`` (the server's answers
+    by action)."""
+    if not isinstance(counters, dict):
+        return {}
+    counts: dict[str, Any] = {}
+    for name in _COULD_NOT_PROCESS_COUNTERS:
+        value = counters.get(name)
+        counts[name] = value if isinstance(value, int) and not isinstance(value, bool) else 0
+    actions = counters.get("failure_actions")
+    counts["failure_actions"] = (
+        {str(k): int(v) for k, v in actions.items() if isinstance(v, int) and not isinstance(v, bool)}
+        if isinstance(actions, dict)
+        else {}
+    )
+    return counts
 
 
 def _restart_after_s(rt_client: Any) -> float:
@@ -182,6 +229,19 @@ class Receiver:
         self._events: dict[str, int] = {}
         # The last loop's ``recent_cycles``, kept across a stack restart.
         self._recent_cycles: list[dict[str, Any]] = []
+        # Could not process: the conversations the server paused for this
+        # agent (``processing_failure`` events answered ``paused``), by id,
+        # with their ``paused_until``; kept across a stack restart (the pause
+        # is the server's and ends on its own), dropped once it has ended.
+        self._paused: dict[str, str] = {}
+        # Written on the loop's thread (events), read from the health
+        # writers' threads (``worker_status``).
+        self._paused_lock = threading.Lock()
+        # The last loop's could-not-process counts (its ``status().counters``).
+        self._could_not_process: dict[str, Any] = {}
+        # When a report last failed, when the gate's split last stopped (epoch
+        # s), and the last runtime check: doctor warns on recent trouble only.
+        self._trouble: dict[str, Any] = {}
 
     # -- lifecycle ----------------------------------------------------------
 
@@ -256,12 +316,18 @@ class Receiver:
                     "socket": snapshot.socket,
                 }
                 self._recent_cycles = [_cycle_record(c) for c in snapshot.recent_cycles][-_RECENT_CYCLES_KEPT:]
+                self._could_not_process = _could_not_process_counts(snapshot.counters)
                 if status["state"] == "idle" and snapshot.coalescer.get("state") == "running":
                     status["state"] = "cycle"
             except Exception:
                 logger.debug("Receiver: loop status raised", exc_info=True)
         loop_status = dict(loop_status or {})
         loop_status["recent_cycles"] = list(self._recent_cycles)
+        loop_status["could_not_process"] = {
+            **self._could_not_process,
+            **self._trouble,
+            "paused": self._paused_conversations(),
+        }
         if self._restarting:
             status["state"] = "restart_wait"
             status["since"] = self._restart_since
@@ -402,6 +468,9 @@ class Receiver:
             handle=self._identity.handle,
             tool_namer=gate.mcp_tool_namer(MCP_SERVER_NAME),
             readiness=invoker.readiness,
+            # Could not process: does the agent's model answer now? One
+            # minimal call on the gate's path (no tools, no peer content, 45 s).
+            check_runtime=invoker.check_runtime,
             on_event=self._on_event,
             max_concurrent_turns=1,
             turn_tracker=invoker.tracker,
@@ -552,6 +621,8 @@ class Receiver:
                 getattr(summary, "held_by_turns", 0),
                 f" failure={getattr(summary, 'failure', None)!r}" if getattr(summary, "failure", None) else "",
             )
+            if getattr(summary, "split_stopped", False) is True:
+                self._trouble["last_split_stopped_at"] = time.time()
             self._refresh_health()
         elif kind in ("turn_outcome", "invite_outcome"):
             outcome = event.get("outcome")
@@ -566,9 +637,93 @@ class Receiver:
             logger.warning(
                 "Receiver: %s turn for %s not started: %s", event.get("kind"), event.get("id"), event.get("error")
             )
+        elif kind == "gate_card":
+            # A card of a failed chunk gated again alone (or one the server said to run again).
+            logger.info(
+                "Receiver: gate call for one card conv=%s → %s%s",
+                event.get("conversation_id"),
+                event.get("outcome"),
+                f" failure={event['failure']!r}" if event.get("failure") else "",
+            )
+        elif kind == "runtime_check":
+            logger.info(
+                "Receiver: runtime check %s%s",
+                "passed" if event.get("ok") else "failed",
+                f" ({event['detail']})" if event.get("detail") else "",
+            )
+            detail = event.get("detail")
+            self._trouble["last_runtime_check"] = {
+                "at": time.time(),
+                "ok": event.get("ok") is True,
+                "detail": None if detail is None else str(detail)[:_FAILURE_TEXT_MAX],
+            }
+        elif kind == "processing_failure":
+            self._note_processing_failure(event)
         elif kind == "error":
             self._last_error = str(event.get("error"))[-500:]
             logger.warning("Receiver: %s", event.get("error"))
+
+    # -- could not process --------------------------------------------------------
+
+    def _note_processing_failure(self, event: dict[str, Any]) -> None:
+        """One could-not-process report and the server's answer: logged
+        (ids and the answer only, never message text); a ``paused`` answer
+        records the conversation's pause, any other answer for it drops it
+        (it went again)."""
+        conversation_id = event.get("conversation_id")
+        action = event.get("action")
+        paused_until = event.get("paused_until")
+        error = event.get("error")
+        if error:
+            self._trouble["last_report_error_at"] = time.time()
+            logger.warning(
+                "Receiver: could not process — the report for conv=%s (%s %s) failed: %s; "
+                "nothing more is done for it (the server re-wakes)",
+                conversation_id,
+                event.get("kind"),
+                event.get("outcome"),
+                error,
+            )
+        else:
+            logger.warning(
+                "Receiver: could not process — reported conv=%s (%s %s, evidence %s, through %s); "
+                "the server answered %s%s",
+                conversation_id,
+                event.get("kind"),
+                event.get("outcome"),
+                event.get("evidence"),
+                event.get("through_message_id"),
+                action,
+                {
+                    "retry": " (the first failure: it goes again)",
+                    "hidden": " (its new messages are hidden from this agent, a note in their place, still unread: it goes again)",
+                    "paused": f" (muted for this agent until {paused_until}; the mute ends on its own)",
+                    "none": " (nothing left to act on)",
+                }.get(str(action), ""),
+            )
+        if not isinstance(conversation_id, str) or not conversation_id or error:
+            return
+        with self._paused_lock:
+            if action == "paused" and isinstance(paused_until, str) and paused_until:
+                self._paused.pop(conversation_id, None)
+                self._paused[conversation_id] = paused_until
+                while len(self._paused) > _PAUSED_KEPT:
+                    self._paused.pop(next(iter(self._paused)))
+            else:
+                self._paused.pop(conversation_id, None)
+
+    def _paused_conversations(self, *, now: float | None = None) -> list[dict[str, str]]:
+        """The conversations still paused, soonest end first; ended ones are dropped."""
+        moment = time.time() if now is None else now
+        live: list[tuple[float, str, str]] = []
+        with self._paused_lock:
+            for conversation_id, until in list(self._paused.items()):
+                end = pause_end(until)
+                if end is not None and end <= moment:
+                    del self._paused[conversation_id]
+                    continue
+                live.append((end if end is not None else float("inf"), conversation_id, until))
+        return [{"conversation_id": cid, "until": until} for _end, cid, until in sorted(live)]
 
     # -- health ----------------------------------------------------------------
 

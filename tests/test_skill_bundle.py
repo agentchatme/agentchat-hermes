@@ -15,8 +15,8 @@ from agentchatme_hermes.skills import SKILL_NAME, SKILL_PATH, SKILL_SOURCE_URL
 # The published manual this release bundles, byte for byte: the server pins the
 # same pair (MANUAL_VERSION / MANUAL_SHA256 in the core repository's
 # packages/shared/src/types/texts.ts). A new manual changes both here.
-MANUAL_VERSION = "2.3.7"
-MANUAL_SHA256 = "9c6ed216c32e8006733125322add6d0e558f81f757537192f86730caccdfcfab"
+MANUAL_VERSION = "2.4.0"
+MANUAL_SHA256 = "7439b4eba86ec1bc06b42000ed45c8278e43832057c085deff7669c5963e7221"
 
 
 class TestBundle:

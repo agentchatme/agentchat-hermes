@@ -6,6 +6,11 @@ completion: ``call_model(prompt) -> str``. No tools are attached — the gate
 prompt says so, and a model that could call the hosted tools would act
 instead of answering.
 
+The same call, with :data:`RUNTIME_CHECK_PROMPT`, is the kit's runtime check
+(could not process): does the agent's model answer right now? It carries no
+AgentChat or peer content, asks for a few tokens, is bounded at
+:data:`RUNTIME_CHECK_TIMEOUT_S`, and its answer is discarded.
+
 Two ways to make that call, in this order:
 
 1. **Hermes' public plugin LLM** (``ctx.llm.complete``, Hermes' "host-owned
@@ -55,6 +60,21 @@ DEFAULT_MAX_TOKENS = 2048
 
 # What Hermes' audit line for the call says it was for.
 GATE_CALL_PURPOSE = "agentchat gate call"
+
+# The runtime check (could not process): one minimal completion on the gate's
+# own path, so a pass shows the agent's model answers now. No AgentChat or
+# peer content; the answer is discarded.
+RUNTIME_CHECK_PROMPT = "Reply with the single word OK."
+RUNTIME_CHECK_PURPOSE = "agentchat runtime check"
+# Its bound (the request's own timeout); the kit's ceiling for a check is
+# its gate-call deadline (60 s or more).
+RUNTIME_CHECK_TIMEOUT_S = 45.0
+# The gate's own output cap. A one-word answer uses a few tokens; a model that
+# reasons first (the call sets no reasoning option, so the provider's default
+# applies) needs room, or it answers with no text — or, with thinking on, a
+# provider refuses a cap below its thinking budget — and the check fails while
+# the gate works.
+RUNTIME_CHECK_MAX_TOKENS = DEFAULT_MAX_TOKENS
 
 # How often a cancellable call looks at its cancel event.
 _CANCEL_POLL_S = 0.05
@@ -174,6 +194,7 @@ def build_call_model(
     call_llm: CallLlm | None = None,
     host_llm: Any = None,
     gate_loop: GateLoop | None = None,
+    purpose: str = GATE_CALL_PURPOSE,
 ) -> CallModel:
     """A ``call_model`` for :func:`agentchatme.gate.run`.
 
@@ -184,6 +205,8 @@ def build_call_model(
     tests never reach a provider — defaults to Hermes' auxiliary client.
     ``gate_loop`` runs ``ctx.llm.acomplete`` when the caller passes a
     ``cancel`` handle; without one the sync ``complete`` is used.
+    ``purpose`` is what Hermes' audit line says the call was for (the gate,
+    or the runtime check).
     """
     runtime = dict(main_runtime)
 
@@ -197,7 +220,7 @@ def build_call_model(
                 "temperature": 0.0,
                 "max_tokens": max_tokens,
                 "timeout": timeout_s,
-                "purpose": GATE_CALL_PURPOSE,
+                "purpose": purpose,
             }
             if cancel is not None and cancellable and gate_loop is not None:
                 assert acomplete is not None
@@ -228,6 +251,16 @@ def build_call_model(
         return content_of(response)
 
     return call_model
+
+
+def is_timeout(exc: BaseException) -> bool:
+    """Whether ``exc`` is a request timing out: Python's own timeout errors,
+    or a client library's timeout class (``openai.APITimeoutError``,
+    ``httpx.TimeoutException`` / ``ReadTimeout``, ``requests``' ``Timeout``
+    and the like, which do not derive from :class:`TimeoutError`)."""
+    if isinstance(exc, (TimeoutError, asyncio.TimeoutError, concurrent.futures.TimeoutError)):
+        return True
+    return any("Timeout" in cls.__name__ for cls in type(exc).__mro__)
 
 
 def content_of(response: Any) -> str:

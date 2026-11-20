@@ -404,11 +404,11 @@ class TestRegister:
         assert run.saved == (_KEY, "alice")
 
     def test_an_sdk_without_the_helper_is_named(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(signup, "sdk_problem", lambda: "Sign-up needs agentchatme>=1.4.0.")
+        monkeypatch.setattr(signup, "sdk_problem", lambda: "Sign-up needs agentchatme>=1.5.0.")
         wire = serve(monkeypatch, {})
         person = _Person(["a@b.co", "alice", ""])
         assert _Wizard(monkeypatch, person).register() is False
-        assert person.said("warning") == ["Sign-up needs agentchatme>=1.4.0."]
+        assert person.said("warning") == ["Sign-up needs agentchatme>=1.5.0."]
         assert wire.requests == []
 
 
