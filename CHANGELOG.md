@@ -4,8 +4,9 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
-Built and tested against the `agentchatme` SDK with could not process (`agentchatme/agentchat-python#32`); the SDK floor
-(`pyproject.toml`, `plugin.yaml`, `kit.py`) moves to that release when this one is cut.
+## [0.6.0] — 2026-11-20
+
+Minor release (added behaviour → minor +1, `VERSIONING.md`). Needs agentchatme 1.5.0. Manual 2.4.0.
 
 ### Added
 
@@ -46,12 +47,19 @@ Built and tested against the `agentchatme` SDK with could not process (`agentcha
   zero AgentChat calls, so the kit knows it never looked and reports nothing for the conversation.
 - **Gate off** (`AGENTCHATME_REPLY_GATE_ENABLED=false`): from a server that serves `conversation_run_template`, the kit
   starts one turn per conversation with a message owed, prompted for that one conversation, one at a time.
-- **Manual 2.3.7.** The bundled `agentchatme_hermes/skills/agentchat/SKILL.md` is `https://agentchat.me/skill.md` 2.3.7
-  verbatim (sha256 `9c6ed216…`, the hash AgentChat pins; 0.5.4 bundled 2.3.6). Every curl example now sends
-  `Authorization: Bearer $AGENTCHAT_API_KEY` and uses `-sS` instead of `-fsS`, so an error body shows. The Hermes line
-  leads with `hermes agentchat login` at a masked prompt (`--api-key-file <path>` or `-` from 0.5.4). The manual also
-  covers `agentchat_download_file`, when a muted message is delivered, the wake when a mute ends, and
-  `preview.truncated`. A test pins the bundled file's sha256 and version.
+- **The SDK floor is `agentchatme>=1.5.0,<2`** (was 1.4.0) in `pyproject.toml`, both `plugin.yaml` files and the
+  git-clone shim (which upgrades an older installed SDK): the kit with could not process. `kit.py` says so too: a kit
+  whose `ReceiveLoop` takes no `check_runtime` is reported at load (one ERROR, not receiving) and by `hermes agentchat
+  doctor`, instead of a receive loop that cannot start.
+- **Manual 2.4.0.** The bundled `agentchatme_hermes/skills/agentchat/SKILL.md` is `https://agentchat.me/skill.md` 2.4.0
+  verbatim (sha256 `7439b4eb…`, the hash AgentChat pins; 0.5.4 bundled 2.3.6). Since 2.3.6: every curl example sends
+  `Authorization: Bearer $AGENTCHAT_API_KEY` and uses `-sS` instead of `-fsS`, so an error body shows; the Hermes line
+  leads with `hermes agentchat login` at a masked prompt (`--api-key-file <path>` or `-` from 0.5.4); the manual covers
+  `agentchat_download_file`, when a muted message is delivered, the wake when a mute ends, and `preview.truncated`
+  (2.3.7). New in 2.4.0: a run for ONE conversation and the wait scoped to it, could not process (a hidden message as a
+  note, `preview.could_not_process`, `410 COULD_NOT_PROCESS`, the pause as a mute with `source: "could_not_process"`, the
+  report for integration builders), and the cursor rule with `wait_ms`. A test pins the bundled file's sha256 and
+  version.
 
 ## [0.5.4] — 2026-11-18
 

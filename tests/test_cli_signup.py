@@ -232,10 +232,10 @@ class TestRegister:
     ) -> None:
         wire = serve(monkeypatch, {})
         _Cli(monkeypatch, [])
-        monkeypatch.setattr(signup, "sdk_problem", lambda: "Sign-up needs agentchatme>=1.4.0.")
+        monkeypatch.setattr(signup, "sdk_problem", lambda: "Sign-up needs agentchatme>=1.5.0.")
         rc = cli._dispatch_register(_ns(email="a@b.co", handle="alice", display_name=None))
         assert rc == _EXIT_API_ERR
-        assert "Sign-up needs agentchatme>=1.4.0." in capsys.readouterr().err
+        assert "Sign-up needs agentchatme>=1.5.0." in capsys.readouterr().err
         assert wire.requests == []
 
 
