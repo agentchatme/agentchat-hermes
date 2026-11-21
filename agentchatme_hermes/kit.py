@@ -18,9 +18,13 @@ import importlib
 # kit with could not process (the gate-chunk split, the failure report,
 # ``check_runtime``, ``TurnEnd`` / ``RunEnd`` ``timed_out``), which the
 # receiver passes and the invoker builds: an older kit would refuse them and
-# the receive loop could not start.
-KIT_MIN_VERSION = "1.5.0"
+# the receive loop could not start (:func:`kit_problem` checks that by
+# capability); 1.6.1 is the ``ManualSync`` that retries while the manual is not
+# the served one (5 min doubling to 1 h), so a failed download does not wait
+# for the next texts change (:func:`manual_retry_problem`, a doctor warning).
+KIT_MIN_VERSION = "1.6.1"
 KIT_REQUIREMENT = f"agentchatme>={KIT_MIN_VERSION}"
+_MANUAL_RETRY_FLOOR = (1, 6, 1)
 
 
 def kit_problem() -> str | None:
@@ -55,6 +59,39 @@ def _has_could_not_process(integration: object) -> bool:
         return "check_runtime" in inspect.signature(loop).parameters
     except (TypeError, ValueError):
         return False
+
+
+def manual_retry_problem() -> str | None:
+    """``None`` when the installed kit's ``ManualSync`` retries while the
+    manual is stale (1.6.1); otherwise what ``doctor`` says. Not a reason to
+    stop receiving: the manual is still synced at start and on every texts
+    change."""
+    installed = installed_sdk_version()
+    parsed = _release(installed)
+    if parsed is None or parsed >= _MANUAL_RETRY_FLOOR:
+        return None
+    return (
+        f"the installed agentchatme ({installed}) does not retry a failed manual download: the "
+        "gateway tries again only when the served texts change or it restarts. Upgrade it in the "
+        f"Hermes environment (pip install -U '{KIT_REQUIREMENT}') and restart the gateway"
+    )
+
+
+def _release(version: str) -> tuple[int, int, int] | None:
+    """``"1.6.0"`` → ``(1, 6, 0)``; a pre-release counts as its release; ``None`` when unreadable."""
+    parts: list[int] = []
+    for piece in version.split(".")[:3]:
+        digits = ""
+        for char in piece:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            return None
+        parts.append(int(digits))
+    if len(parts) != 3:
+        return None
+    return parts[0], parts[1], parts[2]
 
 
 def installed_sdk_version() -> str:

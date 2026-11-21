@@ -400,7 +400,7 @@ class TestDoctorFixMovesTheKey:
         monkeypatch.setitem(sys.modules, "agentchatme", sdk)
         monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)
         monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)
-        monkeypatch.setattr(cli, "_doctor_identity_texts", lambda *a, **k: (None, None))
+        monkeypatch.setattr(cli, "_doctor_identity_texts", lambda *a, **k: (None, None, None))
         monkeypatch.setattr(cli, "place_identity_and_tools", lambda **_kw: [])
         monkeypatch.setattr(kit, "kit_problem", lambda: None)
         monkeypatch.setattr(mcp_registration, "inspect_entry_identity", lambda **_kw: ("ours", "current"))

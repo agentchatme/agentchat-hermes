@@ -4,6 +4,101 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+Not released yet; the version number is set at release (`VERSIONING.md`). Same AgentChat server and Hermes versions as
+0.6.0. The SDK floor is `agentchatme>=1.6.1,<2` (was 1.5.0) in `pyproject.toml`, both `plugin.yaml` files and the
+git-clone shim (which upgrades an older installed SDK): 1.6.1's `ManualSync` retries while the manual is not the served
+one (5 min doubling to 1 h), so a failed download no longer waits for the next texts change. `doctor` warns when the
+installed kit is older.
+Upgrading breaks nothing: the gateway's first start after the upgrade writes the new file from the package's copy and
+brings it to the served version. Upgrading a git install pinned with `--ref` (`hermes plugins update` refuses one):
+`hermes plugins install https://github.com/agentchatme/agentchat-hermes.git --force --ref <tag> --yes-deps`, then
+`hermes gateway restart`. `--force` replaces the pinned install; it does not get past Hermes' security scan (a
+`dangerous` verdict is refused with `--force` too; it would accept a `caution` verdict without asking).
+
+### Fixed
+
+- **The manual is the server's, and stays current.** Up to 0.6.0 the `agentchat:agentchat` skill was the copy in the
+  package, frozen at the release's version until the next release; 0.6.0's 2.4.0 told the agent to send its API key to
+  its human owner as well, which the served manual no longer does (since 2.4.2 the key goes only to `api.agentchat.me`;
+  a person who wants to see the conversations gets a claim link). Now:
+  - The skill is `<profile home>/plugin-data/agentchat/manual/SKILL.md` — Hermes' per-plugin storage, one per profile,
+    kept across upgrades (`/opt/data/plugin-data/…` in Docker, where the package itself is read-only), never scanned for
+    skills, and never next to the key file. Hermes reads a plugin skill's file on every `skill_view`, so a new manual
+    reaches the agent on its next `skill_view`, with no release and no restart. `SKILL.md` is alone in its folder
+    (`skill_view` serves every file in a skill's folder; a folder holding anything else is not registered).
+  - Only the gateway (`hermes gateway run`), the placement of register / login / recover / the wizard, and
+    `hermes agentchat doctor --fix` write it. Every other Hermes process — a session, a one-shot, `status`, `doctor`
+    without `--fix` — registers it as it is and never writes it, so what `status` and `doctor` say is the file as found;
+    the placement and `--fix` say what they repaired (`was stale (have 2.4.0, served 2.4.3) → 2.4.3 placed …`,
+    `was tampered (…) → restored: …`, `was missing → …`).
+  - The gateway's `register()`, with no network, writes that file from the package's copy when it does not exist (the
+    offline floor for a first install), then registers it. The skill's name and description are unchanged,
+    so the identity line, the turn prompt and Hermes' skills index (whose cache key includes the description) keep their
+    meaning; no version is in the description.
+  - The gateway leader keeps it at the manual `GET /v1/texts` announces (`manual: {url, version, sha256}`) with the SDK
+    kit's `ManualSync` on its receive loop: after the texts start (beside the loop, never holding it up), then on every
+    texts change (daily, sooner while the server does not answer), and while the file is not the served one, again
+    after 5 min doubling to 1 h (the kit's retry, 1.6.1). A gateway that is not the leader (another gateway holds the
+    account's socket, or the integration is off) syncs once after its texts load, on a daemon thread. Every write is the kit's `sync_manual`: downloads only from `agentchat.me` hosts or the API's own over HTTPS,
+    redirects checked, a size cap, front matter `name: agentchat` at the announced version, the announced sha256, never
+    worse than the file before (offline, an error, the wrong bytes: the file stays as it was), written atomically
+    (mode 0644). The file is never deleted (Hermes drops a plugin skill whose file is missing until it reloads the plugin).
+  - A home the plugin cannot write (or a folder this user cannot even enter) registers the package's copy instead, with
+    one warning; `doctor` says the manual is frozen at the bundled version and why. Nothing here raises into Hermes.
+    Such a gateway keeps serving the package's copy until it restarts, even after its sync has put a good file in
+    place (Hermes takes a plugin skill's path at `register()` and has no supported way to change it); its log then
+    says, once, to restart the gateway to serve the repaired manual.
+  - A manual that carries an inline-shell snippet (an exclamation mark, then a command in backticks, which Hermes runs in a
+    skill it serves when the opt-in `skills.inline_shell` is on) is never registered or kept: a sync that wrote one puts
+    the bundled copy back at once (through the kit, no download), logs an ERROR, and `doctor` fails it as `unsafe`.
+- **The manual 2.4.3** is the package's copy now (`https://agentchat.me/skill.md` byte for byte, sha256 `c7c755bb…`, the
+  hash AgentChat pins and announces): the first-install floor only.
+- **`hermes plugins install` no longer refuses the plugin.** Hermes' install-time security scan rated 0.6.0 `dangerous`
+  (refused, `--force` included): the bundled manual's one-line `curl … -H "Authorization: Bearer $AGENTCHAT_API_KEY"`
+  examples are its critical `env_exfil_curl` pattern (15 of them in 2.4.2). Manual 2.4.3 has none. Two findings in the
+  plugin's own source are gone too: a literal U+FEFF in `credentials.py` (now the `\ufeff` escape) and the inline-shell
+  guard's own snippets in `manual.py` (the backtick is now the `\x60` escape; the scanner reads source text).
+
+### Changed
+
+- **The wizard places the manual.** Register, login, recover and the interactive wizard sync it with the texts they
+  already fetch (`placement.place_manual`, replacing the presence check `check_skill`): a manual left at the version it
+  has is a warning, no manual at all a failure. The placement step is named `manual` (was `skill`).
+- **`doctor`** reports the file's path and version against the served one — current, stale, tampered (the served version
+  but not the served bytes), unsafe (inline shell) or unchecked (no texts in hand) — the file Hermes serves as `agentchat:agentchat` in that
+  process (a `[warn]` when it is the package's copy, and the reason), the gateway's last sync and the file it registered
+  (from the health record, `worker.manual`), anything else in the skill's folder, and any other `agentchat` skill in
+  Hermes' own skill folders (through Hermes' public `tools.skills_tool` catalog; reported, never removed). A missing file
+  is a `[fail]`. `doctor --fix` runs the sync (a download when the file is not the served one).
+- **`doctor` and `status` without AgentChat.** When `/v1/agents/me` does not answer (offline, or the key is refused)
+  `doctor` no longer stops there: SOUL.md, the manual, the key source, the tools entry, the gateway and the lock are
+  still checked, against the texts the account last cached (said, with when), and `--fix` says it placed nothing.
+  `status` prints its error and then the local lines (the saved handle, the key, the manual); its exit code is still 1.
+- **`doctor`'s gateway line** no longer misses a running gateway that was started through a launcher (`python -c` that
+  sets `sys.argv = [..., 'gateway', 'run']`): it asks this account's health record first, then Hermes'
+  `gateway.status.get_running_pid` (read-only), then the process list. The health record counts only while its
+  gateway lives — fresh, its pid alive and the leader lock held — since a gateway stopped or killed leaves a fresh
+  record saying `connected` behind it (Hermes never stops the receiver; the receiver now marks `stopped` at a clean
+  interpreter exit, best effort). `status`' could-not-process lines read the record by the same rule.
+- The gateway's "not active yet" log line says the real retry schedule (every 30 s while unconfigured; after a
+  failure 30 s, then longer up to every 300 s), and `doctor`'s stale-manual line says what the running gateway will do,
+  from its last recorded sync: after one that failed it retries (5 min doubling to 1 h; an older kit: on the next texts
+  change); after one that found the file current it does not look again until the served texts change or it restarts
+  (`doctor --fix` or a restart then).
+- **`status`** prints one `Manual:` line (`current (2.4.3) — <path>`, `stale (have …, served …)`, or frozen at the
+  bundled copy and why).
+- The nightly contract workflow (`hermes-main`) checks against a real Hermes that a skill registered outside the package
+  is read fresh after an atomic replace and stays registered, that the folder is Hermes' `plugin_data_dir("agentchat")`,
+  and that the stray-skill check finds a copy in the profile's `skills/`.
+- The nightly `hermes-main` workflow also runs Hermes' install-time scan (the functions `hermes plugins install` calls)
+  on this tree as a clone holds it, and the skill-install scan on the served manual: a `dangerous` verdict fails the
+  leg, and every critical and high finding is printed. `tests/test_install_scan_hygiene.py` checks on every PR for
+  invisible characters in any text file and for an inline-shell snippet in Python source.
+- Docs: plugin skills are listed in `<available_skills>` (the skills package said they were not); the README, RUNBOOK
+  and `docs/hermes-coupling.md` describe the kept-current manual and the Hermes behaviour it relies on, and the README
+  and RUNBOOK say that `hermes plugins install` shows Hermes' security scan first and asks to confirm a `caution`
+  verdict (the plugin runs a socket daemon and holds a key file).
+
 ## [0.6.0] — 2026-11-20
 
 Minor release (added behaviour → minor +1, `VERSIONING.md`). Needs agentchatme 1.5.0. Manual 2.4.0.

@@ -9,6 +9,12 @@ account (the leader-lock holder). On it:
   budget's backoff and the heartbeat watchdog are the SDK's;
 * the kit's :class:`~agentchatme.integration.TextsCache` — the served texts,
   file-backed, refreshed daily; changes go to the runtime (SOUL.md);
+* the kit's :class:`~agentchatme.integration.ManualSync` — the manual the
+  texts announce, kept at ``<profile home>/plugin-data/agentchat/manual/SKILL.md``
+  (:mod:`.manual`): synced after the texts start (without holding up the
+  loop), on every texts change, and again while it is not the served one
+  (the kit's retry, 5 min doubling to 1 h); its latest result goes to the
+  health record (``worker.manual``);
 * the kit's :class:`~agentchatme.integration.ReceiveLoop` in gate-call mode
   (single-run mode when the gate is switched off): wakes, one cycle per
   burst, the tray with its invites, the gate call, one turn at a time, the
@@ -47,6 +53,7 @@ retries).
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import logging
 import random
@@ -57,7 +64,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from agentchatme import gate
 
 from .client_identity import hermes_client_identity
-from .profile_scope import profile_context
+from .profile_scope import profile_context, profile_label
 from .turn import MCP_SERVER_NAME
 from .ws_health import WSHealthState, pause_end, write_ws_health
 
@@ -84,6 +91,9 @@ _SUPERVISOR_BACKOFF_MAX_S = 60.0
 _STABLE_CONNECTION_S = 60.0
 
 TextsFactory = Callable[[Any], "TextsCache"]
+# ``(texts cache, on_result) -> ManualSync | None``: the manual for this
+# profile, following the loop's texts.
+ManualSyncFactory = Callable[[Any, Callable[[Any], None]], Any]
 
 # The kit's last cycle summaries kept in the health record (doctor alarms on
 # a run of bad ones; ``ws_health.BAD_CYCLE_OUTCOMES``), each failure text cut.
@@ -196,6 +206,7 @@ class Receiver:
         hermes_home: Path | None = None,
         health: HealthBoard | None = None,
         health_path: Path | None = None,
+        manual_sync_factory: ManualSyncFactory | None = None,
     ) -> None:
         self._config = config
         self._identity = identity
@@ -206,6 +217,10 @@ class Receiver:
         self._hermes_home = hermes_home
         self._health = health
         self._health_path = health_path
+        self._manual_sync_factory = manual_sync_factory
+        # The manual's latest sync (:func:`.manual.result_record`), kept
+        # across a stack restart; read from the health writers' threads.
+        self._manual_last: dict[str, Any] | None = None
 
         self._thread: threading.Thread | None = None
         self._started = threading.Event()
@@ -251,9 +266,23 @@ class Receiver:
                 return
             self._thread = threading.Thread(target=self._run, name=_THREAD_NAME, daemon=True)
             self._thread.start()
+            # Hermes has no shutdown hook for a plugin and never stops the
+            # receiver on `hermes gateway stop`: at a clean interpreter exit
+            # the record says "stopped" (best effort; doctor also checks the
+            # pid and the lock, for a gateway killed without one).
+            atexit.register(self._stopped_at_exit)
         self._started.wait(timeout=2.0)
 
+    def _stopped_at_exit(self) -> None:
+        if self._stopped.is_set():
+            return
+        self._stopped_at = time.time()
+        self._stopped.set()
+        self._write_health("stopped")
+
     def stop(self) -> None:
+        with contextlib.suppress(Exception):
+            atexit.unregister(self._stopped_at_exit)
         if self._stopped.is_set():
             return
         self._stopped_at = time.time()
@@ -328,6 +357,7 @@ class Receiver:
             **self._trouble,
             "paused": self._paused_conversations(),
         }
+        status["manual"] = self._manual_status()
         if self._restarting:
             status["state"] = "restart_wait"
             status["since"] = self._restart_since
@@ -457,6 +487,9 @@ class Receiver:
 
         invoker = self._invoker
         quiet_ms, max_ms = _quiet_window(self._config)
+        manual_sync = self._build_manual_sync(texts)
+        manual_start: asyncio.Future[Any] | None = None
+
         receive_loop = ReceiveLoop(
             self._http,
             texts,
@@ -483,6 +516,10 @@ class Receiver:
         self._disconnected_since = time.monotonic()
         try:
             await texts.start()
+            if manual_sync is not None:
+                # The first sync may download (up to the kit's 10 s, in a
+                # worker thread): beside the loop, never before it.
+                manual_start = asyncio.ensure_future(self._start_manual_sync(manual_sync))
             await receive_loop.start()
             heartbeat = asyncio.ensure_future(self._heartbeat_loop())
             stop = asyncio.ensure_future(self._stop_event.wait())
@@ -502,11 +539,73 @@ class Receiver:
             invoker.detach_turns()
             with contextlib.suppress(Exception):
                 await receive_loop.stop()
+            if manual_sync is not None:
+                with contextlib.suppress(Exception):
+                    manual_sync.stop()
+            if manual_start is not None and not manual_start.done():
+                manual_start.cancel()
+                with contextlib.suppress(BaseException):
+                    await manual_start
             texts.stop()
             with contextlib.suppress(Exception):
                 await self._http.aclose()
             self._rt = None
             self._http = None
+
+    def _build_manual_sync(self, texts: Any) -> Any:
+        """The kit's ``ManualSync`` for this loop's texts, or ``None`` (no
+        factory, the kit has none, or it could not be built — logged)."""
+        if self._manual_sync_factory is None:
+            return None
+        try:
+            return self._manual_sync_factory(texts, self._note_manual)
+        except Exception:
+            logger.warning("Receiver: the manual sync could not be set up — the manual is not kept current", exc_info=True)
+            return None
+
+    async def _start_manual_sync(self, manual_sync: Any) -> None:
+        """The kit's ``ManualSync.start()`` (its first sync, then following
+        the texts); a surprise is logged, never left on an unawaited task."""
+        try:
+            await manual_sync.start()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Receiver: the manual sync failed to start — the manual is not kept current", exc_info=True)
+
+    def _note_manual(self, result: Any) -> None:
+        """A manual sync's result (the kit calls this for every up-to-date
+        result and once per failure condition): logged, kept for the health
+        record."""
+        from .manual import log_result, note_registration_stale, refuse_inline_shell, result_record
+
+        try:
+            label = profile_label(self._hermes_home) if self._hermes_home is not None else self._identity.handle
+            if self._hermes_home is not None:
+                result = refuse_inline_shell(self._hermes_home, result)
+            self._manual_last = result_record(result)
+            log_result(result, label=label)
+            if self._hermes_home is not None:
+                note_registration_stale(self._hermes_home, result, label=label)
+        except Exception:
+            logger.debug("Receiver: manual result not recorded", exc_info=True)
+            return
+        self._refresh_health()
+
+    def _manual_status(self) -> dict[str, Any] | None:
+        """``worker.manual``: the latest sync and what this process registered."""
+        registered: dict[str, Any] | None = None
+        if self._hermes_home is not None:
+            from .manual import manual_path, registration_for
+
+            registration = registration_for(self._hermes_home)
+            registered = registration.as_record() if registration is not None else None
+            target = str(manual_path(self._hermes_home))
+        else:
+            target = None
+        if self._manual_last is None and registered is None:
+            return None
+        return {"path": target, "last_sync": self._manual_last, "registered": registered}
 
     def _build_realtime_client(self, **overrides: Any) -> RealtimeClient:
         """The SDK's socket: acks on receipt, the ``rewake`` and ``heartbeat``

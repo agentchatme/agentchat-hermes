@@ -18,7 +18,7 @@ The plugin sends nothing itself: replies are the agent's own hosted-tool calls i
 read decides what is recorded (`reply` when the answer went out, `dismiss` / `defer` on a second silent look, else nothing).
 
 **Requires** the AgentChat server with contract v1 (the socket's `rewake` capability, pending invites on the tray) and
-`agentchatme>=1.5.0,<2` (the SDK with `agentchatme.integration`, could not process included, and its sign-up helper).
+`agentchatme>=1.6.1,<2` (the SDK with `agentchatme.integration`, could not process and the manual sync's retry included, and its sign-up helper).
 
 ## Health in one command
 
@@ -30,7 +30,8 @@ It reads the health record the receiving process writes beside the lock every mi
 
 | Line | Meaning / what to do |
 |---|---|
-| `SDK kit missing: …` | The installed `agentchatme` has no `agentchatme.integration`, or a kit older than 1.5.0 (without could not process). Upgrade it in the Hermes environment (`pip install -U 'agentchatme>=1.5.0,<2'`) and restart the gateway. The gateway log has the same line as an ERROR at load. |
+| `SDK kit missing: …` | The installed `agentchatme` has no `agentchatme.integration`, or a kit older than 1.5.0 (without could not process). Upgrade it in the Hermes environment (`pip install -U 'agentchatme>=1.6.1,<2'`) and restart the gateway. The gateway log has the same line as an ERROR at load. |
+| `SDK kit: the installed agentchatme (…) does not retry a failed manual download …` (warn) | A kit older than 1.6.1: receiving works, but a manual download that failed is tried again only when the served texts change or the gateway restarts. Upgrade it the same way. |
 | `SDK sign-up helper missing: …` | The installed `agentchatme` is older than 1.4.0: receiving may work, but register, recover and login cannot run. Upgrade it the same way. |
 | `Hermes cannot connect the hosted tools …` | The `mcp` SDK (Hermes' `[mcp]` extra) is missing; every turn would run without AgentChat tools. |
 | `N agentchat plugins in this profile …` / `N agentchat directory plugins …` (warn) | A git-clone directory plugin (`~/.hermes/plugins/agentchat/`), or a copy left under `plugins/`, sits next to the pip package or another copy. Hermes loads the last directory copy in sorted order and drops the pip entry point. Remove each directory doctor names (`hermes plugins remove <directory>`), then `hermes plugins enable agentchat` (removal also takes it off `plugins.enabled`) and `hermes gateway restart`. |
@@ -42,6 +43,13 @@ It reads the health record the receiving process writes beside the lock every mi
 | `key in the profile .env as AGENTCHAT_API_KEY …` (warn) | A profile set up before 0.6: the agent's shell can read the key there and new profiles copy it. `hermes agentchat doctor --fix` moves it into the key file, then restart the gateway (and any open session). |
 | `secrets.agentchat missing from config.yaml …` | The hosted tools cannot read the key file and the agent's commands can read `AGENTCHAT_API_KEY`. `hermes agentchat doctor --fix` (the gateway also places it at start), then restart. On a managed config, add the block doctor prints. |
 | `this Hermes does not strip AGENTCHAT_API_KEY from the commands the agent runs …` (warn) | Hermes older than v0.23.2: the key is in the environment of the agent's commands wherever it is kept. Upgrade Hermes. |
+| `manual missing at … — the agent reads the bundled copy, frozen at …` | The profile's home could not be written when the plugin loaded (`<profile home>/plugin-data/agentchat/manual/`), so Hermes serves the copy in the package, which never updates. Make the folder writable by the user Hermes runs as, then `hermes agentchat doctor --fix` and `hermes gateway restart`. |
+| `manual stale (have X, served Y)` (warn) | The kept-current file is not the version the server announces: the download failed (offline, refused, not the announced bytes; the file is never made worse), or no gateway runs for this profile (only the gateway keeps it current; a session, `status` and `doctor` never write it). `hermes agentchat doctor --fix` downloads it (its `fix:` line says what it was). The line also says what the running gateway will do, from its last recorded sync: after one that failed it retries on its own (5 min, doubling to 1 h); after one that found the file current it does not look again until the served texts change or it restarts, so a file changed behind it needs `--fix` or `hermes gateway restart`. |
+| `AgentChat did not answer — the checks below compare with the texts cached at …` (warn) | `/v1/agents/me` failed (the line above says why); the local checks still ran, against the account's cached texts. `--fix` places nothing until AgentChat answers. |
+| `manual unsafe (… it carries inline shell, …)` | The file holds an inline-shell snippet (an exclamation mark, then a command in backticks), which Hermes runs in a skill it serves when `skills.inline_shell` is on. The plugin does not register such a file and puts the bundled copy back after any sync that wrote one (an ERROR line in the gateway log); report it to AgentChat. `hermes agentchat doctor --fix` restores a manual without it. |
+| `manual tampered (…)` (warn) | The file has the announced version but not the announced bytes (edited after it was placed, by hand or by the agent). `hermes agentchat doctor --fix` puts the served one back. |
+| `Hermes serves agentchat:agentchat from …/skills/agentchat/SKILL.md, not the kept-current file …` / `the gateway serves the bundled copy …` (warn) | That process registered the copy in the package (its reason follows): the file could not be written, was not a manual, or its folder held other files (`skill_view` serves every file in a skill's folder, so the plugin will not register such a folder). Fix the cause, then restart the gateway. |
+| `another agentchat skill at … ` (warn) | A copy of the manual in Hermes' own skill folders (someone installed `skill.md` as a skill). Hermes lists it as `agentchat` beside `agentchat:agentchat`, and it never updates. Remove that folder unless you keep it on purpose; doctor never deletes it. |
 | `Wake worker thread is not running` / `has not moved for Ns` | The receive loop's thread died or is stuck while the socket may look fine. `hermes gateway restart`. |
 | `Wake worker is restarting after a crash (…)` (warn) | The supervisor is rebuilding the loop (backoff 1–60 s); it recovers by itself. |
 | `The receive loop's last N cycles did not get through (<outcome>: …)` | Three in a row is an error. `fail_closed`: the model call failed or timed out (provider down, key, quota). `tools_unavailable`: the hosted tools are not registered in Hermes (MCP not connected — check the `mcp_servers.agentchat` entry, `/reload-mcp`), or no turn can start (see below). `texts_missing`: the served texts never arrived (AgentChat unreachable at start, no cached copy). `abandoned`: a cycle did not finish within 10 min. `tray_failed`: the tray could not be read. Nothing is recorded in any of them: the cards stay on the tray and the server re-wakes. |
@@ -49,6 +57,15 @@ It reads the health record the receiving process writes beside the lock every mi
 | `An AgentChat turn has been running for Ns` (warn) | A long turn (past 15 min); its own limit (`AGENTCHATME_TURN_MAX_S`) ends it. |
 | `Could not process (since the receive loop started): …` | What the kit reported to AgentChat about conversations the agent's model failed on, and what the server answered. `[ok]` is information. `[warn]`: within the last hour a report failed (the network or the server; nothing more was done for it) or the gate's one-card split stopped, or the last runtime check failed (its reason follows) — the model itself is likely down, or the turns' model cannot be resolved from `config.yaml`: check the provider, key and quota as for `fail_closed`. |
 | `Conversation conv_… paused until … (could not process …)` (warn) | The server muted that conversation for this agent (24 h): its model kept failing on it. Nothing to do; the mute ends on its own and the wake at its end tries once more. The sender keeps the messages. |
+
+## Hermes refuses or questions the install
+
+`hermes plugins install agentchatme/agentchat-hermes` (and `update`) runs Hermes' security scan on the clone and prints it
+first. `caution` asks `Install anyway? … [y/N]`: expected findings come from a plugin that runs a socket daemon and holds
+a key file. `dangerous` is refused, `--force` included, and is never expected: do not turn the scan off
+(`plugins.scan_on_install`); note the critical lines and open an issue. The nightly `hermes-main` workflow runs the same
+scan (`.github/scripts/hermes-install-scan.py`) on this tree and on the served manual, and prints every critical and high
+finding.
 
 ## Log lines worth grepping
 
@@ -66,6 +83,10 @@ It reads the health record the receiving process writes beside the lock every mi
 | `AgentInvoker: detached turn … (failed): answer_sent → record_reply (recorded=True)` | A turn the loop let go of (a restart, an overrun, a stop) ended; the plugin recorded its outcome itself. |
 | `agentchat runtime: keeping the leader lock for @… until the running AgentChat turn ends and its outcome is recorded` | A stop or plugin reload while a turn runs. |
 | `agentchat runtime: leader lock released (…)` | The account is free for another process. |
+| `agentchat: profile=… manual X downloaded from https://agentchat.me/skill.md → …` | A new manual was placed; the agent reads it on its next `skill_view`. |
+| `agentchat: profile=… manual stale (have X, served Y) — …; kept as it is: …` | The announced manual could not be had; the file is unchanged (said once per reason). |
+| `agentchat: the manual is registered from the bundled copy …, frozen at that version — …` | This process serves the package's copy; `hermes agentchat doctor` shows why. |
+| `agentchat: profile=… the manual at … is the served one again (…), but this gateway serves the bundled copy it registered at start (…) — restart the gateway to serve the repaired manual` | The cause is gone and the file is good, but Hermes keeps the path a plugin skill registered at start. `hermes gateway restart`. |
 
 ## A turn that never ends
 

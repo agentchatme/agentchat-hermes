@@ -16,14 +16,15 @@ Surfaces:
   dies). The handle is sent because an email can back several agents; it
   defaults to the locally configured one.
 * **``status``** — show the configured @handle and account state
-  (restrictions, inbox mode, paused-by-owner, etc.) and where the key is.
+  (restrictions, inbox mode, paused-by-owner, etc.), where the key is and
+  whether the manual is the served one.
 * **``logout``** — remove the key file and any key line from the profile
   ``.env``, strip the identity line from SOUL.md, remove our
   ``secrets.agentchat`` and ``mcp_servers.agentchat`` entries.
 * **``doctor``** — check every placement (key, identity line, manual,
   the key source, hosted tools) plus the lock and the daemon's health;
-  ``--fix`` re-places, and moves a key still in the profile ``.env`` into
-  the key file.
+  ``--fix`` re-places (the manual: one sync with the server), and moves a
+  key still in the profile ``.env`` into the key file.
 
 ``register`` and ``recover`` run on the SDK's sign-up helper
 (:mod:`.signup`): one interactive run that follows the server's answer —
@@ -33,8 +34,9 @@ are. The handle saved is always the one the server returned.
 
 Every successful register / login / recover *places* the integration: the
 key in this profile's key file, the served identity line in SOUL.md, the
-key source (``secrets.agentchat``) and the hosted MCP server
-(``mcp_servers.agentchat``) in ``config.yaml`` — see :mod:`.placement`.
+served manual as the ``agentchat:agentchat`` skill, the key source
+(``secrets.agentchat``) and the hosted MCP server (``mcp_servers.agentchat``)
+in ``config.yaml`` — see :mod:`.placement`.
 
 The wizard is the only path users need. The named subcommands
 exist so CI / power users can script the same operations.
@@ -46,6 +48,7 @@ releases up to 0.5.3 kept it.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sys
 import time
@@ -70,7 +73,7 @@ from .config import (
 from .placement import (
     PlacementStep,
     place_identity_and_tools,
-    resolve_identity_line,
+    resolve_texts,
 )
 from .soul_anchor import remove_soul_anchor
 from .wizard import _mask_key
@@ -447,20 +450,39 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
         base_url=api_base,
         client_identity=hermes_client_identity(),
     )
+    from .profile_scope import resolve_hermes_home
+
+    hermes_home = resolve_hermes_home()
+    problem: str | None = None
     try:
         try:
             me = client.get_me()
         except UnauthorizedError:
-            return _exit_with(
-                "Saved key no longer authenticates. Run "
-                "`hermes agentchat login` with a fresh key."
-            )
+            problem = "Saved key no longer authenticates. Run `hermes agentchat login` with a fresh key."
         except (AgentChatError, SDKConnectionError) as exc:
-            return _exit_with(f"Status fetch failed: {exc}")
+            problem = f"Status fetch failed: {exc}"
+        if problem is None:
+            texts = _load_served_texts(client, api_key=saved_key, api_base=api_base, hermes_home=hermes_home)
     finally:
         client.close()
+    if problem is not None:
+        # What is on this machine still says something: the key, the
+        # manual (against the cached texts), the gateway's last record.
+        _, _, cached, _ = _doctor_cached_texts(api_key=saved_key, api_base=api_base, hermes_home=hermes_home)
+        code = _exit_with(problem)
+        _print_local_status(
+            resolution,
+            worker=_health_worker(api_base, saved_key),
+            manual=_manual_line(hermes_home, cached.manual if cached is not None else None),
+        )
+        return code
 
-    _print_status(me, resolution, worker=_health_worker(api_base, saved_key))
+    _print_status(
+        me,
+        resolution,
+        worker=_health_worker(api_base, saved_key),
+        manual=_manual_line(hermes_home, texts.manual if texts is not None else None),
+    )
     return _EXIT_OK
 
 
@@ -492,17 +514,20 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     * API reachability + auth (``GET /v1/agents/me``)
     * Account-side flags that would silently suppress live delivery
       (paused-by-owner, inbox mode = strict, etc.)
-    * the four placements: identity line in SOUL.md (present, current,
-      matching the key), the bundled manual, the hosted-tools entry in
-      ``config.yaml``, the key under the name that entry references
+    * the placements: identity line in SOUL.md (present, current,
+      matching the key), the manual (the kept-current file against the
+      served version, the file Hermes serves, the gateway's last sync, any
+      other ``agentchat`` skill in Hermes' skill folders), the hosted-tools
+      entry in ``config.yaml``, the key under the name that entry references
     * Gateway process detection (informational only — the doctor
       itself is a CLI process, so we can only check whether *another*
       process matching ``hermes gateway`` is running)
     * WS leader ownership plus the daemon's heartbeat record (the lock
       alone cannot distinguish a healthy receiver from a dead thread)
 
-    ``--fix`` re-places the identity line and the hosted-tools entry
-    before the checks run (a hand-managed entry is never touched).
+    ``--fix`` re-places the identity line, the manual (one sync: a download
+    when it is not the served one) and the hosted-tools entry before the
+    checks run (a hand-managed entry is never touched).
 
     Exit code is the number of failed checks; ``0`` means clean.
     Each line is prefixed with ``[ok]`` / ``[warn]`` / ``[fail]``
@@ -607,6 +632,11 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         fail(f"SDK kit missing: {problem}")
     else:
         ok("agentchatme.integration (the SDK kit) importable")
+        from .kit import manual_retry_problem
+
+        retry_problem = manual_retry_problem()
+        if retry_problem is not None:
+            warn(f"SDK kit: {retry_problem}")
     signup_problem = _signup_problem()
     if signup_problem is not None:
         fail(f"SDK sign-up helper missing: {signup_problem}")
@@ -636,6 +666,10 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         client_identity=hermes_client_identity(),
     )
     authenticated_handle: str | None = None
+    identity_line: str | None = None
+    identity_template: str | None = None
+    served_texts: Any = None
+    me: Any = None
     try:
         try:
             me = client.get_me()
@@ -644,61 +678,49 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                 "API key did NOT authenticate against /v1/agents/me — "
                 "rotate via `hermes agentchat login`"
             )
-            return _doctor_finalize(failures, warnings_count)
         except (AgentChatError, SDKConnectionError) as exc:
             # Offline is what doctor must report, not a traceback.
             fail(f"Could not reach /v1/agents/me: {exc}")
-            return _doctor_finalize(failures, warnings_count)
 
-        handle = me.get("handle") if isinstance(me, dict) else None
-        if isinstance(handle, str) and handle:
-            authenticated_handle = handle.lstrip("@").lower()
-            ok(f"Authenticated as @{authenticated_handle}")
-        else:
-            fail("Server response missing handle — refusing to trust")
-            return _doctor_finalize(failures, warnings_count)
+        if me is not None:
+            handle = me.get("handle") if isinstance(me, dict) else None
+            if isinstance(handle, str) and handle:
+                authenticated_handle = handle.lstrip("@").lower()
+                ok(f"Authenticated as @{authenticated_handle}")
+            else:
+                fail("Server response missing handle — refusing to trust")
+                return _doctor_finalize(failures, warnings_count)
 
-        # The served texts: the identity line the anchor check compares
-        # against, and proof that /v1/texts answers for this key.
-        identity_line, identity_template = _doctor_identity_texts(
-            client, api_key=saved_key, api_base=api_base, hermes_home=hermes_home
-        )
-        if identity_line is not None:
-            ok("served texts available (/v1/texts, or the cached copy)")
-        else:
-            warn(
-                "/v1/texts unreachable and nothing cached — the identity line cannot be "
-                "placed or verified until the server answers"
+            # The served texts: the identity line the anchor check compares
+            # against, and proof that /v1/texts answers for this key.
+            identity_line, identity_template, served_texts = _doctor_identity_texts(
+                client, api_key=saved_key, api_base=api_base, hermes_home=hermes_home
             )
-
-        status = me.get("status") if isinstance(me, dict) else None
-        if status == "active":
-            ok(f"Account status: {status}")
-        elif status:
-            warn(f"Account status: {status} — may suppress live delivery")
-        else:
-            warn("Account status field missing from /v1/agents/me response")
-
-        settings = me.get("settings") if isinstance(me, dict) else None
-        if isinstance(settings, dict):
-            inbox_mode = settings.get("inbox_mode")
-            if inbox_mode == "open":
-                ok(f"Inbox mode: {inbox_mode}")
-            elif inbox_mode:
+            if identity_line is not None:
+                ok("served texts available (/v1/texts, or the cached copy)")
+            else:
                 warn(
-                    f"Inbox mode: {inbox_mode} — non-contact senders "
-                    "may be blocked. Adjust on the AgentChat dashboard "
-                    "if you expect cold inbound."
+                    "/v1/texts unreachable and nothing cached — the identity line cannot be "
+                    "placed or verified until the server answers"
                 )
-
-        paused = (
-            me.get("paused_by_owner") if isinstance(me, dict) else None
-        )
-        if paused and paused != "none":
-            warn(
-                f"Account paused by owner ({paused}) — agent will "
-                "not receive new inbound until un-paused"
+            _doctor_account_lines(me, ok=ok, warn=warn)
+        else:
+            # The local checks below still run (SOUL.md, the manual, the key
+            # source, the tools entry, the gateway) against the texts this
+            # account last cached; nothing is fetched again.
+            identity_line, identity_template, served_texts, fetched_at = _doctor_cached_texts(
+                api_key=saved_key, api_base=api_base, hermes_home=hermes_home
             )
+            if served_texts is not None:
+                warn(
+                    "AgentChat did not answer — the checks below compare with the texts cached "
+                    f"at {fetched_at or '?'}"
+                )
+            else:
+                warn(
+                    "AgentChat did not answer and no texts are cached — the identity line and the "
+                    "manual cannot be compared with the served ones"
+                )
 
         # NOTE: deliberately do NOT call /v1/messages/sync from the
         # doctor. The gateway drains sync on every (re)connect, and a
@@ -709,15 +731,23 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     finally:
         client.close()
 
+    if getattr(args, "fix", False) and authenticated_handle is None:
+        warn("--fix skipped: nothing is placed until AgentChat answers for this key")
+
     if getattr(args, "fix", False) and authenticated_handle is not None:
         for level, line in _fix_key(
             resolution, handle=authenticated_handle, api_base=api_base, home=hermes_home
         ):
             {"ok": ok, "warn": warn, "fail": fail}[level](line)
         for step in place_identity_and_tools(
-            handle=authenticated_handle, identity_line=identity_line, api_base=api_base
+            handle=authenticated_handle,
+            identity_line=identity_line,
+            api_base=api_base,
+            served_manual=served_texts.manual if served_texts is not None else None,
+            hermes_home=hermes_home,
         ):
-            (fail if step.failed else ok)(f"fix: {step.name} {step.status} — {step.detail}")
+            report = fail if step.failed else warn if step.status == "warned" else ok
+            report(f"fix: {step.name} {step.status} — {step.detail}")
 
     try:
         from .soul_anchor import (
@@ -772,12 +802,15 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     except ImportError:
         warn("soul_anchor module not importable — skipping anchor check")
 
-    from .placement import BUNDLED_SKILL_PATH
-
-    if BUNDLED_SKILL_PATH.exists():
-        ok("manual bundled as the agentchat:agentchat skill (https://agentchat.me/skill.md)")
-    else:
-        fail(f"bundled manual missing at {BUNDLED_SKILL_PATH} — reinstall agentchatme-hermes")
+    _doctor_manual_checks(
+        hermes_home,
+        served=served_texts.manual if served_texts is not None else None,
+        worker=_health_worker(api_base, saved_key),
+        cmd=cmd,
+        ok=ok,
+        warn=warn,
+        fail=fail,
+    )
 
     _doctor_secrets_checks(resolution, cmd=cmd, ok=ok, warn=warn, fail=fail)
 
@@ -845,8 +878,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     except ImportError:
         warn("mcp_registration module not importable — skipping tool-source check")
 
-    if _other_gateway_running():
-        ok("Hermes gateway process detected (live inbound active)")
+    gateway = _gateway_running(api_base, saved_key, hermes_home)
+    if gateway is not None:
+        ok(f"Hermes gateway running ({gateway})")
     else:
         warn(
             "No `hermes gateway` process detected — start one "
@@ -1225,12 +1259,43 @@ def _fix_key(
     return lines
 
 
+def _gateway_running(api_base: str, api_key: str, hermes_home: Path) -> str | None:
+    """How ``doctor`` knows a Hermes gateway is running, or ``None``. In order:
+
+    1. this account's health record, while its gateway lives (:func:`_live_health`:
+       fresh, its pid alive, the leader lock held);
+    2. Hermes' own answer for this profile, ``gateway.status.get_running_pid``
+       (public; read-only with ``cleanup_stale=False``): its lock and pid file
+       checked against the live process, however it was launched;
+    3. a process whose command line runs ``hermes gateway`` (argv, also a
+       ``sys.argv = [..., 'gateway', 'run']`` launcher).
+    """
+    health = _live_health(api_base, api_key, hermes_home)
+    if health is not None:
+        return f"pid {health['pid']}, holding this account's socket"
+    try:
+        from gateway.status import get_running_pid  # type: ignore[import-not-found]
+
+        pid = get_running_pid(cleanup_stale=False)
+        if pid is not None:
+            return f"pid {pid}, Hermes' gateway lock for this profile"
+    except Exception:
+        logger.debug("doctor: Hermes' gateway status not read", exc_info=True)
+    if _other_gateway_running():
+        return "found by its command line"
+    return None
+
+
+_ARGV_GATEWAY_RUN = re.compile(r"""['"]gateway['"]\s*,\s*['"]run['"]""")
+
+
 def _other_gateway_running() -> bool:
     """Best-effort: is a *different* ``hermes gateway`` process alive?
 
-    The doctor itself is a CLI process, so we exclude our own pid.
-    Cross-platform via ``psutil`` when available, falls back to
-    ``False`` (informational warning) when not.
+    The doctor itself is a CLI process, so we exclude our own pid. A
+    ``gateway`` argument, or a launcher that sets ``sys.argv = [...,
+    'gateway', 'run']`` in its ``-c`` code. Cross-platform via ``psutil`` when
+    available, falls back to ``False`` (informational warning) when not.
     """
     try:
         import os
@@ -1249,7 +1314,7 @@ def _other_gateway_running() -> bool:
                 if not cmdline:
                     continue
                 joined = " ".join(str(arg) for arg in cmdline)
-                if "hermes" in joined and "gateway" in cmdline:
+                if "hermes" in joined and ("gateway" in cmdline or _ARGV_GATEWAY_RUN.search(joined)):
                     return True
             except (psutil.NoSuchProcess, psutil.AccessDenied):
                 continue
@@ -1297,21 +1362,27 @@ def _dispatch_logout(_args: argparse.Namespace) -> int:
 
 
 def _install_placement(handle: str, *, api_base: str, api_key: str) -> list[PlacementStep]:
-    """Place the identity line, verify the manual, register the hosted tools.
+    """Place the identity line and the manual, register the hosted tools.
 
-    The identity line is fetched from the server for this key (the cached
-    copy when the server is unreachable; skipped when neither exists — the
-    gateway places it later). Failure is non-fatal: credentials are already
-    persisted and the account is fully operational. Each failed step is
-    printed with its reason so the operator can repair it
+    The texts (the identity line, the manual's announcement) are fetched from
+    the server for this key (the cached copy when the server is unreachable;
+    without either the line is skipped and the manual is the bundled copy —
+    the gateway places both later). Failure is non-fatal: credentials are
+    already persisted and the account is fully operational. Each failed step
+    is printed with its reason so the operator can repair it
     (``hermes agentchat doctor --fix`` re-runs this).
     """
-    identity_line = resolve_identity_line(api_key=api_key, api_base=api_base)
+    from .turn import identity_line as render_identity_line
+
+    texts = resolve_texts(api_key=api_key, api_base=api_base)
     steps = place_identity_and_tools(
-        handle=handle, identity_line=identity_line, api_base=api_base
+        handle=handle,
+        identity_line=render_identity_line(texts) if texts is not None else None,
+        api_base=api_base,
+        served_manual=texts.manual if texts is not None else None,
     )
     for step in steps:
-        if step.failed or step.status == "skipped":
+        if step.needs_attention:
             sys.stderr.write(f"Warning: {step.name}: {step.detail}\n")
             sys.stderr.flush()
         else:
@@ -1319,26 +1390,315 @@ def _install_placement(handle: str, *, api_base: str, api_key: str) -> list[Plac
     return steps
 
 
-def _doctor_identity_texts(
-    client: Any, *, api_key: str, api_base: str, hermes_home: Path
-) -> tuple[str | None, str | None]:
-    """``(identity line, template)`` for ``doctor``: one fetch on the open client, else the cache."""
+def _doctor_account_lines(me: Any, *, ok: Callable[[str], None], warn: Callable[[str], None]) -> None:
+    """``doctor``'s lines from ``/v1/agents/me``: status, inbox mode, an owner's pause."""
+    status = me.get("status") if isinstance(me, dict) else None
+    if status == "active":
+        ok(f"Account status: {status}")
+    elif status:
+        warn(f"Account status: {status} — may suppress live delivery")
+    else:
+        warn("Account status field missing from /v1/agents/me response")
+
+    settings = me.get("settings") if isinstance(me, dict) else None
+    if isinstance(settings, dict):
+        inbox_mode = settings.get("inbox_mode")
+        if inbox_mode == "open":
+            ok(f"Inbox mode: {inbox_mode}")
+        elif inbox_mode:
+            warn(
+                f"Inbox mode: {inbox_mode} — non-contact senders "
+                "may be blocked. Adjust on the AgentChat dashboard "
+                "if you expect cold inbound."
+            )
+
+    paused = me.get("paused_by_owner") if isinstance(me, dict) else None
+    if paused and paused != "none":
+        warn(
+            f"Account paused by owner ({paused}) — agent will "
+            "not receive new inbound until un-paused"
+        )
+
+
+def _doctor_cached_texts(
+    *, api_key: str, api_base: str, hermes_home: Path
+) -> tuple[str | None, str | None, Any, str | None]:
+    """``(identity line, template, texts, cached at)`` from the account's cached
+    texts only — AgentChat did not answer, so nothing is fetched."""
     try:
         from .state import state_dir_for_account
-        from .texts import load_texts
+        from .texts import cached_texts
         from .turn import identity_line as render_identity_line
         from .turn import identity_line_template as render_identity_line_template
     except ImportError:
-        return None, None
+        return None, None, None, None
+    state_dir = state_dir_for_account(hermes_home=hermes_home, api_base=api_base, api_key=api_key)
+    texts, fetched_at = cached_texts(state_dir)
+    if texts is None:
+        return None, None, None, None
+    return render_identity_line(texts), render_identity_line_template(texts), texts, fetched_at
+
+
+def _doctor_identity_texts(
+    client: Any, *, api_key: str, api_base: str, hermes_home: Path
+) -> tuple[str | None, str | None, Any]:
+    """``(identity line, template, texts)`` for ``doctor``: one fetch on the
+    open client, else the cache; ``(None, None, None)`` without either."""
+    texts = _load_served_texts(client, api_key=api_key, api_base=api_base, hermes_home=hermes_home)
+    if texts is None:
+        return None, None, None
+    from .turn import identity_line as render_identity_line
+    from .turn import identity_line_template as render_identity_line_template
+
+    return render_identity_line(texts), render_identity_line_template(texts), texts
+
+
+def _load_served_texts(client: Any, *, api_key: str, api_base: str, hermes_home: Path) -> Any:
+    """The served texts for ``doctor`` and ``status``: one fetch on the open
+    client, else the account's cached copy, else ``None``. Never raises."""
+    try:
+        from .state import state_dir_for_account
+        from .texts import load_texts
+    except ImportError:
+        return None
     state_dir = state_dir_for_account(hermes_home=hermes_home, api_base=api_base, api_key=api_key)
     try:
-        texts = load_texts(client, state_dir=state_dir)
+        return load_texts(client, state_dir=state_dir)
     except Exception as exc:
-        logger.debug("doctor: texts load raised: %s", exc)
-        return None, None
-    if texts is None:
-        return None, None
-    return render_identity_line(texts), render_identity_line_template(texts)
+        logger.debug("cli: texts load raised: %s", exc)
+        return None
+
+
+# ───────────────────────── the manual ─────────────────────────
+
+
+def _registered_manual(hermes_home: Path) -> tuple[Path | None, str | None]:
+    """``(path, reason)``: the file Hermes holds as ``agentchat:agentchat`` in
+    this process — Hermes' own registry when it can be asked, else what this
+    plugin's ``register()`` gave it — and, for the bundled copy, why.
+    ``(None, None)`` when neither knows (``doctor`` run outside Hermes)."""
+    from .manual import registration_for
+
+    ours = registration_for(hermes_home)
+    reason = ours.reason if ours is not None else None
+    held: Path | None = None
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        found = get_plugin_manager().find_plugin_skill("agentchat:agentchat")
+        held = Path(found) if found is not None else None
+    except Exception:
+        held = None
+    if held is None and ours is not None:
+        held = ours.path
+    if held is not None and ours is not None and held != ours.path:
+        reason = None  # Hermes holds a path this process did not give it
+    return held, reason
+
+
+def _routine_registration(hermes_home: Path) -> bool:
+    """This process registered the package's copy only because nothing was
+    placed yet when it started (it places nothing itself): not a fault to report."""
+    from .manual import registration_for
+
+    registration = registration_for(hermes_home)
+    return registration is not None and registration.routine
+
+
+def _manual_line(hermes_home: Path, served: Any) -> str:
+    """The manual in one line, for ``status``."""
+    from .manual import bundled_version, check, manual_path
+
+    target = manual_path(hermes_home)
+    state = check(target, served)
+    held, reason = _registered_manual(hermes_home)
+    if _routine_registration(hermes_home) and state.state == "missing":
+        return (
+            f"missing — {target} is not placed yet; Hermes sessions read the bundled copy "
+            f"{bundled_version() or '?'} until the gateway, a login or `doctor --fix` places it"
+        )
+    if held is not None and held != target:
+        return (
+            f"frozen at the bundled copy {bundled_version() or '?'} ({held}){f': {reason}' if reason else ''} "
+            f"— {target}: {state.summary}"
+        )
+    return state.detail
+
+
+def _doctor_manual_checks(
+    hermes_home: Path,
+    *,
+    served: Any,
+    worker: Any,
+    cmd: str,
+    ok: Callable[[str], None],
+    warn: Callable[[str], None],
+    fail: Callable[[str], None],
+) -> None:
+    """The manual: the kept-current file against the texts' announcement, the
+    file Hermes serves as ``agentchat:agentchat``, the gateway's last sync,
+    the skill's folder, and any other ``agentchat`` skill in Hermes' own
+    skill folders (reported, never removed)."""
+    from .manual import MANUAL_URL, bundled_version, check, manual_path, other_files
+
+    target = manual_path(hermes_home)
+    bundled = bundled_version() or "?"
+    state = check(target, served)
+    if state.state == "current":
+        ok(f"manual {state.detail} (kept current from {MANUAL_URL})")
+    elif state.state == "missing" and _routine_registration(hermes_home):
+        fail(
+            f"manual {state.summary} at {target} — not placed yet: Hermes sessions read the bundled "
+            f"copy {bundled} until the gateway, a login or `{cmd} doctor --fix` places it"
+        )
+    elif state.state == "missing":
+        fail(
+            f"manual {state.summary} at {target} — the agent reads the bundled copy, frozen at "
+            f"{bundled}, until this profile's home lets the plugin write it (`{cmd} doctor --fix` "
+            "tries again)"
+        )
+    elif state.state == "stale":
+        warn(
+            f"manual {state.detail} — `{cmd} doctor --fix` downloads the served one; "
+            f"{_gateway_manual_outlook(worker, cmd)}"
+        )
+    elif state.state == "tampered":
+        warn(
+            f"manual {state.detail} — not the text the server serves (edited after it was "
+            f"placed); `{cmd} doctor --fix` puts the served one back"
+        )
+    elif state.state == "unsafe":
+        fail(
+            f"manual {state.detail} — Hermes runs inline shell in a skill it serves when "
+            f"skills.inline_shell is on, so the plugin does not register this file; `{cmd} doctor "
+            "--fix` puts a manual without it back"
+        )
+    else:
+        warn(f"manual {state.detail} — it cannot be compared until /v1/texts answers")
+
+    held, reason = _registered_manual(hermes_home)
+    if held is not None and not _routine_registration(hermes_home):
+        if held == target:
+            ok(f"Hermes serves agentchat:agentchat from {target}")
+        else:
+            warn(
+                f"Hermes serves agentchat:agentchat from {held}, not the kept-current file — frozen "
+                f"at the bundled {bundled}{f': {reason}' if reason else ''}"
+            )
+
+    section = worker.get("manual") if isinstance(worker, dict) else None
+    if isinstance(section, dict):
+        registered = section.get("registered")
+        if isinstance(registered, dict) and registered.get("kept_current") is False:
+            why = registered.get("reason")
+            warn(
+                f"the gateway serves the bundled copy {registered.get('path')}, frozen at {bundled}"
+                + (f": {why}" if why else "")
+                + f" — restart the gateway once {target} is in place"
+            )
+        last = section.get("last_sync")
+        if isinstance(last, dict):
+            at = last.get("at")
+            age = f", {time.time() - float(at):.0f}s ago" if isinstance(at, (int, float)) else ""
+            detail = last.get("detail") or last.get("state")
+            if last.get("up_to_date") is False or last.get("state") == "failed":
+                warn(f"the gateway's last manual sync{age}: {detail}")
+            else:
+                ok(f"the gateway keeps the manual current (last sync{age}: {detail})")
+
+    others = other_files(target.parent)
+    if others:
+        warn(
+            f"{target.parent} holds other files ({', '.join(others[:5])}): skill_view serves every "
+            "file in a skill's folder, so the plugin registers the bundled copy until they are moved out"
+        )
+
+    for path, version in _stray_agentchat_skills(exclude=(target,)):
+        warn(
+            f"another agentchat skill at {path} ({version or 'no version'}): Hermes lists it as "
+            "`agentchat` beside agentchat:agentchat, and that copy never updates — remove its folder "
+            "unless you keep it on purpose (doctor never deletes it)"
+        )
+
+
+def _gateway_manual_outlook(worker: Any, cmd: str) -> str:
+    """What the running gateway will do about a stale manual, from its last
+    recorded sync (the health record's ``worker.manual.last_sync``). The kit
+    tries again by itself only after a sync that left the file not the served
+    one; after a current one it looks again only when the served texts change
+    or the gateway restarts, so a file changed behind it stays as it is."""
+    section = worker.get("manual") if isinstance(worker, dict) else None
+    last = section.get("last_sync") if isinstance(section, dict) else None
+    if worker is None:
+        return "no running gateway keeps it current for this account"
+    if not isinstance(last, dict):
+        return "the running gateway has recorded no sync of it yet"
+    at = last.get("at")
+    ago = f" {time.time() - float(at):.0f}s ago" if isinstance(at, (int, float)) else ""
+    if last.get("up_to_date") is False or last.get("state") == "failed":
+        from .kit import manual_retry_problem
+
+        if manual_retry_problem() is None:
+            return (
+                f"the gateway's last sync{ago} did not bring it current, so it tries again on its own "
+                "(after 5 min, doubling to 1 h)"
+            )
+        return f"the gateway's last sync{ago} did not bring it current; it tries again when the served texts change"
+    if last.get("up_to_date") is True:
+        return (
+            f"the gateway's last sync{ago} found it current, so the gateway does not look at it again until "
+            f"the served texts change or it restarts: run `{cmd} doctor --fix` or `hermes gateway restart`"
+        )
+    return "the gateway had no served version to compare with at its last sync; it syncs once the texts arrive"
+
+
+def _stray_agentchat_skills(*, exclude: tuple[Path, ...] = ()) -> list[tuple[Path, str | None]]:
+    """``(SKILL.md, version)`` of a skill Hermes loads as ``agentchat`` from its
+    own skill folders (the profile's ``skills/``, ``create_dir``, external and
+    trusted project folders) — a copy of the manual someone installed, which
+    never updates. Through Hermes' public skill-catalog helpers
+    (``tools.skills_tool``: ``find_all_skills``, ``skill_search_dirs``,
+    ``locate_skill``; Hermes v0.22.5 and later): the copy ``skill_view
+    agentchat`` would load, not every file on disk. ``[]`` outside Hermes or on
+    an older one. Never raises."""
+    try:
+        from tools.skills_tool import find_all_skills, locate_skill, skill_search_dirs
+    except Exception:
+        return []
+    from .manual import read_version
+
+    skip: set[Path] = set()
+    for path in exclude:
+        try:
+            skip.add(path.resolve())
+        except OSError:
+            continue
+    found: list[tuple[Path, str | None]] = []
+    try:
+        names = [
+            str(entry["name"])
+            for entry in find_all_skills()
+            if isinstance(entry, dict)
+            and isinstance(entry.get("name"), str)
+            and (entry["name"] == "agentchat" or entry["name"].endswith("/agentchat"))
+        ]
+        roots, _active = skill_search_dirs()
+    except Exception:
+        logger.debug("doctor: Hermes' skill catalog could not be read", exc_info=True)
+        return []
+    for name in names:
+        try:
+            error, _skill_dir, skill_md = locate_skill(name, None, roots)
+            if error is not None or skill_md is None:
+                continue
+            path = Path(skill_md)
+            if path.resolve() in skip:
+                continue
+            version = read_version(path)
+        except Exception:
+            continue
+        found.append((path, version))
+    return found
 
 
 def _uninstall_secrets_registration() -> None:
@@ -1725,10 +2085,22 @@ def _describe_could_not_process(worker: Any, *, now: float) -> list[tuple[str, s
 
 def _health_worker(api_base: str, api_key: str) -> Any:
     """The health record's ``worker`` section for this profile's account
-    (what the running gateway last wrote), or ``None``. Never raises:
-    status prints what it can."""
+    (what the running gateway last wrote), or ``None`` (see
+    :func:`_live_health`). Never raises: status prints what it can."""
+    health = _live_health(api_base, api_key)
+    return health.get("worker") if health is not None else None
+
+
+def _live_health(api_base: str, api_key: str, hermes_home: Path | None = None) -> Any:
+    """This account's health record, only while the gateway that writes it
+    lives: fresh (≤ 150 s), not ``stopped``, its pid alive, and the leader
+    lock beside it held (where the lock can be probed). A gateway stopped or
+    killed leaves a fresh record saying ``connected`` behind it (Hermes has no
+    shutdown hook for a plugin; the receiver marks ``stopped`` at exit only
+    when the interpreter exits cleanly), so freshness alone is not enough.
+    ``None`` otherwise. Never raises."""
     try:
-        from .leader_lock import lock_path_for
+        from .leader_lock import describe_lock_holder, lock_path_for
         from .profile_scope import account_fingerprint, resolve_hermes_home, resolve_setting
         from .ws_health import (
             HEALTH_STALE_AFTER_SECONDS,
@@ -1739,19 +2111,71 @@ def _health_worker(api_base: str, api_key: str) -> Any:
 
         lock_dir_raw = (resolve_setting("AGENTCHATME_LOCK_DIR") or "").strip()
         lock_path = lock_path_for(
-            hermes_home=resolve_hermes_home(),
+            hermes_home=hermes_home if hermes_home is not None else resolve_hermes_home(),
             account_fingerprint=account_fingerprint(api_base, api_key),
             lock_dir=Path(lock_dir_raw).expanduser() if lock_dir_raw else None,
         )
         health = read_ws_health(health_path_for(lock_path))
-        if health is None or health_age_seconds(health) > HEALTH_STALE_AFTER_SECONDS:
+        if health is None or health["state"] == "stopped":
             return None
-        return health.get("worker")
+        if health_age_seconds(health) > HEALTH_STALE_AFTER_SECONDS:
+            return None
+        if _pid_alive(health["pid"]) is not True:
+            return None
+        lock = describe_lock_holder(lock_path)
+        if lock in ("free", "not present"):
+            return None
+        return health
     except Exception:
         return None
 
 
-def _print_status(me: dict[str, Any], resolution: KeyResolution | None = None, *, worker: Any = None) -> None:
+def _pid_alive(pid: int) -> bool | None:
+    """Whether a process with ``pid`` exists here; ``None`` when that cannot be
+    told (Windows without ``psutil``: ``os.kill`` there would end the process)."""
+    try:
+        import importlib
+
+        psutil: Any = importlib.import_module("psutil")
+        return bool(psutil.pid_exists(pid))
+    except ImportError:
+        pass
+    if os.name == "nt":
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists, owned by another user
+    except OSError:
+        return None
+    return True
+
+
+def _print_local_status(resolution: KeyResolution, *, worker: Any, manual: str) -> None:
+    """``status`` when AgentChat did not answer: what this machine holds."""
+    saved = _read_saved_handle()
+    _printline("")
+    _printline(f"  Handle:        {f'@{saved}' if saved else 'unknown'} (saved here; AgentChat did not answer)")
+    _printline(f"  Plugin:        agentchatme-hermes {__version__} (integration)")
+    _printline(f"  Key:           {_key_location_line(resolution)}")
+    for note in (*resolution.notes, *(shared_note(h) for h in resolution.shared_with)):
+        _printline(f"  Note:          {note}")
+    _printline(f"  Manual:        {manual}")
+    section = _could_not_process_section(worker)
+    if section is not None:
+        _printline(f"  Could not process: {_could_not_process_summary(section)}")
+    _printline("")
+
+
+def _print_status(
+    me: dict[str, Any],
+    resolution: KeyResolution | None = None,
+    *,
+    worker: Any = None,
+    manual: str | None = None,
+) -> None:
     handle = me.get("handle", "unknown")
     status = me.get("status", "unknown")
     settings = me.get("settings") or {}
@@ -1772,6 +2196,8 @@ def _print_status(me: dict[str, Any], resolution: KeyResolution | None = None, *
         _printline(f"  Key:           {_key_location_line(resolution)}")
         for note in (*resolution.notes, *(shared_note(h) for h in resolution.shared_with)):
             _printline(f"  Note:          {note}")
+    if manual is not None:
+        _printline(f"  Manual:        {manual}")
     # Could not process, from the running gateway's health record (absent
     # when no gateway receives for this account, or from an older release).
     section = _could_not_process_section(worker)

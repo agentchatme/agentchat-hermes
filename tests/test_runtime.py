@@ -342,6 +342,82 @@ class TestIntegrationOff:
             assert rt._leader_retry_thread is None
 
 
+class TestManualSync:
+    """The manual follows the texts in the gateway only: the leader's receive
+    loop keeps it current (the kit's ManualSync, built through the factory
+    handed to the receiver); a gateway that is not the leader (another holds
+    the socket, or the integration is off) syncs it once after the start-time
+    texts load, on a daemon thread (never the caller's). Any other Hermes
+    process (a session, ``status``, ``doctor``) never writes it."""
+
+    _TEXTS: ClassVar[dict[str, Any]] = {
+        "version": "1",
+        "manual": {"url": "https://agentchat.me/skill.md", "version": "2.4.2", "sha256": "0" * 64},
+        "wake_instruction": "w",
+        "invite_prompt": "i",
+        "identity_line": "I am @alice on AgentChat.",
+        "identity_line_template": "I am @<handle> on AgentChat.",
+    }
+
+    def _run(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, gateway_mode: bool, lock_winner: bool, integration: bool = True, texts: bool = True) -> tuple[Any, list[dict[str, Any]], Any]:
+        from agentchatme.types import Texts
+
+        from agentchatme_hermes import manual
+        from agentchatme_hermes.runtime import Runtime
+
+        calls: list[dict[str, Any]] = []
+        monkeypatch.setattr(manual, "sync_in_background", lambda **kw: calls.append(kw))
+        served = Texts.model_validate(self._TEXTS) if texts else None
+        with _patched_runtime(lock_winner=lock_winner) as (ws_cls, _inv, _client, _acq, _rel), patch(
+            "agentchatme_hermes.runtime.load_texts", MagicMock(return_value=served)
+        ):
+            cfg = _config(hermes_home=tmp_path / ".hermes")
+            cfg.integration_enabled = integration
+            rt = Runtime(cfg, gateway_mode=gateway_mode)
+            rt.start()
+            rt.stop()
+        return served, calls, ws_cls
+
+    @pytest.mark.parametrize(
+        ("gateway_mode", "lock_winner", "integration"),
+        [(True, False, True), (True, True, False)],
+        ids=["follower-gateway", "integration-off"],
+    )
+    def test_a_gateway_without_the_loop_syncs_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gateway_mode: bool, lock_winner: bool, integration: bool
+    ) -> None:
+        served, calls, _ws = self._run(monkeypatch, tmp_path, gateway_mode=gateway_mode, lock_winner=lock_winner, integration=integration)
+        assert served is not None
+        assert calls == [
+            {"home": tmp_path / ".hermes", "served": served.manual, "api_base": "https://api.example.test", "label": "default"}
+        ]
+
+    @pytest.mark.parametrize("integration", [True, False])
+    def test_a_process_that_is_not_the_gateway_never_syncs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, integration: bool
+    ) -> None:
+        """`hermes chat`, `hermes agentchat status`, `doctor` without --fix:
+        what they report is the file as found."""
+        _served, calls, ws_cls = self._run(monkeypatch, tmp_path, gateway_mode=False, lock_winner=True, integration=integration)
+        assert calls == [] and not ws_cls.called
+
+    def test_without_texts_nothing_is_announced(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        _served, calls, _ws = self._run(monkeypatch, tmp_path, gateway_mode=True, lock_winner=False, texts=False)
+        assert len(calls) == 1 and calls[0]["served"] is None  # sync_in_background does nothing then
+
+    def test_the_leader_hands_its_loop_the_manual(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from agentchatme_hermes import manual
+
+        _served, calls, ws_cls = self._run(monkeypatch, tmp_path, gateway_mode=True, lock_winner=True)
+        assert calls == [], "the receive loop's ManualSync keeps it current"
+        factory = ws_cls.call_args.kwargs["manual_sync_factory"]
+        built: list[tuple[Any, dict[str, Any]]] = []
+        monkeypatch.setattr(manual, "manual_sync_for", lambda texts, **kw: built.append((texts, kw)) or "sync")
+        on_result = MagicMock()
+        assert factory("the loop's texts", on_result) == "sync"
+        assert built == [("the loop's texts", {"home": tmp_path / ".hermes", "on_result": on_result})]
+
+
 _SERVED = {
     "version": "1",
     "manual": {"url": "u", "version": "v"},

@@ -19,6 +19,7 @@ import sys
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
+import pytest
 from fake_keys import api_key
 
 from agentchatme_hermes._register import _is_gateway_context
@@ -26,8 +27,6 @@ from agentchatme_hermes.leader_lock import GATEWAY_ENV_MARKER
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 class TestIsGatewayContext:
@@ -437,6 +436,12 @@ class TestReconcileMcpRegistration:
         assert any("hosted tools not registered" in r.getMessage() for r in caplog.records)
 
 
+def _bundled_bytes() -> bytes:
+    from agentchatme_hermes.manual import BUNDLED_MANUAL_PATH
+
+    return BUNDLED_MANUAL_PATH.read_bytes()
+
+
 class TestSurface:
     def test_skill_registered_and_no_native_tools(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -454,9 +459,27 @@ class TestSurface:
         assert ctx.register_skill.called
         skill_kwargs = ctx.register_skill.call_args.kwargs
         assert skill_kwargs["name"] == "agentchat"
-        assert skill_kwargs["path"].name == "SKILL.md"
-        assert skill_kwargs["path"].parent.name == "agentchat"
+        # A process that is not the gateway writes nothing: with no file placed
+        # yet it registers the package's copy.
+        target = tmp_path / ".hermes" / "plugin-data" / "agentchat" / "manual" / "SKILL.md"
+        assert skill_kwargs["path"].read_bytes() == _bundled_bytes()
+        assert skill_kwargs["path"] != target and not target.exists()
         assert not ctx.register_tool.called, "no native tools — the hosted MCP server is the tool source"
+
+    def test_the_gateway_places_the_manual_and_registers_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import _register
+
+        monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
+        monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: None)
+        monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
+        monkeypatch.setattr(_register.ActivationWatcher, "start", lambda self: None)
+        ctx = MagicMock()
+        _register.register(ctx)
+        target = tmp_path / ".hermes" / "plugin-data" / "agentchat" / "manual" / "SKILL.md"
+        assert ctx.register_skill.call_args.kwargs["path"] == target
+        assert target.read_bytes() == _bundled_bytes()
 
 
 class TestActivationWatcher:
@@ -709,7 +732,24 @@ class TestWithoutTheKit:
         monkeypatch.setattr(integration, "ReceiveLoop", OldReceiveLoop)
         problem = kit_problem()
         assert problem is not None and "without could not process" in problem and KIT_REQUIREMENT in problem
-        assert KIT_REQUIREMENT == "agentchatme>=1.5.0"
+        assert KIT_REQUIREMENT == "agentchatme>=1.6.1"
+
+    @pytest.mark.parametrize(
+        ("installed", "said"),
+        [("1.6.0", True), ("1.5.1", True), ("1.6.1", False), ("1.6.2rc1", False), ("1.7.0", False), ("not installed", False)],
+    )
+    def test_a_kit_whose_manual_sync_does_not_retry_is_a_doctor_warning(
+        self, monkeypatch: pytest.MonkeyPatch, installed: str, said: bool
+    ) -> None:
+        """1.6.1's ManualSync retries while the manual is stale; an older kit
+        still receives, so it is a warning, never a reason to stop."""
+        from agentchatme_hermes import kit
+
+        monkeypatch.setattr(kit, "installed_sdk_version", lambda: installed)
+        problem = kit.manual_retry_problem()
+        assert (problem is not None) is said
+        if said:
+            assert installed in problem and "agentchatme>=1.6.1" in problem
 
     def test_the_plugin_and_its_cli_import_without_the_kit(self) -> None:
         import os

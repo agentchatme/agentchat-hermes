@@ -332,7 +332,7 @@ def remove_env_lines(env_file: Path, names: tuple[str, ...]) -> bool:
         return False
     text = raw.decode("utf-8")
     lines = text.splitlines(keepends=True)
-    kept = [line for line in lines if _line_key(line.lstrip("﻿")) not in names]
+    kept = [line for line in lines if _line_key(line.lstrip("\ufeff")) not in names]
     if len(kept) == len(lines):
         return False
     tmp = env_file.with_name(f".{env_file.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")

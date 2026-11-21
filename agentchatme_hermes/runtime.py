@@ -13,6 +13,10 @@ bound to that profile's own key, home, SOUL.md and leader lock. Owns:
 * The served texts in use (from the SDK kit's ``TextsCache``: a one-shot
   load at start, then the receive loop's daily-refreshed cache), with
   listeners for the SOUL.md identity line.
+* The manual (:mod:`.manual`): the leader's receive loop keeps it current
+  (the kit's ``ManualSync``); a gateway runtime that is not the leader syncs it
+  once, on a daemon thread, after the start-time texts load; any other process
+  never writes it.
 * The :class:`~.receiver.Receiver` (the kit's receive loop on a supervised
   thread: socket, texts, wakes, gate, turns), leader only.
 * The :class:`AgentInvoker` (the loop's Hermes callbacks: model call, turn), leader only.
@@ -27,6 +31,7 @@ import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple
 
+from . import manual as manual_module
 from .agent_invoker import AgentInvoker
 from .client_identity import hermes_client_identity
 from .leader_lock import lock_path_for, release_leader_lock, try_acquire_ws_leader_lock
@@ -268,6 +273,13 @@ class Runtime:
                     and self.integration_enabled
                     and self._try_acquire_leader()
                 )
+                if not self._is_leader and self._gateway_mode_requested:
+                    # A gateway with no receive loop for this account (another
+                    # process is the leader, or the integration is off): one
+                    # sync against the texts just loaded, off this thread.
+                    # Any other Hermes process (a session, `status`, `doctor`)
+                    # never writes the manual: they report it as found.
+                    self._sync_manual_once()
 
                 if self._is_leader:
                     self._start_leader_components()
@@ -350,6 +362,7 @@ class Runtime:
             host_llm=self._host_llm,
         )
         state_dir = self._state_dir
+        home = self._hermes_home
         self._receiver = Receiver(
             config=self._config,
             identity=self._identity,
@@ -360,9 +373,28 @@ class Runtime:
             hermes_home=self._hermes_home,
             health=health,
             health_path=health_path_for(self._lock_path),
+            manual_sync_factory=lambda texts, on_result: manual_module.manual_sync_for(
+                texts, home=home, on_result=on_result
+            ),
         )
         health.set_worker_status(self._receiver.worker_status)
         self._receiver.start()
+
+    def _sync_manual_once(self) -> None:
+        """One manual sync on a daemon thread, against the texts in use (a
+        gateway runtime that is not the leader: another gateway holds the
+        socket, or the integration is off). Nothing without texts: nothing is
+        announced."""
+        texts = self.texts
+        try:
+            manual_module.sync_in_background(
+                home=self._hermes_home,
+                served=getattr(texts, "manual", None) if texts is not None else None,
+                api_base=self._config.api_base,
+                label=profile_label(self._hermes_home),
+            )
+        except Exception:
+            logger.warning("agentchat runtime: the manual sync could not start", exc_info=True)
 
     def _start_leader_retry(self) -> None:
         """Keep contesting the election from a follower-gateway runtime."""

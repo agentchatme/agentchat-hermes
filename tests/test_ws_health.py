@@ -7,6 +7,8 @@ import sys
 import time
 from typing import TYPE_CHECKING
 
+import pytest
+
 from agentchatme_hermes.ws_health import (
     health_age_seconds,
     health_path_for,
@@ -16,8 +18,6 @@ from agentchatme_hermes.ws_health import (
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 def test_health_round_trip_is_atomic_shape_and_private(tmp_path: Path) -> None:
@@ -179,15 +179,20 @@ def test_doctor_lines_for_could_not_process() -> None:
     assert pause_end("2026-11-20T23:13:48.12345+00:00") == pause_end("2026-11-20T23:13:48.123450Z")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the leader lock is fcntl, POSIX-only")
 def test_status_shows_could_not_process_from_this_accounts_health_record(capsys: pytest.CaptureFixture[str]) -> None:
     """``hermes agentchat status`` reads the running gateway's record for
     this account (beside its leader lock) and prints the counts and the
-    paused conversations; no record, a stale one, or one without the section
-    prints nothing more."""
+    paused conversations; no record, a stale one, one whose gateway is gone
+    (the lock free), or one without the section prints nothing more."""
     from fake_keys import api_key
 
     from agentchatme_hermes import cli
-    from agentchatme_hermes.leader_lock import lock_path_for
+    from agentchatme_hermes.leader_lock import (
+        lock_path_for,
+        release_leader_lock,
+        try_acquire_ws_leader_lock,
+    )
     from agentchatme_hermes.profile_scope import account_fingerprint, resolve_hermes_home
 
     base, key = "https://api.example.test", api_key("status")
@@ -201,7 +206,13 @@ def test_status_shows_could_not_process_from_this_accounts_health_record(capsys:
         }},
     }
     write_ws_health(handle="me", state="connected", path=health_path_for(lock), worker=worker)
-    found = cli._health_worker(base, key)
+    assert cli._health_worker(base, key) is None, "the lock is free: no gateway lives behind the record"
+    fd = try_acquire_ws_leader_lock(lock)
+    assert fd is not None
+    try:
+        found = cli._health_worker(base, key)
+    finally:
+        release_leader_lock(fd)
     assert found == worker
     cli._print_status({"handle": "me", "status": "active"}, worker=found)
     out = capsys.readouterr().out
