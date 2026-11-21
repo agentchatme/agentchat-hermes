@@ -4,6 +4,9 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+Needs `agentchatme>=1.8.0,<2` (was 1.6.1) in `pyproject.toml`, both `plugin.yaml` files and the git-clone shim (which
+upgrades an older installed SDK): 1.8.0's `anchor.owner` / `decide` / `follow` are the strict identity-block rule.
+
 ### Fixed
 
 - **The SOUL.md refresh no longer rewrites your own words.** The activation path refreshed the identity block whenever

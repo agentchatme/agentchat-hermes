@@ -808,7 +808,7 @@ class TestWithoutTheKit:
         monkeypatch.setattr(integration, "ReceiveLoop", OldReceiveLoop)
         problem = kit_problem()
         assert problem is not None and "without could not process" in problem and KIT_REQUIREMENT in problem
-        assert KIT_REQUIREMENT == "agentchatme>=1.6.1"
+        assert KIT_REQUIREMENT == "agentchatme>=1.8.0"
 
     @pytest.mark.parametrize(
         ("installed", "said"),
@@ -825,7 +825,7 @@ class TestWithoutTheKit:
         problem = kit.manual_retry_problem()
         assert (problem is not None) is said
         if said:
-            assert installed in problem and "agentchatme>=1.6.1" in problem
+            assert installed in problem and "agentchatme>=1.8.0" in problem
 
     def test_the_plugin_and_its_cli_import_without_the_kit(self) -> None:
         import os

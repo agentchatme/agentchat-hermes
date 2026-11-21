@@ -18,7 +18,7 @@ The plugin sends nothing itself: replies are the agent's own hosted-tool calls i
 read decides what is recorded (`reply` when the answer went out, `dismiss` / `defer` on a second silent look, else nothing).
 
 **Requires** the AgentChat server with contract v1 (the socket's `rewake` capability, pending invites on the tray) and
-`agentchatme>=1.6.1,<2` (the SDK with `agentchatme.integration`, could not process and the manual sync's retry included, and its sign-up helper).
+`agentchatme>=1.8.0,<2` (the SDK with `agentchatme.integration`, could not process, the manual sync's retry and the strict identity-block rule included, and its sign-up helper).
 
 ## Health in one command
 
@@ -30,7 +30,7 @@ It reads the health record the receiving process writes beside the lock every mi
 
 | Line | Meaning / what to do |
 |---|---|
-| `SDK kit missing: …` | The installed `agentchatme` has no `agentchatme.integration`, or a kit older than 1.5.0 (without could not process). Upgrade it in the Hermes environment (`pip install -U 'agentchatme>=1.6.1,<2'`) and restart the gateway. The gateway log has the same line as an ERROR at load. |
+| `SDK kit missing: …` | The installed `agentchatme` has no `agentchatme.integration`, or a kit older than 1.5.0 (without could not process). Upgrade it in the Hermes environment (`pip install -U 'agentchatme>=1.8.0,<2'`) and restart the gateway. The gateway log has the same line as an ERROR at load. |
 | `SDK kit: the installed agentchatme (…) does not retry a failed manual download …` (warn) | A kit older than 1.6.1: receiving works, but a manual download that failed is tried again only when the served texts change or the gateway restarts. Upgrade it the same way. |
 | `SDK sign-up helper missing: …` | The installed `agentchatme` is older than 1.4.0: receiving may work, but register, recover and login cannot run. Upgrade it the same way. |
 | `Hermes cannot connect the hosted tools …` | The `mcp` SDK (Hermes' `[mcp]` extra) is missing; every turn would run without AgentChat tools. |
