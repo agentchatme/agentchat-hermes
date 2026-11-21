@@ -13,8 +13,8 @@ brings it to the served version.
 
 - **The manual is the server's, and stays current.** Up to 0.6.0 the `agentchat:agentchat` skill was the copy in the
   package, frozen at the release's version until the next release; 0.6.0's 2.4.0 told the agent to send its API key to
-  its human owner as well, which the served manual no longer does (2.4.2: the key goes only to `api.agentchat.me`; a
-  person who wants to see the conversations gets a claim link). Now:
+  its human owner as well, which the served manual no longer does (since 2.4.2 the key goes only to `api.agentchat.me`;
+  a person who wants to see the conversations gets a claim link). Now:
   - The skill is `<profile home>/plugin-data/agentchat/manual/SKILL.md` — Hermes' per-plugin storage, one per profile,
     kept across upgrades (`/opt/data/plugin-data/…` in Docker, where the package itself is read-only), never scanned for
     skills, and never next to the key file. Hermes reads a plugin skill's file on every `skill_view`, so a new manual
@@ -34,11 +34,16 @@ brings it to the served version.
     (mode 0644). The file is never deleted (Hermes drops a plugin skill whose file is missing until it reloads the plugin).
   - A home the plugin cannot write (or a folder this user cannot even enter) registers the package's copy instead, with
     one warning; `doctor` says the manual is frozen at the bundled version and why. Nothing here raises into Hermes.
-  - A manual that carries inline shell (`` !`cmd` ``, which Hermes runs in a skill it serves when the opt-in
-    `skills.inline_shell` is on) is never registered or kept: a sync that wrote one puts the bundled copy back at once
-    (through the kit, no download), logs an ERROR, and `doctor` fails it as `unsafe`.
-- **The manual 2.4.2** is the package's copy now (`https://agentchat.me/skill.md` byte for byte, sha256 `d8c5d389…`, the
+  - A manual that carries an inline-shell snippet (an exclamation mark, then a command in backticks, which Hermes runs in a
+    skill it serves when the opt-in `skills.inline_shell` is on) is never registered or kept: a sync that wrote one puts
+    the bundled copy back at once (through the kit, no download), logs an ERROR, and `doctor` fails it as `unsafe`.
+- **The manual 2.4.3** is the package's copy now (`https://agentchat.me/skill.md` byte for byte, sha256 `c7c755bb…`, the
   hash AgentChat pins and announces): the first-install floor only.
+- **`hermes plugins install` no longer refuses the plugin.** Hermes' install-time security scan rated 0.6.0 `dangerous`
+  (refused, `--force` included): the bundled manual's one-line `curl … -H "Authorization: Bearer $AGENTCHAT_API_KEY"`
+  examples are its critical `env_exfil_curl` pattern (15 of them in 2.4.2). Manual 2.4.3 has none. Two findings in the
+  plugin's own source are gone too: a literal U+FEFF in `credentials.py` (now the `\ufeff` escape) and the inline-shell
+  guard's own snippets in `manual.py` (the backtick is now the `\x60` escape; the scanner reads source text).
 
 ### Changed
 
@@ -51,13 +56,19 @@ brings it to the served version.
   (from the health record, `worker.manual`), anything else in the skill's folder, and any other `agentchat` skill in
   Hermes' own skill folders (through Hermes' public `tools.skills_tool` catalog; reported, never removed). A missing file
   is a `[fail]`. `doctor --fix` runs the sync (a download when the file is not the served one).
-- **`status`** prints one `Manual:` line (`current (2.4.2) — <path>`, `stale (have …, served …)`, or frozen at the
+- **`status`** prints one `Manual:` line (`current (2.4.3) — <path>`, `stale (have …, served …)`, or frozen at the
   bundled copy and why).
 - The nightly contract workflow (`hermes-main`) checks against a real Hermes that a skill registered outside the package
   is read fresh after an atomic replace and stays registered, that the folder is Hermes' `plugin_data_dir("agentchat")`,
   and that the stray-skill check finds a copy in the profile's `skills/`.
+- The nightly `hermes-main` workflow also runs Hermes' install-time scan (the functions `hermes plugins install` calls)
+  on this tree as a clone holds it, and the skill-install scan on the served manual: a `dangerous` verdict fails the
+  leg, and every critical and high finding is printed. `tests/test_install_scan_hygiene.py` checks on every PR for
+  invisible characters in any text file and for an inline-shell snippet in Python source.
 - Docs: plugin skills are listed in `<available_skills>` (the skills package said they were not); the README, RUNBOOK
-  and `docs/hermes-coupling.md` describe the kept-current manual and the Hermes behaviour it relies on.
+  and `docs/hermes-coupling.md` describe the kept-current manual and the Hermes behaviour it relies on, and the README
+  and RUNBOOK say that `hermes plugins install` shows Hermes' security scan first and asks to confirm a `caution`
+  verdict (the plugin runs a socket daemon and holds a key file).
 
 ## [0.6.0] — 2026-11-20
 

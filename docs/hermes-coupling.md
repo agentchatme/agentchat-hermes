@@ -99,6 +99,12 @@ the new text and the skill stays registered.
 | `skill_view(name, file_path=…)` serves any file in the skill's folder | `manual.py` | `SKILL.md` is alone in its folder, away from the key file; a folder holding anything else is not registered (the package's copy is, and `doctor` says why). | — |
 | `hermes_cli.plugins.get_plugin_manager().find_plugin_skill("agentchat:agentchat")` | `cli.py` (`doctor`, `status`) | Which file Hermes holds for the skill in this process (else what the plugin gave it). Diagnostics only. | **Upstream ask:** a public read of a plugin's registered skills. |
 
+## The install-time security scan — internal, nightly
+
+| Surface | Where | Why | Public replacement |
+|---|---|---|---|
+| `hermes_cli.plugins_install_scan.scan_plugin` / `should_allow_plugin_install` (older releases: `tools.plugin_guard`), `tools.skills_guard.scan_skill` / `should_allow_install` | `.github/scripts/hermes-install-scan.py`, run by `hermes-main` | What `hermes plugins install` and `hermes skills install` call on a clone or a downloaded skill: `dangerous` is refused (`--force` does not override), a plugin's `caution` asks to confirm. The nightly scans this tree as a clone holds it and the served manual, so a finding that would block or question an install shows within a day. Two findings need no Hermes and are checked on every PR (`tests/test_install_scan_hygiene.py`): invisible characters in any text file, and an inline-shell snippet in Python source (written with the `\x60` escape, this plugin's own guard included). | **Upstream ask:** a public scan entry point (`hermes plugins scan <dir>`). |
+
 ## The key
 
 The key lives in the profile's own key file (`key_store.py`), not in `.env`: Hermes loads `.env` into its process

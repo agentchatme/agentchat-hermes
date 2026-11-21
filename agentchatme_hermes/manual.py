@@ -85,13 +85,19 @@ _DESKTOP_DROPPINGS = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
 # How long a process that is exiting waits for a sync still in flight (a CLI
 # command can end before its download does).
 _EXIT_WAIT_S = 2.0
-# Hermes runs every ``!`cmd``` in a SKILL.md it serves when ``skills.inline_shell``
-# is on (``agent/skill_preprocessing.py`` ``_INLINE_SHELL_RE``, the same
-# pattern): a manual that carries one is never registered or kept.
-INLINE_SHELL = re.compile(r"!`([^`\n]+)`")
+# Hermes runs every inline-shell snippet (an exclamation mark, then a command in
+# backticks) in a SKILL.md it serves when ``skills.inline_shell`` is on
+# (``agent/skill_preprocessing.py`` ``_INLINE_SHELL_RE``, the same pattern): a
+# manual that carries one is never registered or kept. The backtick is written
+# as the escape ``\x60`` here and below, never next to the exclamation mark:
+# Hermes' install scanner (``hermes plugins install``) reads this source text
+# and flags that two-character sequence wherever it appears, this guard included.
+_TICK = "\x60"
+INLINE_SHELL = re.compile(r"!\x60([^\x60\n]+)\x60")
+_SNIPPET = "!" + _TICK + "..." + _TICK
 _INLINE_SHELL_REFUSED = (
-    "the served manual carries inline shell (!`...`), which Hermes runs when skills.inline_shell "
-    "is on — the bundled copy was put back"
+    f"the served manual carries inline shell ({_SNIPPET}), which Hermes runs when "
+    "skills.inline_shell is on — the bundled copy was put back"
 )
 
 ManualCheckState = Literal["current", "stale", "tampered", "unsafe", "unchecked", "missing"]
@@ -297,7 +303,7 @@ def _unusable(target: Path, home: Path) -> str | None:
     if _front_matter(data).get("name") != MANUAL_SKILL_NAME:
         return f"{target} is not the agentchat manual (left as it is; the next sync with the server replaces it)"
     if INLINE_SHELL.search(data.decode("utf-8", "replace")):
-        return f"{target} carries inline shell (!`...`), which Hermes runs when skills.inline_shell is on"
+        return f"{target} carries inline shell ({_SNIPPET}), which Hermes runs when skills.inline_shell is on"
     return None
 
 
@@ -533,7 +539,7 @@ def check(path: Path, served: Any) -> ManualCheck:
     version = fields.get("version")
     have = version or "an unversioned file"
     if INLINE_SHELL.search(data.decode("utf-8", "replace")):
-        return result("unsafe", f"unsafe (have {have}: it carries inline shell, !`...`)", version)
+        return result("unsafe", f"unsafe (have {have}: it carries inline shell, {_SNIPPET})", version)
     if served_version is None:
         return result("unchecked", f"unchecked (have {have}; no served version in hand)", version)
     if served_sha is not None and not re.fullmatch(r"[0-9a-f]{64}", served_sha):

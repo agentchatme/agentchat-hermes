@@ -13,6 +13,13 @@ name: hermes-main
 # turn stopped by the time limit and a real ctx.llm call, both against a
 # localhost model stub.
 #
+# Each leg also runs Hermes' own install-time security scan (the functions
+# `hermes plugins install` calls, .github/scripts/hermes-install-scan.py) on this
+# tree as a clone holds it, and the skill-install scan on the manual
+# https://agentchat.me/skill.md serves now: a `dangerous` verdict, which Hermes
+# refuses even with --force, fails the leg; every critical and high finding is
+# printed. Both run even when the tests failed.
+#
 # Two legs. `main`: a red leg means Hermes main changed something the next
 # Hermes release would break here. `latest release`: the newest hermes-agent
 # release that is neither a draft nor a pre-release, looked up at run time
@@ -129,6 +136,7 @@ jobs:
           version: "0.12.13"
 
       - name: Hermes as its own CI installs it (uv.lock, Python 3.14, mcp extra)
+        id: hermes
         working-directory: hermes-agent
         run: |
           set -euo pipefail
@@ -162,6 +170,31 @@ jobs:
             echo "::error::the Hermes contract tests were skipped — Hermes did not import"
             exit 1
           fi
+
+      # The tree `hermes plugins install agentchatme/agentchat-hermes` clones:
+      # the tracked files of this commit (git archive), nothing the steps above
+      # wrote into the checkout.
+      - name: Hermes' install scan of this plugin (as hermes plugins install runs it)
+        if: ${{ !cancelled() && steps.hermes.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          tree="$RUNNER_TEMP/scan/agentchat"
+          mkdir -p "$tree"
+          git -C plugin archive --format=tar HEAD | tar -x -C "$tree"
+          hermes-agent/.venv/bin/python plugin/.github/scripts/hermes-install-scan.py \
+            plugin "$tree" https://github.com/agentchatme/agentchat-hermes.git
+
+      - name: Hermes' skill-install scan of the served manual (as hermes skills install runs it)
+        if: ${{ !cancelled() && steps.hermes.outcome == 'success' }}
+        run: |
+          set -euo pipefail
+          skill="$RUNNER_TEMP/served-manual/agentchat"
+          mkdir -p "$skill"
+          curl -sS --fail --max-time 30 -o "$skill/SKILL.md" https://agentchat.me/skill.md
+          sed -n 's/^version: //p' "$skill/SKILL.md" | head -1 | sed 's/^/served manual version: /'
+          sha256sum "$skill/SKILL.md"
+          hermes-agent/.venv/bin/python plugin/.github/scripts/hermes-install-scan.py \
+            skill "$skill" https://agentchat.me/skill.md
 
   report:
     name: Open, update or close the nightly issue

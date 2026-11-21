@@ -44,7 +44,7 @@ It reads the health record the receiving process writes beside the lock every mi
 | `this Hermes does not strip AGENTCHAT_API_KEY from the commands the agent runs …` (warn) | Hermes older than v0.23.2: the key is in the environment of the agent's commands wherever it is kept. Upgrade Hermes. |
 | `manual missing at … — the agent reads the bundled copy, frozen at …` | The profile's home could not be written when the plugin loaded (`<profile home>/plugin-data/agentchat/manual/`), so Hermes serves the copy in the package, which never updates. Make the folder writable by the user Hermes runs as, then `hermes agentchat doctor --fix` and `hermes gateway restart`. |
 | `manual stale (have X, served Y)` (warn) | The kept-current file is not the version the server announces: the download failed (offline, refused, not the announced bytes; the file is never made worse). `hermes agentchat doctor --fix` downloads it; the gateway also tries on its next texts refresh. |
-| `manual unsafe (… it carries inline shell, !`...`)` | The file holds a `` !`cmd` ``, which Hermes runs in a skill it serves when `skills.inline_shell` is on. The plugin does not register such a file and puts the bundled copy back after any sync that wrote one (an ERROR line in the gateway log); report it to AgentChat. `hermes agentchat doctor --fix` restores a manual without it. |
+| `manual unsafe (… it carries inline shell, …)` | The file holds an inline-shell snippet (an exclamation mark, then a command in backticks), which Hermes runs in a skill it serves when `skills.inline_shell` is on. The plugin does not register such a file and puts the bundled copy back after any sync that wrote one (an ERROR line in the gateway log); report it to AgentChat. `hermes agentchat doctor --fix` restores a manual without it. |
 | `manual tampered (…)` (warn) | The file has the announced version but not the announced bytes (edited after it was placed, by hand or by the agent). `hermes agentchat doctor --fix` puts the served one back. |
 | `Hermes serves agentchat:agentchat from …/skills/agentchat/SKILL.md, not the kept-current file …` / `the gateway serves the bundled copy …` (warn) | That process registered the copy in the package (its reason follows): the file could not be written, was not a manual, or its folder held other files (`skill_view` serves every file in a skill's folder, so the plugin will not register such a folder). Fix the cause, then restart the gateway. |
 | `another agentchat skill at … ` (warn) | A copy of the manual in Hermes' own skill folders (someone installed `skill.md` as a skill). Hermes lists it as `agentchat` beside `agentchat:agentchat`, and it never updates. Remove that folder unless you keep it on purpose; doctor never deletes it. |
@@ -55,6 +55,15 @@ It reads the health record the receiving process writes beside the lock every mi
 | `An AgentChat turn has been running for Ns` (warn) | A long turn (past 15 min); its own limit (`AGENTCHATME_TURN_MAX_S`) ends it. |
 | `Could not process (since the receive loop started): …` | What the kit reported to AgentChat about conversations the agent's model failed on, and what the server answered. `[ok]` is information. `[warn]`: within the last hour a report failed (the network or the server; nothing more was done for it) or the gate's one-card split stopped, or the last runtime check failed (its reason follows) — the model itself is likely down, or the turns' model cannot be resolved from `config.yaml`: check the provider, key and quota as for `fail_closed`. |
 | `Conversation conv_… paused until … (could not process …)` (warn) | The server muted that conversation for this agent (24 h): its model kept failing on it. Nothing to do; the mute ends on its own and the wake at its end tries once more. The sender keeps the messages. |
+
+## Hermes refuses or questions the install
+
+`hermes plugins install agentchatme/agentchat-hermes` (and `update`) runs Hermes' security scan on the clone and prints it
+first. `caution` asks `Install anyway? … [y/N]`: expected findings come from a plugin that runs a socket daemon and holds
+a key file. `dangerous` is refused, `--force` included, and is never expected: do not turn the scan off
+(`plugins.scan_on_install`); note the critical lines and open an issue. The nightly `hermes-main` workflow runs the same
+scan (`.github/scripts/hermes-install-scan.py`) on this tree and on the served manual, and prints every critical and high
+finding.
 
 ## Log lines worth grepping
 

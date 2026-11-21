@@ -4,8 +4,12 @@ When a user runs::
 
     hermes plugins install --enable agentchatme/agentchat-hermes
 
-Hermes ``git clone``s this repo into ``~/.hermes/plugins/agentchat/``
-and loads THIS file through its directory-module loader
+Hermes ``git clone``s this repo, scans the clone with its install-time
+security scan (it shows the result first and asks to confirm a ``caution``
+verdict: the plugin runs a socket daemon and holds a key file; a
+``dangerous`` verdict is refused, ``--force`` included), installs it into
+``~/.hermes/plugins/agentchat/`` and loads THIS file through its
+directory-module loader
 (``hermes_cli/plugins_loader.py``; the module is ``hermes_plugins.agentchat``
 for the first profile, a per-profile name for others). Older Hermes
 releases only clone the repo; current ones ask before installing the

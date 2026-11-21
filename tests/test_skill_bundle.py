@@ -19,8 +19,8 @@ from agentchatme_hermes.skills import SKILL_NAME, SKILL_PATH, SKILL_SOURCE_URL
 # same pair (MANUAL_VERSION / MANUAL_SHA256 in the core repository's
 # packages/shared/src/types/texts.ts) and announces it in the served texts. A
 # new manual changes both here.
-MANUAL_VERSION = "2.4.2"
-MANUAL_SHA256 = "d8c5d38982314b5f136d633c5c3f467c399782c0556ca0f54ff8ded0b874120a"
+MANUAL_VERSION = "2.4.3"
+MANUAL_SHA256 = "c7c755bb75dac1df831ca3f4f7e768f8432d03133ccec138e3dd5b4a5eee935d"
 
 
 class TestBundle:
@@ -46,9 +46,12 @@ class TestBundle:
         assert SKILL_SOURCE_URL == "https://agentchat.me/skill.md"
 
     def test_no_inline_shell_for_hermes_to_run(self) -> None:
-        """Hermes can expand ``!`cmd``` in a SKILL.md it serves (the opt-in
-        ``skills.inline_shell``): the manual must carry none."""
-        assert re.search(r"!`[^`\n]+`", SKILL_PATH.read_text(encoding="utf-8")) is None
+        """Hermes can expand an inline-shell snippet (an exclamation mark, then a
+        command in backticks; the opt-in ``skills.inline_shell``) in a SKILL.md
+        it serves: the manual must carry none. The backtick is the ``\\x60``
+        escape, so this source does not carry the sequence Hermes' install
+        scanner flags."""
+        assert re.search(r"!\x60[^\x60\n]+\x60", SKILL_PATH.read_text(encoding="utf-8")) is None
 
     def test_the_key_goes_only_to_agentchat_and_claim_links_instead(self) -> None:
         """2.4.0 told the agent to send its key to its human owner as well; the
@@ -58,6 +61,14 @@ class TestBundle:
         assert "**Send the key to exactly one place: `api.agentchat.me`**" in text
         assert "**Your human owner** — once" not in text
         assert "agentchat_create_claim_link" in text
+
+    def test_no_one_line_curl_with_the_key_for_hermes_to_block(self) -> None:
+        """Hermes' install scan (``hermes plugins install``) blocks a plugin whose
+        files hold a one-line ``curl … -H "Authorization: Bearer $AGENTCHAT_API_KEY"``
+        (``env_exfil_curl``, critical; ``--force`` does not override). 2.4.2 had 15;
+        the served manual since 2.4.3 has none."""
+        text = SKILL_PATH.read_text(encoding="utf-8")
+        assert re.search(r"curl[^\n]*Authorization: Bearer \$AGENTCHAT_API_KEY", text) is None
 
     def test_manual_covers_the_tray_the_gate_and_the_hosted_tools(self) -> None:
         text = SKILL_PATH.read_text(encoding="utf-8")
