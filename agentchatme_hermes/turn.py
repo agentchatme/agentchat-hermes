@@ -71,8 +71,9 @@ def identity_line(texts: Texts) -> str:
 
 
 def identity_line_template(texts: Texts) -> str:
-    """The served template (``<handle>`` unfilled): what
-    :func:`.soul_anchor.read_anchor_handle` recognises an unmarked block by."""
+    """The served template (``<handle>`` unfilled): a block an earlier release
+    wrote without a handle line is this agent's when its text is this, filled
+    in, exactly (the kit's ``anchor.owner``)."""
     return texts.identity_line_template.strip()
 
 

@@ -75,7 +75,7 @@ from .placement import (
     place_identity_and_tools,
     resolve_texts,
 )
-from .soul_anchor import remove_soul_anchor
+from .soul_anchor import AnchorError, remove_soul_anchor
 from .wizard import _mask_key
 
 if TYPE_CHECKING:
@@ -637,6 +637,11 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         retry_problem = manual_retry_problem()
         if retry_problem is not None:
             warn(f"SDK kit: {retry_problem}")
+        from .soul_anchor import anchor_kit_problem
+
+        soul_problem = anchor_kit_problem()
+        if soul_problem is not None:
+            warn(f"SDK kit: {soul_problem}")
     signup_problem = _signup_problem()
     if signup_problem is not None:
         fail(f"SDK sign-up helper missing: {signup_problem}")
@@ -745,62 +750,23 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             api_base=api_base,
             served_manual=served_texts.manual if served_texts is not None else None,
             hermes_home=hermes_home,
+            identity_template=identity_template,
+            # Another agent's block is a mismatch to fix (the key, or the
+            # block), never something `--fix` decides by replacing it.
+            replace_other_agent=False,
         ):
             report = fail if step.failed else warn if step.status == "warned" else ok
             report(f"fix: {step.name} {step.status} — {step.detail}")
 
-    try:
-        from .soul_anchor import (
-            anchor_is_current,
-            has_anchor,
-            read_anchor_handle,
-            resolve_soul_path,
-        )
-
-        if has_anchor():
-            anchored = read_anchor_handle(template=identity_template)
-            if (
-                anchored is not None
-                and authenticated_handle is not None
-                and anchored != authenticated_handle
-            ):
-                fail(
-                    f"IDENTITY MISMATCH: {resolve_soul_path()} says @{anchored} "
-                    f"but the configured key authenticates as "
-                    f"@{authenticated_handle}. This profile holds another "
-                    "agent's key or another agent's SOUL.md — run "
-                    "`hermes agentchat login` here with the right key, or "
-                    "re-register."
-                )
-            elif anchored is not None and identity_line is None:
-                warn(
-                    f"SOUL.md identity line present (@{anchored}) — cannot verify its text "
-                    "while /v1/texts is unreachable"
-                )
-            elif (
-                anchored is not None
-                and identity_line is not None
-                and anchor_is_current(identity_line, template=identity_template) is False
-            ):
-                warn(
-                    "SOUL.md identity line differs from the served text — run "
-                    "`hermes agentchat doctor --fix` to place the served line"
-                )
-            elif anchored is None:
-                warn(
-                    "SOUL.md agentchat block was hand-edited and names no handle this plugin "
-                    "recognises — it is yours, left alone; the served identity line is at "
-                    "https://agentchat.me/skill.md (Be reachable)"
-                )
-            else:
-                ok(f"SOUL.md identity line present (@{anchored}, served text)")
-        else:
-            warn(
-                "SOUL.md identity line missing — run "
-                "`hermes agentchat doctor --fix` (or `hermes agentchat login`) to place it"
-            )
-    except ImportError:
-        warn("soul_anchor module not importable — skipping anchor check")
+    _doctor_soul_checks(
+        handle=authenticated_handle,
+        identity_line=identity_line,
+        template=identity_template,
+        cmd=cmd,
+        ok=ok,
+        warn=warn,
+        fail=fail,
+    )
 
     _doctor_manual_checks(
         hermes_home,
@@ -1375,11 +1341,14 @@ def _install_placement(handle: str, *, api_base: str, api_key: str) -> list[Plac
     from .turn import identity_line as render_identity_line
 
     texts = resolve_texts(api_key=api_key, api_base=api_base)
+    from .turn import identity_line_template as render_identity_line_template
+
     steps = place_identity_and_tools(
         handle=handle,
         identity_line=render_identity_line(texts) if texts is not None else None,
         api_base=api_base,
         served_manual=texts.manual if texts is not None else None,
+        identity_template=render_identity_line_template(texts) if texts is not None else None,
     )
     for step in steps:
         if step.needs_attention:
@@ -1388,6 +1357,74 @@ def _install_placement(handle: str, *, api_base: str, api_key: str) -> list[Plac
         else:
             _printline(f"{step.name}: {step.detail}")
     return steps
+
+
+def _doctor_soul_checks(
+    *,
+    handle: str | None,
+    identity_line: str | None,
+    template: str | None,
+    cmd: str,
+    ok: Callable[[str], None],
+    warn: Callable[[str], None],
+    fail: Callable[[str], None],
+) -> None:
+    """The identity block in SOUL.md, read the way a refresh would: the kit's
+    ``decide`` with the served line in hand, else the strict ``owner``. A
+    block's words naming ``@handle`` do not make it this agent's (only its
+    handle line, or a text AgentChat served word for word, do)."""
+    try:
+        from .soul_anchor import AnchorError, inspect_soul
+    except ImportError:
+        warn("soul_anchor module not importable — skipping anchor check")
+        return
+    try:
+        state = inspect_soul(handle=handle, identity_line=identity_line, template=template)
+    except AnchorError as exc:
+        warn(f"SOUL.md identity line not checked — {exc}")
+        return
+    where = state.path
+    outcome = state.outcome
+    if outcome == "absent":
+        warn(f"SOUL.md identity line missing — run `{cmd} doctor --fix` (or `{cmd} login`) to place it")
+    elif outcome == "unreadable":
+        warn(f"SOUL.md identity line not checked — {state.detail}")
+    elif outcome == "unchanged":
+        ok(f"SOUL.md identity line present (@{state.claimed}, served text)")
+    elif outcome == "updated":
+        warn(
+            f"SOUL.md identity line for @{state.claimed} is not the served one (older text, or the served text "
+            f"in an older shape) — `{cmd} doctor --fix` places it (a running gateway also does when the texts change)"
+        )
+    elif outcome == "other_agent" or (
+        outcome == "unverified" and state.claimed is not None and handle is not None and state.claimed != handle
+    ):
+        fail(
+            f"IDENTITY MISMATCH: {where} says @{state.claimed} but the configured key authenticates as "
+            f"@{handle}. This profile holds another agent's key or another agent's SOUL.md — run "
+            f"`{cmd} login` here with the right key, or re-register."
+        )
+    elif outcome == "hand_edited":
+        names = f"; its words name @{state.named}" if state.named else ""
+        warn(
+            f"SOUL.md agentchat block was edited by hand: it has no handle line and is not a text AgentChat "
+            f"served{names}. It is yours, left alone — `{cmd} doctor --fix` puts the served identity line back "
+            "(your edit is replaced)"
+        )
+    elif outcome == "several_blocks":
+        warn(
+            f"{where} holds more than one AgentChat block — left alone (one write would remove the others); "
+            f"remove the extra ones by hand, then `{cmd} doctor --fix`"
+        )
+    elif outcome == "unverified" and state.claimed is not None:
+        warn(f"SOUL.md identity line present (@{state.claimed}) — cannot verify its text while /v1/texts is unreachable")
+    elif outcome == "unverified":
+        warn(
+            "SOUL.md agentchat block has no handle line; whether it is a text AgentChat served is checked "
+            "when /v1/texts answers"
+        )
+    else:
+        warn(f"SOUL.md identity line: {state.detail}")
 
 
 def _doctor_account_lines(me: Any, *, ok: Callable[[str], None], warn: Callable[[str], None]) -> None:
@@ -1744,7 +1781,7 @@ def _uninstall_soul_anchor() -> None:
     """Strip the AgentChat identity block from SOUL.md (idempotent)."""
     try:
         removed = remove_soul_anchor()
-    except OSError as exc:
+    except (OSError, AnchorError) as exc:
         sys.stderr.write(
             f"Warning: could not remove the AgentChat block from SOUL.md "
             f"({exc}). You can delete the block between "

@@ -2,6 +2,36 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The SOUL.md refresh no longer rewrites your own words.** The activation path refreshed the identity block whenever
+  a loose reading found this agent's `@handle` in it, so a block without a handle line whose words merely said "I am
+  @handle …" (yours, edited by hand) was replaced by the served line. The rule is now the SDK kit's, one copy for every
+  integration (`agentchatme.integration.anchor`, 1.8.0): a block is this agent's only when it carries this agent's
+  handle line, or when, without one, its whole text is EXACTLY a text AgentChat served (the served line, the served
+  template filled in, a line served before). The refresh is the kit's `anchor.follow`:
+  - this agent's own block is brought to the served line, written atomically, the rest of the file byte for byte (CRLF
+    stays CRLF, a missing final newline stays missing, a byte-order mark, the mode, a symlink);
+  - a block edited by hand is left alone and said once (the log, and `doctor`: "`doctor --fix` puts the served
+    identity line back");
+  - another agent's block is left alone with the IDENTITY MISMATCH error;
+  - several AgentChat blocks are left alone (one write would remove the others);
+  - with no block at all the served line is placed, as before.
+- **Placement on request** (`register`, `login`, `recover`, the wizard, `doctor --fix`) brings this agent's block to the
+  served line, places one where there is none, and puts a hand-edited block back to the served line; another agent's
+  block is replaced by `login` and the wizard (this profile becomes this agent) and never by `doctor --fix` (a mismatch
+  to fix, said). Every write is atomic, keeps the file's line breaks, and a SOUL.md that is not UTF-8 is never
+  written (said). `logout` removes the block the same way.
+- **`doctor`** reads SOUL.md the way the refresh does: the kit's `decide` with the served texts in hand (current, an
+  older text of ours, edited by hand and how to restore it, another agent's, several blocks), the strict `owner` when
+  AgentChat does not answer, and warns when the installed kit has no strict reading.
+
+### Removed
+
+- `soul_anchor.has_anchor`, `read_anchor_handle` and `anchor_is_current`: they read a block's owner loosely.
+
 ## [0.6.1] — 2026-11-21
 
 Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): the plugin placed a manual frozen at its release, and Hermes' install scanner refused 0.6.0 (its bundled manual's one-line curl examples), so this release fixes how the manual is placed and installed. Same AgentChat server and Hermes versions as

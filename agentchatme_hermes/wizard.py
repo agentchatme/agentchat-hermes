@@ -44,8 +44,9 @@ from .placement import (
     resolve_texts,
 )
 from .profile_scope import resolve_hermes_home
-from .soul_anchor import remove_soul_anchor
+from .soul_anchor import AnchorError, remove_soul_anchor
 from .turn import identity_line as render_identity_line
+from .turn import identity_line_template as render_identity_line_template
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -369,7 +370,7 @@ def _logout_flow(
         removed = remove_soul_anchor()
         if removed:
             _step("Identity line removed from SOUL.md")
-    except OSError as exc:
+    except (OSError, AnchorError) as exc:
         # Non-fatal — credentials are cleared, the anchor's just stuck.
         # User can delete the block manually if it matters.
         logger.warning("logout: SOUL.md anchor strip failed: %s", exc)
@@ -673,6 +674,7 @@ def _place_or_warn(handle: str, api_key: str, print_warning: Any) -> None:
         identity_line=render_identity_line(texts) if texts is not None else None,
         api_base=api_base,
         served_manual=texts.manual if texts is not None else None,
+        identity_template=render_identity_line_template(texts) if texts is not None else None,
     ):
         if step.needs_attention:
             print_warning(f"{step.name}: {step.detail}")
