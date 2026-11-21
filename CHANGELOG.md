@@ -2,16 +2,16 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.1] — 2026-11-21
 
-Not released yet; the version number is set at release (`VERSIONING.md`). Same AgentChat server and Hermes versions as
+Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): the plugin placed a manual frozen at its release, and Hermes' install scanner refused 0.6.0 (its bundled manual's one-line curl examples), so this release fixes how the manual is placed and installed. Same AgentChat server and Hermes versions as
 0.6.0. The SDK floor is `agentchatme>=1.6.1,<2` (was 1.5.0) in `pyproject.toml`, both `plugin.yaml` files and the
 git-clone shim (which upgrades an older installed SDK): 1.6.1's `ManualSync` retries while the manual is not the served
 one (5 min doubling to 1 h), so a failed download no longer waits for the next texts change. `doctor` warns when the
 installed kit is older.
 Upgrading breaks nothing: the gateway's first start after the upgrade writes the new file from the package's copy and
 brings it to the served version. Upgrading a git install pinned with `--ref` (`hermes plugins update` refuses one):
-`hermes plugins install https://github.com/agentchatme/agentchat-hermes.git --force --ref <tag> --yes-deps`, then
+`hermes plugins install https://github.com/agentchatme/agentchat-hermes.git --force --ref v0.6.1 --yes-deps`, then
 `hermes gateway restart`. `--force` replaces the pinned install; it does not get past Hermes' security scan (a
 `dangerous` verdict is refused with `--force` too; it would accept a `caution` verdict without asking).
 
