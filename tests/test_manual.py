@@ -398,7 +398,9 @@ class TestSync:
             assert placement.place_manual(BUNDLE_ANNOUNCED, api_base=API, hermes_home=home).failed
             lines = _Lines()
             lines.run(home, BUNDLE_ANNOUNCED)
-            assert lines.of("fail") and "unreadable" in lines.of("fail")[0]
+            # "unreadable (Permission denied)" on 3.9 to 3.13, "missing" on 3.14.
+            (failure,) = lines.of("fail")
+            assert f"the agent reads the bundled copy, frozen at {BUNDLE_VERSION}" in failure
             assert cli._manual_line(home, BUNDLE_ANNOUNCED).startswith("frozen at the bundled copy")
         finally:
             folder.chmod(0o700)
