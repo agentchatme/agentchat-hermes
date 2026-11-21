@@ -7,14 +7,16 @@ process is loading us:
 * **Gateway mode** (the long-lived ``hermes gateway run`` process, AND it
   successfully grabbed the per-account WS leader lock): full runtime —
   identity resolution, the served texts, the WS daemon that wakes, the
-  invoker that gates and starts turns, the bundled manual as a skill.
+  invoker that gates and starts turns, the manual as a skill (kept current
+  from the server by the receive loop).
 
 * **CLI mode** (every other Hermes process — TUI/REPL, named subcommands,
   one-shot agents, Hermes-spawned child Python that inherits
   ``_HERMES_GATEWAY=1`` from its parent, or a second gateway whose flock
   acquisition lost the race): light runtime — identity only, no WS, no
-  invoker. The skill is still registered; the agent's tools are the hosted
-  MCP server declared in ``config.yaml`` and are available in every mode.
+  invoker. The skill is still registered (and the manual synced once after
+  the texts load); the agent's tools are the hosted MCP server declared in
+  ``config.yaml`` and are available in every mode.
   Live inbound stays exclusively with the leader-lock holder.
 
 Mode selection has two layered signals (see :mod:`.leader_lock`):
@@ -106,20 +108,22 @@ def register(ctx: Any) -> None:
     # Receiving is the SDK kit's receive loop: an agentchatme without it can
     # neither receive nor place the identity line. Say so once, loudly, and
     # keep the CLI so `hermes agentchat doctor` says it too.
+    hermes_home = resolve_hermes_home()
     problem = kit_problem()
     if problem is not None:
         logger.error("agentchat plugin: not receiving — %s", problem)
-        _register_surface(ctx)
+        _register_surface(ctx, hermes_home)
         return
 
-    hermes_home = resolve_hermes_home()
     profile = profile_label(hermes_home)
     gateway_mode = _is_gateway_context(ctx)
 
     # The manual is registered unconditionally as the ``agentchat:agentchat``
-    # skill. Tools are not registered here: they are the hosted MCP server
-    # declared in the profile's config.yaml (see mcp_registration).
-    _register_surface(ctx)
+    # skill: this profile's kept-current file (created from the bundled copy
+    # when missing; local only, no network). Tools are not registered here:
+    # they are the hosted MCP server declared in the profile's config.yaml
+    # (see mcp_registration).
+    _register_surface(ctx, hermes_home)
 
     watcher = ActivationWatcher(
         hermes_home=hermes_home,
@@ -163,14 +167,21 @@ def register(ctx: Any) -> None:
         )
 
 
-def _register_surface(ctx: Any) -> None:
-    """Register the bundled manual as a skill. No tools — see module docstring."""
+def _register_surface(ctx: Any, hermes_home: Path) -> None:
+    """Register the manual as the ``agentchat:agentchat`` skill. No tools — see
+    module docstring. Never raises: a skill that cannot be registered must not
+    cost the CLI or the receive loop."""
     try:
         from .skills import register_skill
 
-        register_skill(ctx)
-    except ImportError:
-        logger.debug("agentchatme_hermes.skills not yet present; skipping skill registration")
+        register_skill(ctx, hermes_home=hermes_home)
+    except Exception:
+        logger.error(
+            "agentchat plugin: the manual could not be registered as the agentchat:agentchat skill "
+            "for %s",
+            hermes_home,
+            exc_info=True,
+        )
 
 
 class ActivationWatcher:

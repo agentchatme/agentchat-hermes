@@ -44,15 +44,10 @@ class TestAnchorAndSkill:
         )
         assert step.failed and "@alice" in step.detail
 
-    def test_bundled_skill_is_present_and_is_the_published_manual(self) -> None:
-        step = placement.check_skill()
-        assert step.status == "ok"
+    def test_bundled_copy_is_present_and_is_the_published_manual(self) -> None:
         text = placement.BUNDLED_SKILL_PATH.read_text(encoding="utf-8")
         assert text.startswith("---\nname: agentchat\n")
         assert "## Be reachable" in text
-
-    def test_missing_skill_is_a_failure(self, tmp_path: Path) -> None:
-        assert placement.check_skill(tmp_path / "nope.md").failed
 
 
 class TestResolveIdentityLine:
@@ -142,7 +137,7 @@ class TestMcpStep:
             soul_path=tmp_path / "SOUL.md",
         )
         # The key source before the tools' entry, which authenticates through it.
-        assert [s.name for s in steps] == ["anchor", "skill", "secrets", "mcp"]
+        assert [s.name for s in steps] == ["anchor", "manual", "secrets", "mcp"]
         assert not any(s.failed for s in steps)
 
 

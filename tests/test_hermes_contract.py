@@ -217,6 +217,101 @@ def test_plugin_context_surface() -> None:
     assert isinstance(inspect.getattr_static(context, "llm"), property)
 
 
+# ─── the manual: a plugin skill whose file the plugin keeps current ────────
+
+
+@pytest.fixture
+def _plugin_manager(_hermes_home: Path) -> Iterator[Any]:
+    """This profile's real plugin manager, discovered first (as at boot, so the
+    ``discover_plugins()`` inside ``skill_view`` finds a finished sweep), with
+    our skill entry removed again afterwards."""
+    plugins = _import("hermes_cli.plugins")
+    plugins.discover_plugins()
+    manager = plugins.get_plugin_manager()
+    try:
+        yield manager
+    finally:
+        manager.remove_plugin_skill("agentchat:agentchat")
+
+
+def test_a_skill_outside_the_package_is_read_fresh_after_an_atomic_replace(
+    _hermes_home: Path, _plugin_manager: Any
+) -> None:
+    """The design the manual rests on, from Hermes' code rather than a
+    documented contract: ``register_skill`` takes any existing path (here
+    ``<home>/plugin-data/agentchat/manual/SKILL.md``, outside the package),
+    ``skill_view`` reads that file fresh on every call, and a file replaced
+    atomically (temp + rename) is served at once and stays registered."""
+    import hashlib
+
+    import httpx
+
+    from agentchatme_hermes import manual
+    from agentchatme_hermes.skills import SKILL_DESCRIPTION, register_skill
+
+    plugins = _import("hermes_cli.plugins")
+    skills_tool = _import("tools.skills_tool")
+    manifest = _import("hermes_cli.plugins_manifest").PluginManifest(name="agentchat", source="entrypoint")
+    ctx = plugins.PluginContext(manifest, _plugin_manager)
+
+    path = register_skill(ctx, hermes_home=_hermes_home)
+    assert path == manual.manual_path(_hermes_home)
+    assert manual.BUNDLED_MANUAL_PATH.parent not in path.parents, "outside the package"
+    assert Path(_plugin_manager.find_plugin_skill("agentchat:agentchat")) == path
+    rows = {meta["name"]: meta for meta in _plugin_manager.list_plugin_skill_metadata()}
+    assert rows["agentchat:agentchat"]["description"] == SKILL_DESCRIPTION, "the index row names no version"
+
+    first = json.loads(skills_tool.skill_view("agentchat:agentchat"))
+    assert first["success"] is True, first
+    assert manual.BUNDLED_MANUAL_PATH.read_text(encoding="utf-8").split("\n", 3)[2] in first["content"]
+    assert Path(first["skill_dir"]) == path.parent
+
+    body = b"---\nname: agentchat\nversion: 9.9.9\ndescription: x\n---\nTHE NEW MANUAL\n"
+    client = httpx.Client(transport=httpx.MockTransport(lambda _request: httpx.Response(200, content=body)))
+    served = {"url": "https://agentchat.me/skill.md", "version": "9.9.9", "sha256": hashlib.sha256(body).hexdigest()}
+    try:
+        result = manual.sync_once(home=_hermes_home, served=served, api_base="https://api.agentchat.me", http_client=client)
+    finally:
+        client.close()
+    assert result is not None and result.state == "updated" and path.read_bytes() == body
+
+    second = json.loads(skills_tool.skill_view("agentchat:agentchat"))
+    assert second["success"] is True and "THE NEW MANUAL" in second["content"], second
+    assert Path(_plugin_manager.find_plugin_skill("agentchat:agentchat")) == path, "still registered"
+    # The folder holds only SKILL.md: skill_view(file_path=...) has nothing else to serve.
+    assert sorted(p.name for p in path.parent.iterdir()) == ["SKILL.md"]
+    other = json.loads(skills_tool.skill_view("agentchat:agentchat", file_path="credentials.json"))
+    assert other["success"] is False
+
+
+def test_the_manual_lives_in_hermes_plugin_storage(_hermes_home: Path) -> None:
+    """``plugins/plugin_storage.plugin_data_dir`` is Hermes' per-plugin storage;
+    the plugin computes the same folder from the profile's home (never from
+    ``get_hermes_home()`` on a thread without the profile)."""
+    from agentchatme_hermes import manual
+
+    storage = _import("plugins.plugin_storage")
+    assert Path(storage.plugin_data_dir("agentchat")).resolve() == manual.manual_dir(_hermes_home).parent.resolve()
+
+
+def test_doctor_finds_a_stray_agentchat_skill_through_hermes(_hermes_home: Path) -> None:
+    """``doctor`` reports an ``agentchat`` skill in Hermes' own skill folders
+    through the public skill-catalog helpers (``tools.skills_tool``:
+    ``find_all_skills``, ``skill_search_dirs``, ``locate_skill``) and never
+    removes it."""
+    from agentchatme_hermes import cli
+
+    skills_tool = _import("tools.skills_tool")
+    for name in ("find_all_skills", "skill_search_dirs", "locate_skill"):
+        assert callable(getattr(skills_tool, name, None)), name
+    stray = _hermes_home / "skills" / "agentchat" / "SKILL.md"
+    stray.parent.mkdir(parents=True)
+    stray.write_text("---\nname: agentchat\nversion: 2.3.1\n---\nold\n", encoding="utf-8")
+    found = cli._stray_agentchat_skills()
+    assert [(p.resolve(), v) for p, v in found] == [(stray.resolve(), "2.3.1")]
+    assert stray.exists()
+
+
 def test_hermes_unload_stops_our_runtime(tmp_path: Path) -> None:
     """A plugin reload/disable runs ``ctx.on_unload``: our hook stops the
     runtime (socket, worker, lock) and forgets it."""

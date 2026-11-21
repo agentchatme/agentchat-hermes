@@ -159,6 +159,15 @@ class TestDoctor:
         # The SDK stand-in above has no kit; a clean install has it.
         monkeypatch.setattr(kit, "kit_problem", lambda: None)  # type: ignore[attr-defined]
 
+        # Hermes runs the plugin's register() before any `hermes agentchat`
+        # command: the manual is placed and registered by then.
+        from agentchatme_hermes.manual import manual_path
+        from agentchatme_hermes.profile_scope import resolve_hermes_home
+        from agentchatme_hermes.skills import register_skill
+
+        home = resolve_hermes_home()
+        assert register_skill(MagicMock(), hermes_home=home) == manual_path(home)
+
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         captured = capsys.readouterr()  # type: ignore[attr-defined]
         assert "Authenticated as @alice" in captured.out
@@ -166,7 +175,9 @@ class TestDoctor:
         assert "[ok]   secrets.agentchat in config.yaml" in captured.out
         assert api_key("xyz") not in captured.out
         assert "[ok]   Hermes MCP client importable" in captured.out
-        assert "manual bundled" in captured.out
+        # No texts from the stand-in client: the manual cannot be compared.
+        assert "[warn] manual unchecked (have " in captured.out
+        assert f"[ok]   Hermes serves agentchat:agentchat from {manual_path(home)}" in captured.out
         # Exit code reflects failures only (warnings allowed). Plausible
         # warns from a fresh checkout: no gateway process, no SOUL.md
         # anchor, hosted-tools entry not checkable without Hermes. All

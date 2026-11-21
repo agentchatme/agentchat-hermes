@@ -16,14 +16,15 @@ Surfaces:
   dies). The handle is sent because an email can back several agents; it
   defaults to the locally configured one.
 * **``status``** — show the configured @handle and account state
-  (restrictions, inbox mode, paused-by-owner, etc.) and where the key is.
+  (restrictions, inbox mode, paused-by-owner, etc.), where the key is and
+  whether the manual is the served one.
 * **``logout``** — remove the key file and any key line from the profile
   ``.env``, strip the identity line from SOUL.md, remove our
   ``secrets.agentchat`` and ``mcp_servers.agentchat`` entries.
 * **``doctor``** — check every placement (key, identity line, manual,
   the key source, hosted tools) plus the lock and the daemon's health;
-  ``--fix`` re-places, and moves a key still in the profile ``.env`` into
-  the key file.
+  ``--fix`` re-places (the manual: one sync with the server), and moves a
+  key still in the profile ``.env`` into the key file.
 
 ``register`` and ``recover`` run on the SDK's sign-up helper
 (:mod:`.signup`): one interactive run that follows the server's answer —
@@ -33,8 +34,9 @@ are. The handle saved is always the one the server returned.
 
 Every successful register / login / recover *places* the integration: the
 key in this profile's key file, the served identity line in SOUL.md, the
-key source (``secrets.agentchat``) and the hosted MCP server
-(``mcp_servers.agentchat``) in ``config.yaml`` — see :mod:`.placement`.
+served manual as the ``agentchat:agentchat`` skill, the key source
+(``secrets.agentchat``) and the hosted MCP server (``mcp_servers.agentchat``)
+in ``config.yaml`` — see :mod:`.placement`.
 
 The wizard is the only path users need. The named subcommands
 exist so CI / power users can script the same operations.
@@ -70,7 +72,7 @@ from .config import (
 from .placement import (
     PlacementStep,
     place_identity_and_tools,
-    resolve_identity_line,
+    resolve_texts,
 )
 from .soul_anchor import remove_soul_anchor
 from .wizard import _mask_key
@@ -447,6 +449,9 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
         base_url=api_base,
         client_identity=hermes_client_identity(),
     )
+    from .profile_scope import resolve_hermes_home
+
+    hermes_home = resolve_hermes_home()
     try:
         try:
             me = client.get_me()
@@ -457,10 +462,16 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
             )
         except (AgentChatError, SDKConnectionError) as exc:
             return _exit_with(f"Status fetch failed: {exc}")
+        texts = _load_served_texts(client, api_key=saved_key, api_base=api_base, hermes_home=hermes_home)
     finally:
         client.close()
 
-    _print_status(me, resolution, worker=_health_worker(api_base, saved_key))
+    _print_status(
+        me,
+        resolution,
+        worker=_health_worker(api_base, saved_key),
+        manual=_manual_line(hermes_home, texts.manual if texts is not None else None),
+    )
     return _EXIT_OK
 
 
@@ -492,17 +503,20 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     * API reachability + auth (``GET /v1/agents/me``)
     * Account-side flags that would silently suppress live delivery
       (paused-by-owner, inbox mode = strict, etc.)
-    * the four placements: identity line in SOUL.md (present, current,
-      matching the key), the bundled manual, the hosted-tools entry in
-      ``config.yaml``, the key under the name that entry references
+    * the placements: identity line in SOUL.md (present, current,
+      matching the key), the manual (the kept-current file against the
+      served version, the file Hermes serves, the gateway's last sync, any
+      other ``agentchat`` skill in Hermes' skill folders), the hosted-tools
+      entry in ``config.yaml``, the key under the name that entry references
     * Gateway process detection (informational only — the doctor
       itself is a CLI process, so we can only check whether *another*
       process matching ``hermes gateway`` is running)
     * WS leader ownership plus the daemon's heartbeat record (the lock
       alone cannot distinguish a healthy receiver from a dead thread)
 
-    ``--fix`` re-places the identity line and the hosted-tools entry
-    before the checks run (a hand-managed entry is never touched).
+    ``--fix`` re-places the identity line, the manual (one sync: a download
+    when it is not the served one) and the hosted-tools entry before the
+    checks run (a hand-managed entry is never touched).
 
     Exit code is the number of failed checks; ``0`` means clean.
     Each line is prefixed with ``[ok]`` / ``[warn]`` / ``[fail]``
@@ -660,7 +674,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
 
         # The served texts: the identity line the anchor check compares
         # against, and proof that /v1/texts answers for this key.
-        identity_line, identity_template = _doctor_identity_texts(
+        identity_line, identity_template, served_texts = _doctor_identity_texts(
             client, api_key=saved_key, api_base=api_base, hermes_home=hermes_home
         )
         if identity_line is not None:
@@ -715,9 +729,14 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         ):
             {"ok": ok, "warn": warn, "fail": fail}[level](line)
         for step in place_identity_and_tools(
-            handle=authenticated_handle, identity_line=identity_line, api_base=api_base
+            handle=authenticated_handle,
+            identity_line=identity_line,
+            api_base=api_base,
+            served_manual=served_texts.manual if served_texts is not None else None,
+            hermes_home=hermes_home,
         ):
-            (fail if step.failed else ok)(f"fix: {step.name} {step.status} — {step.detail}")
+            report = fail if step.failed else warn if step.status == "warned" else ok
+            report(f"fix: {step.name} {step.status} — {step.detail}")
 
     try:
         from .soul_anchor import (
@@ -772,12 +791,15 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     except ImportError:
         warn("soul_anchor module not importable — skipping anchor check")
 
-    from .placement import BUNDLED_SKILL_PATH
-
-    if BUNDLED_SKILL_PATH.exists():
-        ok("manual bundled as the agentchat:agentchat skill (https://agentchat.me/skill.md)")
-    else:
-        fail(f"bundled manual missing at {BUNDLED_SKILL_PATH} — reinstall agentchatme-hermes")
+    _doctor_manual_checks(
+        hermes_home,
+        served=served_texts.manual if served_texts is not None else None,
+        worker=_health_worker(api_base, saved_key),
+        cmd=cmd,
+        ok=ok,
+        warn=warn,
+        fail=fail,
+    )
 
     _doctor_secrets_checks(resolution, cmd=cmd, ok=ok, warn=warn, fail=fail)
 
@@ -1297,21 +1319,27 @@ def _dispatch_logout(_args: argparse.Namespace) -> int:
 
 
 def _install_placement(handle: str, *, api_base: str, api_key: str) -> list[PlacementStep]:
-    """Place the identity line, verify the manual, register the hosted tools.
+    """Place the identity line and the manual, register the hosted tools.
 
-    The identity line is fetched from the server for this key (the cached
-    copy when the server is unreachable; skipped when neither exists — the
-    gateway places it later). Failure is non-fatal: credentials are already
-    persisted and the account is fully operational. Each failed step is
-    printed with its reason so the operator can repair it
+    The texts (the identity line, the manual's announcement) are fetched from
+    the server for this key (the cached copy when the server is unreachable;
+    without either the line is skipped and the manual is the bundled copy —
+    the gateway places both later). Failure is non-fatal: credentials are
+    already persisted and the account is fully operational. Each failed step
+    is printed with its reason so the operator can repair it
     (``hermes agentchat doctor --fix`` re-runs this).
     """
-    identity_line = resolve_identity_line(api_key=api_key, api_base=api_base)
+    from .turn import identity_line as render_identity_line
+
+    texts = resolve_texts(api_key=api_key, api_base=api_base)
     steps = place_identity_and_tools(
-        handle=handle, identity_line=identity_line, api_base=api_base
+        handle=handle,
+        identity_line=render_identity_line(texts) if texts is not None else None,
+        api_base=api_base,
+        served_manual=texts.manual if texts is not None else None,
     )
     for step in steps:
-        if step.failed or step.status == "skipped":
+        if step.needs_attention:
             sys.stderr.write(f"Warning: {step.name}: {step.detail}\n")
             sys.stderr.flush()
         else:
@@ -1321,24 +1349,208 @@ def _install_placement(handle: str, *, api_base: str, api_key: str) -> list[Plac
 
 def _doctor_identity_texts(
     client: Any, *, api_key: str, api_base: str, hermes_home: Path
-) -> tuple[str | None, str | None]:
-    """``(identity line, template)`` for ``doctor``: one fetch on the open client, else the cache."""
+) -> tuple[str | None, str | None, Any]:
+    """``(identity line, template, texts)`` for ``doctor``: one fetch on the
+    open client, else the cache; ``(None, None, None)`` without either."""
+    texts = _load_served_texts(client, api_key=api_key, api_base=api_base, hermes_home=hermes_home)
+    if texts is None:
+        return None, None, None
+    from .turn import identity_line as render_identity_line
+    from .turn import identity_line_template as render_identity_line_template
+
+    return render_identity_line(texts), render_identity_line_template(texts), texts
+
+
+def _load_served_texts(client: Any, *, api_key: str, api_base: str, hermes_home: Path) -> Any:
+    """The served texts for ``doctor`` and ``status``: one fetch on the open
+    client, else the account's cached copy, else ``None``. Never raises."""
     try:
         from .state import state_dir_for_account
         from .texts import load_texts
-        from .turn import identity_line as render_identity_line
-        from .turn import identity_line_template as render_identity_line_template
     except ImportError:
-        return None, None
+        return None
     state_dir = state_dir_for_account(hermes_home=hermes_home, api_base=api_base, api_key=api_key)
     try:
-        texts = load_texts(client, state_dir=state_dir)
+        return load_texts(client, state_dir=state_dir)
     except Exception as exc:
-        logger.debug("doctor: texts load raised: %s", exc)
-        return None, None
-    if texts is None:
-        return None, None
-    return render_identity_line(texts), render_identity_line_template(texts)
+        logger.debug("cli: texts load raised: %s", exc)
+        return None
+
+
+# ───────────────────────── the manual ─────────────────────────
+
+
+def _registered_manual(hermes_home: Path) -> tuple[Path | None, str | None]:
+    """``(path, reason)``: the file Hermes holds as ``agentchat:agentchat`` in
+    this process — Hermes' own registry when it can be asked, else what this
+    plugin's ``register()`` gave it — and, for the bundled copy, why.
+    ``(None, None)`` when neither knows (``doctor`` run outside Hermes)."""
+    from .manual import registration_for
+
+    ours = registration_for(hermes_home)
+    reason = ours.reason if ours is not None else None
+    held: Path | None = None
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+
+        found = get_plugin_manager().find_plugin_skill("agentchat:agentchat")
+        held = Path(found) if found is not None else None
+    except Exception:
+        held = None
+    if held is None and ours is not None:
+        held = ours.path
+    if held is not None and ours is not None and held != ours.path:
+        reason = None  # Hermes holds a path this process did not give it
+    return held, reason
+
+
+def _manual_line(hermes_home: Path, served: Any) -> str:
+    """The manual in one line, for ``status``."""
+    from .manual import bundled_version, check, manual_path
+
+    target = manual_path(hermes_home)
+    state = check(target, served)
+    held, reason = _registered_manual(hermes_home)
+    if held is not None and held != target:
+        return (
+            f"frozen at the bundled copy {bundled_version() or '?'} ({held}){f': {reason}' if reason else ''} "
+            f"— {target}: {state.summary}"
+        )
+    return state.detail
+
+
+def _doctor_manual_checks(
+    hermes_home: Path,
+    *,
+    served: Any,
+    worker: Any,
+    cmd: str,
+    ok: Callable[[str], None],
+    warn: Callable[[str], None],
+    fail: Callable[[str], None],
+) -> None:
+    """The manual: the kept-current file against the texts' announcement, the
+    file Hermes serves as ``agentchat:agentchat``, the gateway's last sync,
+    the skill's folder, and any other ``agentchat`` skill in Hermes' own
+    skill folders (reported, never removed)."""
+    from .manual import MANUAL_URL, bundled_version, check, manual_path, other_files
+
+    target = manual_path(hermes_home)
+    bundled = bundled_version() or "?"
+    state = check(target, served)
+    if state.state == "current":
+        ok(f"manual {state.detail} (kept current from {MANUAL_URL})")
+    elif state.state == "missing":
+        fail(
+            f"manual {state.summary} at {target} — the agent reads the bundled copy, frozen at "
+            f"{bundled}, until this profile's home lets the plugin write it (`{cmd} doctor --fix` "
+            "tries again)"
+        )
+    elif state.state == "stale":
+        warn(
+            f"manual {state.detail} — `{cmd} doctor --fix` downloads the served one; the gateway "
+            "also does on its next texts refresh"
+        )
+    elif state.state == "tampered":
+        warn(
+            f"manual {state.detail} — not the text the server serves (edited after it was "
+            f"placed); `{cmd} doctor --fix` puts the served one back"
+        )
+    else:
+        warn(f"manual {state.detail} — it cannot be compared until /v1/texts answers")
+
+    held, reason = _registered_manual(hermes_home)
+    if held is not None:
+        if held == target:
+            ok(f"Hermes serves agentchat:agentchat from {target}")
+        else:
+            warn(
+                f"Hermes serves agentchat:agentchat from {held}, not the kept-current file — frozen "
+                f"at the bundled {bundled}{f': {reason}' if reason else ''}"
+            )
+
+    section = worker.get("manual") if isinstance(worker, dict) else None
+    if isinstance(section, dict):
+        registered = section.get("registered")
+        if isinstance(registered, dict) and registered.get("kept_current") is False:
+            why = registered.get("reason")
+            warn(
+                f"the gateway serves the bundled copy {registered.get('path')}, frozen at {bundled}"
+                + (f": {why}" if why else "")
+                + f" — restart the gateway once {target} is in place"
+            )
+        last = section.get("last_sync")
+        if isinstance(last, dict):
+            at = last.get("at")
+            age = f", {time.time() - float(at):.0f}s ago" if isinstance(at, (int, float)) else ""
+            detail = last.get("detail") or last.get("state")
+            if last.get("up_to_date") is False or last.get("state") == "failed":
+                warn(f"the gateway's last manual sync{age}: {detail}")
+            else:
+                ok(f"the gateway keeps the manual current (last sync{age}: {detail})")
+
+    others = other_files(target.parent)
+    if others:
+        warn(
+            f"{target.parent} holds other files ({', '.join(others[:5])}): skill_view serves every "
+            "file in a skill's folder, so the plugin registers the bundled copy until they are moved out"
+        )
+
+    for path, version in _stray_agentchat_skills(exclude=(target,)):
+        warn(
+            f"another agentchat skill at {path} ({version or 'no version'}): Hermes lists it as "
+            "`agentchat` beside agentchat:agentchat, and that copy never updates — remove its folder "
+            "unless you keep it on purpose (doctor never deletes it)"
+        )
+
+
+def _stray_agentchat_skills(*, exclude: tuple[Path, ...] = ()) -> list[tuple[Path, str | None]]:
+    """``(SKILL.md, version)`` of a skill Hermes loads as ``agentchat`` from its
+    own skill folders (the profile's ``skills/``, ``create_dir``, external and
+    trusted project folders) — a copy of the manual someone installed, which
+    never updates. Through Hermes' public skill-catalog helpers
+    (``tools.skills_tool``: ``find_all_skills``, ``skill_search_dirs``,
+    ``locate_skill``; Hermes v0.22.5 and later): the copy ``skill_view
+    agentchat`` would load, not every file on disk. ``[]`` outside Hermes or on
+    an older one. Never raises."""
+    try:
+        from tools.skills_tool import find_all_skills, locate_skill, skill_search_dirs
+    except Exception:
+        return []
+    from .manual import read_version
+
+    skip: set[Path] = set()
+    for path in exclude:
+        try:
+            skip.add(path.resolve())
+        except OSError:
+            continue
+    found: list[tuple[Path, str | None]] = []
+    try:
+        names = [
+            str(entry["name"])
+            for entry in find_all_skills()
+            if isinstance(entry, dict)
+            and isinstance(entry.get("name"), str)
+            and (entry["name"] == "agentchat" or entry["name"].endswith("/agentchat"))
+        ]
+        roots, _active = skill_search_dirs()
+    except Exception:
+        logger.debug("doctor: Hermes' skill catalog could not be read", exc_info=True)
+        return []
+    for name in names:
+        try:
+            error, _skill_dir, skill_md = locate_skill(name, None, roots)
+            if error is not None or skill_md is None:
+                continue
+            path = Path(skill_md)
+            if path.resolve() in skip:
+                continue
+            version = read_version(path)
+        except Exception:
+            continue
+        found.append((path, version))
+    return found
 
 
 def _uninstall_secrets_registration() -> None:
@@ -1751,7 +1963,13 @@ def _health_worker(api_base: str, api_key: str) -> Any:
         return None
 
 
-def _print_status(me: dict[str, Any], resolution: KeyResolution | None = None, *, worker: Any = None) -> None:
+def _print_status(
+    me: dict[str, Any],
+    resolution: KeyResolution | None = None,
+    *,
+    worker: Any = None,
+    manual: str | None = None,
+) -> None:
     handle = me.get("handle", "unknown")
     status = me.get("status", "unknown")
     settings = me.get("settings") or {}
@@ -1772,6 +1990,8 @@ def _print_status(me: dict[str, Any], resolution: KeyResolution | None = None, *
         _printline(f"  Key:           {_key_location_line(resolution)}")
         for note in (*resolution.notes, *(shared_note(h) for h in resolution.shared_with)):
             _printline(f"  Note:          {note}")
+    if manual is not None:
+        _printline(f"  Manual:        {manual}")
     # Could not process, from the running gateway's health record (absent
     # when no gateway receives for this account, or from an older release).
     section = _could_not_process_section(worker)

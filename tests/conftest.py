@@ -119,6 +119,42 @@ def _process_env_snapshot() -> Iterator[None]:
     config._PROCESS_ENV_AT_IMPORT.clear()
 
 
+@pytest.fixture(autouse=True)
+def _manual_sync_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A runtime syncs the manual by itself: once on a daemon thread when it
+    is not the leader, and through the kit's ``ManualSync`` on the leader's
+    receive loop. Either would download the manual the test's texts announce
+    — a network attempt the guard fails, from a thread the test does not
+    own. Off by default; ``test_manual.py`` turns them back on
+    (:func:`manual_sync_on`) where it tests them."""
+    from agentchatme_hermes import manual
+
+    monkeypatch.setattr(manual, "sync_in_background", lambda **_kw: None)
+    monkeypatch.setattr(manual, "manual_sync_for", lambda *_a, **_kw: None)
+
+
+_REAL_MANUAL_SYNC: dict[str, Any] = {}
+
+
+def _remember_real_manual_sync() -> None:
+    from agentchatme_hermes import manual
+
+    _REAL_MANUAL_SYNC.setdefault("sync_in_background", manual.sync_in_background)
+    _REAL_MANUAL_SYNC.setdefault("manual_sync_for", manual.manual_sync_for)
+
+
+_remember_real_manual_sync()
+
+
+@pytest.fixture
+def manual_sync_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Undo :func:`_manual_sync_off` for one test."""
+    from agentchatme_hermes import manual
+
+    for name, real in _REAL_MANUAL_SYNC.items():
+        monkeypatch.setattr(manual, name, real)
+
+
 _THREAD_GRACE_S = 2.0
 
 

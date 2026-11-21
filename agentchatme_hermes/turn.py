@@ -36,7 +36,7 @@ MCP_SERVER_NAME = "agentchat"
 # Hermes' registry prefix and delimiter (tools/mcp_tool_schema.py, v0.22.5).
 MCP_TOOL_PREFIX = "mcp__"
 
-# The Hermes skill namespace for the bundled manual: ``<plugin>:<skill>``.
+# The Hermes skill namespace for the manual: ``<plugin>:<skill>``.
 SKILL_REF = "agentchat:agentchat"
 
 def mcp_tool_name(tool: str) -> str:

@@ -21,7 +21,8 @@ What the wizard owns:
   in this profile's key file (:mod:`agentchatme_hermes.credentials`; never the
   profile ``.env``), then *placing the integration*
   (:mod:`agentchatme_hermes.placement`): the served identity line in
-  ``SOUL.md``, the key source and the hosted MCP server in ``config.yaml``;
+  ``SOUL.md``, the served manual as the ``agentchat:agentchat`` skill, the key
+  source and the hosted MCP server in ``config.yaml``;
 * logout: the key file and any ``.env`` key line removed, the identity line
   stripped, our ``secrets.agentchat`` and ``mcp_servers.agentchat`` entries
   removed.
@@ -40,10 +41,11 @@ from . import credentials, key_store, signup
 from .config import ENV_API_BASE, ENV_HANDLE, resolve_key
 from .placement import (
     place_identity_and_tools,
-    resolve_identity_line,
+    resolve_texts,
 )
 from .profile_scope import resolve_hermes_home
 from .soul_anchor import remove_soul_anchor
+from .turn import identity_line as render_identity_line
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -655,20 +657,24 @@ def _save_key(api_key: str, handle: str, print_warning: Any) -> bool:
 
 
 def _place_or_warn(handle: str, api_key: str, print_warning: Any) -> None:
-    """Place the identity line, verify the manual, register the hosted tools.
+    """Place the identity line and the manual, register the hosted tools.
 
-    The identity line is fetched from the server for this key (cached copy
-    when the server is unreachable; skipped when neither exists — the
-    gateway places it later). Non-fatal — the credentials are persisted and
-    the runtime will boot; each failed step is surfaced so the operator can
-    repair it (``hermes agentchat doctor --fix`` re-runs the placement).
+    The texts (the identity line, the manual's announcement) are fetched from
+    the server for this key (cached copy when the server is unreachable;
+    without either the line is skipped and the manual is the bundled copy —
+    the gateway places both later). Non-fatal — the credentials are persisted
+    and the runtime will boot; each failed step is surfaced so the operator
+    can repair it (``hermes agentchat doctor --fix`` re-runs the placement).
     """
     api_base = _api_base()
-    identity_line = resolve_identity_line(api_key=api_key, api_base=api_base)
+    texts = resolve_texts(api_key=api_key, api_base=api_base)
     for step in place_identity_and_tools(
-        handle=handle, identity_line=identity_line, api_base=api_base
+        handle=handle,
+        identity_line=render_identity_line(texts) if texts is not None else None,
+        api_base=api_base,
+        served_manual=texts.manual if texts is not None else None,
     ):
-        if step.failed or step.status == "skipped":
+        if step.needs_attention:
             print_warning(f"{step.name}: {step.detail}")
         else:
             _step(step.detail)

@@ -77,11 +77,11 @@ class _Wizard:
         self.placed: list[str] = []
         self.waits: list[float] = []
         monkeypatch.delenv("AGENTCHATME_API_BASE", raising=False)
-        monkeypatch.setattr(wizard, "resolve_identity_line", lambda **_kw: "I am @x on AgentChat.")
+        monkeypatch.setattr(wizard, "resolve_texts", lambda **_kw: None)
         monkeypatch.setattr(
             wizard,
             "place_identity_and_tools",
-            lambda *, handle, identity_line, api_base, soul_path=None: self.placed.append(handle) or [],
+            lambda *, handle, identity_line, api_base, served_manual=None, **_kw: self.placed.append(handle) or [],
         )
         monkeypatch.setattr(signup, "_pause", self.waits.append)
         # A Hermes whose MCP client reads the key file (secret sources, secrets.agentchat).

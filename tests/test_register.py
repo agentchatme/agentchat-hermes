@@ -437,6 +437,12 @@ class TestReconcileMcpRegistration:
         assert any("hosted tools not registered" in r.getMessage() for r in caplog.records)
 
 
+def _bundled_bytes() -> bytes:
+    from agentchatme_hermes.manual import BUNDLED_MANUAL_PATH
+
+    return BUNDLED_MANUAL_PATH.read_bytes()
+
+
 class TestSurface:
     def test_skill_registered_and_no_native_tools(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -454,8 +460,9 @@ class TestSurface:
         assert ctx.register_skill.called
         skill_kwargs = ctx.register_skill.call_args.kwargs
         assert skill_kwargs["name"] == "agentchat"
-        assert skill_kwargs["path"].name == "SKILL.md"
-        assert skill_kwargs["path"].parent.name == "agentchat"
+        # This profile's kept-current file, not the package's copy.
+        assert skill_kwargs["path"] == tmp_path / ".hermes" / "plugin-data" / "agentchat" / "manual" / "SKILL.md"
+        assert skill_kwargs["path"].read_bytes() == _bundled_bytes()
         assert not ctx.register_tool.called, "no native tools — the hosted MCP server is the tool source"
 
 

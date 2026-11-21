@@ -13,8 +13,12 @@
    the file Hermes loads into every turn. Nothing is placed when the texts
    cannot be fetched and nothing is cached; the gateway places the line as
    soon as a fetch succeeds.
-3. **The manual** — ``https://agentchat.me/skill.md`` verbatim, bundled as
-   the ``agentchat:agentchat`` skill. Nothing to write; verified present.
+3. **The manual** — the one the served texts announce
+   (``https://agentchat.me/skill.md``, with its version and sha256), as the
+   ``agentchat:agentchat`` skill: ``<profile home>/plugin-data/agentchat/
+   manual/SKILL.md``, downloaded and checked by the SDK kit when it is not the
+   announced one, the bundled copy only when nothing verified can be had
+   (:mod:`.manual`). The gateway keeps it current from then on.
 4. **The tools** — ``mcp_servers.agentchat`` in the profile's
    ``config.yaml`` (:mod:`.mcp_registration`), with
    ``Authorization: "Bearer ${AGENTCHAT_API_KEY}"`` as a template: the key
@@ -27,9 +31,11 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+from . import manual as manual_module
 from .client_identity import hermes_client_identity
+from .manual import BUNDLED_MANUAL_PATH
 from .mcp_registration import McpRegistrationError, install_entry
 from .profile_scope import resolve_hermes_home
 from .soul_anchor import AnchorError, normalize_handle, write_soul_anchor
@@ -37,9 +43,15 @@ from .state import state_dir_for_account
 from .texts import load_texts
 from .turn import identity_line as render_identity_line
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    from agentchatme.types import Texts
+
 logger = logging.getLogger(__name__)
 
-BUNDLED_SKILL_PATH = Path(__file__).parent / "skills" / "agentchat" / "SKILL.md"
+# The package's copy of the manual: the fallback bytes only (see :mod:`.manual`).
+BUNDLED_SKILL_PATH = BUNDLED_MANUAL_PATH
 
 TEXTS_UNAVAILABLE_DETAIL = (
     "identity line not placed: /v1/texts is unreachable and nothing is cached — the gateway "
@@ -49,7 +61,9 @@ TEXTS_UNAVAILABLE_DETAIL = (
 
 @dataclass(frozen=True)
 class PlacementStep:
-    """One placement outcome: ``name`` ∈ anchor | skill | secrets | mcp; ``status`` ∈ ok | changed | skipped | failed."""
+    """One placement outcome: ``name`` ∈ anchor | manual | secrets | mcp; ``status`` ∈ ok |
+    changed | warned | skipped | failed. ``warned``: done as far as it can be and
+    nothing broken, but not current (a manual left at the version it has)."""
 
     name: str
     status: str
@@ -58,6 +72,12 @@ class PlacementStep:
     @property
     def failed(self) -> bool:
         return self.status == "failed"
+
+    @property
+    def needs_attention(self) -> bool:
+        """Printed as a warning by the wizard and the CLI (``failed``,
+        ``warned`` or ``skipped``)."""
+        return self.status in ("failed", "warned", "skipped")
 
 
 # ─── the served identity line ──────────────────────────────────────────────
@@ -72,6 +92,22 @@ def resolve_identity_line(
 ) -> str | None:
     """The served identity line for the account behind ``api_key``, as served for Hermes.
 
+    :func:`resolve_texts`, then its identity line. Never raises.
+    """
+    texts = resolve_texts(api_key=api_key, api_base=api_base, hermes_home=hermes_home, state_dir=state_dir)
+    return render_identity_line(texts) if texts is not None else None
+
+
+def resolve_texts(
+    *,
+    api_key: str,
+    api_base: str,
+    hermes_home: Path | None = None,
+    state_dir: Path | None = None,
+) -> Texts | None:
+    """The served texts for the account behind ``api_key``, as served for Hermes:
+    the identity line and the manual's announcement.
+
     One fetch through the SDK (writing the account's texts cache), else the
     cached copy, else ``None``. For the wizard, the CLI and ``doctor``,
     which run outside the gateway's receive loop.
@@ -80,7 +116,7 @@ def resolve_identity_line(
     try:
         from agentchatme import AgentChatClient
     except ImportError:
-        logger.debug("placement: agentchatme not importable; no identity line")
+        logger.debug("placement: agentchatme not importable; no texts")
         return None
     home = hermes_home if hermes_home is not None else resolve_hermes_home()
     account_dir = state_dir_for_account(
@@ -90,13 +126,12 @@ def resolve_identity_line(
         api_key=api_key, base_url=api_base, client_identity=hermes_client_identity()
     )
     try:
-        texts = load_texts(client, state_dir=account_dir)
+        return load_texts(client, state_dir=account_dir)
     finally:
         try:
             client.close()
         except Exception:
             logger.debug("placement: client close raised", exc_info=True)
-    return render_identity_line(texts) if texts is not None else None
 
 
 # ─── identity, manual, tools ───────────────────────────────────────────────
@@ -114,10 +149,34 @@ def place_anchor(
     return PlacementStep("anchor", "ok", f"identity line for @{normalize_handle(handle)} in {path}")
 
 
-def check_skill(path: Path = BUNDLED_SKILL_PATH) -> PlacementStep:
-    if not path.exists():
-        return PlacementStep("skill", "failed", f"bundled manual missing at {path} — reinstall the package")
-    return PlacementStep("skill", "ok", f"manual bundled as the agentchat:agentchat skill ({path.name})")
+def place_manual(
+    served: Any, *, api_base: str | None, hermes_home: Path | None = None
+) -> PlacementStep:
+    """The manual the served texts announce (``served``: ``texts.manual``, ``None``
+    when no texts are in hand) as this profile's ``agentchat:agentchat`` file.
+
+    One sync through the SDK kit (a download when the file is not the announced
+    manual). A manual not at the announced version is a warning, never a
+    failed placement: the agent reads the file it has (the old one, or the
+    bundled copy) and the gateway keeps trying; only no manual at all fails.
+    ``api_base`` is the API base the texts came from: it decides where a
+    download may go. Never raises.
+    """
+    home = hermes_home if hermes_home is not None else resolve_hermes_home()
+    result = manual_module.sync_once(home=home, served=served, api_base=api_base)
+    if result is None:
+        return PlacementStep(
+            "manual",
+            "failed",
+            f"the agentchatme SDK kit is not installed, so the manual cannot be placed at "
+            f"{manual_module.manual_path(home)} (the agent reads the bundled copy)",
+        )
+    detail = manual_module.describe_result(result)
+    if result.state == "failed":
+        return PlacementStep("manual", "failed", f"{detail} (the agent reads the bundled copy)")
+    if result.up_to_date is False:
+        return PlacementStep("manual", "warned", f"{detail} (the gateway keeps trying)")
+    return PlacementStep("manual", "changed" if result.written else "ok", detail)
 
 
 def place_secrets() -> PlacementStep:
@@ -189,11 +248,15 @@ def place_identity_and_tools(
     identity_line: str | None,
     api_base: str,
     soul_path: Path | None = None,
+    served_manual: Any = None,
+    hermes_home: Path | None = None,
 ) -> list[PlacementStep]:
-    """Anchor, skill, the key source, tools — in that order (the tools' entry needs the key source). Never raises."""
+    """Anchor, manual, the key source, tools — in that order (the tools' entry
+    needs the key source). ``served_manual`` is the texts' announcement
+    (``texts.manual``), ``None`` when no texts are in hand. Never raises."""
     return [
         place_anchor(handle=handle, identity_line=identity_line, soul_path=soul_path),
-        check_skill(),
+        place_manual(served_manual, api_base=api_base, hermes_home=hermes_home),
         place_secrets(),
         place_mcp(api_base),
     ]

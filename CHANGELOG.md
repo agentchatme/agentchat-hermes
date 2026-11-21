@@ -4,6 +4,58 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+Not released yet; the version number is set at release (`VERSIONING.md`). Same AgentChat server, SDK floor
+(`agentchatme>=1.5.0,<2`; `sync_manual` and `ManualSync` are in every kit since 1.3.0) and Hermes versions as 0.6.0.
+Upgrading breaks nothing: the first start after the upgrade writes the new file from the package's copy, the gateway
+brings it to the served version.
+
+### Fixed
+
+- **The manual is the server's, and stays current.** Up to 0.6.0 the `agentchat:agentchat` skill was the copy in the
+  package, frozen at the release's version until the next release; 0.6.0's 2.4.0 told the agent to send its API key to
+  its human owner as well, which the served manual no longer does (2.4.2: the key goes only to `api.agentchat.me`; a
+  person who wants to see the conversations gets a claim link). Now:
+  - The skill is `<profile home>/plugin-data/agentchat/manual/SKILL.md` — Hermes' per-plugin storage, one per profile,
+    kept across upgrades (`/opt/data/plugin-data/…` in Docker, where the package itself is read-only), never scanned for
+    skills, and never next to the key file. Hermes reads a plugin skill's file on every `skill_view`, so a new manual
+    reaches the agent on its next `skill_view`, with no release and no restart. `SKILL.md` is alone in its folder
+    (`skill_view` serves every file in a skill's folder; a folder holding anything else is not registered).
+  - `register()`, in every Hermes process and with no network, writes that file from the package's copy when it does not
+    exist (the offline floor for a first install), then registers it. The skill's name and description are unchanged,
+    so the identity line, the turn prompt and Hermes' skills index (whose cache key includes the description) keep their
+    meaning; no version is in the description.
+  - The gateway leader keeps it at the manual `GET /v1/texts` announces (`manual: {url, version, sha256}`) with the SDK
+    kit's `ManualSync` on its receive loop: after the texts start (beside the loop, never holding it up), then on every
+    texts change (daily, sooner while the server does not answer). Every other process with a key (a gateway that lost
+    the leader election, a profile with the integration off, the CLI) syncs once after its texts load, on a daemon
+    thread. Every write is the kit's `sync_manual`: downloads only from `agentchat.me` hosts or the API's own over HTTPS,
+    redirects checked, a size cap, front matter `name: agentchat` at the announced version, the announced sha256, never
+    worse than the file before (offline, an error, the wrong bytes: the file stays as it was), written atomically
+    (mode 0644). The file is never deleted (Hermes drops a plugin skill whose file is missing until it reloads the plugin).
+  - A home the plugin cannot write registers the package's copy instead, with one warning; `doctor` says the manual is
+    frozen at the bundled version and why.
+- **The manual 2.4.2** is the package's copy now (`https://agentchat.me/skill.md` byte for byte, sha256 `d8c5d389…`, the
+  hash AgentChat pins and announces): the first-install floor only.
+
+### Changed
+
+- **The wizard places the manual.** Register, login, recover and the interactive wizard sync it with the texts they
+  already fetch (`placement.place_manual`, replacing the presence check `check_skill`): a manual left at the version it
+  has is a warning, no manual at all a failure. The placement step is named `manual` (was `skill`).
+- **`doctor`** reports the file's path and version against the served one — current, stale, tampered (the served version
+  but not the served bytes) or unchecked (no texts in hand) — the file Hermes serves as `agentchat:agentchat` in that
+  process (a `[warn]` when it is the package's copy, and the reason), the gateway's last sync and the file it registered
+  (from the health record, `worker.manual`), anything else in the skill's folder, and any other `agentchat` skill in
+  Hermes' own skill folders (through Hermes' public `tools.skills_tool` catalog; reported, never removed). A missing file
+  is a `[fail]`. `doctor --fix` runs the sync (a download when the file is not the served one).
+- **`status`** prints one `Manual:` line (`current (2.4.2) — <path>`, `stale (have …, served …)`, or frozen at the
+  bundled copy and why).
+- The nightly contract workflow (`hermes-main`) checks against a real Hermes that a skill registered outside the package
+  is read fresh after an atomic replace and stays registered, that the folder is Hermes' `plugin_data_dir("agentchat")`,
+  and that the stray-skill check finds a copy in the profile's `skills/`.
+- Docs: plugin skills are listed in `<available_skills>` (the skills package said they were not); the README, RUNBOOK
+  and `docs/hermes-coupling.md` describe the kept-current manual and the Hermes behaviour it relies on.
+
 ## [0.6.0] — 2026-11-20
 
 Minor release (added behaviour → minor +1, `VERSIONING.md`). Needs agentchatme 1.5.0. Manual 2.4.0.
