@@ -621,6 +621,11 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         fail(f"SDK kit missing: {problem}")
     else:
         ok("agentchatme.integration (the SDK kit) importable")
+        from .kit import manual_retry_problem
+
+        retry_problem = manual_retry_problem()
+        if retry_problem is not None:
+            warn(f"SDK kit: {retry_problem}")
     signup_problem = _signup_problem()
     if signup_problem is not None:
         fail(f"SDK sign-up helper missing: {signup_problem}")

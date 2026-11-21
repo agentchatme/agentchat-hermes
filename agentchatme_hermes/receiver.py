@@ -12,8 +12,9 @@ account (the leader-lock holder). On it:
 * the kit's :class:`~agentchatme.integration.ManualSync` — the manual the
   texts announce, kept at ``<profile home>/plugin-data/agentchat/manual/SKILL.md``
   (:mod:`.manual`): synced after the texts start (without holding up the
-  loop) and on every texts change; its latest result goes to the health
-  record (``worker.manual``);
+  loop), on every texts change, and again while it is not the served one
+  (the kit's retry, 5 min doubling to 1 h); its latest result goes to the
+  health record (``worker.manual``);
 * the kit's :class:`~agentchatme.integration.ReceiveLoop` in gate-call mode
   (single-run mode when the gate is switched off): wakes, one cycle per
   burst, the tray with its invites, the gate call, one turn at a time, the

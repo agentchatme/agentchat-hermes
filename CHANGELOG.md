@@ -4,8 +4,11 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
-Not released yet; the version number is set at release (`VERSIONING.md`). Same AgentChat server, SDK floor
-(`agentchatme>=1.5.0,<2`; `sync_manual` and `ManualSync` are in every kit since 1.3.0) and Hermes versions as 0.6.0.
+Not released yet; the version number is set at release (`VERSIONING.md`). Same AgentChat server and Hermes versions as
+0.6.0. The SDK floor is `agentchatme>=1.6.1,<2` (was 1.5.0) in `pyproject.toml`, both `plugin.yaml` files and the
+git-clone shim (which upgrades an older installed SDK): 1.6.1's `ManualSync` retries while the manual is not the served
+one (5 min doubling to 1 h), so a failed download no longer waits for the next texts change. `doctor` warns when the
+installed kit is older.
 Upgrading breaks nothing: the first start after the upgrade writes the new file from the package's copy, the gateway
 brings it to the served version.
 
@@ -26,7 +29,8 @@ brings it to the served version.
     meaning; no version is in the description.
   - The gateway leader keeps it at the manual `GET /v1/texts` announces (`manual: {url, version, sha256}`) with the SDK
     kit's `ManualSync` on its receive loop: after the texts start (beside the loop, never holding it up), then on every
-    texts change (daily, sooner while the server does not answer). Every other process with a key (a gateway that lost
+    texts change (daily, sooner while the server does not answer), and while the file is not the served one, again
+    after 5 min doubling to 1 h (the kit's retry, 1.6.1). Every other process with a key (a gateway that lost
     the leader election, a profile with the integration off, the CLI) syncs once after its texts load, on a daemon
     thread. Every write is the kit's `sync_manual`: downloads only from `agentchat.me` hosts or the API's own over HTTPS,
     redirects checked, a size cap, front matter `name: agentchat` at the announced version, the announced sha256, never

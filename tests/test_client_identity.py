@@ -76,16 +76,19 @@ def test_the_shim_upgrades_an_sdk_older_than_the_kit(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(metadata, "version", version)
     shim._ensure_sdk_current()
-    assert installs == ["agentchatme>=1.5.0,<2"], "1.2.1 has no kit: upgraded"
+    assert installs == ["agentchatme>=1.6.1,<2"], "1.2.1 has no kit: upgraded"
     installed["version"] = "1.4.0"
     shim._ensure_sdk_current()
-    assert installs == ["agentchatme>=1.5.0,<2"] * 2, "1.4.0 has no could not process: upgraded"
-    for current in ("1.5.0", "1.5.1rc1", "1.10.0"):
+    assert installs == ["agentchatme>=1.6.1,<2"] * 2, "1.4.0 has no could not process: upgraded"
+    installed["version"] = "1.6.0"
+    shim._ensure_sdk_current()
+    assert installs == ["agentchatme>=1.6.1,<2"] * 3, "1.6.0's manual sync does not retry: upgraded"
+    for current in ("1.6.1", "1.6.2rc1", "1.7.0", "1.10.0"):
         installed["version"] = current
         shim._ensure_sdk_current()
     installed["version"] = None  # not installed: the plain install path handles it
     shim._ensure_sdk_current()
-    assert installs == ["agentchatme>=1.5.0,<2"] * 2
+    assert installs == ["agentchatme>=1.6.1,<2"] * 3
 
     def failing() -> None:
         raise RuntimeError("no pip, no uv")

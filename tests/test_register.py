@@ -19,6 +19,7 @@ import sys
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
+import pytest
 from fake_keys import api_key
 
 from agentchatme_hermes._register import _is_gateway_context
@@ -26,8 +27,6 @@ from agentchatme_hermes.leader_lock import GATEWAY_ENV_MARKER
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 class TestIsGatewayContext:
@@ -716,7 +715,24 @@ class TestWithoutTheKit:
         monkeypatch.setattr(integration, "ReceiveLoop", OldReceiveLoop)
         problem = kit_problem()
         assert problem is not None and "without could not process" in problem and KIT_REQUIREMENT in problem
-        assert KIT_REQUIREMENT == "agentchatme>=1.5.0"
+        assert KIT_REQUIREMENT == "agentchatme>=1.6.1"
+
+    @pytest.mark.parametrize(
+        ("installed", "said"),
+        [("1.6.0", True), ("1.5.1", True), ("1.6.1", False), ("1.6.2rc1", False), ("1.7.0", False), ("not installed", False)],
+    )
+    def test_a_kit_whose_manual_sync_does_not_retry_is_a_doctor_warning(
+        self, monkeypatch: pytest.MonkeyPatch, installed: str, said: bool
+    ) -> None:
+        """1.6.1's ManualSync retries while the manual is stale; an older kit
+        still receives, so it is a warning, never a reason to stop."""
+        from agentchatme_hermes import kit
+
+        monkeypatch.setattr(kit, "installed_sdk_version", lambda: installed)
+        problem = kit.manual_retry_problem()
+        assert (problem is not None) is said
+        if said:
+            assert installed in problem and "agentchatme>=1.6.1" in problem
 
     def test_the_plugin_and_its_cli_import_without_the_kit(self) -> None:
         import os
