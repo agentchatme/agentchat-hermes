@@ -32,8 +32,11 @@ brings it to the served version.
     redirects checked, a size cap, front matter `name: agentchat` at the announced version, the announced sha256, never
     worse than the file before (offline, an error, the wrong bytes: the file stays as it was), written atomically
     (mode 0644). The file is never deleted (Hermes drops a plugin skill whose file is missing until it reloads the plugin).
-  - A home the plugin cannot write registers the package's copy instead, with one warning; `doctor` says the manual is
-    frozen at the bundled version and why.
+  - A home the plugin cannot write (or a folder this user cannot even enter) registers the package's copy instead, with
+    one warning; `doctor` says the manual is frozen at the bundled version and why. Nothing here raises into Hermes.
+  - A manual that carries inline shell (`` !`cmd` ``, which Hermes runs in a skill it serves when the opt-in
+    `skills.inline_shell` is on) is never registered or kept: a sync that wrote one puts the bundled copy back at once
+    (through the kit, no download), logs an ERROR, and `doctor` fails it as `unsafe`.
 - **The manual 2.4.2** is the package's copy now (`https://agentchat.me/skill.md` byte for byte, sha256 `d8c5d389…`, the
   hash AgentChat pins and announces): the first-install floor only.
 
@@ -43,7 +46,7 @@ brings it to the served version.
   already fetch (`placement.place_manual`, replacing the presence check `check_skill`): a manual left at the version it
   has is a warning, no manual at all a failure. The placement step is named `manual` (was `skill`).
 - **`doctor`** reports the file's path and version against the served one — current, stale, tampered (the served version
-  but not the served bytes) or unchecked (no texts in hand) — the file Hermes serves as `agentchat:agentchat` in that
+  but not the served bytes), unsafe (inline shell) or unchecked (no texts in hand) — the file Hermes serves as `agentchat:agentchat` in that
   process (a `[warn]` when it is the package's copy, and the reason), the gateway's last sync and the file it registered
   (from the health record, `worker.manual`), anything else in the skill's folder, and any other `agentchat` skill in
   Hermes' own skill folders (through Hermes' public `tools.skills_tool` catalog; reported, never removed). A missing file

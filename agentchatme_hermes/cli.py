@@ -1456,6 +1456,12 @@ def _doctor_manual_checks(
             f"manual {state.detail} — not the text the server serves (edited after it was "
             f"placed); `{cmd} doctor --fix` puts the served one back"
         )
+    elif state.state == "unsafe":
+        fail(
+            f"manual {state.detail} — Hermes runs inline shell in a skill it serves when "
+            f"skills.inline_shell is on, so the plugin does not register this file; `{cmd} doctor "
+            "--fix` puts a manual without it back"
+        )
     else:
         warn(f"manual {state.detail} — it cannot be compared until /v1/texts answers")
 

@@ -47,6 +47,7 @@ kit is missing.
 from __future__ import annotations
 
 import atexit
+import dataclasses
 import hashlib
 import logging
 import re
@@ -84,8 +85,16 @@ _DESKTOP_DROPPINGS = frozenset({".DS_Store", "Thumbs.db", "desktop.ini"})
 # How long a process that is exiting waits for a sync still in flight (a CLI
 # command can end before its download does).
 _EXIT_WAIT_S = 2.0
+# Hermes runs every ``!`cmd``` in a SKILL.md it serves when ``skills.inline_shell``
+# is on (``agent/skill_preprocessing.py`` ``_INLINE_SHELL_RE``, the same
+# pattern): a manual that carries one is never registered or kept.
+INLINE_SHELL = re.compile(r"!`([^`\n]+)`")
+_INLINE_SHELL_REFUSED = (
+    "the served manual carries inline shell (!`...`), which Hermes runs when skills.inline_shell "
+    "is on — the bundled copy was put back"
+)
 
-ManualCheckState = Literal["current", "stale", "tampered", "unchecked", "missing"]
+ManualCheckState = Literal["current", "stale", "tampered", "unsafe", "unchecked", "missing"]
 
 
 # ─── where ───────────────────────────────────────────────────────────────────
@@ -220,7 +229,18 @@ def prepare(home: Path) -> ManualRegistration | None:
         from agentchatme.integration import sync_manual
     except ImportError:
         return frozen("the agentchatme SDK kit is not installed, so the manual cannot be kept current")
+    try:
+        return _prepare(home, target, sync_manual, frozen)
+    except Exception as exc:  # EACCES on a folder this user cannot traverse, and any surprise
+        return frozen(f"{target} could not be checked: {exc}")
 
+
+def _prepare(
+    home: Path,
+    target: Path,
+    sync_manual: Callable[..., ManualSyncResult],
+    frozen: Callable[[str], ManualRegistration | None],
+) -> ManualRegistration | None:
     for leftover in stray_writes(target.parent):
         try:
             leftover.unlink()
@@ -276,6 +296,8 @@ def _unusable(target: Path, home: Path) -> str | None:
         return f"{target} cannot be read: {exc}"
     if _front_matter(data).get("name") != MANUAL_SKILL_NAME:
         return f"{target} is not the agentchat manual (left as it is; the next sync with the server replaces it)"
+    if INLINE_SHELL.search(data.decode("utf-8", "replace")):
+        return f"{target} carries inline shell (!`...`), which Hermes runs when skills.inline_shell is on"
     return None
 
 
@@ -292,16 +314,68 @@ def sync_once(
     except ImportError:
         return None
     try:
-        return sync_manual(
+        result = sync_manual(
             path=manual_path(home),
             served=served,
             api_base=api_base,
             fallback=bundled_bytes(),
             http_client=http_client,
         )
-    except Exception:  # the kit never raises; this is belt and braces
-        logger.exception("agentchat: the manual sync raised")
+    except Exception as exc:  # EACCES on a folder this user cannot traverse (the kit's own checks)
+        logger.debug("agentchat: the manual sync raised", exc_info=True)
+        return _failed_result(manual_path(home), served, exc)
+    return refuse_inline_shell(home, result)
+
+
+def refuse_inline_shell(home: Path, result: ManualSyncResult) -> ManualSyncResult:
+    """After a sync that wrote: a manual that carries inline shell
+    (:data:`INLINE_SHELL`) is replaced by the bundled copy (through the kit,
+    atomically, no network), and the result says so. Otherwise ``result``."""
+    if not result.written:
+        return result
+    try:
+        text = manual_path(home).read_bytes().decode("utf-8", "replace")
+    except OSError:
+        return result
+    if not INLINE_SHELL.search(text):
+        return result
+    logger.error("agentchat: %s (%s)", _INLINE_SHELL_REFUSED, manual_path(home))
+    restored = _restore_bundled(home)
+    base = restored if restored is not None else result
+    return dataclasses.replace(base, up_to_date=False, error=_INLINE_SHELL_REFUSED)
+
+
+def _restore_bundled(home: Path) -> ManualSyncResult | None:
+    """The bundled copy written over the file, through the kit (the bundled
+    bytes announced as themselves: no download)."""
+    bundle = bundled_bytes()
+    version = bundled_version()
+    if bundle is None or version is None or INLINE_SHELL.search(bundle.decode("utf-8", "replace")):
         return None
+    try:
+        from agentchatme.integration import ServedManual, sync_manual
+
+        return sync_manual(
+            path=manual_path(home),
+            served=ServedManual(url=MANUAL_URL, version=version, sha256=hashlib.sha256(bundle).hexdigest()),
+            api_base="https://api.agentchat.me",
+            fallback=bundle,
+        )
+    except Exception:
+        logger.debug("agentchat: the bundled copy could not be put back", exc_info=True)
+        return None
+
+
+def _failed_result(path: Path, served: Any, exc: BaseException) -> ManualSyncResult:
+    from agentchatme.integration import ManualSyncResult
+
+    version, _sha = _announcement(served)
+    url = served.get("url") if isinstance(served, dict) else getattr(served, "url", None)
+    return ManualSyncResult(
+        state="failed", path=path, version=None, previous=None, tampered=False, served=version,
+        url=url if isinstance(url, str) else None, source=None, written=False,
+        up_to_date=None if version is None else False, error=f"{path} could not be checked: {exc}",
+    )
 
 
 _inflight: set[threading.Thread] = set()
@@ -321,7 +395,10 @@ def sync_in_background(*, home: Path, served: Any, api_base: str | None, label: 
         try:
             result = sync_once(home=home, served=served, api_base=api_base)
             if result is not None:
-                log_result(result, label=label)
+                # Every short-lived process runs this: a manual it could not
+                # bring current is said at INFO (doctor and the gateway say
+                # it louder); a write that failed is a warning.
+                log_result(result, label=label, quiet=True)
         finally:
             with _inflight_lock:
                 _inflight.discard(threading.current_thread())
@@ -359,13 +436,16 @@ def manual_sync_for(
     )
 
 
-def log_result(result: ManualSyncResult, *, label: str) -> None:
-    """One sync's outcome, at the level it deserves."""
+def log_result(result: ManualSyncResult, *, label: str, quiet: bool = False) -> None:
+    """One sync's outcome, at the level it deserves (``quiet``: a manual left
+    at the version it has is INFO, not a warning)."""
     line = describe_result(result)
-    if result.state == "updated":
-        logger.info("agentchat: profile=%s manual %s", label, line)
-    elif result.up_to_date is False or result.state == "failed":
+    if result.error == _INLINE_SHELL_REFUSED or result.state == "failed":
         logger.warning("agentchat: profile=%s manual %s", label, line)
+    elif result.state == "updated":
+        logger.info("agentchat: profile=%s manual %s", label, line)
+    elif result.up_to_date is False:
+        (logger.info if quiet else logger.warning)("agentchat: profile=%s manual %s", label, line)
     else:
         logger.debug("agentchat: profile=%s manual %s", label, line)
 
@@ -392,6 +472,8 @@ def describe_result(result: ManualSyncResult) -> str:
         if result.tampered
         else (result.previous or "an unversioned file")
     )
+    if result.error == _INLINE_SHELL_REFUSED:
+        return f"refused: {result.error} ({result.version}) → {at}"
     if result.state == "current":
         return f"current ({result.version}) — {at}"
     if result.state == "updated":
@@ -437,9 +519,9 @@ def check(path: Path, served: Any) -> ManualCheck:
     def result(state: ManualCheckState, summary: str, version: str | None = None) -> ManualCheck:
         return ManualCheck(state=state, path=path, version=version, served=served_version, summary=summary)
 
-    if path.is_symlink() or not path.is_file():
-        return result("missing", "missing")
     try:
+        if path.is_symlink() or not path.is_file():
+            return result("missing", "missing")
         data = path.read_bytes()
     except OSError as exc:
         return result("missing", f"unreadable ({exc})")
@@ -450,6 +532,8 @@ def check(path: Path, served: Any) -> ManualCheck:
         return result("tampered", "not the agentchat manual (its front matter does not name agentchat)")
     version = fields.get("version")
     have = version or "an unversioned file"
+    if INLINE_SHELL.search(data.decode("utf-8", "replace")):
+        return result("unsafe", f"unsafe (have {have}: it carries inline shell, !`...`)", version)
     if served_version is None:
         return result("unchecked", f"unchecked (have {have}; no served version in hand)", version)
     if served_sha is not None and not re.fullmatch(r"[0-9a-f]{64}", served_sha):
@@ -502,6 +586,7 @@ def _front_matter(data: bytes) -> dict[str, str]:
 
 __all__ = [
     "BUNDLED_MANUAL_PATH",
+    "INLINE_SHELL",
     "MANUAL_URL",
     "ManualCheck",
     "ManualRegistration",
@@ -517,6 +602,7 @@ __all__ = [
     "prepare",
     "read_version",
     "record_registration",
+    "refuse_inline_shell",
     "registration_for",
     "result_record",
     "stray_writes",

@@ -561,9 +561,11 @@ class Receiver:
         """A manual sync's result (the kit calls this for every up-to-date
         result and once per failure condition): logged, kept for the health
         record."""
-        from .manual import log_result, result_record
+        from .manual import log_result, refuse_inline_shell, result_record
 
         try:
+            if self._hermes_home is not None:
+                result = refuse_inline_shell(self._hermes_home, result)
             self._manual_last = result_record(result)
             log_result(
                 result,
