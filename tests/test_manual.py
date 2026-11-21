@@ -324,6 +324,11 @@ class TestSync:
                     seen.add(registered.read_bytes())
                 except FileNotFoundError:
                     problems.append("missing")
+                except PermissionError:
+                    # Windows: a file being replaced is briefly not openable
+                    # (a failed read, retried — never a missing file).
+                    if os.name != "nt":
+                        problems.append("denied")
                 time.sleep(0.0005)
 
         reader = threading.Thread(target=read, name="reader")
@@ -383,7 +388,10 @@ class TestSync:
         try:
             assert register_skill(_Ctx(), hermes_home=home) == BUNDLED_MANUAL_PATH
             registration = manual.registration_for(home)
-            assert registration is not None and "could not be checked" in (registration.reason or "")
+            # Python 3.9 to 3.13 pathlib raises EACCES ("could not be checked");
+            # 3.14 reads it as absent, and the write then fails.
+            reason = registration.reason if registration is not None else ""
+            assert "could not be checked" in (reason or "") or "cannot be written" in (reason or "")
             assert manual.check(manual_path(home), BUNDLE_ANNOUNCED).state == "missing"
             result = manual.sync_once(home=home, served=BUNDLE_ANNOUNCED, api_base=API)
             assert result is not None and result.state == "failed" and result.up_to_date is False
