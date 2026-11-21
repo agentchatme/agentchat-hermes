@@ -25,6 +25,7 @@ import argparse
 import asyncio
 import hashlib
 import importlib.util
+import json
 import logging
 import os
 import sys
@@ -1124,17 +1125,39 @@ class TestOffline:
 
 
 class TestLabCosmetics:
-    def test_the_stale_line_says_the_gateway_retries(self, home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        from agentchatme_hermes import kit
-
+    @pytest.mark.parametrize(
+        ("worker", "said"),
+        [
+            (None, "no running gateway keeps it current for this account"),
+            ({"state": "idle"}, "the running gateway has recorded no sync of it yet"),
+            (
+                {"manual": {"last_sync": {"at": time.time() - 40, "state": "kept", "up_to_date": False}}},
+                "did not bring it current, so it tries again on its own (after 5 min, doubling to 1 h)",
+            ),
+            (
+                {"manual": {"last_sync": {"at": time.time() - 40, "state": "current", "up_to_date": True}}},
+                "found it current, so the gateway does not look at it again until the served texts change or it "
+                "restarts: run `hermes agentchat doctor --fix` or `hermes gateway restart`",
+            ),
+        ],
+        ids=["no-gateway", "no-sync-yet", "last-sync-failed", "last-sync-current"],
+    )
+    def test_the_stale_line_says_what_the_gateway_will_do(self, home: Path, worker: Any, said: str) -> None:
+        """The kit retries only after a sync that left the file not current; a
+        file changed behind a gateway whose last sync was current waits for the
+        next texts change or a restart."""
         register_skill(_Ctx(), hermes_home=home)
         lines = _Lines()
-        lines.run(home, _announce(_body("9.9.9"), "9.9.9"))
-        assert any("retries on its own, after 5 min doubling to 1 h" in w for w in lines.of("warn"))
+        lines.run(home, _announce(_body("9.9.9"), "9.9.9"), worker)
+        stale = [w for w in lines.of("warn") if w.startswith("manual stale")]
+        assert len(stale) == 1 and said in stale[0], stale
+
+    def test_an_old_kit_retries_only_on_a_texts_change(self, home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import kit
+
         monkeypatch.setattr(kit, "manual_retry_problem", lambda: "old kit")
-        lines = _Lines()
-        lines.run(home, _announce(_body("9.9.9"), "9.9.9"))
-        assert any("tries again when the served texts change" in w for w in lines.of("warn"))
+        failed = {"manual": {"last_sync": {"state": "kept", "up_to_date": False}}}
+        assert "tries again when the served texts change" in cli._gateway_manual_outlook(failed, "hermes agentchat")
 
     def test_the_activation_log_says_the_real_schedule(self, tmp_path: Path) -> None:
         from agentchatme_hermes._register import ActivationWatcher
@@ -1146,17 +1169,70 @@ class TestLabCosmetics:
 
 
 class TestGatewayDetection:
-    def test_a_fresh_health_record_is_a_running_gateway(self, home: Path) -> None:
-        from agentchatme_hermes.leader_lock import lock_path_for
+    @pytest.fixture
+    def _nothing_else(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """No other evidence of a gateway: Hermes' answer and the process list say none."""
+        status = types.ModuleType("gateway.status")
+        status.get_running_pid = lambda **_kw: None  # type: ignore[attr-defined]
+        if "gateway" not in sys.modules:
+            monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
+        monkeypatch.setitem(sys.modules, "gateway.status", status)
+        monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the leader lock is fcntl, POSIX-only")
+    def test_a_health_record_counts_only_while_its_gateway_lives(self, home: Path, _nothing_else: None) -> None:
+        """A gateway stopped or killed leaves a fresh record saying "connected"
+        (Hermes never stops the receiver): the record counts only with its pid
+        alive and the leader lock held."""
+        import subprocess
+
+        from agentchatme_hermes.leader_lock import (
+            lock_path_for,
+            release_leader_lock,
+            try_acquire_ws_leader_lock,
+        )
         from agentchatme_hermes.profile_scope import account_fingerprint
-        from agentchatme_hermes.ws_health import health_path_for, write_ws_health
+        from agentchatme_hermes.ws_health import health_path_for, read_ws_health, write_ws_health
 
         key = api_key("gw")
-        path = health_path_for(lock_path_for(hermes_home=home, account_fingerprint=account_fingerprint(API, key)))
+        lock = lock_path_for(hermes_home=home, account_fingerprint=account_fingerprint(API, key))
+        path = health_path_for(lock)
         write_ws_health(handle="alice", state="connected", path=path)
-        assert cli._gateway_running(API, key, home) == f"pid {os.getpid()}, holding this account's socket"
-        write_ws_health(handle="alice", state="connected", path=path, now=time.time() - 3600)
-        assert cli._gateway_running(API, key, home) != f"pid {os.getpid()}, holding this account's socket"
+        assert cli._gateway_running(API, key, home) is None, "no lock held: the gateway is gone"
+        fd = try_acquire_ws_leader_lock(lock)
+        assert fd is not None
+        try:
+            assert cli._gateway_running(API, key, home) == f"pid {os.getpid()}, holding this account's socket"
+            gone = subprocess.Popen([sys.executable, "-c", "pass"])
+            gone.wait()
+            record = read_ws_health(path)
+            assert record is not None
+            path.write_text(json.dumps({**record, "pid": gone.pid}), encoding="utf-8")
+            assert cli._gateway_running(API, key, home) is None, "the record's pid is dead"
+            write_ws_health(handle="alice", state="stopped", path=path)
+            assert cli._gateway_running(API, key, home) is None
+            write_ws_health(handle="alice", state="connected", path=path, now=time.time() - 3600)
+            assert cli._gateway_running(API, key, home) is None, "stale"
+        finally:
+            release_leader_lock(fd)
+
+    def test_the_receiver_marks_stopped_at_a_clean_exit(self, home: Path, tmp_path: Path) -> None:
+        from agentchatme_hermes.agent_invoker import AgentInvoker
+        from agentchatme_hermes.receiver import Receiver
+        from agentchatme_hermes.types import AgentIdentity
+        from agentchatme_hermes.ws_health import read_ws_health
+
+        path = tmp_path / "ws.health.json"
+        receiver = Receiver(
+            config=SimpleNamespace(api_key=api_key("x"), api_base=API, ws_url="wss://x"),
+            identity=AgentIdentity(handle="me"),
+            invoker=AgentInvoker(config=SimpleNamespace(), identity=AgentIdentity(handle="me"), runtime=SimpleNamespace()),
+            texts_factory=lambda client: None,  # type: ignore[arg-type,return-value]
+            health_path=path,
+        )
+        receiver._stopped_at_exit()  # what atexit runs
+        record = read_ws_health(path)
+        assert record is not None and record["state"] == "stopped"
 
     def test_hermes_own_answer(self, home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         status = types.ModuleType("gateway.status")

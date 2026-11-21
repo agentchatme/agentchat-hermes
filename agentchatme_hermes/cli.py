@@ -48,6 +48,7 @@ releases up to 0.5.3 kept it.
 from __future__ import annotations
 
 import logging
+import os
 import re
 import sys
 import time
@@ -1261,39 +1262,17 @@ def _fix_key(
 def _gateway_running(api_base: str, api_key: str, hermes_home: Path) -> str | None:
     """How ``doctor`` knows a Hermes gateway is running, or ``None``. In order:
 
-    1. this account's health record is fresh: the gateway holding its socket
-       wrote it within the last 150 s (the record names its pid);
+    1. this account's health record, while its gateway lives (:func:`_live_health`:
+       fresh, its pid alive, the leader lock held);
     2. Hermes' own answer for this profile, ``gateway.status.get_running_pid``
        (public; read-only with ``cleanup_stale=False``): its lock and pid file
        checked against the live process, however it was launched;
     3. a process whose command line runs ``hermes gateway`` (argv, also a
        ``sys.argv = [..., 'gateway', 'run']`` launcher).
     """
-    try:
-        from .leader_lock import lock_path_for
-        from .profile_scope import account_fingerprint, resolve_setting
-        from .ws_health import (
-            HEALTH_STALE_AFTER_SECONDS,
-            health_age_seconds,
-            health_path_for,
-            read_ws_health,
-        )
-
-        lock_dir_raw = (resolve_setting("AGENTCHATME_LOCK_DIR") or "").strip()
-        lock_path = lock_path_for(
-            hermes_home=hermes_home,
-            account_fingerprint=account_fingerprint(api_base, api_key),
-            lock_dir=Path(lock_dir_raw).expanduser() if lock_dir_raw else None,
-        )
-        health = read_ws_health(health_path_for(lock_path))
-        if (
-            health is not None
-            and health["state"] != "stopped"
-            and health_age_seconds(health) <= HEALTH_STALE_AFTER_SECONDS
-        ):
-            return f"pid {health['pid']}, holding this account's socket"
-    except Exception:
-        logger.debug("doctor: health record not read", exc_info=True)
+    health = _live_health(api_base, api_key, hermes_home)
+    if health is not None:
+        return f"pid {health['pid']}, holding this account's socket"
     try:
         from gateway.status import get_running_pid  # type: ignore[import-not-found]
 
@@ -1579,14 +1558,10 @@ def _doctor_manual_checks(
             "tries again)"
         )
     elif state.state == "stale":
-        from .kit import manual_retry_problem
-
-        gateway = (
-            "a running gateway also retries on its own, after 5 min doubling to 1 h"
-            if manual_retry_problem() is None
-            else "a running gateway also tries again when the served texts change"
+        warn(
+            f"manual {state.detail} — `{cmd} doctor --fix` downloads the served one; "
+            f"{_gateway_manual_outlook(worker, cmd)}"
         )
-        warn(f"manual {state.detail} — `{cmd} doctor --fix` downloads the served one; {gateway}")
     elif state.state == "tampered":
         warn(
             f"manual {state.detail} — not the text the server serves (edited after it was "
@@ -1644,6 +1619,37 @@ def _doctor_manual_checks(
             "`agentchat` beside agentchat:agentchat, and that copy never updates — remove its folder "
             "unless you keep it on purpose (doctor never deletes it)"
         )
+
+
+def _gateway_manual_outlook(worker: Any, cmd: str) -> str:
+    """What the running gateway will do about a stale manual, from its last
+    recorded sync (the health record's ``worker.manual.last_sync``). The kit
+    tries again by itself only after a sync that left the file not the served
+    one; after a current one it looks again only when the served texts change
+    or the gateway restarts, so a file changed behind it stays as it is."""
+    section = worker.get("manual") if isinstance(worker, dict) else None
+    last = section.get("last_sync") if isinstance(section, dict) else None
+    if worker is None:
+        return "no running gateway keeps it current for this account"
+    if not isinstance(last, dict):
+        return "the running gateway has recorded no sync of it yet"
+    at = last.get("at")
+    ago = f" {time.time() - float(at):.0f}s ago" if isinstance(at, (int, float)) else ""
+    if last.get("up_to_date") is False or last.get("state") == "failed":
+        from .kit import manual_retry_problem
+
+        if manual_retry_problem() is None:
+            return (
+                f"the gateway's last sync{ago} did not bring it current, so it tries again on its own "
+                "(after 5 min, doubling to 1 h)"
+            )
+        return f"the gateway's last sync{ago} did not bring it current; it tries again when the served texts change"
+    if last.get("up_to_date") is True:
+        return (
+            f"the gateway's last sync{ago} found it current, so the gateway does not look at it again until "
+            f"the served texts change or it restarts: run `{cmd} doctor --fix` or `hermes gateway restart`"
+        )
+    return "the gateway had no served version to compare with at its last sync; it syncs once the texts arrive"
 
 
 def _stray_agentchat_skills(*, exclude: tuple[Path, ...] = ()) -> list[tuple[Path, str | None]]:
@@ -2079,10 +2085,22 @@ def _describe_could_not_process(worker: Any, *, now: float) -> list[tuple[str, s
 
 def _health_worker(api_base: str, api_key: str) -> Any:
     """The health record's ``worker`` section for this profile's account
-    (what the running gateway last wrote), or ``None``. Never raises:
-    status prints what it can."""
+    (what the running gateway last wrote), or ``None`` (see
+    :func:`_live_health`). Never raises: status prints what it can."""
+    health = _live_health(api_base, api_key)
+    return health.get("worker") if health is not None else None
+
+
+def _live_health(api_base: str, api_key: str, hermes_home: Path | None = None) -> Any:
+    """This account's health record, only while the gateway that writes it
+    lives: fresh (≤ 150 s), not ``stopped``, its pid alive, and the leader
+    lock beside it held (where the lock can be probed). A gateway stopped or
+    killed leaves a fresh record saying ``connected`` behind it (Hermes has no
+    shutdown hook for a plugin; the receiver marks ``stopped`` at exit only
+    when the interpreter exits cleanly), so freshness alone is not enough.
+    ``None`` otherwise. Never raises."""
     try:
-        from .leader_lock import lock_path_for
+        from .leader_lock import describe_lock_holder, lock_path_for
         from .profile_scope import account_fingerprint, resolve_hermes_home, resolve_setting
         from .ws_health import (
             HEALTH_STALE_AFTER_SECONDS,
@@ -2093,16 +2111,46 @@ def _health_worker(api_base: str, api_key: str) -> Any:
 
         lock_dir_raw = (resolve_setting("AGENTCHATME_LOCK_DIR") or "").strip()
         lock_path = lock_path_for(
-            hermes_home=resolve_hermes_home(),
+            hermes_home=hermes_home if hermes_home is not None else resolve_hermes_home(),
             account_fingerprint=account_fingerprint(api_base, api_key),
             lock_dir=Path(lock_dir_raw).expanduser() if lock_dir_raw else None,
         )
         health = read_ws_health(health_path_for(lock_path))
-        if health is None or health_age_seconds(health) > HEALTH_STALE_AFTER_SECONDS:
+        if health is None or health["state"] == "stopped":
             return None
-        return health.get("worker")
+        if health_age_seconds(health) > HEALTH_STALE_AFTER_SECONDS:
+            return None
+        if _pid_alive(health["pid"]) is not True:
+            return None
+        lock = describe_lock_holder(lock_path)
+        if lock in ("free", "not present"):
+            return None
+        return health
     except Exception:
         return None
+
+
+def _pid_alive(pid: int) -> bool | None:
+    """Whether a process with ``pid`` exists here; ``None`` when that cannot be
+    told (Windows without ``psutil``: ``os.kill`` there would end the process)."""
+    try:
+        import importlib
+
+        psutil: Any = importlib.import_module("psutil")
+        return bool(psutil.pid_exists(pid))
+    except ImportError:
+        pass
+    if os.name == "nt":
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists, owned by another user
+    except OSError:
+        return None
+    return True
 
 
 def _print_local_status(resolution: KeyResolution, *, worker: Any, manual: str) -> None:

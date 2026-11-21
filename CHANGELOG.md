@@ -76,10 +76,15 @@ brings it to the served version. Upgrading a git install pinned with `--ref` (`h
   `status` prints its error and then the local lines (the saved handle, the key, the manual); its exit code is still 1.
 - **`doctor`'s gateway line** no longer misses a running gateway that was started through a launcher (`python -c` that
   sets `sys.argv = [..., 'gateway', 'run']`): it asks this account's health record first, then Hermes'
-  `gateway.status.get_running_pid` (read-only), then the process list.
+  `gateway.status.get_running_pid` (read-only), then the process list. The health record counts only while its
+  gateway lives — fresh, its pid alive and the leader lock held — since a gateway stopped or killed leaves a fresh
+  record saying `connected` behind it (Hermes never stops the receiver; the receiver now marks `stopped` at a clean
+  interpreter exit, best effort). `status`' could-not-process lines read the record by the same rule.
 - The gateway's "not active yet" log line says the real retry schedule (every 30 s while unconfigured; after a
-  failure 30 s, then longer up to every 300 s), and `doctor`'s stale-manual line says the gateway retries after 5 min
-  doubling to 1 h (with an older kit: on the next texts change).
+  failure 30 s, then longer up to every 300 s), and `doctor`'s stale-manual line says what the running gateway will do,
+  from its last recorded sync: after one that failed it retries (5 min doubling to 1 h; an older kit: on the next texts
+  change); after one that found the file current it does not look again until the served texts change or it restarts
+  (`doctor --fix` or a restart then).
 - **`status`** prints one `Manual:` line (`current (2.4.3) — <path>`, `stale (have …, served …)`, or frozen at the
   bundled copy and why).
 - The nightly contract workflow (`hermes-main`) checks against a real Hermes that a skill registered outside the package

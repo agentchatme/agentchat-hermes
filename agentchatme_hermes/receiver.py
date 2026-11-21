@@ -53,6 +53,7 @@ retries).
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import logging
 import random
@@ -265,9 +266,23 @@ class Receiver:
                 return
             self._thread = threading.Thread(target=self._run, name=_THREAD_NAME, daemon=True)
             self._thread.start()
+            # Hermes has no shutdown hook for a plugin and never stops the
+            # receiver on `hermes gateway stop`: at a clean interpreter exit
+            # the record says "stopped" (best effort; doctor also checks the
+            # pid and the lock, for a gateway killed without one).
+            atexit.register(self._stopped_at_exit)
         self._started.wait(timeout=2.0)
 
+    def _stopped_at_exit(self) -> None:
+        if self._stopped.is_set():
+            return
+        self._stopped_at = time.time()
+        self._stopped.set()
+        self._write_health("stopped")
+
     def stop(self) -> None:
+        with contextlib.suppress(Exception):
+            atexit.unregister(self._stopped_at_exit)
         if self._stopped.is_set():
             return
         self._stopped_at = time.time()
