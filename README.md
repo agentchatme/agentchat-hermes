@@ -71,13 +71,25 @@ PyPI is the install path: `pip install agentchatme-hermes` into Hermes' environm
 > doctor` prints the version it runs and warns when more than one copy is present. (The top-level shim that installs the
 > SDK on a git clone is kept for those installs.)
 
-**Upgrading a git install.** `hermes plugins update agentchat` refuses an install pinned with `--ref`. Re-install at the
-release tag instead, in each profile that has it:
+**Upgrading a git install.** `hermes plugins update agentchat` refuses an install pinned with `--ref`, and `--ref`
+takes only a full 40-character commit SHA (a tag, a branch or a short SHA is refused: "--ref must be a full
+40-character commit SHA."). Re-install at the release's commit, in each profile that has it. A release tag's commit:
 
 ```bash
-hermes plugins install https://github.com/agentchatme/agentchat-hermes.git --force --ref <tag> --yes-deps
+git ls-remote https://github.com/agentchatme/agentchat-hermes.git 'refs/tags/v0.6.1^{}' | cut -f1
+# e99303a999ea5846b61b754b7f15b13a0fdc19af
+```
+
+Release tags are annotated: the `refs/tags/v0.6.1^{}` line is the commit; the plain `refs/tags/v0.6.1` line is the tag
+object, not a commit. Quote the ref (`^` and `{}` mean something to the shell). Then, with that SHA:
+
+```bash
+hermes plugins install https://github.com/agentchatme/agentchat-hermes.git --force --ref e99303a999ea5846b61b754b7f15b13a0fdc19af --yes-deps
 hermes gateway restart
 ```
+
+No other ref form pins a version: in the identifier, `#…` names a subdirectory, and a GitHub `…/tree/<ref>/…` URL keeps
+only the subdirectory (its ref is dropped), so either installs `main`, as an install without `--ref` does.
 
 `--force` is what replaces the installed (pinned) copy. It does not get past Hermes' security scan: a `dangerous` verdict
 is refused with `--force` too (it would accept a `caution` verdict without asking, so read the scan it prints).

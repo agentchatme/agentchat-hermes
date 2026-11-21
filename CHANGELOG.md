@@ -37,6 +37,11 @@ upgrades an older installed SDK): 1.8.0's `anchor.owner` / `decide` / `follow` a
   older text of ours, edited by hand and how to restore it, another agent's, several blocks), the strict `owner` when
   AgentChat does not answer, and warns when the installed kit has no strict reading.
 
+- **The upgrade command for a pinned git install** (README, and the 0.6.1 and 0.5.4 entries below) gave a release tag
+  to `--ref`; Hermes takes only a full 40-character commit SHA there. It now gives the release's commit and how to
+  resolve a tag to it: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git 'refs/tags/vX.Y.Z^{}' | cut -f1`
+  (release tags are annotated: the `^{}` line is the commit).
+
 ### Removed
 
 - `soul_anchor.has_anchor`, `read_anchor_handle` and `anchor_is_current`: they read a block's owner loosely.
@@ -50,7 +55,9 @@ one (5 min doubling to 1 h), so a failed download no longer waits for the next t
 installed kit is older.
 Upgrading breaks nothing: the gateway's first start after the upgrade writes the new file from the package's copy and
 brings it to the served version. Upgrading a git install pinned with `--ref` (`hermes plugins update` refuses one):
-`hermes plugins install https://github.com/agentchatme/agentchat-hermes.git --force --ref v0.6.1 --yes-deps`, then
+`hermes plugins install https://github.com/agentchatme/agentchat-hermes.git --force --ref e99303a999ea5846b61b754b7f15b13a0fdc19af --yes-deps`
+(the commit of `v0.6.1`; `--ref` takes only a full 40-character commit SHA — this entry first gave the tag, which Hermes
+refuses), then
 `hermes gateway restart`. `--force` replaces the pinned install; it does not get past Hermes' security scan (a
 `dangerous` verdict is refused with `--force` too; it would accept a `caution` verdict without asking).
 
@@ -197,7 +204,7 @@ Minor release (added behaviour → minor +1, `VERSIONING.md`). Needs agentchatme
 
 ## [0.5.4] — 2026-11-18
 
-Fixed existing behaviour, so patch +1 (`VERSIONING.md`). Upgrading a git-pinned install: `hermes plugins install agentchatme/agentchat-hermes --force --ref v0.5.4` (a plain `--force` reinstalls the pinned commit).
+Fixed existing behaviour, so patch +1 (`VERSIONING.md`). Upgrading a git-pinned install: `hermes plugins install agentchatme/agentchat-hermes --force --ref dc7e5f1a6526472d48177f470dcff7955351eca7` (the commit of `v0.5.4`; `--ref` takes only a full 40-character commit SHA — this entry first gave the tag, which Hermes refuses; a plain `--force` reinstalls the pinned commit).
 
 Not released yet; the version number is set at release (`VERSIONING.md`). Same AgentChat server and SDK floor
 (`agentchatme>=1.4.0,<2`). Keeping the key out of the agent's commands needs Hermes v0.23.2 or later; everything else
