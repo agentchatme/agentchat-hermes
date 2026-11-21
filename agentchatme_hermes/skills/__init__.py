@@ -6,9 +6,10 @@ fresh from its registered path on every ``skill_view``, so the path registered
 here is the per-profile file the plugin keeps current,
 ``<profile home>/plugin-data/agentchat/manual/SKILL.md`` (:mod:`..manual`), not
 the copy in this package. The package's ``skills/agentchat/SKILL.md`` is the
-offline floor: written there when no file exists yet, and registered itself
-only when that file cannot be written — ``hermes agentchat doctor`` then says
-the manual is frozen at the bundled version.
+offline floor: the gateway writes it there when no file exists yet; it is
+registered itself only when that file cannot be used (``hermes agentchat
+doctor`` then says the manual is frozen at the bundled version), and by a
+process that places nothing while the file is not there yet.
 
 Per Hermes' skill contract (``hermes_cli/plugins_content.py``), a plugin skill
 is namespaced ``<plugin_name>:<skill_name>`` and listed in the system prompt's
@@ -43,15 +44,17 @@ SKILL_DESCRIPTION = (
 )
 
 
-def register_skill(ctx: Any, *, hermes_home: Path) -> Path | None:
+def register_skill(ctx: Any, *, hermes_home: Path, place: bool = True) -> Path | None:
     """Register the manual for the profile at ``hermes_home``; return the path
     Hermes was given (``None`` when there is no manual at all).
 
-    Local only — no network: the file is created from the bundled bytes when
-    missing, then registered. When it cannot be (written, read, or is not the
-    manual), the bundled copy is registered instead and that is said once.
+    Local only — no network. ``place`` (the gateway): the file is created from
+    the bundled bytes when missing, then registered. Without ``place`` (every
+    other Hermes process) nothing is written. When the file cannot be used
+    (written, read, or is not the manual), the bundled copy is registered
+    instead and that is said once.
     """
-    registration = prepare(hermes_home)
+    registration = prepare(hermes_home, place=place)
     if registration is None:
         return None
     try:
@@ -68,8 +71,13 @@ def register_skill(ctx: Any, *, hermes_home: Path) -> Path | None:
         )
         ctx.register_skill(name=SKILL_NAME, path=registration.path, description=SKILL_DESCRIPTION)
     record_registration(hermes_home, registration)
-    if registration.kept_current:
-        logger.debug("agentchat: registered skill %s -> %s", SKILL_NAME, registration.path)
+    if registration.kept_current or registration.routine:
+        logger.debug(
+            "agentchat: registered skill %s -> %s%s",
+            SKILL_NAME,
+            registration.path,
+            f" ({registration.reason})" if registration.routine else "",
+        )
     else:
         logger.warning(
             "agentchat: the manual is registered from the bundled copy %s, frozen at that version — %s. "

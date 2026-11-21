@@ -562,16 +562,16 @@ class Receiver:
         """A manual sync's result (the kit calls this for every up-to-date
         result and once per failure condition): logged, kept for the health
         record."""
-        from .manual import log_result, refuse_inline_shell, result_record
+        from .manual import log_result, note_registration_stale, refuse_inline_shell, result_record
 
         try:
+            label = profile_label(self._hermes_home) if self._hermes_home is not None else self._identity.handle
             if self._hermes_home is not None:
                 result = refuse_inline_shell(self._hermes_home, result)
             self._manual_last = result_record(result)
-            log_result(
-                result,
-                label=profile_label(self._hermes_home) if self._hermes_home is not None else self._identity.handle,
-            )
+            log_result(result, label=label)
+            if self._hermes_home is not None:
+                note_registration_stale(self._hermes_home, result, label=label)
         except Exception:
             logger.debug("Receiver: manual result not recorded", exc_info=True)
             return

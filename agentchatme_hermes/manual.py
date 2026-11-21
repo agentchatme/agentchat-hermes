@@ -26,19 +26,30 @@ file it keeps current, not the copy in the package::
 Who writes it, always through the kit's ``sync_manual`` / ``ManualSync`` (the
 host pin, the redirect checks, the size cap, front matter ``name: agentchat``
 at the announced version, the announced sha256, never worse than before,
-atomic, mode 0644):
+atomic, mode 0644) — and only these; every other Hermes process (a chat or
+TUI session, a one-shot, ``hermes agentchat status``, ``doctor`` without
+``--fix``, any other command) reads the file and never writes it, so what
+``status`` and ``doctor`` report is the file as found:
 
-* ``register()``, in every Hermes process, locally (:func:`prepare`): the
-  bundled copy when there is no file yet — the offline floor for a first
-  install. Then the file is registered. When it cannot be written (or is not a
-  manual) the bundled copy itself is registered, and ``doctor`` says the manual
-  is frozen at that version.
+* the gateway (``hermes gateway run``), at ``register()``, locally
+  (:func:`prepare` with ``place=True``): the bundled copy when there is no file
+  yet — the offline floor for a first install. Then the file is registered.
+  When it cannot be written (or is not a manual) the bundled copy itself is
+  registered, and ``doctor`` says the manual is frozen at that version.
 * the gateway leader: the kit's ``ManualSync`` on its receive loop, following
-  the texts (at start, daily, on every change; :func:`manual_sync_for`);
-* every other process with a key — a follower gateway, a profile with the
-  integration off, the CLI: one sync on a daemon thread after the texts load
-  (:func:`sync_in_background`);
-* ``hermes agentchat doctor --fix`` and the wizard's placement: one sync.
+  the texts (at start, on every change, and while the file is not the served
+  one again after 5 min doubling to 1 h; :func:`manual_sync_for`);
+* a gateway that is not the leader (another gateway holds this account's
+  socket, or the integration is off): one sync on a daemon thread after its
+  texts load (:func:`sync_in_background`);
+* the placement of ``hermes agentchat register`` / ``login`` / ``recover`` /
+  the wizard, and ``hermes agentchat doctor --fix``: one sync, saying what it
+  repaired (:func:`describe_repair`).
+
+A process that registered the bundled copy keeps serving it until it restarts,
+even once its sync has put a good file in place: Hermes takes a plugin skill's
+path at ``register()`` and has no supported way to change it later. The
+gateway says so in its log (:func:`note_registration_stale`).
 
 The package's ``skills/agentchat/SKILL.md`` is only those fallback bytes. This
 module imports nothing from the SDK at import time: the CLI must load where the
@@ -183,6 +194,10 @@ class ManualRegistration:
     target: Path
     reason: str | None = None
     """Why the bundled copy was registered instead of ``target``."""
+    routine: bool = False
+    """The bundled copy because this process places nothing and the file is
+    not there yet (not a fault: the gateway, a login or ``doctor --fix``
+    places it)."""
 
     @property
     def kept_current(self) -> bool:
@@ -207,15 +222,17 @@ def registration_for(home: Path) -> ManualRegistration | None:
         return _registrations.get(hermes_home_key(Path(home)))
 
 
-def prepare(home: Path) -> ManualRegistration | None:
+def prepare(home: Path, *, place: bool = True) -> ManualRegistration | None:
     """The file to register for the profile at ``home``. Local only — no network.
 
-    Creates the kept-current file from the bundled bytes when there is none
-    (the kit's ``sync_manual`` with nothing announced writes its fallback only
-    then, atomically). Returns the bundled copy instead, with the reason, when
-    the file cannot be written, is not the agentchat manual, or shares its
-    folder with anything else; ``None`` when there is no manual at all. Never
-    raises.
+    ``place`` (the gateway): creates the kept-current file from the bundled
+    bytes when there is none (the kit's ``sync_manual`` with nothing announced
+    writes its fallback only then, atomically) and removes a temp file a dead
+    write left. Without ``place`` nothing is written: the file is registered
+    as it is, or the bundled copy when there is none yet. Returns the bundled
+    copy, with the reason, when the file cannot be written, is not the
+    agentchat manual, or shares its folder with anything else; ``None`` when
+    there is no manual at all. Never raises.
     """
     target = manual_path(home)
     bundled = BUNDLED_MANUAL_PATH if BUNDLED_MANUAL_PATH.is_file() else None
@@ -236,9 +253,33 @@ def prepare(home: Path) -> ManualRegistration | None:
     except ImportError:
         return frozen("the agentchatme SDK kit is not installed, so the manual cannot be kept current")
     try:
+        if not place:
+            return _look(home, target, bundled, frozen)
         return _prepare(home, target, sync_manual, frozen)
     except Exception as exc:  # EACCES on a folder this user cannot traverse, and any surprise
         return frozen(f"{target} could not be checked: {exc}")
+
+
+def _look(
+    home: Path,
+    target: Path,
+    bundled: Path | None,
+    frozen: Callable[[str], ManualRegistration | None],
+) -> ManualRegistration | None:
+    """:func:`prepare` without writing: the file as it is, else the bundled copy."""
+    if not (target.exists() or target.is_symlink()):
+        if bundled is None:
+            return frozen(f"{target} does not exist")
+        return ManualRegistration(
+            path=bundled,
+            target=target,
+            reason=f"{target} is not placed yet (the gateway, a login or `doctor --fix` places it)",
+            routine=True,
+        )
+    problem = _unusable(target, home)
+    if problem is not None:
+        return frozen(problem)
+    return ManualRegistration(path=target, target=target)
 
 
 def _prepare(
@@ -390,9 +431,9 @@ _exit_hook_installed = False
 
 
 def sync_in_background(*, home: Path, served: Any, api_base: str | None, label: str) -> threading.Thread | None:
-    """One sync on a daemon thread (a process that holds no receive loop: a
-    follower gateway, integration off, the CLI). ``None`` when nothing is
-    announced: without an announcement there is nothing to sync to."""
+    """One sync on a daemon thread (a gateway that holds no receive loop for
+    this account: another gateway is the leader, or the integration is off).
+    ``None`` when nothing is announced: there is nothing to sync to."""
     if served is None:
         return None
     global _exit_hook_installed
@@ -401,10 +442,11 @@ def sync_in_background(*, home: Path, served: Any, api_base: str | None, label: 
         try:
             result = sync_once(home=home, served=served, api_base=api_base)
             if result is not None:
-                # Every short-lived process runs this: a manual it could not
-                # bring current is said at INFO (doctor and the gateway say
-                # it louder); a write that failed is a warning.
+                # A gateway that is not the leader: a manual it could not
+                # bring current is said at INFO (doctor says it louder); a
+                # write that failed is a warning.
                 log_result(result, label=label, quiet=True)
+                note_registration_stale(home, result, label=label)
         finally:
             with _inflight_lock:
                 _inflight.discard(threading.current_thread())
@@ -483,13 +525,8 @@ def describe_result(result: ManualSyncResult) -> str:
     if result.state == "current":
         return f"current ({result.version}) — {at}"
     if result.state == "updated":
-        how = (
-            f"downloaded from {result.url}"
-            if result.source == "download"
-            else "placed from the bundled copy (the served version)"
-        )
-        was = f" (was {have})" if result.previous is not None else ""
-        return f"{result.version} {how} → {at}{was}"
+        was = f"was {have} → " if result.previous is not None or result.tampered else ""
+        return f"{was}{result.version} {_how(result)} → {at}"
     if result.state == "fallback":
         if result.served is None:
             return f"bundled copy {result.version} → {at} (no served version in hand to check it against)"
@@ -499,6 +536,58 @@ def describe_result(result: ManualSyncResult) -> str:
             return f"unchecked (have {have}; no served version in hand) — {at}"
         return f"stale (have {have}, served {result.served}) — {at}; kept as it is: {result.error}"
     return f"could not write {at}: {result.error}"
+
+
+def _how(result: ManualSyncResult) -> str:
+    if result.source == "download":
+        return f"downloaded from {result.url}"
+    return "placed from the bundled copy (the served version)"
+
+
+def describe_repair(before: ManualCheck, result: ManualSyncResult) -> str:
+    """One sync by the wizard's placement or ``doctor --fix``, saying what the
+    file was before when the sync changed it: ``was stale (have 2.4.0, served
+    2.4.3) → 2.4.3 placed from the bundled copy …``, ``was tampered (…) →
+    restored: …``, ``was missing → …``."""
+    if result.error == _INLINE_SHELL_REFUSED or not result.written:
+        return describe_result(result)
+    if result.state == "fallback":
+        return f"was {before.summary} → {describe_result(result)}"
+    verb = "restored: " if before.state in ("tampered", "unsafe") else ""
+    return f"was {before.summary} → {verb}{result.version} {_how(result)} → {result.path}"
+
+
+_said_stale_registration: set[str] = set()
+_said_lock = threading.Lock()
+
+
+def note_registration_stale(home: Path, result: ManualSyncResult, *, label: str) -> None:
+    """A gateway that registered the bundled copy at start, whose sync has now
+    put a usable manual at the kept-current path: Hermes keeps serving the
+    path it was given at ``register()``, so the gateway says, once, to restart."""
+    registration = registration_for(home)
+    if registration is None or registration.kept_current or result.up_to_date is not True:
+        return
+    target = manual_path(home)
+    try:
+        if _unusable(target, home) is not None:
+            return
+    except OSError:
+        return
+    key = hermes_home_key(Path(home))
+    with _said_lock:
+        if key in _said_stale_registration:
+            return
+        _said_stale_registration.add(key)
+    logger.warning(
+        "agentchat: profile=%s the manual at %s is the served one again (%s), but this gateway "
+        "serves the bundled copy it registered at start (%s) — restart the gateway to serve the "
+        "repaired manual",
+        label,
+        target,
+        result.version,
+        registration.reason or "it could not use the file then",
+    )
 
 
 # ─── checking (status, doctor) ───────────────────────────────────────────────
@@ -599,11 +688,13 @@ __all__ = [
     "bundled_bytes",
     "bundled_version",
     "check",
+    "describe_repair",
     "describe_result",
     "log_result",
     "manual_dir",
     "manual_path",
     "manual_sync_for",
+    "note_registration_stale",
     "other_files",
     "prepare",
     "read_version",

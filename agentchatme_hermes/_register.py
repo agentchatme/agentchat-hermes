@@ -14,9 +14,10 @@ process is loading us:
   one-shot agents, Hermes-spawned child Python that inherits
   ``_HERMES_GATEWAY=1`` from its parent, or a second gateway whose flock
   acquisition lost the race): light runtime — identity only, no WS, no
-  invoker. The skill is still registered (and the manual synced once after
-  the texts load); the agent's tools are the hosted MCP server declared in
-  ``config.yaml`` and are available in every mode.
+  invoker. The skill is still registered — as the manual is found; only the
+  gateway writes it (a gateway that lost the race syncs it once) — and the
+  agent's tools are the hosted MCP server declared in ``config.yaml``,
+  available in every mode.
   Live inbound stays exclusively with the leader-lock holder.
 
 Mode selection has two layered signals (see :mod:`.leader_lock`):
@@ -109,21 +110,22 @@ def register(ctx: Any) -> None:
     # neither receive nor place the identity line. Say so once, loudly, and
     # keep the CLI so `hermes agentchat doctor` says it too.
     hermes_home = resolve_hermes_home()
+    gateway_mode = _is_gateway_context(ctx)
     problem = kit_problem()
     if problem is not None:
         logger.error("agentchat plugin: not receiving — %s", problem)
-        _register_surface(ctx, hermes_home)
+        _register_surface(ctx, hermes_home, place=False)
         return
 
     profile = profile_label(hermes_home)
-    gateway_mode = _is_gateway_context(ctx)
 
     # The manual is registered unconditionally as the ``agentchat:agentchat``
-    # skill: this profile's kept-current file (created from the bundled copy
-    # when missing; local only, no network). Tools are not registered here:
-    # they are the hosted MCP server declared in the profile's config.yaml
-    # (see mcp_registration).
-    _register_surface(ctx, hermes_home)
+    # skill: this profile's kept-current file. Only the gateway writes it
+    # (from the bundled copy when missing; local only, no network); every
+    # other process registers it as it is (see manual.py). Tools are not
+    # registered here: they are the hosted MCP server declared in the
+    # profile's config.yaml (see mcp_registration).
+    _register_surface(ctx, hermes_home, place=gateway_mode)
 
     watcher = ActivationWatcher(
         hermes_home=hermes_home,
@@ -149,12 +151,12 @@ def register(ctx: Any) -> None:
         # most common reason a freshly installed profile never received.
         watcher.start()
         logger.info(
-            "agentchat plugin: %s for profile=%s (%s) — gateway will "
-            "re-check every %.0fs and activate without a restart.",
+            "agentchat plugin: %s for profile=%s (%s) — gateway will %s and activate without a "
+            "restart.",
             reason,
             profile,
             hermes_home,
-            ACTIVATION_RETRY_S,
+            watcher.retry_schedule(),
         )
     else:
         logger.info(
@@ -167,14 +169,15 @@ def register(ctx: Any) -> None:
         )
 
 
-def _register_surface(ctx: Any, hermes_home: Path) -> None:
-    """Register the manual as the ``agentchat:agentchat`` skill. No tools — see
-    module docstring. Never raises: a skill that cannot be registered must not
-    cost the CLI or the receive loop."""
+def _register_surface(ctx: Any, hermes_home: Path, *, place: bool = True) -> None:
+    """Register the manual as the ``agentchat:agentchat`` skill (``place``: the
+    gateway, which may write it). No tools — see module docstring. Never
+    raises: a skill that cannot be registered must not cost the CLI or the
+    receive loop."""
     try:
         from .skills import register_skill
 
-        register_skill(ctx, hermes_home=hermes_home)
+        register_skill(ctx, hermes_home=hermes_home, place=place)
     except Exception:
         logger.error(
             "agentchat plugin: the manual could not be registered as the agentchat:agentchat skill "
@@ -296,6 +299,15 @@ class ActivationWatcher:
             "gateway" if self._gateway_mode else "cli",
         )
         return "active"
+
+    def retry_schedule(self) -> str:
+        """What :meth:`next_delay` does from here, in words, for the log."""
+        if self._failures == 0:
+            return f"re-check every {ACTIVATION_RETRY_S:.0f}s"
+        return (
+            f"retry in {self.next_delay():.0f}s, then at longer intervals up to every "
+            f"{ACTIVATION_RETRY_MAX_S:.0f}s while it keeps failing"
+        )
 
     def next_delay(self) -> float:
         """Backoff for the watcher thread: flat while unconfigured, exponential after failures."""

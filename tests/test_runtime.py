@@ -343,11 +343,12 @@ class TestIntegrationOff:
 
 
 class TestManualSync:
-    """The manual follows the texts: the leader's receive loop keeps it
-    current (the kit's ManualSync, built through the factory handed to the
-    receiver); every other runtime — a follower gateway, the integration off,
-    the CLI — syncs it once after the start-time texts load, on a daemon
-    thread (never the caller's)."""
+    """The manual follows the texts in the gateway only: the leader's receive
+    loop keeps it current (the kit's ManualSync, built through the factory
+    handed to the receiver); a gateway that is not the leader (another holds
+    the socket, or the integration is off) syncs it once after the start-time
+    texts load, on a daemon thread (never the caller's). Any other Hermes
+    process (a session, ``status``, ``doctor``) never writes it."""
 
     _TEXTS: ClassVar[dict[str, Any]] = {
         "version": "1",
@@ -379,10 +380,10 @@ class TestManualSync:
 
     @pytest.mark.parametrize(
         ("gateway_mode", "lock_winner", "integration"),
-        [(False, True, True), (True, False, True), (True, True, False)],
-        ids=["cli", "follower-gateway", "integration-off"],
+        [(True, False, True), (True, True, False)],
+        ids=["follower-gateway", "integration-off"],
     )
-    def test_a_runtime_without_the_loop_syncs_once(
+    def test_a_gateway_without_the_loop_syncs_once(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gateway_mode: bool, lock_winner: bool, integration: bool
     ) -> None:
         served, calls, _ws = self._run(monkeypatch, tmp_path, gateway_mode=gateway_mode, lock_winner=lock_winner, integration=integration)
@@ -391,8 +392,17 @@ class TestManualSync:
             {"home": tmp_path / ".hermes", "served": served.manual, "api_base": "https://api.example.test", "label": "default"}
         ]
 
+    @pytest.mark.parametrize("integration", [True, False])
+    def test_a_process_that_is_not_the_gateway_never_syncs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, integration: bool
+    ) -> None:
+        """`hermes chat`, `hermes agentchat status`, `doctor` without --fix:
+        what they report is the file as found."""
+        _served, calls, ws_cls = self._run(monkeypatch, tmp_path, gateway_mode=False, lock_winner=True, integration=integration)
+        assert calls == [] and not ws_cls.called
+
     def test_without_texts_nothing_is_announced(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        _served, calls, _ws = self._run(monkeypatch, tmp_path, gateway_mode=False, lock_winner=True, texts=False)
+        _served, calls, _ws = self._run(monkeypatch, tmp_path, gateway_mode=True, lock_winner=False, texts=False)
         assert len(calls) == 1 and calls[0]["served"] is None  # sync_in_background does nothing then
 
     def test_the_leader_hands_its_loop_the_manual(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

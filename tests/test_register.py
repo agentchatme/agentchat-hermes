@@ -459,10 +459,27 @@ class TestSurface:
         assert ctx.register_skill.called
         skill_kwargs = ctx.register_skill.call_args.kwargs
         assert skill_kwargs["name"] == "agentchat"
-        # This profile's kept-current file, not the package's copy.
-        assert skill_kwargs["path"] == tmp_path / ".hermes" / "plugin-data" / "agentchat" / "manual" / "SKILL.md"
+        # A process that is not the gateway writes nothing: with no file placed
+        # yet it registers the package's copy.
+        target = tmp_path / ".hermes" / "plugin-data" / "agentchat" / "manual" / "SKILL.md"
         assert skill_kwargs["path"].read_bytes() == _bundled_bytes()
+        assert skill_kwargs["path"] != target and not target.exists()
         assert not ctx.register_tool.called, "no native tools — the hosted MCP server is the tool source"
+
+    def test_the_gateway_places_the_manual_and_registers_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import _register
+
+        monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
+        monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: None)
+        monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
+        monkeypatch.setattr(_register.ActivationWatcher, "start", lambda self: None)
+        ctx = MagicMock()
+        _register.register(ctx)
+        target = tmp_path / ".hermes" / "plugin-data" / "agentchat" / "manual" / "SKILL.md"
+        assert ctx.register_skill.call_args.kwargs["path"] == target
+        assert target.read_bytes() == _bundled_bytes()
 
 
 class TestActivationWatcher:

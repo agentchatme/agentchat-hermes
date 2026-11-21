@@ -39,7 +39,7 @@ from unittest.mock import MagicMock
 import pytest
 from agentchatme.types import Texts
 from fake_keys import api_key
-from sdk_wire import answer, raw, serve
+from sdk_wire import answer, connect_error, raw, serve
 
 from agentchatme_hermes import cli, manual, placement
 from agentchatme_hermes.manual import BUNDLED_MANUAL_PATH, manual_path
@@ -895,7 +895,10 @@ class TestDoctor:
 
         cli._dispatch_doctor(argparse.Namespace(fix=True))
         out = capsys.readouterr().out
-        assert "[ok]   fix: manual changed — 9.9.9 downloaded from https://agentchat.me/skill.md" in out
+        assert (
+            f"[ok]   fix: manual changed — was stale (have {BUNDLE_VERSION}, served 9.9.9) → 9.9.9 downloaded "
+            "from https://agentchat.me/skill.md" in out
+        )
         assert f"[ok]   manual current (9.9.9) — {manual_path(home)}" in out
         assert manual_path(home).read_bytes() == body
         assert api_key("doctor") not in out
@@ -925,6 +928,256 @@ class TestDoctor:
         line = cli._manual_line(home, BUNDLE_ANNOUNCED)
         assert line.startswith(f"frozen at the bundled copy {BUNDLE_VERSION} ({BUNDLED_MANUAL_PATH})")
         assert f"— {manual_path(home)}: missing" in line
+
+
+# ─── read-only processes; repairs said; the lab round's findings ──────────────
+
+
+ME_OK = {"handle": "alice", "status": "active", "settings": {"inbox_mode": "open"}, "paused_by_owner": "none"}
+
+
+def _cache_texts(monkeypatch: pytest.MonkeyPatch, home: Path, key: str, announced: dict[str, Any]) -> None:
+    """Have the account's texts cache hold ``announced`` (the kit's own file,
+    written by one online load)."""
+    from agentchatme import AgentChatClient
+
+    from agentchatme_hermes.state import state_dir_for_account
+    from agentchatme_hermes.texts import load_texts
+
+    serve(monkeypatch, {"/v1/texts": answer(200, _texts_payload(announced))})
+    client = AgentChatClient(api_key=key, base_url=API)
+    try:
+        assert load_texts(client, state_dir=state_dir_for_account(hermes_home=home, api_base=API, api_key=key)) is not None
+    finally:
+        client.close()
+
+
+class TestReadOnly:
+    """Only the gateway, the placement of register / login / recover / the
+    wizard, and ``doctor --fix`` write the manual. Every other Hermes process
+    (a session, ``status``, ``doctor``) reads it: they report it as found."""
+
+    def test_a_process_that_places_nothing_writes_nothing(self, home: Path) -> None:
+        ctx = _Ctx()
+        assert register_skill(ctx, hermes_home=home, place=False) == BUNDLED_MANUAL_PATH
+        registration = manual.registration_for(home)
+        assert registration is not None and registration.routine and not registration.kept_current
+        assert not (home / "plugin-data").exists(), "nothing created"
+
+    def test_a_stale_or_tampered_file_is_registered_and_left_as_found(self, home: Path) -> None:
+        target = manual_path(home)
+        target.parent.mkdir(parents=True)
+        stale_tmp = target.parent / ".SKILL.md.4242.0a1b2c3d4e5f.tmp"
+        for content in (OLD, BUNDLE + b"\nedited\n"):
+            target.write_bytes(content)
+            stale_tmp.write_bytes(b"x")
+            old = time.time() - 3600
+            os.utime(stale_tmp, (old, old))
+            assert register_skill(_Ctx(), hermes_home=home, place=False) == target
+            assert target.read_bytes() == content
+            assert stale_tmp.exists(), "a process that places nothing removes nothing either"
+            stale_tmp.unlink()
+
+    def test_nothing_placed_yet_is_said_plainly(self, home: Path) -> None:
+        register_skill(_Ctx(), hermes_home=home, place=False)
+        lines = _Lines()
+        lines.run(home, BUNDLE_ANNOUNCED)
+        (failure,) = lines.of("fail")
+        assert failure.startswith(f"manual missing at {manual_path(home)}")
+        assert not [w for w in lines.of("warn") if w.startswith("Hermes serves")], "no second line about it"
+        assert cli._manual_line(home, BUNDLE_ANNOUNCED).startswith(f"missing — {manual_path(home)} is not placed yet")
+
+    def test_doctor_and_status_report_the_file_as_found(self, home: Path, manual_sync_on: None) -> None:
+        target = manual_path(home)
+        target.parent.mkdir(parents=True)
+        target.write_bytes(OLD)
+        register_skill(_Ctx(), hermes_home=home, place=False)
+        lines = _Lines()
+        lines.run(home, BUNDLE_ANNOUNCED)
+        assert any(w.startswith("manual stale (have 2.4.0, served 2.4.3)") for w in lines.of("warn"))
+        assert cli._manual_line(home, BUNDLE_ANNOUNCED).startswith("stale (have 2.4.0, served 2.4.3)")
+        assert target.read_bytes() == OLD, "a plain doctor or status changes nothing"
+
+    @pytest.mark.parametrize(
+        ("content", "said"),
+        [
+            (OLD, "was stale (have 2.4.0, served 2.4.3) → 2.4.3 placed from the bundled copy (the served version)"),
+            (BUNDLE + b"\nedited\n", "was tampered (have 2.4.3, but its sha256 is not the served text's) → restored: 2.4.3 placed"),
+            (None, "was missing → 2.4.3 placed from the bundled copy"),
+        ],
+        ids=["stale", "tampered", "missing"],
+    )
+    def test_a_repair_says_what_it_was(self, home: Path, content: bytes | None, said: str) -> None:
+        target = manual_path(home)
+        if content is not None:
+            target.parent.mkdir(parents=True)
+            target.write_bytes(content)
+        step = placement.place_manual(BUNDLE_ANNOUNCED, api_base=API, hermes_home=home)
+        assert step.status == "changed" and step.detail.startswith(said), step.detail
+        assert target.read_bytes() == BUNDLE
+        again = placement.place_manual(BUNDLE_ANNOUNCED, api_base=API, hermes_home=home)
+        assert (again.status, again.detail) == ("ok", f"current (2.4.3) — {target}")
+
+    def test_an_unsafe_file_is_restored_and_said(self, home: Path) -> None:
+        target = manual_path(home)
+        target.parent.mkdir(parents=True)
+        target.write_bytes(_body("2.4.3", _shell("id")))
+        step = placement.place_manual(BUNDLE_ANNOUNCED, api_base=API, hermes_home=home)
+        assert step.status == "changed" and step.detail.startswith("was unsafe (have 2.4.3: it carries inline shell")
+        assert "→ restored: 2.4.3 placed" in step.detail and target.read_bytes() == BUNDLE
+
+    def test_doctor_fix_says_what_it_repaired(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from key_files import save_key
+
+        key = api_key("repair")
+        save_key(key)
+        target = manual_path(home)
+        target.parent.mkdir(parents=True)
+        target.write_bytes(OLD)
+        serve(monkeypatch, {"/v1/agents/me": answer(200, ME_OK), "/v1/texts": answer(200, _texts_payload(BUNDLE_ANNOUNCED))})
+        monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)
+        monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)
+        register_skill(_Ctx(), hermes_home=home, place=False)
+        cli._dispatch_doctor(argparse.Namespace(fix=True))
+        out = capsys.readouterr().out
+        assert "[ok]   fix: manual changed — was stale (have 2.4.0, served 2.4.3) → 2.4.3 placed from the bundled copy" in out
+        assert f"[ok]   manual current (2.4.3) — {target}" in out
+
+
+class TestGatewayServesTheBundle:
+    """A gateway that registered the bundled copy keeps serving it (Hermes
+    takes the path at register()): once its sync has put a good file in
+    place, its log says to restart."""
+
+    def test_the_gateway_says_restart_once(self, home: Path, caplog: pytest.LogCaptureFixture) -> None:
+        target = manual_path(home)
+        target.parent.mkdir(parents=True)
+        (target.parent / "notes.txt").write_text("x", encoding="utf-8")
+        assert register_skill(_Ctx(), hermes_home=home) == BUNDLED_MANUAL_PATH
+        (target.parent / "notes.txt").unlink()
+        result = manual.sync_once(home=home, served=BUNDLE_ANNOUNCED, api_base=API)
+        assert result is not None and result.up_to_date is True
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.manual"):
+            manual.note_registration_stale(home, result, label="default")
+            manual.note_registration_stale(home, result, label="default")
+        said = [r.getMessage() for r in caplog.records if "restart the gateway to serve the repaired manual" in r.getMessage()]
+        assert len(said) == 1 and "holds other files" in said[0]
+
+    def test_nothing_to_say_when_it_serves_the_file(self, home: Path, caplog: pytest.LogCaptureFixture) -> None:
+        register_skill(_Ctx(), hermes_home=home)
+        result = manual.sync_once(home=home, served=BUNDLE_ANNOUNCED, api_base=API)
+        assert result is not None
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.manual"):
+            manual.note_registration_stale(home, result, label="default")
+        assert not [r for r in caplog.records if "restart the gateway" in r.getMessage()]
+
+
+class TestOffline:
+    """AgentChat unreachable: doctor and status still show what is on this
+    machine, against the texts the account last cached."""
+
+    def _setup(self, monkeypatch: pytest.MonkeyPatch, home: Path) -> str:
+        from key_files import save_key
+
+        key = api_key("offline")
+        save_key(key)
+        _cache_texts(monkeypatch, home, key, BUNDLE_ANNOUNCED)
+        target = manual_path(home)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(OLD)
+        register_skill(_Ctx(), hermes_home=home, place=False)
+        serve(monkeypatch, {"/v1/agents/me": connect_error("dns"), "/v1/texts": connect_error("dns")})
+        monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)
+        monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)
+        return key
+
+    def test_doctor_still_runs_the_local_checks(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._setup(monkeypatch, home)
+        rc = cli._dispatch_doctor(argparse.Namespace(fix=True))
+        out = capsys.readouterr().out
+        assert rc >= 1 and "[fail] Could not reach /v1/agents/me: dns" in out
+        assert "[warn] AgentChat did not answer — the checks below compare with the texts cached at " in out
+        assert "[warn] --fix skipped: nothing is placed until AgentChat answers for this key" in out
+        assert f"[warn] manual stale (have 2.4.0, served 2.4.3) — {manual_path(home)}" in out
+        assert "SOUL.md identity line missing" in out, "the anchor check still runs"
+        assert "WS leader lock" in out, "and the lock check"
+        assert manual_path(home).read_bytes() == OLD, "nothing placed offline"
+
+    def test_status_still_shows_the_manual(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        self._setup(monkeypatch, home)
+        assert cli._dispatch_status(argparse.Namespace()) == 1
+        captured = capsys.readouterr()
+        assert "Status fetch failed: dns" in captured.err
+        assert f"  Manual:        stale (have 2.4.0, served 2.4.3) — {manual_path(home)}" in captured.out
+        assert "AgentChat did not answer" in captured.out and "  Key:           " in captured.out
+
+    def test_nothing_cached_is_said(self, home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes.texts import cached_texts
+
+        assert cached_texts(home / "nowhere") == (None, None)
+
+
+class TestLabCosmetics:
+    def test_the_stale_line_says_the_gateway_retries(self, home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import kit
+
+        register_skill(_Ctx(), hermes_home=home)
+        lines = _Lines()
+        lines.run(home, _announce(_body("9.9.9"), "9.9.9"))
+        assert any("retries on its own, after 5 min doubling to 1 h" in w for w in lines.of("warn"))
+        monkeypatch.setattr(kit, "manual_retry_problem", lambda: "old kit")
+        lines = _Lines()
+        lines.run(home, _announce(_body("9.9.9"), "9.9.9"))
+        assert any("tries again when the served texts change" in w for w in lines.of("warn"))
+
+    def test_the_activation_log_says_the_real_schedule(self, tmp_path: Path) -> None:
+        from agentchatme_hermes._register import ActivationWatcher
+
+        watcher = ActivationWatcher(hermes_home=tmp_path, profile="default", gateway_mode=True)
+        assert watcher.retry_schedule() == "re-check every 30s"
+        watcher._failures = 2
+        assert watcher.retry_schedule() == "retry in 60s, then at longer intervals up to every 300s while it keeps failing"
+
+
+class TestGatewayDetection:
+    def test_a_fresh_health_record_is_a_running_gateway(self, home: Path) -> None:
+        from agentchatme_hermes.leader_lock import lock_path_for
+        from agentchatme_hermes.profile_scope import account_fingerprint
+        from agentchatme_hermes.ws_health import health_path_for, write_ws_health
+
+        key = api_key("gw")
+        path = health_path_for(lock_path_for(hermes_home=home, account_fingerprint=account_fingerprint(API, key)))
+        write_ws_health(handle="alice", state="connected", path=path)
+        assert cli._gateway_running(API, key, home) == f"pid {os.getpid()}, holding this account's socket"
+        write_ws_health(handle="alice", state="connected", path=path, now=time.time() - 3600)
+        assert cli._gateway_running(API, key, home) != f"pid {os.getpid()}, holding this account's socket"
+
+    def test_hermes_own_answer(self, home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        status = types.ModuleType("gateway.status")
+        seen: list[Any] = []
+        status.get_running_pid = lambda **kw: seen.append(kw) or 4321  # type: ignore[attr-defined]
+        if "gateway" not in sys.modules:
+            monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
+        monkeypatch.setitem(sys.modules, "gateway.status", status)
+        assert cli._gateway_running(API, api_key("gw"), home) == "pid 4321, Hermes' gateway lock for this profile"
+        assert seen == [{"cleanup_stale": False}], "read-only: never removes a pid file"
+
+    @pytest.mark.parametrize(
+        ("joined", "found"),
+        [
+            ("python3 -I -I -c import sys, runpy; sys.argv = ['-c', 'gateway', 'run']; runpy.run_module('hermes_cli.main')", True),
+            ('python -c sys.argv = ["-c", "gateway", "run"]', True),
+            ("hermes chat", False),
+        ],
+    )
+    def test_a_launcher_that_sets_argv_in_its_code(self, joined: str, found: bool) -> None:
+        assert bool(cli._ARGV_GATEWAY_RUN.search(joined)) is found
 
 
 @pytest.fixture(autouse=True)

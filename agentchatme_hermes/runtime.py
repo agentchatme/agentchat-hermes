@@ -14,8 +14,9 @@ bound to that profile's own key, home, SOUL.md and leader lock. Owns:
   load at start, then the receive loop's daily-refreshed cache), with
   listeners for the SOUL.md identity line.
 * The manual (:mod:`.manual`): the leader's receive loop keeps it current
-  (the kit's ``ManualSync``); a runtime that is not the leader syncs it once,
-  on a daemon thread, after the start-time texts load.
+  (the kit's ``ManualSync``); a gateway runtime that is not the leader syncs it
+  once, on a daemon thread, after the start-time texts load; any other process
+  never writes it.
 * The :class:`~.receiver.Receiver` (the kit's receive loop on a supervised
   thread: socket, texts, wakes, gate, turns), leader only.
 * The :class:`AgentInvoker` (the loop's Hermes callbacks: model call, turn), leader only.
@@ -272,9 +273,12 @@ class Runtime:
                     and self.integration_enabled
                     and self._try_acquire_leader()
                 )
-                if not self._is_leader:
-                    # No receive loop here to keep the manual current: one
+                if not self._is_leader and self._gateway_mode_requested:
+                    # A gateway with no receive loop for this account (another
+                    # process is the leader, or the integration is off): one
                     # sync against the texts just loaded, off this thread.
+                    # Any other Hermes process (a session, `status`, `doctor`)
+                    # never writes the manual: they report it as found.
                     self._sync_manual_once()
 
                 if self._is_leader:
@@ -378,8 +382,9 @@ class Runtime:
 
     def _sync_manual_once(self) -> None:
         """One manual sync on a daemon thread, against the texts in use (a
-        runtime that is not the leader: a follower gateway, the integration
-        off, the CLI). Nothing without texts: nothing is announced."""
+        gateway runtime that is not the leader: another gateway holds the
+        socket, or the integration is off). Nothing without texts: nothing is
+        announced."""
         texts = self.texts
         try:
             manual_module.sync_in_background(

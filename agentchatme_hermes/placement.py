@@ -156,13 +156,16 @@ def place_manual(
     when no texts are in hand) as this profile's ``agentchat:agentchat`` file.
 
     One sync through the SDK kit (a download when the file is not the announced
-    manual). A manual not at the announced version is a warning, never a
+    manual); the detail says what the file was when the sync changed it
+    (``was stale (…) → 2.4.3 placed …``, ``was tampered (…) → restored: …``).
+    A manual not at the announced version is a warning, never a
     failed placement: the agent reads the file it has (the old one, or the
     bundled copy) and the gateway keeps trying; only no manual at all fails.
     ``api_base`` is the API base the texts came from: it decides where a
     download may go. Never raises.
     """
     home = hermes_home if hermes_home is not None else resolve_hermes_home()
+    before = manual_module.check(manual_module.manual_path(home), served)
     result = manual_module.sync_once(home=home, served=served, api_base=api_base)
     if result is None:
         return PlacementStep(
@@ -171,7 +174,7 @@ def place_manual(
             f"the agentchatme SDK kit is not installed, so the manual cannot be placed at "
             f"{manual_module.manual_path(home)} (the agent reads the bundled copy)",
         )
-    detail = manual_module.describe_result(result)
+    detail = manual_module.describe_repair(before, result)
     if result.state == "failed":
         return PlacementStep("manual", "failed", f"{detail} (the agent reads the bundled copy)")
     if result.up_to_date is False:

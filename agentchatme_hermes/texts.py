@@ -59,6 +59,38 @@ def load_texts(client: Any, *, state_dir: Path | None) -> Texts | None:
     return cache.current()
 
 
+class _NoNetwork:
+    """A client for :func:`cached_texts`: every fetch fails at once."""
+
+    base_url = None
+
+    class texts:  # the SDK client's attribute name
+        @staticmethod
+        def get(**_kw: Any) -> Any:
+            raise ConnectionError("not fetched (AgentChat did not answer)")
+
+
+def cached_texts(state_dir: Path) -> tuple[Texts | None, str | None]:
+    """The account's cached texts and when they were served, without any
+    network (``doctor`` and ``status`` when AgentChat did not answer). Through
+    the kit's ``TextsCache``: its own file, read the way the cache reads it.
+    ``(None, None)`` when nothing is cached. Never raises."""
+    from agentchatme.integration import TextsCache
+
+    try:
+        cache = TextsCache(
+            _NoNetwork(),
+            runtime=TEXTS_RUNTIME,
+            file_path=state_dir / TEXTS_FILENAME,
+            on_error=lambda _error: None,
+        )
+        cache.refresh_sync()
+        return cache.current(), cache.fetched_at
+    except Exception as exc:
+        logger.debug("texts: cached copy unreadable: %s", exc)
+        return None, None
+
+
 def remove_legacy_cache(state_dir: Path) -> None:
     """Remove the pre-kit ``texts.json`` (never read; see the module docstring)."""
     path = state_dir / LEGACY_TEXTS_FILENAME
