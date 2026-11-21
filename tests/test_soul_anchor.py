@@ -476,3 +476,37 @@ class TestDoctorLines:
         assert "fix: anchor changed — the AgentChat block in" in out and "was edited by hand" in out
         assert "[ok]   SOUL.md identity line present (@alice, served text)" in out
         assert soul.read_text(encoding="utf-8").startswith("# Mine\n\n") and "my words" not in soul.read_text(encoding="utf-8")
+
+    def test_status_reports_the_block_as_found(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from fake_keys import api_key
+        from key_files import save_key
+        from sdk_wire import answer, serve
+
+        from agentchatme_hermes import cli
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        save_key(api_key("status-soul"))
+        soul = home / "SOUL.md"
+        write_soul_anchor(_line_v2(), handle="alice", soul_path=soul)  # ours, an older text
+        before = soul.read_bytes()
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        texts = {
+            "version": "1", "runtime": "hermes",
+            "manual": {"url": "https://agentchat.me/skill.md", "version": "2.4.3"},
+            "wake_instruction": "w", "invite_prompt": "i",
+            "identity_line": _line(), "identity_line_template": _line("<handle>"),
+        }
+        serve(monkeypatch, {
+            "/v1/agents/me": answer(200, {"handle": "alice", "status": "active", "settings": {"inbox_mode": "open"}}),
+            "/v1/texts": answer(200, texts),
+        })
+        assert cli._dispatch_status(argparse.Namespace()) == 0
+        out = capsys.readouterr().out
+        assert f"  Identity:      not the served one (@alice, an older text) — {soul}" in out
+        assert soul.read_bytes() == before, "status writes nothing"

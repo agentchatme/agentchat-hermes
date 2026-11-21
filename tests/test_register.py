@@ -914,3 +914,82 @@ class TestKeyReachesTheHostedToolsOnly:
         watcher = _register.ActivationWatcher(hermes_home=tmp_path, profile="default", gateway_mode=True)
         assert watcher.try_activate() == "active"
         assert order == ["secrets", "mcp"]
+
+
+class TestGatewayOnlyReconcile:
+    """SOUL.md follows the manual's rule (``runtime.keeps_placements_current``):
+    only a gateway-mode process refreshes or backfills it by itself. A plain
+    ``doctor`` or ``status`` (any process that is not the gateway) reports it
+    as found and writes nothing; placement on request stays the CLI's."""
+
+    def _activate(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, soul: Path, *, gateway: bool) -> None:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register, soul_anchor
+
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        runtime = SimpleNamespace(
+            identity=SimpleNamespace(handle="ops"),
+            hermes_home=tmp_path,
+            gateway_mode_requested=gateway,
+            identity_line=lambda: _served_line("ops"),
+            identity_line_template=lambda: _SERVED_TEMPLATE,
+        )
+        monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: SimpleNamespace(api_base="https://api.example.test"))
+        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)
+        monkeypatch.setattr(_register, "_reconcile_key_store", lambda cfg: None)
+        monkeypatch.setattr(_register, "_reconcile_secrets_block", lambda rt: None)
+        monkeypatch.setattr(_register, "_reconcile_mcp_registration", lambda rt: None)
+        watcher = _register.ActivationWatcher(hermes_home=tmp_path, profile="default", gateway_mode=gateway)
+        assert watcher.try_activate() == "active"
+
+    def test_a_stale_block_of_ours_is_reported_not_rewritten_then_refreshed_by_the_gateway(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import cli, soul_anchor
+
+        soul = tmp_path / "SOUL.md"
+        soul_anchor.write_soul_anchor("an older served line for @ops", handle="ops", soul_path=soul)
+        before = soul.read_bytes()
+
+        # `hermes agentchat doctor` / `status`: the activation in that process writes nothing ...
+        self._activate(monkeypatch, tmp_path, soul, gateway=False)
+        assert soul.read_bytes() == before
+        lines: list[tuple[str, str]] = []
+        cli._doctor_soul_checks(
+            handle="ops", identity_line=_served_line("ops"), template=_SERVED_TEMPLATE, cmd="hermes agentchat",
+            ok=lambda line: lines.append(("ok", line)), warn=lambda line: lines.append(("warn", line)),
+            fail=lambda line: lines.append(("fail", line)),
+        )
+        assert lines and lines[0][0] == "warn" and "is not the served one" in lines[0][1]
+        status = cli._identity_line_status(handle="ops", identity_line=_served_line("ops"), template=_SERVED_TEMPLATE, home=tmp_path)
+        assert status is not None and status.startswith("not the served one (@ops, an older text)")
+        assert soul.read_bytes() == before, "... and reports it as found"
+
+        # The gateway keeps it current.
+        self._activate(monkeypatch, tmp_path, soul, gateway=True)
+        assert _served_line("ops") in soul.read_text(encoding="utf-8")
+        status = cli._identity_line_status(handle="ops", identity_line=_served_line("ops"), template=_SERVED_TEMPLATE, home=tmp_path)
+        assert status is not None and status.startswith("served (@ops)")
+
+    def test_no_backfill_outside_the_gateway(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        self._activate(monkeypatch, tmp_path, soul, gateway=False)
+        assert not soul.exists()
+        self._activate(monkeypatch, tmp_path, soul, gateway=True)
+        assert _owner(soul) == "ops"
+
+    def test_the_manual_and_soul_md_share_one_rule(self) -> None:
+        """runtime.keeps_placements_current gates both: the follower's manual
+        sync and the SOUL.md reconcile. A runtime that does not say is a reader."""
+        import inspect as _inspect
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register, runtime
+        from agentchatme_hermes.runtime import keeps_placements_current
+
+        assert keeps_placements_current(SimpleNamespace(gateway_mode_requested=True)) is True
+        assert keeps_placements_current(SimpleNamespace(gateway_mode_requested=False)) is False
+        assert keeps_placements_current(SimpleNamespace()) is False
+        assert "keeps_placements_current(self)" in _inspect.getsource(runtime.Runtime.start)
+        assert "keeps_placements_current(runtime)" in _inspect.getsource(_register.ActivationWatcher.try_activate)

@@ -122,9 +122,12 @@ def register(ctx: Any) -> None:
     # The manual is registered unconditionally as the ``agentchat:agentchat``
     # skill: this profile's kept-current file. Only the gateway writes it
     # (from the bundled copy when missing; local only, no network); every
-    # other process registers it as it is (see manual.py). Tools are not
-    # registered here: they are the hosted MCP server declared in the
-    # profile's config.yaml (see mcp_registration).
+    # other process registers it as it is (see manual.py). ``gateway_mode``
+    # is the same flag the runtime is built with, so this and
+    # runtime.keeps_placements_current (the follower's manual sync, the
+    # SOUL.md reconcile) are one decision. Tools are not registered here:
+    # they are the hosted MCP server declared in the profile's config.yaml
+    # (see mcp_registration).
     _register_surface(ctx, hermes_home, place=gateway_mode)
 
     watcher = ActivationWatcher(
@@ -283,7 +286,13 @@ class ActivationWatcher:
             # Not refused, not silent: the same agent in two profiles (or a
             # leftover copy of the key) is said where the operator looks.
             logger.warning("agentchat plugin: profile=%s — %s", self._profile, note)
-        _reconcile_soul_anchor_when_texts_arrive(runtime)
+        # SOUL.md is kept current by the gateway only (the rule the manual
+        # follows: runtime.keeps_placements_current); every other process
+        # reports it as found. Placement on request is the CLI's own step.
+        from .runtime import keeps_placements_current
+
+        if keeps_placements_current(runtime):
+            _reconcile_soul_anchor_when_texts_arrive(runtime)
         _reconcile_key_store(config)
         _reconcile_secrets_block(runtime)
         _reconcile_mcp_registration(runtime)
@@ -517,7 +526,9 @@ def _say_once(path: Any, outcome: str, detail: str, message: str, *args: Any) ->
 
 def _reconcile_soul_anchor(runtime: Any) -> None:
     """Keep this agent's SOUL.md identity block at the served line; backfill it
-    when there is none; flag an identity mismatch.
+    when there is none; flag an identity mismatch. Run only in a gateway-mode
+    process (:func:`.runtime.keeps_placements_current`, the manual's rule):
+    everywhere else SOUL.md is reported as found and never written.
 
     The rule for whose block it is, and the write, are the SDK kit's
     (``anchor.follow``, strict): only this agent's own block — its handle line,

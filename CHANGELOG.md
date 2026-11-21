@@ -27,6 +27,12 @@ upgrades an older installed SDK): 1.8.0's `anchor.owner` / `decide` / `follow` a
   block is replaced by `login` and the wizard (this profile becomes this agent) and never by `doctor --fix` (a mismatch
   to fix, said). Every write is atomic, keeps the file's line breaks, and a SOUL.md that is not UTF-8 is never
   written (said). `logout` removes the block the same way.
+- **Only the gateway keeps SOUL.md current** (the manual's rule since 0.6.1, now one predicate for both,
+  `runtime.keeps_placements_current`): the refresh and the backfill run in `hermes gateway run` only. A session, a
+  one-shot, `status`, `doctor` without `--fix` and every other command report SOUL.md as found and write nothing to it;
+  placement on request (`register`, `login`, `recover`, the wizard, `doctor --fix`) is unchanged.
+- **`status`** prints one `Identity:` line: served, not the served one (an older text of ours), edited by hand, another
+  agent's (IDENTITY MISMATCH), several blocks, or missing — read the way the refresh reads it, never written.
 - **`doctor`** reads SOUL.md the way the refresh does: the kit's `decide` with the served texts in hand (current, an
   older text of ours, edited by hand and how to restore it, another agent's, several blocks), the strict `owner` when
   AgentChat does not answer, and warns when the installed kit has no strict reading.

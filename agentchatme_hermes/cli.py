@@ -468,22 +468,73 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
     if problem is not None:
         # What is on this machine still says something: the key, the
         # manual (against the cached texts), the gateway's last record.
-        _, _, cached, _ = _doctor_cached_texts(api_key=saved_key, api_base=api_base, hermes_home=hermes_home)
+        cached_line, cached_template, cached, _ = _doctor_cached_texts(
+            api_key=saved_key, api_base=api_base, hermes_home=hermes_home
+        )
         code = _exit_with(problem)
         _print_local_status(
             resolution,
             worker=_health_worker(api_base, saved_key),
             manual=_manual_line(hermes_home, cached.manual if cached is not None else None),
+            identity=_identity_line_status(
+                handle=_read_saved_handle(), identity_line=cached_line, template=cached_template, home=hermes_home
+            ),
         )
         return code
 
+    from .turn import identity_line as render_identity_line
+    from .turn import identity_line_template as render_identity_line_template
+
+    handle = me.get("handle") if isinstance(me, dict) else None
     _print_status(
         me,
         resolution,
         worker=_health_worker(api_base, saved_key),
         manual=_manual_line(hermes_home, texts.manual if texts is not None else None),
+        identity=_identity_line_status(
+            handle=handle.lstrip("@").lower() if isinstance(handle, str) and handle else None,
+            identity_line=render_identity_line(texts) if texts is not None else None,
+            template=render_identity_line_template(texts) if texts is not None else None,
+            home=hermes_home,
+        ),
     )
     return _EXIT_OK
+
+
+def _identity_line_status(
+    *, handle: str | None, identity_line: str | None, template: str | None, home: Path
+) -> str | None:
+    """SOUL.md's identity block in one line, for ``status``: read as the refresh
+    would read it (the kit's strict rule), written never."""
+    try:
+        from .soul_anchor import AnchorError, inspect_soul
+    except ImportError:
+        return None
+    try:
+        state = inspect_soul(handle=handle, identity_line=identity_line, template=template)
+    except AnchorError as exc:
+        return f"not checked — {exc}"
+    cmd = cli_prefix(home)
+    where = state.path
+    outcome = state.outcome
+    if outcome == "absent":
+        return f"missing — {where} (`{cmd} doctor --fix` or `{cmd} login` places it)"
+    if outcome == "unreadable":
+        return f"not checked — {state.detail}"
+    if outcome == "unchanged":
+        return f"served (@{state.claimed}) — {where}"
+    if outcome == "updated":
+        return f"not the served one (@{state.claimed}, an older text) — {where}; the gateway refreshes it, or `{cmd} doctor --fix`"
+    if outcome == "hand_edited":
+        return f"edited by hand (yours, left alone) — {where}; `{cmd} doctor --fix` puts the served line back"
+    if outcome == "other_agent":
+        return f"IDENTITY MISMATCH: @{state.claimed}'s block, but the key is @{handle}'s — {where}"
+    if outcome == "several_blocks":
+        return f"more than one AgentChat block (left alone) — {where}"
+    if outcome == "unverified":
+        who = f"@{state.claimed}'s" if state.claimed else "no handle line"
+        return f"{who} (not verified: no served texts in hand) — {where}"
+    return f"{state.detail}"
 
 
 def _key_location_line(resolution: KeyResolution) -> str:
@@ -2190,7 +2241,7 @@ def _pid_alive(pid: int) -> bool | None:
     return True
 
 
-def _print_local_status(resolution: KeyResolution, *, worker: Any, manual: str) -> None:
+def _print_local_status(resolution: KeyResolution, *, worker: Any, manual: str, identity: str | None = None) -> None:
     """``status`` when AgentChat did not answer: what this machine holds."""
     saved = _read_saved_handle()
     _printline("")
@@ -2200,6 +2251,8 @@ def _print_local_status(resolution: KeyResolution, *, worker: Any, manual: str) 
     for note in (*resolution.notes, *(shared_note(h) for h in resolution.shared_with)):
         _printline(f"  Note:          {note}")
     _printline(f"  Manual:        {manual}")
+    if identity is not None:
+        _printline(f"  Identity:      {identity}")
     section = _could_not_process_section(worker)
     if section is not None:
         _printline(f"  Could not process: {_could_not_process_summary(section)}")
@@ -2212,6 +2265,7 @@ def _print_status(
     *,
     worker: Any = None,
     manual: str | None = None,
+    identity: str | None = None,
 ) -> None:
     handle = me.get("handle", "unknown")
     status = me.get("status", "unknown")
@@ -2235,6 +2289,8 @@ def _print_status(
             _printline(f"  Note:          {note}")
     if manual is not None:
         _printline(f"  Manual:        {manual}")
+    if identity is not None:
+        _printline(f"  Identity:      {identity}")
     # Could not process, from the running gateway's health record (absent
     # when no gateway receives for this account, or from an older release).
     section = _could_not_process_section(worker)
