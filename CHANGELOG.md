@@ -2,7 +2,9 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.3] — 2026-11-22
+
+Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): logout removes only the SOUL.md block AgentChat placed for this agent; setup and `doctor --fix` leave a block a person edited (delete it, then `doctor --fix`, to have the served line); logout says when a running gateway still holds the agent's connection. Upgrade with the full commit SHA: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git 'refs/tags/v0.6.3^{}' | cut -f1`.
 
 ### Changed
 
