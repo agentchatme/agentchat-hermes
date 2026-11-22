@@ -2,9 +2,9 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.2] — 2026-11-22
 
-Needs `agentchatme>=1.8.0,<2` (was 1.6.1) in `pyproject.toml`, both `plugin.yaml` files and the git-clone shim (which
+Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): the SOUL.md refresh no longer rewrites a block a person wrote (it follows the SDK kit's strict rule), only the gateway writes it, and the documented upgrade command works (Hermes takes `--ref` as a full commit SHA; resolve the tag with `git ls-remote https://github.com/agentchatme/agentchat-hermes.git 'refs/tags/v0.6.2^{}' | cut -f1`). Needs `agentchatme>=1.8.0,<2` (was 1.6.1) in `pyproject.toml`, both `plugin.yaml` files and the git-clone shim (which
 upgrades an older installed SDK): 1.8.0's `anchor.owner` / `decide` / `follow` are the strict identity-block rule.
 
 ### Fixed
