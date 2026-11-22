@@ -286,7 +286,7 @@ class TestDoctorClientHeader:
 
     def test_current_entry_has_no_header_warning(self, monkeypatch: Any, capsys: Any) -> None:
         out = self._run(monkeypatch, capsys, "ours", "current")
-        assert "hosted tools registered" in out
+        assert "hosted tools entry in config.yaml" in out
         assert "X-AgentChat-Client" not in out
 
     def test_entry_from_an_earlier_release_warns_with_the_fix(self, monkeypatch: Any, capsys: Any) -> None:

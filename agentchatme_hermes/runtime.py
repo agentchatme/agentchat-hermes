@@ -394,6 +394,11 @@ class Runtime:
         )
         health.set_worker_status(self._receiver.worker_status)
         self._receiver.start()
+        # The runtime activated, so api.agentchat.me answers now: a hosted
+        # tools server Hermes parked while it did not (a gateway started
+        # offline) is asked to reconnect, or every wake ends tools_unavailable
+        # until Hermes' own self-probe (5 min, up to an hour).
+        self._invoker.nudge_hosted_tools("the AgentChat runtime activated")
 
     def _sync_manual_once(self) -> None:
         """One manual sync on a daemon thread, against the texts in use (a

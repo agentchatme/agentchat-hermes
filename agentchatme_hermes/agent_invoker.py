@@ -88,7 +88,12 @@ from .config import (
     DEFAULT_TURN_IDLE_S,
     DEFAULT_TURN_MAX_S,
 )
-from .hosted_tools import wait_for_hosted_tools
+from .hosted_tools import (
+    hosted_server_state,
+    reconnect_record,
+    request_reconnect,
+    wait_for_hosted_tools,
+)
 from .model_call import (
     DEFAULT_MAX_TOKENS,
     GATE_CALL_PURPOSE,
@@ -104,6 +109,7 @@ from .model_call import (
 from .profile_scope import (
     ProfileScopeError,
     profile_context,
+    profile_label,
     profile_turn_scope,
     resolve_hermes_home,
 )
@@ -270,6 +276,40 @@ class AgentInvoker:
         with self._state_lock:
             self._heartbeat_at = time.time()
 
+    def nudge_hosted_tools(self, reason: str) -> None:
+        """Ask Hermes to reconnect the hosted tools server if it parked it
+        (:func:`.hosted_tools.request_reconnect`): the runtime just activated,
+        so api.agentchat.me answers now. A no-op for a server connected or
+        connecting. Never raises."""
+        home = self._home()
+        try:
+            with profile_context(home):
+                request_reconnect(key=str(home), reason=reason, label=f" profile={profile_label(home)}")
+        except Exception:
+            logger.debug("AgentInvoker: hosted tools nudge raised", exc_info=True)
+
+    def hosted_tools_status(self) -> dict[str, Any] | None:
+        """Hermes' reading of the hosted tools server for the health record
+        (``doctor`` reads it from the running gateway): its status, error and
+        tool count, and the reconnect requests made. ``None`` when not known."""
+        home = self._home()
+        try:
+            with profile_context(home):
+                state = hosted_server_state()
+        except Exception:
+            logger.debug("AgentInvoker: hosted tools status raised", exc_info=True)
+            return None
+        if state is None:
+            return None
+        return {
+            "status": state.status,
+            "error": state.error,
+            "tools": state.tools,
+            "needs_auth": state.needs_auth,
+            "reconnect": reconnect_record(str(home)),
+            "at": time.time(),
+        }
+
     def live_turns(self) -> int:
         """Turns not finished with (reply, invite, or a single-run run): a
         thread still running, a report the loop has not taken yet, or an
@@ -424,8 +464,9 @@ class AgentInvoker:
                 ready=False,
                 reason=f"{hung} earlier turns overran and have not ended — no turn can start",
             )
-        with profile_context(self._home()):
-            held = wait_for_hosted_tools(label="turn", stopped=self._stopped)
+        home = self._home()
+        with profile_context(home):
+            held = wait_for_hosted_tools(label="turn", stopped=self._stopped, key=str(home))
         if held is None:
             return Readiness(ready=False, reason="stopping")
         if not held:

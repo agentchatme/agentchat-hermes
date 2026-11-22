@@ -573,6 +573,36 @@ class TestReadiness:
         answer = inv.readiness()
         assert answer.ready is False and "not registered" in (answer.reason or "")
 
+    def test_the_hold_is_keyed_by_the_profile(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """The reconnect request a held turn makes is rate-limited per profile."""
+        home = tmp_path / "profiles" / "b"
+        inv = _invoker(monkeypatch, home=home)
+        seen: list[dict[str, Any]] = []
+        monkeypatch.setattr(invoker_module, "wait_for_hosted_tools", lambda **kw: seen.append(kw) or True)
+        assert inv.readiness().ready is True
+        assert seen and seen[0]["key"] == str(home) and seen[0]["label"] == "turn"
+
+    def test_the_nudge_asks_once_and_the_status_reports_it(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        home = tmp_path / "profiles" / "b"
+        inv = _invoker(monkeypatch, home=home)
+        def state() -> hosted_tools_module.ServerState:
+            return hosted_tools_module.ServerState(status="failed", error="offline")
+
+        asked: list[str] = []
+        monkeypatch.setattr(hosted_tools_module, "hosted_server_state", state)
+        monkeypatch.setattr(invoker_module, "hosted_server_state", state)
+        monkeypatch.setattr(hosted_tools_module, "_hermes_reconnect", lambda name: asked.append(name) or True)
+        hosted_tools_module._gates.clear()
+        inv.nudge_hosted_tools("the AgentChat runtime activated")
+        assert asked == ["agentchat"]
+        status = inv.hosted_tools_status()
+        assert status is not None and status["status"] == "failed" and status["error"] == "offline"
+        assert status["reconnect"]["requests"] == 1
+        inv.nudge_hosted_tools("again")
+        assert asked == ["agentchat"], "rate-limited"
+
     def test_stopping_is_not_ready(self, monkeypatch: pytest.MonkeyPatch) -> None:
         inv = _invoker(monkeypatch)
         inv.stop()

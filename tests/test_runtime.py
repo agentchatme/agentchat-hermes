@@ -115,6 +115,9 @@ class TestRuntimeStartLeaderMode:
             assert invoker_cls.called
             ws_cls.return_value.start.assert_called_once()
             invoker_cls.return_value.start.assert_not_called()  # the receiver runs it; it has no thread
+            # MS-F19: the runtime activated, so a hosted tools server Hermes parked
+            # while api.agentchat.me was unreachable is asked to reconnect.
+            invoker_cls.return_value.nudge_hosted_tools.assert_called_once_with("the AgentChat runtime activated")
 
             assert rt.identity.handle == "alice"
             assert rt.client is fake_client

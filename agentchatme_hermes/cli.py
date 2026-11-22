@@ -855,8 +855,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             )
             if entry_state == "ours":
                 ok(
-                    f"hosted tools registered: mcp_servers.agentchat → {hosted_mcp_url(api_base)} "
-                    "(tools appear as mcp__agentchat__<tool>; `hermes mcp test agentchat` probes it)"
+                    f"hosted tools entry in config.yaml: mcp_servers.agentchat → {hosted_mcp_url(api_base)} "
+                    "(tools appear as mcp__agentchat__<tool>; `hermes mcp test agentchat` probes it; "
+                    "whether the running gateway has them connected is the WS daemon section below)"
                 )
                 if identity == "missing":
                     warn(
@@ -975,6 +976,10 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                 if worker_report is not None:
                     level, text = worker_report
                     {"ok": ok, "warn": warn, "fail": fail}[level](text)
+                tools_report = _describe_hosted_tools(health.get("worker"), now=time.time())
+                if tools_report is not None:
+                    level, text = tools_report
+                    {"ok": ok, "warn": warn, "fail": fail}[level](text)
                 for level, text in _describe_could_not_process(health.get("worker"), now=time.time()):
                     {"ok": ok, "warn": warn, "fail": fail}[level](text)
         elif state == "free":
@@ -1002,6 +1007,53 @@ _WORKER_LONG_TURN_S = 900.0
 # model or the tray unreachable, no texts, no hosted tools, no turn can
 # start, a cycle abandoned) is an error.
 _WORKER_BAD_CYCLES = 3
+
+
+# What to do about a cycle that did not get through, by its outcome.
+_CYCLE_REMEDIES = {
+    "tools_unavailable": (
+        "; the hosted tools line below says why — the plugin asks Hermes to reconnect them, and "
+        "`hermes gateway restart` reconnects them at once"
+    ),
+}
+
+
+def _describe_hosted_tools(worker: Any, *, now: float) -> tuple[str, str] | None:
+    """``(ok|warn|fail, line)`` for the running gateway's hosted tools server,
+    as Hermes reads it there (the health record's ``worker.hosted_tools``,
+    written by the gateway every minute). ``None`` when the record has none
+    (an older plugin, or a Hermes whose MCP state is not readable)."""
+    from .hosted_tools import RECONNECT_FIRST_INTERVAL_S, ServerState, describe_cause
+
+    section = worker.get("hosted_tools") if isinstance(worker, dict) else None
+    if not isinstance(section, dict) or not isinstance(section.get("status"), str):
+        return None
+    status = section["status"]
+    error = section.get("error") if isinstance(section.get("error"), str) else None
+    tools = section.get("tools") if isinstance(section.get("tools"), int) else 0
+    at = section.get("at")
+    age = f", read {now - float(at):.0f}s ago" if isinstance(at, (int, float)) else ""
+    if status == "connected":
+        return "ok", f"The running gateway has the hosted tools connected ({tools} tool(s){age})"
+    if status == "connecting":
+        return "warn", f"The running gateway is still connecting the hosted tools{age}"
+    if status == "failed":
+        raw_reconnect = section.get("reconnect")
+        reconnect: dict[str, Any] = raw_reconnect if isinstance(raw_reconnect, dict) else {}
+        asked = reconnect.get("asked_ago_s")
+        requests = reconnect.get("requests") if isinstance(reconnect.get("requests"), int) else 0
+        asked_line = (
+            f"; the plugin asked Hermes to reconnect them {requests} time(s), last {float(asked):.0f}s ago"
+            if isinstance(asked, (int, float))
+            else f"; the plugin asks Hermes to reconnect them when a wake needs them (at most every {RECONNECT_FIRST_INTERVAL_S:.0f}s)"
+        )
+        why = f" ({error})" if error else ""
+        return "fail", (
+            f"The running gateway has no hosted AgentChat tools: Hermes parked mcp_servers.agentchat after its "
+            f"connection failed{why}, so the agent is woken but cannot answer{asked_line} — run "
+            f"`hermes gateway restart` to reconnect them now"
+        )
+    return "fail", f"The running gateway has no hosted AgentChat tools: {describe_cause(ServerState(status=status, error=error))}"
 
 
 def _describe_worker(worker: Any, *, now: float) -> tuple[str, str] | None:
@@ -1052,12 +1104,13 @@ def _describe_worker(worker: Any, *, now: float) -> tuple[str, str] | None:
     if bad and newest is not None:
         what = str(newest.get("outcome") or "?")
         why = f": {newest['failure']}" if newest.get("failure") else ""
+        remedy = _CYCLE_REMEDIES.get(what, "")
         if bad >= _WORKER_BAD_CYCLES:
             return "fail", (
                 f"The receive loop's last {bad} cycles did not get through ({what}{why}) — "
-                "AgentChat messages are not being answered"
+                f"AgentChat messages are not being answered{remedy}"
             )
-        return "warn", f"The receive loop's last cycle did not get through ({what}{why})"
+        return "warn", f"The receive loop's last cycle did not get through ({what}{why}){remedy}"
     if state == "turn" and in_state is not None and in_state > _WORKER_LONG_TURN_S:
         return "warn", f"An AgentChat turn has been running for {in_state:.0f}s"
     last_turn = worker.get("last_turn")
