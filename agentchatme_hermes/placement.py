@@ -152,9 +152,10 @@ def place_anchor(
 ) -> PlacementStep:
     """The served identity line in SOUL.md, on request (:func:`.soul_anchor.place_soul_anchor`):
     this agent's block brought to the served line, one placed where there is
-    none, a block edited by hand put back; another agent's block replaced only
-    with ``replace_other`` (login, the wizard), refused otherwise (``doctor --fix``).
-    The detail says what it was. Never raises."""
+    none; a block edited by hand, or several blocks, left (``warned``, with the
+    remedy); another agent's block replaced only with ``replace_other`` (login,
+    the wizard), refused otherwise (``doctor --fix``). The detail says what it
+    was. Never raises."""
     if identity_line is None:
         return PlacementStep("anchor", "skipped", TEXTS_UNAVAILABLE_DETAIL)
     try:
@@ -163,6 +164,8 @@ def place_anchor(
         )
     except (AnchorError, OSError) as exc:
         return PlacementStep("anchor", "failed", f"could not write the identity line to SOUL.md: {exc}")
+    if placement.outcome == "left":
+        return PlacementStep("anchor", "warned", placement.detail)
     if not placement.ok:
         return PlacementStep("anchor", "failed", placement.detail)
     return PlacementStep("anchor", "changed" if placement.wrote else "ok", placement.detail)

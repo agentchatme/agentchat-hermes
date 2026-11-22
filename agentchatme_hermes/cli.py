@@ -529,7 +529,7 @@ def _identity_line_status(
     if outcome == "updated":
         return f"not the served one (@{state.claimed}, an older text) — {where}; the gateway refreshes it, or `{cmd} doctor --fix`"
     if outcome == "hand_edited":
-        return f"edited by hand (yours, left alone) — {where}; `{cmd} doctor --fix` puts the served line back"
+        return f"edited by hand (yours, left alone) — {where}; to have the served line, delete that block, then `{cmd} doctor --fix`"
     if outcome == "other_agent":
         return f"IDENTITY MISMATCH: @{state.claimed}'s block, but the key is @{handle}'s — {where}"
     if outcome == "several_blocks":
@@ -1465,8 +1465,8 @@ def _doctor_soul_checks(
         names = f"; its words name @{state.named}" if state.named else ""
         warn(
             f"SOUL.md agentchat block was edited by hand: it has no handle line and is not a text AgentChat "
-            f"served{names}. It is yours, left alone — `{cmd} doctor --fix` puts the served identity line back "
-            "(your edit is replaced)"
+            f"served{names}. It is yours, left alone (also by `{cmd} doctor --fix` and `{cmd} login`) — to have "
+            f"the served identity line, delete that block, then run `{cmd} doctor --fix`"
         )
     elif outcome == "several_blocks":
         warn(

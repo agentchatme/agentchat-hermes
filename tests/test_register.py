@@ -370,7 +370,10 @@ class TestReconcileSoulAnchor:
         assert soul.read_text(encoding="utf-8") == mine
         said = [r.getMessage() for r in caplog.records if "edited by hand" in r.getMessage()]
         assert len(said) == 1, "said once, not on every texts change"
-        assert "`hermes agentchat doctor --fix` puts the served identity line for @ops back" in said[0]
+        assert said[0].endswith(
+            "It is yours: not refreshed; to have the served line, delete that block, then run "
+            "`hermes agentchat doctor --fix`."
+        )
 
     def test_one_word_changed_is_left_alone(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         from agentchatme_hermes import _register, soul_anchor

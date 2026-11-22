@@ -4,6 +4,21 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+### Changed
+
+- **A block you edited inside the AgentChat markers is left on every path.** Setup (`register`, `login`, `recover`, the
+  wizard) and `doctor --fix` used to put the served identity line back over a hand-edited block. So a block that
+  `logout` kept was overwritten at the next `login` or reinstall. The user's words are now replaced only once they
+  delete the block themselves. Setup leaves the block with a warning: "…was edited by hand, so it is left; to have the
+  served line, delete that block, then run `hermes agentchat doctor --fix`". `doctor --fix` leaves it with the same
+  remedy, and so do the gateway's log line and `status`. The full policy:
+  - This agent's own block is brought to the served line by every writing path.
+  - Another agent's block is replaced by setup (said: the profile becomes this agent), refused by `doctor --fix`, and
+    left by the gateway and `logout`.
+  - Several blocks are left by every path, with a warning from setup.
+  - A placement is decided on the text it replaces: a block written while it runs is not overwritten (the file is read
+    again before the rename, and the decision is made again).
+
 ### Fixed
 
 - **`logout` removes only the identity block AgentChat placed for this agent.** It stripped any AgentChat block from

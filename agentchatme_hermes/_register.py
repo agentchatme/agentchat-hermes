@@ -535,8 +535,9 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
     or, without one, a text AgentChat served word for word — is brought to the
     served line, atomically, the rest of the file kept byte for byte. A block
     whose words merely name ``@handle`` was edited by hand: it is the user's,
-    left alone, and said (``hermes agentchat doctor --fix`` puts the served
-    line back when asked). With no block at all the served line is placed
+    left alone, and said (also by ``login`` and ``doctor --fix``: the served
+    line replaces it only once the user deletes it). With no block at all the
+    served line is placed
     (the non-wizard path: a key set in the environment, a container, a
     profile upgraded from before v3).
 
@@ -616,14 +617,15 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
             actual,
         )
     elif outcome == "hand_edited":
+        from .soul_anchor import hand_edited_remedy
+
         _say_once(
             path,
             outcome,
             result.detail,
-            "agentchat plugin: SOUL.md — %s. It is yours: not refreshed. `hermes agentchat doctor --fix` "
-            "puts the served identity line for @%s back in its place (your edit is replaced).",
+            "agentchat plugin: SOUL.md — %s. It is yours: not refreshed; %s.",
             result.detail,
-            actual,
+            hand_edited_remedy(path),
         )
     elif outcome == "several_blocks":
         _say_once(

@@ -43,10 +43,13 @@ refresh — the activation path, on every texts change: ``anchor.follow``
           edited by hand is the user's; several blocks are left as they are).
           With no block at all, the line is placed (the backfill).
 place   — the wizard and ``register`` / ``login`` / ``recover`` after the key
-          is validated, and ``doctor --fix``: an explicit request, so a block
-          edited by hand is put back to the served line, and (``login`` and
-          the wizard only) another agent's block is replaced by this one's.
-          ``doctor --fix`` never replaces another agent's block.
+          is validated, and ``doctor --fix``: this agent's own block is
+          brought to the served line, and one is placed where there is none.
+          A block edited by hand is the user's and is left (said, with the
+          remedy: delete that block, then ``doctor --fix``); several blocks
+          are left. Another agent's block is replaced by setup (``login``,
+          the wizard: this profile becomes this agent, said) and refused by
+          ``doctor --fix`` (a mismatch to fix).
 remove  — ``hermes agentchat logout`` (and the wizard's logout): only the
           block AgentChat placed for this profile's agent — ``anchor.owner``
           (strict) is this profile's handle. A block edited by hand, another
@@ -311,22 +314,38 @@ def inspect_soul(
 
 # ─── place (wizard, register / login / recover, doctor --fix) ───────────────
 
-PlacementOutcome = Literal["unchanged", "updated", "placed", "restored", "replaced_other", "refused", "failed"]
+PlacementOutcome = Literal["unchanged", "updated", "placed", "replaced_other", "left", "refused", "failed"]
+
+PLACE_ATTEMPTS = 3
+"""Decisions in all before a placement leaves a file that keeps changing under it."""
 
 
 @dataclass(frozen=True)
 class AnchorPlacement:
+    """What a placement did. ``left``: a block edited by hand, or several
+    blocks, left as they are on purpose (a warning: ``detail`` gives the
+    remedy). ``refused``: another agent's block, kept by ``doctor --fix``."""
+
     outcome: PlacementOutcome
     path: Path
     detail: str
 
     @property
     def ok(self) -> bool:
-        return self.outcome not in ("refused", "failed")
+        """This agent's block holds the served line now."""
+        return self.outcome in ("unchanged", "updated", "placed", "replaced_other")
 
     @property
     def wrote(self) -> bool:
-        return self.outcome in ("updated", "placed", "restored", "replaced_other")
+        return self.outcome in ("updated", "placed", "replaced_other")
+
+
+def hand_edited_remedy(path: Path | str) -> str:
+    """What to do to have the served line instead of a block edited by hand:
+    the user's words are replaced only once they delete the block themselves."""
+    from .config import cli_prefix
+
+    return f"to have the served line, delete that block, then run `{cli_prefix(Path(path).parent)} doctor --fix`"
 
 
 def place_soul_anchor(
@@ -340,76 +359,95 @@ def place_soul_anchor(
     """Place the served identity line for ``handle`` in SOUL.md, on request.
 
     This agent's own block is brought to the served line (``anchor.follow``);
-    no block (or no file) gets one; a block edited by hand is put back to the
-    served line (the request is the user's); another agent's block is
-    replaced only with ``replace_other`` (``login`` and the wizard: this
-    profile becomes this agent), else refused (``doctor --fix``). Several
-    blocks are refused (one write would remove the others). The new text is
-    read back and must be this agent's block with the served line.
+    no block (or no file) gets one. A block edited by hand is the user's: left
+    as it is, with the remedy (delete that block, then ``doctor --fix``).
+    Several blocks are left (one write would remove the others). Another
+    agent's block is replaced only with ``replace_other`` (``login`` and the
+    wizard: this profile becomes this agent), else refused (``doctor --fix``).
+    A write is decided on the text it replaces: if the file changes before
+    the rename, nothing is written and the decision is made again. The new
+    text is read back and must be this agent's block with the served line.
 
     Raises :class:`AnchorError` when the line does not name ``@handle`` (before
     anything is written) or the kit has no strict reading.
     """
+    from .config import cli_prefix
+
     target = soul_path if soul_path is not None else resolve_soul_path()
     bare = normalize_handle(handle)
     block = render_anchor_block(identity_line, handle=bare)
     anchor = _kit()
+    cmd = cli_prefix(Path(target).parent)
 
-    result = anchor.follow(target, handle=bare, identity_line=identity_line, template=template)
-    if result.outcome == "updated":
-        return AnchorPlacement("updated", target, f"identity line for @{bare} refreshed to the served text in {target}")
-    if result.outcome == "unchanged":
-        return AnchorPlacement("unchanged", target, f"identity line for @{bare} in {target} (the served text)")
-    if result.outcome in ("failed", "edited_meanwhile"):
-        return AnchorPlacement("failed", target, result.detail)
-    if result.outcome == "several_blocks":
-        return AnchorPlacement(
-            "refused",
-            target,
-            f"{target} holds more than one AgentChat block — nothing written; remove the extra blocks by hand, "
-            "then run this again",
+    for _ in range(PLACE_ATTEMPTS):
+        result = anchor.follow(target, handle=bare, identity_line=identity_line, template=template)
+        if result.outcome == "updated":
+            return AnchorPlacement("updated", target, f"identity line for @{bare} refreshed to the served text in {target}")
+        if result.outcome == "unchanged":
+            return AnchorPlacement("unchanged", target, f"identity line for @{bare} in {target} (the served text)")
+        if result.outcome in ("failed", "edited_meanwhile"):
+            return AnchorPlacement("failed", target, result.detail)
+        if result.outcome == "hand_edited":
+            return AnchorPlacement(
+                "left", target, f"the AgentChat block in {target} was edited by hand, so it is left; {hand_edited_remedy(target)}"
+            )
+        if result.outcome == "several_blocks":
+            return AnchorPlacement(
+                "left",
+                target,
+                f"{target} holds more than one AgentChat block, so they are left (one write would remove the others); "
+                f"remove the extra ones by hand, then run `{cmd} doctor --fix`",
+            )
+        if result.outcome == "other_agent" and not replace_other:
+            return AnchorPlacement(
+                "refused",
+                target,
+                f"the AgentChat block in {target} is @{result.claimed}'s, not @{bare}'s — not replaced: fix the key "
+                f"(`{cmd} login`) or remove that block",
+            )
+        if result.outcome not in ("absent", "other_agent"):
+            return AnchorPlacement("failed", target, result.detail)
+
+        # No block, or (setup) another agent's: write this agent's, decided on the text it replaces.
+        try:
+            text = read_soul(target)
+        except AnchorError as exc:
+            return AnchorPlacement("failed", target, str(exc))
+        except OSError as exc:
+            return AnchorPlacement("failed", target, f"could not read {target}: {exc}")
+        now = anchor.decide(_without_bom(text or ""), handle=bare, identity_line=identity_line, template=template)
+        if now.outcome != result.outcome or now.claimed != result.claimed:
+            continue  # changed since it was read: decide again
+        try:
+            write_text_atomic(target, anchor.replace(text or "", block), unless_changed_from=text)
+        except _ChangedMeanwhile:
+            continue
+        except OSError as exc:
+            return AnchorPlacement("failed", target, f"could not write the identity line to {target}: {exc}")
+
+        try:
+            back = read_soul(target)
+        except (AnchorError, OSError):
+            back = None
+        # Landed = the kit reads this agent's block, in the current shape, with the served line.
+        landed = back is not None and (
+            anchor.decide(_without_bom(back), handle=bare, identity_line=identity_line, template=template).outcome
+            == "unchanged"
         )
-    if result.outcome == "other_agent" and not replace_other:
-        return AnchorPlacement(
-            "refused",
-            target,
-            f"the AgentChat block in {target} is @{result.claimed}'s, not @{bare}'s — not replaced: fix the key "
-            "(`hermes agentchat login`) or remove that block",
-        )
-
-    try:
-        text = read_soul(target)
-    except AnchorError as exc:
-        return AnchorPlacement("failed", target, str(exc))
-    except OSError as exc:
-        return AnchorPlacement("failed", target, f"could not read {target}: {exc}")
-    try:
-        write_text_atomic(target, anchor.replace(text or "", block))
-    except OSError as exc:
-        return AnchorPlacement("failed", target, f"could not write the identity line to {target}: {exc}")
-
-    try:
-        back = read_soul(target)
-    except (AnchorError, OSError):
-        back = None
-    # Landed = the kit reads this agent's block, in the current shape, with the served line.
-    landed = back is not None and (
-        anchor.decide(_without_bom(back), handle=bare, identity_line=identity_line, template=template).outcome
-        == "unchanged"
+        if not landed:
+            return AnchorPlacement(
+                "failed", target, f"{target} did not read back with the served identity line for @{bare} after the write"
+            )
+        if result.outcome == "other_agent":
+            return AnchorPlacement(
+                "replaced_other",
+                target,
+                f"the AgentChat block in {target} was @{result.claimed}'s; it now is @{bare}'s (this profile is @{bare})",
+            )
+        return AnchorPlacement("placed", target, f"identity line for @{bare} placed in {target}")
+    return AnchorPlacement(
+        "failed", target, f"{target} kept changing while the identity line was being placed; nothing written"
     )
-    if not landed:
-        return AnchorPlacement(
-            "failed", target, f"{target} did not read back with the served identity line for @{bare} after the write"
-        )
-    if result.outcome == "hand_edited":
-        return AnchorPlacement(
-            "restored", target, f"the AgentChat block in {target} was edited by hand; it now is @{bare}'s served identity line"
-        )
-    if result.outcome == "other_agent":
-        return AnchorPlacement(
-            "replaced_other", target, f"the AgentChat block in {target} was @{result.claimed}'s; it now is @{bare}'s"
-        )
-    return AnchorPlacement("placed", target, f"identity line for @{bare} placed in {target}")
 
 
 def write_soul_anchor(identity_line: str, *, handle: str, soul_path: Path | None = None) -> Path:
