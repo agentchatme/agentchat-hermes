@@ -6,6 +6,11 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ### Fixed
 
+- **A new install gets only an approved release.** The README's install line resolved the newest tag, and a tag is
+  pushed before the release is approved for PyPI, so a Hermes install (by commit SHA) could take a release that was
+  never approved. The release workflow now moves the `stable` branch to the tagged commit after the approved upload
+  (fast-forward only), and the install and upgrade lines resolve `refs/heads/stable`; a particular release is still
+  `'refs/tags/vX.Y.Z^{}'`.
 - **The agent answers again after a gateway start without network.** When the gateway started while api.agentchat.me
   could not be reached (a reboot before the network, a DNS or provider outage), Hermes' MCP client tried
   `mcp_servers.agentchat` three times and parked it. Parking drops its tools, and the server then waits for a

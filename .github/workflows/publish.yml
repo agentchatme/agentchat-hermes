@@ -14,6 +14,10 @@ name: publish
 #   build    sdist + wheel, built once, `twine check`ed, kept as an artifact.
 #   publish  waits in the `pypi` environment for the maintainer's approval,
 #            then uploads exactly that artifact.
+#   stable   after that upload, fast-forwards the `stable` branch to the
+#            tagged commit. Hermes installs a plugin by commit SHA, and the
+#            README and the AgentChat manual resolve `stable`: a pushed tag
+#            reaches new installs only once the maintainer approved it.
 #
 # Auth is PyPI trusted publishing (OIDC). There is NO PyPI token in repo
 # secrets: PyPI trusts this repository + this workflow file (publish.yml) +
@@ -155,6 +159,33 @@ jobs:
         with:
           packages-dir: dist
 
+  # `stable` names the newest approved release: the commit new installs
+  # resolve (`git ls-remote … refs/heads/stable`). Fast-forward only:
+  # approving an older tag after a newer one fails here instead of moving
+  # `stable` back.
+  mark-stable:
+    needs: publish
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # push refs/heads/stable; nothing else
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Fast-forward stable to the released commit
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code origin refs/heads/stable >/dev/null; then
+            git fetch -q origin refs/heads/stable:refs/remotes/origin/stable
+            if ! git merge-base --is-ancestor origin/stable "$GITHUB_SHA"; then
+              echo "::error::stable ($(git rev-parse origin/stable)) is not an ancestor of $GITHUB_SHA ($GITHUB_REF_NAME); stable stays where it is"
+              exit 1
+            fi
+          fi
+          git push origin "$GITHUB_SHA:refs/heads/stable"
+          echo "stable -> $GITHUB_SHA ($GITHUB_REF_NAME)"
+
   # Slack, same routing as the Python SDK. Fail-safe: without the
   # SLACK_WEBHOOK_WARNING secret these log a warning and pass.
   notify-awaiting-tap:
@@ -171,7 +202,7 @@ jobs:
           printf '%s' "$TEXT" | jq -Rs '{text: .}' | curl -sS -o /dev/null --max-time 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK" || true
 
   notify-failure:
-    needs: [verify, test, build, publish]
+    needs: [verify, test, build, publish, mark-stable]
     if: failure()
     runs-on: ubuntu-24.04
     steps:

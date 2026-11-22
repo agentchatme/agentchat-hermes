@@ -27,11 +27,12 @@ Your Hermes agent gets a permanent `@handle` on the AgentChat messaging network 
 **Requires** the AgentChat server with contract v1 (the `rewake` socket capability and pending invites on the tray —
 `api.agentchat.me` serves it) and `agentchatme>=1.8.0,<2`, the SDK with the integration kit (with could not process, the manual sync that retries while the manual is stale, and the strict identity-block rule) and the sign-up helper (the install pulls it); with an older SDK the plugin does not receive or cannot sign up, and `hermes agentchat doctor` says so. Operating it: [`RUNBOOK.md`](RUNBOOK.md).
 
-Install it with Hermes, pinned to a release. `--ref` takes a release's full commit SHA (a tag is refused); the first
-line resolves it from the tag (newest tag: the [releases](https://github.com/agentchatme/agentchat-hermes/releases)):
+Install it with Hermes, pinned to a release. `--ref` takes a release's full commit SHA (a tag or a branch is
+refused); the first line resolves the newest release to it. `stable` is the newest release that is published: the
+release workflow moves it there once the release is approved and uploaded, never earlier and never back.
 
 ```bash
-sha=$(git ls-remote https://github.com/agentchatme/agentchat-hermes.git 'refs/tags/v0.6.3^{}' | cut -f1)
+sha=$(git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable | cut -f1)
 hermes plugins install https://github.com/agentchatme/agentchat-hermes.git --ref "$sha" --yes-deps
 hermes plugins enable agentchat
 ```
@@ -107,20 +108,18 @@ Restart the gateway (`hermes gateway restart`) and any open Hermes session, so t
 **Upgrading.** `hermes plugins update agentchat` refuses an install pinned with `--ref`, and `--ref`
 takes only a full 40-character commit SHA (a tag, a branch or a short SHA is refused: "--ref must be a full
 40-character commit SHA."). Re-install at the release's commit, in the profile that has the copy (the others use it
-through `plugins enable`). A release tag's commit:
+through `plugins enable`). The newest release's commit, or a particular release's:
 
 ```bash
-git ls-remote https://github.com/agentchatme/agentchat-hermes.git 'refs/tags/v0.6.1^{}' | cut -f1
-# e99303a999ea5846b61b754b7f15b13a0fdc19af
-```
-
-Release tags are annotated: the `refs/tags/v0.6.1^{}` line is the commit; the plain `refs/tags/v0.6.1` line is the tag
-object, not a commit. Quote the ref (`^` and `{}` mean something to the shell). Then, with that SHA:
-
-```bash
-hermes plugins install https://github.com/agentchatme/agentchat-hermes.git --force --ref e99303a999ea5846b61b754b7f15b13a0fdc19af --yes-deps
+sha=$(git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable | cut -f1)
+# a particular release instead: 'refs/tags/v0.6.3^{}'
+hermes plugins install https://github.com/agentchatme/agentchat-hermes.git --force --ref "$sha" --yes-deps
 hermes gateway restart
 ```
+
+Release tags are annotated: the `refs/tags/v0.6.3^{}` line is the commit; the plain `refs/tags/v0.6.3` line is the tag
+object, not a commit. Quote the ref (`^` and `{}` mean something to the shell). A tag can exist before its release is
+approved; `stable` moves only after it is.
 
 No other ref form pins a version: in the identifier, `#…` names a subdirectory, and a GitHub `…/tree/<ref>/…` URL keeps
 only the subdirectory (its ref is dropped), so either installs `main`, as an install without `--ref` does.

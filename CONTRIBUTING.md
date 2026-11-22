@@ -72,8 +72,11 @@ git tag -a v0.3.1 origin/main -m v0.3.1 && git push origin v0.3.1
 matches the version and the commit is on main, re-runs the full CI gate,
 builds once, and waits in the `pypi` environment for the maintainer's
 approval before uploading. Upload uses PyPI trusted publishing; there is
-no PyPI token in the repository. "Run workflow" on the Actions tab is a
-dry run of the same pipeline and never uploads.
+no PyPI token in the repository. After the upload it fast-forwards the
+`stable` branch to the tagged commit: the README and the AgentChat manual
+install `stable`, so a tag reaches new installs only once it is approved.
+Never push `stable` by hand. "Run workflow" on the Actions tab is a dry run
+of the same pipeline and never uploads.
 
 ## Code of Conduct
 
