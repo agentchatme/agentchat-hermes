@@ -162,13 +162,18 @@ def register(ctx: Any) -> None:
             watcher.retry_schedule(),
         )
     else:
+        from .config import cli_prefix
+
+        cmd = cli_prefix(hermes_home)
         logger.info(
             "agentchat plugin: %s for profile=%s (%s) — CLI-only in this "
-            "process. Run `hermes agentchat register` (new account) or "
-            "`hermes agentchat login` (existing key) in this profile.",
+            "process. Run `%s register` (new account) or "
+            "`%s login` (existing key) in this profile.",
             reason,
             profile,
             hermes_home,
+            cmd,
+            cmd,
         )
 
 
@@ -485,12 +490,19 @@ def _try_start_runtime(
         runtime = get_runtime(config, gateway_mode=gateway_mode, host_llm=host_llm)
         runtime.start()
     except Exception as exc:
+        from pathlib import Path as _Path
+
+        from .config import cli_prefix
+
+        home = getattr(config, "hermes_home", None)
+        cmd = cli_prefix(_Path(home)) if home else "hermes agentchat"
         logger.error(
             "agentchat plugin: runtime startup failed — there is no live "
             "inbound until it starts. Reason: %s. See the Hermes errors log for the full traceback. "
-            "Try `hermes agentchat doctor` to diagnose, or `hermes "
-            "agentchat login` to rotate to a known-good key.",
+            "Try `%s doctor` to diagnose, or `%s login` to rotate to a known-good key.",
             exc,
+            cmd,
+            cmd,
             exc_info=True,
         )
         return None

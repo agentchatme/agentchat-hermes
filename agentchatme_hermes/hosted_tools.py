@@ -197,6 +197,8 @@ def request_reconnect(
             gate.interval = min(gate.interval * 2, RECONNECT_MAX_INTERVAL_S)
         gate.last_at = at
         gate.requests += 1
+    if not label:
+        label = _profile_label()
     try:
         asked = (reconnect or _hermes_reconnect)(MCP_SERVER_NAME)
     except Exception as exc:
@@ -219,11 +221,33 @@ def request_reconnect(
     return ReconnectResult("requested", state, 0.0)
 
 
+def _profile_label() -> str:
+    """`` profile=NAME`` for the profile in scope, for a log line; ``""`` when unknown."""
+    try:
+        from .profile_scope import profile_label, resolve_hermes_home
+
+        return f" profile={profile_label(resolve_hermes_home())}"
+    except Exception:
+        return ""
+
+
+def _cmd() -> str:
+    """``hermes agentchat`` for the profile in scope (``hermes -p NAME agentchat``)."""
+    try:
+        from .config import cli_prefix
+        from .profile_scope import resolve_hermes_home
+
+        return cli_prefix(resolve_hermes_home())
+    except Exception:
+        return "hermes agentchat"
+
+
 def describe_cause(state: ServerState | None, reconnect: ReconnectResult | None = None) -> str:
     """Why the hosted tools are not registered, in words, with what to do."""
+    cmd = _cmd()
     if state is None:
         return (
-            "Hermes' MCP state is not readable here; check `hermes agentchat doctor` (the mcp SDK — "
+            f"Hermes' MCP state is not readable here; check `{cmd} doctor` (the mcp SDK — "
             "Hermes' [mcp] extra — and mcp_servers.agentchat in config.yaml)"
         )
     if state.parked:
@@ -247,7 +271,7 @@ def describe_cause(state: ServerState | None, reconnect: ReconnectResult | None 
     if state.status == "disabled":
         return "mcp_servers.agentchat is disabled in this profile's config.yaml — enable it, then `hermes gateway restart`"
     if state.status == "missing":
-        return "mcp_servers.agentchat is not in this profile's config.yaml — `hermes agentchat doctor --fix` adds it"
+        return f"mcp_servers.agentchat is not in this profile's config.yaml — `{cmd} doctor --fix` adds it"
     if state.status == "connected":
         return (
             "Hermes reports mcp_servers.agentchat connected but no mcp__agentchat__ tool is registered for "
@@ -255,7 +279,7 @@ def describe_cause(state: ServerState | None, reconnect: ReconnectResult | None 
         )
     return (
         f"Hermes has not connected mcp_servers.agentchat in this process (status {state.status}); check "
-        "`hermes agentchat doctor` (the mcp SDK — Hermes' [mcp] extra — and mcp_servers.agentchat in config.yaml)"
+        f"`{cmd} doctor` (the mcp SDK — Hermes' [mcp] extra — and mcp_servers.agentchat in config.yaml)"
     )
 
 

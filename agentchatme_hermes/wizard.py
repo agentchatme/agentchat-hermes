@@ -413,7 +413,7 @@ def _paste_existing_key_flow(
     server says it belongs to."""
     print()
     print_info(
-        "Paste your AgentChat API key. Mint one with `hermes agentchat register` "
+        f"Paste your AgentChat API key. Mint one with `{cli_prefix(resolve_hermes_home())} register` "
         "or via the AgentChat docs if you don't have one yet."
     )
     # Masked typing: Hermes' own secret prompt (``prompt(password=True)``).
@@ -662,7 +662,7 @@ def _save_key(api_key: str, handle: str, print_warning: Any) -> bool:
     if outcome.fallback_reason is not None:
         print_warning(
             f"The key was saved in the profile .env, not in the key file: {outcome.fallback_reason}. "
-            "Fix that, then run `hermes agentchat doctor --fix`."
+            f"Fix that, then run `{cli_prefix(resolve_hermes_home())} doctor --fix`."
         )
     elif outcome.path is not None:
         _step(f"Key saved in {outcome.path} (readable by you only)")

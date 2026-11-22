@@ -418,8 +418,11 @@ def place_soul_anchor(
         now = anchor.decide(_without_bom(text or ""), handle=bare, identity_line=identity_line, template=template)
         if now.outcome != result.outcome or now.claimed != result.claimed:
             continue  # changed since it was read: decide again
+        placed = anchor.replace(text or "", block)
+        if result.outcome == "absent":
+            placed = _keep_missing_final_break(text, placed)
         try:
-            write_text_atomic(target, anchor.replace(text or "", block), unless_changed_from=text)
+            write_text_atomic(target, placed, unless_changed_from=text)
         except _ChangedMeanwhile:
             continue
         except OSError as exc:
@@ -448,6 +451,18 @@ def place_soul_anchor(
     return AnchorPlacement(
         "failed", target, f"{target} kept changing while the identity line was being placed; nothing written"
     )
+
+
+def _keep_missing_final_break(before: str | None, after: str) -> str:
+    """The kit appends a block with a line break after it. A file that did not
+    end with one (Hermes' own SOUL.md template does not) keeps not ending with
+    one, so a later removal gives back the file byte for byte."""
+    if not before or before.endswith("\n"):
+        return after
+    for eol in ("\r\n", "\n"):
+        if after.endswith(eol):
+            return after[: -len(eol)]
+    return after
 
 
 def write_soul_anchor(identity_line: str, *, handle: str, soul_path: Path | None = None) -> Path:

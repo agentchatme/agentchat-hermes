@@ -380,6 +380,8 @@ class TestDoctorLines:
             "ok", "The running gateway has the hosted tools connected (31 tool(s), read 5s ago)"
         )
         assert (self._line({"status": "connecting"}) or ("", ""))[0] == "warn"
+        assert (self._line({"status": "configured"}) or ("", ""))[0] == "warn"
+        assert (self._line({"status": "lazy", "tools": 31}) or ("", ""))[0] == "ok", "lazy: registered, connects on first use"
 
     def test_missing_and_disabled_name_their_cause(self) -> None:
         assert "doctor --fix` adds it" in (self._line({"status": "missing"}) or ("", ""))[1]

@@ -48,6 +48,7 @@ releases up to 0.5.3 kept it.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import re
 import sys
@@ -309,13 +310,17 @@ class _KeyInputError(Exception):
     """The key could not be read from where the caller said it is."""
 
 
-_ARGV_KEY_WARNING = (
-    "Warning: --api-key <key> puts the key on the command line, where every user of this "
-    "machine can read it (ps). It still works for now; use instead\n"
-    "  hermes agentchat login --api-key-file <path>\n"
-    "  <command that prints the key> | hermes agentchat login --api-key -\n"
-    "or run `hermes agentchat login` and paste it at the masked prompt."
-)
+def _argv_key_warning(cmd: str = "hermes agentchat") -> str:
+    return (
+        "Warning: --api-key <key> puts the key on the command line, where every user of this "
+        "machine can read it (ps). It still works for now; use instead\n"
+        f"  {cmd} login --api-key-file <path>\n"
+        f"  <command that prints the key> | {cmd} login --api-key -\n"
+        f"or run `{cmd} login` and paste it at the masked prompt."
+    )
+
+
+_ARGV_KEY_WARNING = _argv_key_warning()
 
 
 def _login_key_input(*, key_file: str | None, flag: str | None) -> str:
@@ -327,7 +332,7 @@ def _login_key_input(*, key_file: str | None, flag: str | None) -> str:
     if flag == "-":
         return _read_key_stdin()
     if flag:
-        sys.stderr.write(_ARGV_KEY_WARNING + "\n")
+        sys.stderr.write(_argv_key_warning(_profile_cmd()) + "\n")
         sys.stderr.flush()
         return flag
     if _stdin_is_tty():
@@ -432,10 +437,10 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
         return _exit_with(resolution.refusal)
     saved_key = resolution.api_key
     if not saved_key:
-        _printline(
-            "No AgentChat key configured. Run `hermes agentchat register` "
-            "or `hermes agentchat login`."
-        )
+        from .profile_scope import resolve_hermes_home as _home
+
+        cmd = cli_prefix(_home())
+        _printline(f"No AgentChat key configured. Run `{cmd} register` or `{cmd} login`.")
         return _EXIT_OK
 
     api_base = _api_base()
@@ -461,7 +466,9 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
         try:
             me = client.get_me()
         except UnauthorizedError:
-            problem = "Saved key no longer authenticates. Run `hermes agentchat login` with a fresh key."
+            problem = (
+                f"Saved key no longer authenticates. Run `{cli_prefix(hermes_home)} login` with a fresh key."
+            )
         except (AgentChatError, SDKConnectionError) as exc:
             problem = f"Status fetch failed: {exc}"
         if problem is None:
@@ -642,6 +649,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             )
         else:
             ok(f"installed as a directory plugin at {loaded} ({clone})")
+    copies_line = _git_copies_line(hermes_home)
+    if copies_line is not None:
+        warn(copies_line)
 
     from .config import ENV_INTEGRATION, ENV_INTEGRATION_LEGACY, INTEGRATION_OFF
 
@@ -735,7 +745,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         except UnauthorizedError:
             fail(
                 "API key did NOT authenticate against /v1/agents/me — "
-                "rotate via `hermes agentchat login`"
+                f"rotate via `{cmd} login`"
             )
         except (AgentChatError, SDKConnectionError) as exc:
             # Offline is what doctor must report, not a traceback.
@@ -812,8 +822,13 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             report = fail if step.failed else warn if step.status == "warned" else ok
             report(f"fix: {step.name} {step.status} — {step.detail}")
 
+    # Offline, the block is read against the cached texts for the handle this
+    # profile saved (as `status` does), not left "not verified".
+    soul_handle = authenticated_handle
+    if soul_handle is None and identity_line is not None:
+        soul_handle = _read_saved_handle()
     _doctor_soul_checks(
-        handle=authenticated_handle,
+        handle=soul_handle,
         identity_line=identity_line,
         template=identity_template,
         cmd=cmd,
@@ -863,7 +878,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                     warn(
                         "mcp_servers.agentchat does not say it is Hermes (no X-AgentChat-Client "
                         "header), so the hosted tools treat this agent as an unknown client and "
-                        "offer it webhook-setup tools it does not need — `hermes agentchat doctor "
+                        f"offer it webhook-setup tools it does not need — `{cmd} doctor "
                         "--fix` adds the header (the gateway also does at its next start)"
                     )
                 elif identity == "other":
@@ -892,8 +907,8 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                 )
             else:
                 fail(
-                    "hosted tools NOT registered — mcp_servers.agentchat missing from "
-                    "config.yaml. Run `hermes agentchat doctor --fix`, or add:\n"
+                    "hosted tools entry missing — mcp_servers.agentchat is not in "
+                    f"config.yaml. Run `{cmd} doctor --fix`, or add:\n"
                     + manual_snippet(api_base)
                 )
     except ImportError:
@@ -982,6 +997,15 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                     {"ok": ok, "warn": warn, "fail": fail}[level](text)
                 for level, text in _describe_could_not_process(health.get("worker"), now=time.time()):
                     {"ok": ok, "warn": warn, "fail": fail}[level](text)
+        elif state in ("free", "not present") and gateway is not None:
+            # The gateway runs; AgentChat's runtime in it does not hold this
+            # account's socket (it retries while AgentChat cannot be reached,
+            # or its start failed: the gateway log says which).
+            warn(
+                f"WS leader lock not held ({lock_path}) — the gateway runs, but AgentChat's runtime in it "
+                "has not started for this account: it retries on its own while AgentChat cannot be "
+                "reached (the gateway log says why); no wakes until it does"
+            )
         elif state == "free":
             warn(
                 f"WS leader lock file present but no holder ({lock_path}) — "
@@ -1035,8 +1059,12 @@ def _describe_hosted_tools(worker: Any, *, now: float) -> tuple[str, str] | None
     age = f", read {now - float(at):.0f}s ago" if isinstance(at, (int, float)) else ""
     if status == "connected":
         return "ok", f"The running gateway has the hosted tools connected ({tools} tool(s){age})"
+    if status == "lazy":
+        return "ok", f"The running gateway has the hosted tools registered ({tools} tool(s); they connect on first use{age})"
     if status == "connecting":
         return "warn", f"The running gateway is still connecting the hosted tools{age}"
+    if status == "configured":
+        return "warn", f"The running gateway has not connected the hosted tools yet{age}"
     if status == "failed":
         raw_reconnect = section.get("reconnect")
         reconnect: dict[str, Any] = raw_reconnect if isinstance(raw_reconnect, dict) else {}
@@ -2078,7 +2106,7 @@ def _persist_credentials(*, api_key: str, handle: str, api_base: str) -> bool:
     elif outcome.fallback_reason is not None:
         sys.stderr.write(
             f"Warning: the key was saved in the profile .env as {_ENV_API_KEY}, not in the key "
-            f"file: {outcome.fallback_reason}. Fix that, then run `hermes agentchat doctor --fix` "
+            f"file: {outcome.fallback_reason}. Fix that, then run `{_profile_cmd()} doctor --fix` "
             "to move it.\n"
         )
         sys.stderr.flush()
@@ -2314,21 +2342,10 @@ def _print_status(
 _MANIFEST_NAME = re.compile(r"^name:\s*['\"]?([^'\"#\s]+)['\"]?\s*(?:#.*)?$", re.MULTILINE)
 
 
-def _plugin_copies(hermes_home: Path) -> tuple[list[Path], str | None]:
-    """The ``agentchat`` plugins Hermes can find for this profile.
-
-    Returns the directory plugins named ``agentchat`` under the profile's
-    ``plugins/`` (a ``hermes plugins install`` git clone, or a copy left
-    there), sorted the way Hermes scans them (the last one is the one it
-    loads), and the version of the pip distribution when its ``agentchat``
-    entry point is installed (else ``None``). A directory's name is its
-    manifest's ``name:`` (``plugin.yaml`` or ``plugin.yml``), or the
-    directory name when the manifest has none, as in Hermes. Hermes keeps a
-    directory plugin and drops an entry point with the same name, so with
-    both present the pip package never runs. Never raises.
-    """
+def _agentchat_directories(plugins_dir: Path) -> list[Path]:
+    """The directory plugins named ``agentchat`` under ``plugins_dir``, sorted
+    the way Hermes scans them. Never raises."""
     directories: list[Path] = []
-    plugins_dir = hermes_home / "plugins"
     try:
         candidates = sorted(path for path in plugins_dir.iterdir() if path.is_dir())
     except OSError:
@@ -2346,6 +2363,69 @@ def _plugin_copies(hermes_home: Path) -> tuple[list[Path], str | None]:
         named = _MANIFEST_NAME.search(manifest)
         if (named[1] if named else candidate.name) == "agentchat":
             directories.append(candidate)
+    return directories
+
+
+def _profiles_with_a_git_copy(hermes_home: Path) -> list[Path]:
+    """Every profile home on this machine (the default and each under
+    ``profiles/``) with its own ``agentchat`` directory plugin. Never raises."""
+    from .profile_scope import PROFILES_DIRNAME, hermes_root_of
+
+    root = hermes_root_of(hermes_home)
+    homes = [root]
+    with contextlib.suppress(OSError):
+        homes += sorted(path for path in (root / PROFILES_DIRNAME).iterdir() if path.is_dir())
+    return [home for home in homes if _agentchat_directories(home / "plugins")]
+
+
+def _git_copies_line(hermes_home: Path) -> str | None:
+    """T5-F07: two profiles each with a git install of this plugin. Hermes
+    installs one plugin package for every profile (its plugin venv is a uv
+    workspace), so the second install fails to resolve and leaves that copy
+    disabled, and every copy blocks the next install or update. ``None`` when
+    at most one profile has a copy."""
+    from .profile_scope import profile_label
+
+    homes = _profiles_with_a_git_copy(hermes_home)
+    if len(homes) < 2:
+        return None
+    # The default profile's copy is the first install on most machines; else this profile's.
+    keep = next(
+        (h for h in homes if profile_label(h) == "default"),
+        next((h for h in homes if key_store.same_home(h, hermes_home)), homes[0]),
+    )
+    others = [h for h in homes if h is not keep]
+
+    def steps(home: Path) -> str:
+        label = profile_label(home)
+        flag = "" if label == "default" else f" -p {label}"
+        return f"`hermes{flag} plugins remove agentchat`, then `hermes{flag} plugins enable agentchat`"
+
+    return (
+        f"agentchat is installed from git in {len(homes)} profiles "
+        f"({', '.join(profile_label(h) for h in homes)}). Hermes installs one plugin package for every "
+        "profile, so a second `plugins install` fails (\"Two workspace members are both named "
+        "`agentchatme-hermes`\", yet exits 0), leaves that copy disabled, and blocks the next install or "
+        f"update. Keep the copy in {profile_label(keep)}; in "
+        + "; in ".join(f"{profile_label(h)}: {steps(h)}" for h in others)
+        + " (enable uses the package already installed)"
+    )
+
+
+def _plugin_copies(hermes_home: Path) -> tuple[list[Path], str | None]:
+    """The ``agentchat`` plugins Hermes can find for this profile.
+
+    Returns the directory plugins named ``agentchat`` under the profile's
+    ``plugins/`` (a ``hermes plugins install`` git clone, or a copy left
+    there), sorted the way Hermes scans them (the last one is the one it
+    loads), and the version of the pip distribution when its ``agentchat``
+    entry point is installed (else ``None``). A directory's name is its
+    manifest's ``name:`` (``plugin.yaml`` or ``plugin.yml``), or the
+    directory name when the manifest has none, as in Hermes. Hermes keeps a
+    directory plugin and drops an entry point with the same name, so with
+    both present the pip package never runs. Never raises.
+    """
+    directories = _agentchat_directories(hermes_home / "plugins")
 
     from importlib import metadata
 
@@ -2362,6 +2442,13 @@ def _plugin_copies(hermes_home: Path) -> tuple[list[Path], str | None]:
         return directories, metadata.version("agentchatme-hermes")
     except metadata.PackageNotFoundError:
         return directories, "(version unknown)"
+
+
+def _profile_cmd() -> str:
+    """``hermes agentchat`` spelled for the current profile (``hermes -p NAME agentchat``)."""
+    from .profile_scope import resolve_hermes_home
+
+    return cli_prefix(resolve_hermes_home())
 
 
 def _printline(message: str) -> None:

@@ -1082,3 +1082,42 @@ class TestEveryPath:
         write_soul_anchor(_line_v2(), handle="alice", soul_path=soul)
         assert self._logout() == 0
         assert soul.read_text(encoding="utf-8") == "# Mine\n"
+
+
+# ───────────────────────── a file with no final line break (MS-F16) ─────────────────────────
+
+
+class TestNoFinalLineBreak:
+    """Hermes' own SOUL.md template ends without a line break: placing the block
+    and removing it again gives back the file byte for byte."""
+
+    TEMPLATE = "# Persona\n\nYou are a helpful assistant.\n\nBe concise, not by default."
+
+    @pytest.mark.parametrize("eol", ["\n", "\r\n"], ids=["lf", "crlf"])
+    def test_place_then_remove_round_trips(self, tmp_path: Path, eol: str) -> None:
+        soul = tmp_path / "SOUL.md"
+        original = self.TEMPLATE.replace("\n", eol).encode()
+        soul.write_bytes(original)
+        assert place_soul_anchor(_line(), handle="alice", soul_path=soul).outcome == "placed"
+        placed = soul.read_bytes().decode("utf-8")
+        assert placed.endswith(ANCHOR_END), "no line break added after the block"
+        assert inspect_soul(handle="alice", identity_line=_line(), soul_path=soul).outcome == "unchanged"
+        assert remove_soul_anchor(handle="alice", soul_path=soul).outcome == "removed"
+        assert soul.read_bytes() == original
+
+    def test_a_file_that_ends_with_a_line_break_keeps_it(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(self.TEMPLATE + "\n", encoding="utf-8")
+        place_soul_anchor(_line(), handle="alice", soul_path=soul)
+        assert soul.read_text(encoding="utf-8").endswith(ANCHOR_END + "\n")
+        remove_soul_anchor(handle="alice", soul_path=soul)
+        assert soul.read_text(encoding="utf-8") == self.TEMPLATE + "\n"
+
+    def test_the_gateway_refresh_of_a_block_at_the_end_keeps_the_end(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(self.TEMPLATE, encoding="utf-8")
+        place_soul_anchor(_line_v2(), handle="alice", soul_path=soul)
+        assert follow_soul(handle="alice", identity_line=_line(), soul_path=soul).outcome == "updated"
+        assert soul.read_text(encoding="utf-8").endswith(ANCHOR_END)
+        remove_soul_anchor(handle="alice", soul_path=soul)
+        assert soul.read_text(encoding="utf-8") == self.TEMPLATE

@@ -2,6 +2,61 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **The agent answers again after a gateway start without network.** When the gateway started while api.agentchat.me
+  could not be reached (a reboot before the network, a DNS or provider outage), Hermes' MCP client tried
+  `mcp_servers.agentchat` three times and parked it. Parking drops its tools, and the server then waits for a
+  reconnect request or Hermes' timed self-probe: 5 min, and on v0.23.3 and `main` doubling per failed probe up to an
+  hour. Nothing asked for that reconnect. The plugin's socket came back on its own, so every wake ended
+  `tools_unavailable`, and a message stayed unanswered until `hermes gateway restart`. Now:
+  - The plugin reads Hermes' own state of the server, the one `hermes mcp list` shows.
+  - When that state is parked, it asks Hermes to reconnect, with the same request Hermes' connectors make after a
+    re-authorization. It asks when the AgentChat runtime activates and when a turn is held for the tools, so the
+    tools come back within the hold and the turn starts in that cycle.
+  - It asks at most once a minute per profile, less often while the server stays parked (capped at 30 min). A
+    connected or connecting server is never asked.
+  - The `tools_unavailable` log line names the cause Hermes gives: parked after an error, still connecting, the entry
+    disabled or missing. It no longer blames the mcp SDK.
+- **doctor reports the parked state, with its remedy.** It reads the running gateway's hosted tools state from the
+  health record. A parked server is a `[fail]`: Hermes parked it after its connection failed, the plugin is asking for
+  the reconnect, and `hermes gateway restart` reconnects it now. A `tools_unavailable` cycle says what to do. The
+  config check is called what it is, "hosted tools entry in config.yaml": it used to read "hosted tools registered"
+  while the tools were parked.
+- **logout names the restart that frees the socket.** When the default profile's gateway holds a named profile's
+  socket (a multiplexing gateway), logout now names only `hermes gateway restart`. There, `hermes -p <name> gateway
+  restart` reconnects only Hermes' adapters: it reports success and frees nothing.
+- **Offline, doctor no longer contradicts itself.**
+  - With the gateway running but AgentChat's runtime not started for the account, it says so. It used to say
+    "gateway is not running" next to "Hermes gateway running".
+  - The SOUL.md block is compared with the cached texts for the saved handle, as `status` does, instead of being
+    reported as "cannot verify".
+- **Hints name the profile.** In a named profile they now read `hermes -p <name> agentchat …`: `status` without a key, a
+  key that no longer authenticates, the `--api-key` warning, the start-failure and CLI-only log lines, the wizard and
+  the key source.
+- **Placing the identity line keeps a missing final line break.** Hermes' own SOUL.md template ends without one, so
+  register followed by logout used to leave the file one byte longer. Now it comes back byte for byte.
+
+### Changed
+
+- **The README installs with Hermes, pinned to a release:**
+
+  ```bash
+  sha=$(git ls-remote https://github.com/agentchatme/agentchat-hermes.git 'refs/tags/vX.Y.Z^{}' | cut -f1)
+  hermes plugins install https://github.com/agentchatme/agentchat-hermes.git --ref "$sha" --yes-deps
+  hermes plugins enable agentchat
+  ```
+
+  `pip install agentchatme-hermes` fails on a stock Hermes: the system pip refuses (PEP 668), and Hermes' own Python
+  has no pip. It stays documented only for a Hermes installed with pip into an environment you manage, with how to
+  tell which one you have.
+- **Another profile enables the installed plugin instead of installing it again.** Hermes installs one plugin package
+  for every profile, and a second profile's `plugins install` fails ("Two workspace members are both named
+  `agentchatme-hermes`") while still exiting 0, so the other profile runs `hermes -p <name> plugins enable agentchat`.
+  `doctor` names any profile with its own copy, and gives the two commands that fix it.
+
 ## [0.6.3] — 2026-11-22
 
 Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): logout removes only the SOUL.md block AgentChat placed for this agent; setup and `doctor --fix` leave a block a person edited (delete it, then `doctor --fix`, to have the served line); logout says when a running gateway still holds the agent's connection. Upgrade with the full commit SHA: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git 'refs/tags/v0.6.3^{}' | cut -f1`.

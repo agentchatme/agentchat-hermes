@@ -47,7 +47,7 @@ from pathlib import Path
 from typing import Any
 
 from . import key_store
-from .config import ENV_API_KEY, copy_owner
+from .config import ENV_API_KEY, cli_prefix, copy_owner
 from .profile_scope import profile_label, resolve_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -131,7 +131,7 @@ def build_key_source() -> Any | None:
                 if read.status == "missing":
                     result.error = (
                         f"no AgentChat key saved for profile {profile_label(home)} "
-                        f"({read.path}); run `hermes agentchat login`"
+                        f"({read.path}); run `{cli_prefix(home)} login`"
                     )
                     result.error_kind = ErrorKind.NOT_CONFIGURED
                 elif read.status == "copied":
