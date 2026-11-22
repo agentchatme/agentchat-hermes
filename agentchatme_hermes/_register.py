@@ -598,15 +598,20 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
         else:
             logger.warning("agentchat plugin: SOUL.md identity line not placed for profile=%s — %s", label, placement.detail)
     elif outcome == "other_agent":
+        from .config import cli_prefix
+
+        cmd = cli_prefix(runtime.hermes_home)
         logger.error(
-            "agentchat plugin: IDENTITY MISMATCH for profile=%s — %s says this agent is @%s but "
-            "AGENTCHAT_API_KEY authenticates as @%s. This profile is configured with another agent's "
-            "key (or another agent's SOUL.md). Fix the key with `hermes agentchat login` in this "
-            "profile, or re-run `hermes agentchat register`. Messages this profile sends will be "
-            "attributed to @%s.",
+            "agentchat plugin: IDENTITY MISMATCH for profile=%s — %s holds @%s's AgentChat block, but "
+            "this profile's saved key authenticates as @%s: the key or that block is another agent's. "
+            "Fix the key (`%s login`) or remove that block (then `%s doctor --fix` places @%s's). "
+            "Until then, messages this profile sends are attributed to @%s.",
             label,
             path,
             result.claimed,
+            actual,
+            cmd,
+            cmd,
             actual,
             actual,
         )

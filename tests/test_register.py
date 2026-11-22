@@ -300,8 +300,34 @@ class TestReconcileSoulAnchor:
         with caplog.at_level(logging.ERROR, logger="agentchatme_hermes._register"):
             _register._reconcile_soul_anchor(self._runtime("operations", tmp_path))
         assert soul.read_text() == before
-        messages = [rec.getMessage() for rec in caplog.records]
-        assert any("IDENTITY MISMATCH" in m and "@growth" in m and "@operations" in m for m in messages)
+        messages = [rec.getMessage() for rec in caplog.records if "IDENTITY MISMATCH" in rec.getMessage()]
+        assert len(messages) == 1
+        said = messages[0]
+        assert "@growth's AgentChat block" in said and "authenticates as @operations" in said
+        # The key has been in the key file since 0.5.4, and either side may be the wrong one.
+        assert "AGENTCHAT_API_KEY" not in said
+        assert "Fix the key (`hermes agentchat login`) or remove that block" in said
+        assert "`hermes agentchat doctor --fix` places @operations's" in said
+
+    def test_mismatch_names_the_profile_flag_for_a_named_profile(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from agentchatme_hermes import _register, soul_anchor
+
+        home = tmp_path / ".hermes" / "profiles" / "growth"
+        home.mkdir(parents=True)
+        soul = home / "SOUL.md"
+        soul_anchor.write_soul_anchor(_served_line("ops"), handle="ops", soul_path=soul)
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        with caplog.at_level(logging.ERROR, logger="agentchatme_hermes._register"):
+            _register._reconcile_soul_anchor(self._runtime("growth", home))
+        (said,) = [r.getMessage() for r in caplog.records if "IDENTITY MISMATCH" in r.getMessage()]
+        assert "profile=growth" in said
+        assert "Fix the key (`hermes -p growth agentchat login`) or remove that block" in said
+        assert "`hermes -p growth agentchat doctor --fix`" in said
 
     def test_matching_anchor_is_quiet(
         self,

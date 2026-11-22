@@ -410,6 +410,7 @@ class TestDoctorLines:
         write_soul_anchor(_line("growth"), handle="growth", soul_path=soul)
         ((level, line),) = _Lines().run(soul, monkeypatch, **self._served("ops"))
         assert level == "fail" and line.startswith("IDENTITY MISMATCH") and "@growth" in line and "@ops" in line
+        assert "Fix the key (`hermes agentchat login`) or remove that block" in line
 
     def test_offline_the_strict_owner(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         soul = tmp_path / "SOUL.md"

@@ -1451,9 +1451,9 @@ def _doctor_soul_checks(
         outcome == "unverified" and state.claimed is not None and handle is not None and state.claimed != handle
     ):
         fail(
-            f"IDENTITY MISMATCH: {where} says @{state.claimed} but the configured key authenticates as "
-            f"@{handle}. This profile holds another agent's key or another agent's SOUL.md — run "
-            f"`{cmd} login` here with the right key, or re-register."
+            f"IDENTITY MISMATCH: {where} holds @{state.claimed}'s AgentChat block, but this profile's saved "
+            f"key authenticates as @{handle}: the key or that block is another agent's. Fix the key "
+            f"(`{cmd} login`) or remove that block (then `{cmd} doctor --fix` places @{handle}'s)"
         )
     elif outcome == "hand_edited":
         names = f"; its words name @{state.named}" if state.named else ""

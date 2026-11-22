@@ -37,6 +37,10 @@ upgrades an older installed SDK): 1.8.0's `anchor.owner` / `decide` / `follow` a
   older text of ours, edited by hand and how to restore it, another agent's, several blocks), the strict `owner` when
   AgentChat does not answer, and warns when the installed kit has no strict reading.
 
+- **The IDENTITY MISMATCH lines** (the gateway's log and `doctor`) no longer say "AGENTCHAT_API_KEY authenticates as"
+  (the key has been in the key file since 0.5.4) and no longer name only the key as the cause: either the key or the
+  SOUL.md block can be another agent's, so they say "fix the key (`hermes agentchat login`) or remove that block (then
+  `doctor --fix` places this agent's)", spelled `hermes -p <profile> agentchat …` for a named profile.
 - **The upgrade command for a pinned git install** (README, and the 0.6.1 and 0.5.4 entries below) gave a release tag
   to `--ref`; Hermes takes only a full 40-character commit SHA there. It now gives the release's commit and how to
   resolve a tag to it: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git 'refs/tags/vX.Y.Z^{}' | cut -f1`
