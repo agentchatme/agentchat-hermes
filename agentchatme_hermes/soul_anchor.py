@@ -43,11 +43,19 @@ refresh — the activation path, on every texts change: ``anchor.follow``
           edited by hand is the user's; several blocks are left as they are).
           With no block at all, the line is placed (the backfill).
 place   — the wizard and ``register`` / ``login`` / ``recover`` after the key
-          is validated, and ``doctor --fix``: an explicit request, so a block
-          edited by hand is put back to the served line, and (``login`` and
-          the wizard only) another agent's block is replaced by this one's.
-          ``doctor --fix`` never replaces another agent's block.
-remove  — ``hermes agentchat logout``.
+          is validated, and ``doctor --fix``: this agent's own block is
+          brought to the served line, and one is placed where there is none.
+          A block edited by hand is the user's and is left (said, with the
+          remedy: delete that block, then ``doctor --fix``); several blocks
+          are left. Another agent's block is replaced by setup (``login``,
+          the wizard: this profile becomes this agent, said) and refused by
+          ``doctor --fix`` (a mismatch to fix).
+remove  — ``hermes agentchat logout`` (and the wizard's logout): only the
+          block AgentChat placed for this profile's agent — ``anchor.owner``
+          (strict) is this profile's handle. A block edited by hand, another
+          agent's, or several blocks are left as they are, and the step says
+          so: removing AgentChat never takes the user's words, or another
+          agent's identity, out of their file.
 orphan  — if the user uninstalls the package without running ``logout``,
           the block stays in SOUL.md. Documented in the README.
 
@@ -178,11 +186,26 @@ def _without_bom(text: str) -> str:
     return text[1:] if text.startswith("\ufeff") else text
 
 
-def write_text_atomic(path: Path, text: str) -> None:
+class _ChangedMeanwhile(Exception):
+    """The file is no longer the text a write was decided on (nothing written)."""
+
+
+def _still(target: Path, expected: str) -> bool:
+    try:
+        return target.read_bytes() == expected.encode("utf-8")
+    except FileNotFoundError:
+        return False
+
+
+def write_text_atomic(path: Path, text: str, *, unless_changed_from: str | None = None) -> None:
     """Replace the file at ``path`` (through a symlink: the file it points to)
     with ``text`` as UTF-8: a temp file beside it (created exclusively, the
     file's mode), flushed, then renamed over it. A reader sees the old file or
-    the new one, never part of one; a failure leaves the old file as it was."""
+    the new one, never part of one; a failure leaves the old file as it was.
+
+    With ``unless_changed_from`` (the text the write was decided on), the file
+    is read again right before the rename, and if it is no longer that text
+    (or is gone) nothing is written: :class:`_ChangedMeanwhile`."""
     target = Path(path)
     if target.is_symlink():
         target = target.resolve()
@@ -203,6 +226,8 @@ def write_text_atomic(path: Path, text: str) -> None:
             os.fsync(handle.fileno())
         with contextlib.suppress(OSError):
             os.chmod(tmp, mode)
+        if unless_changed_from is not None and not _still(target, unless_changed_from):
+            raise _ChangedMeanwhile(str(target))
         os.replace(tmp, target)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -289,22 +314,38 @@ def inspect_soul(
 
 # ─── place (wizard, register / login / recover, doctor --fix) ───────────────
 
-PlacementOutcome = Literal["unchanged", "updated", "placed", "restored", "replaced_other", "refused", "failed"]
+PlacementOutcome = Literal["unchanged", "updated", "placed", "replaced_other", "left", "refused", "failed"]
+
+PLACE_ATTEMPTS = 3
+"""Decisions in all before a placement leaves a file that keeps changing under it."""
 
 
 @dataclass(frozen=True)
 class AnchorPlacement:
+    """What a placement did. ``left``: a block edited by hand, or several
+    blocks, left as they are on purpose (a warning: ``detail`` gives the
+    remedy). ``refused``: another agent's block, kept by ``doctor --fix``."""
+
     outcome: PlacementOutcome
     path: Path
     detail: str
 
     @property
     def ok(self) -> bool:
-        return self.outcome not in ("refused", "failed")
+        """This agent's block holds the served line now."""
+        return self.outcome in ("unchanged", "updated", "placed", "replaced_other")
 
     @property
     def wrote(self) -> bool:
-        return self.outcome in ("updated", "placed", "restored", "replaced_other")
+        return self.outcome in ("updated", "placed", "replaced_other")
+
+
+def hand_edited_remedy(path: Path | str) -> str:
+    """What to do to have the served line instead of a block edited by hand:
+    the user's words are replaced only once they delete the block themselves."""
+    from .config import cli_prefix
+
+    return f"to have the served line, delete that block, then run `{cli_prefix(Path(path).parent)} doctor --fix`"
 
 
 def place_soul_anchor(
@@ -318,76 +359,95 @@ def place_soul_anchor(
     """Place the served identity line for ``handle`` in SOUL.md, on request.
 
     This agent's own block is brought to the served line (``anchor.follow``);
-    no block (or no file) gets one; a block edited by hand is put back to the
-    served line (the request is the user's); another agent's block is
-    replaced only with ``replace_other`` (``login`` and the wizard: this
-    profile becomes this agent), else refused (``doctor --fix``). Several
-    blocks are refused (one write would remove the others). The new text is
-    read back and must be this agent's block with the served line.
+    no block (or no file) gets one. A block edited by hand is the user's: left
+    as it is, with the remedy (delete that block, then ``doctor --fix``).
+    Several blocks are left (one write would remove the others). Another
+    agent's block is replaced only with ``replace_other`` (``login`` and the
+    wizard: this profile becomes this agent), else refused (``doctor --fix``).
+    A write is decided on the text it replaces: if the file changes before
+    the rename, nothing is written and the decision is made again. The new
+    text is read back and must be this agent's block with the served line.
 
     Raises :class:`AnchorError` when the line does not name ``@handle`` (before
     anything is written) or the kit has no strict reading.
     """
+    from .config import cli_prefix
+
     target = soul_path if soul_path is not None else resolve_soul_path()
     bare = normalize_handle(handle)
     block = render_anchor_block(identity_line, handle=bare)
     anchor = _kit()
+    cmd = cli_prefix(Path(target).parent)
 
-    result = anchor.follow(target, handle=bare, identity_line=identity_line, template=template)
-    if result.outcome == "updated":
-        return AnchorPlacement("updated", target, f"identity line for @{bare} refreshed to the served text in {target}")
-    if result.outcome == "unchanged":
-        return AnchorPlacement("unchanged", target, f"identity line for @{bare} in {target} (the served text)")
-    if result.outcome in ("failed", "edited_meanwhile"):
-        return AnchorPlacement("failed", target, result.detail)
-    if result.outcome == "several_blocks":
-        return AnchorPlacement(
-            "refused",
-            target,
-            f"{target} holds more than one AgentChat block — nothing written; remove the extra blocks by hand, "
-            "then run this again",
+    for _ in range(PLACE_ATTEMPTS):
+        result = anchor.follow(target, handle=bare, identity_line=identity_line, template=template)
+        if result.outcome == "updated":
+            return AnchorPlacement("updated", target, f"identity line for @{bare} refreshed to the served text in {target}")
+        if result.outcome == "unchanged":
+            return AnchorPlacement("unchanged", target, f"identity line for @{bare} in {target} (the served text)")
+        if result.outcome in ("failed", "edited_meanwhile"):
+            return AnchorPlacement("failed", target, result.detail)
+        if result.outcome == "hand_edited":
+            return AnchorPlacement(
+                "left", target, f"the AgentChat block in {target} was edited by hand, so it is left; {hand_edited_remedy(target)}"
+            )
+        if result.outcome == "several_blocks":
+            return AnchorPlacement(
+                "left",
+                target,
+                f"{target} holds more than one AgentChat block, so they are left (one write would remove the others); "
+                f"remove the extra ones by hand, then run `{cmd} doctor --fix`",
+            )
+        if result.outcome == "other_agent" and not replace_other:
+            return AnchorPlacement(
+                "refused",
+                target,
+                f"the AgentChat block in {target} is @{result.claimed}'s, not @{bare}'s — not replaced: fix the key "
+                f"(`{cmd} login`) or remove that block",
+            )
+        if result.outcome not in ("absent", "other_agent"):
+            return AnchorPlacement("failed", target, result.detail)
+
+        # No block, or (setup) another agent's: write this agent's, decided on the text it replaces.
+        try:
+            text = read_soul(target)
+        except AnchorError as exc:
+            return AnchorPlacement("failed", target, str(exc))
+        except OSError as exc:
+            return AnchorPlacement("failed", target, f"could not read {target}: {exc}")
+        now = anchor.decide(_without_bom(text or ""), handle=bare, identity_line=identity_line, template=template)
+        if now.outcome != result.outcome or now.claimed != result.claimed:
+            continue  # changed since it was read: decide again
+        try:
+            write_text_atomic(target, anchor.replace(text or "", block), unless_changed_from=text)
+        except _ChangedMeanwhile:
+            continue
+        except OSError as exc:
+            return AnchorPlacement("failed", target, f"could not write the identity line to {target}: {exc}")
+
+        try:
+            back = read_soul(target)
+        except (AnchorError, OSError):
+            back = None
+        # Landed = the kit reads this agent's block, in the current shape, with the served line.
+        landed = back is not None and (
+            anchor.decide(_without_bom(back), handle=bare, identity_line=identity_line, template=template).outcome
+            == "unchanged"
         )
-    if result.outcome == "other_agent" and not replace_other:
-        return AnchorPlacement(
-            "refused",
-            target,
-            f"the AgentChat block in {target} is @{result.claimed}'s, not @{bare}'s — not replaced: fix the key "
-            "(`hermes agentchat login`) or remove that block",
-        )
-
-    try:
-        text = read_soul(target)
-    except AnchorError as exc:
-        return AnchorPlacement("failed", target, str(exc))
-    except OSError as exc:
-        return AnchorPlacement("failed", target, f"could not read {target}: {exc}")
-    try:
-        write_text_atomic(target, anchor.replace(text or "", block))
-    except OSError as exc:
-        return AnchorPlacement("failed", target, f"could not write the identity line to {target}: {exc}")
-
-    try:
-        back = read_soul(target)
-    except (AnchorError, OSError):
-        back = None
-    # Landed = the kit reads this agent's block, in the current shape, with the served line.
-    landed = back is not None and (
-        anchor.decide(_without_bom(back), handle=bare, identity_line=identity_line, template=template).outcome
-        == "unchanged"
+        if not landed:
+            return AnchorPlacement(
+                "failed", target, f"{target} did not read back with the served identity line for @{bare} after the write"
+            )
+        if result.outcome == "other_agent":
+            return AnchorPlacement(
+                "replaced_other",
+                target,
+                f"the AgentChat block in {target} was @{result.claimed}'s; it now is @{bare}'s (this profile is @{bare})",
+            )
+        return AnchorPlacement("placed", target, f"identity line for @{bare} placed in {target}")
+    return AnchorPlacement(
+        "failed", target, f"{target} kept changing while the identity line was being placed; nothing written"
     )
-    if not landed:
-        return AnchorPlacement(
-            "failed", target, f"{target} did not read back with the served identity line for @{bare} after the write"
-        )
-    if result.outcome == "hand_edited":
-        return AnchorPlacement(
-            "restored", target, f"the AgentChat block in {target} was edited by hand; it now is @{bare}'s served identity line"
-        )
-    if result.outcome == "other_agent":
-        return AnchorPlacement(
-            "replaced_other", target, f"the AgentChat block in {target} was @{result.claimed}'s; it now is @{bare}'s"
-        )
-    return AnchorPlacement("placed", target, f"identity line for @{bare} placed in {target}")
 
 
 def write_soul_anchor(identity_line: str, *, handle: str, soul_path: Path | None = None) -> Path:
@@ -403,25 +463,142 @@ def write_soul_anchor(identity_line: str, *, handle: str, soul_path: Path | None
 
 # ─── remove (logout) ────────────────────────────────────────────────────────
 
+REMOVE_ATTEMPTS = 3
+"""Decisions in all (the first, and the ones made again after the file changed
+under the write) before a removal leaves the file for now."""
 
-def remove_soul_anchor(*, soul_path: Path | None = None) -> bool:
-    """Idempotently strip the AgentChat identity block from SOUL.md.
+RemovalOutcome = Literal[
+    "removed",
+    "absent",
+    "hand_edited",
+    "other_agent",
+    "several_blocks",
+    "handle_unknown",
+    "edited_meanwhile",
+    "failed",
+]
 
-    Returns ``True`` if a block was found and removed, ``False`` if the file or
-    the block was absent. The rest of the file is kept as it was (its line
-    breaks, whether it ends with one); the write is atomic. A file left empty
-    is kept (not deleted): Hermes treats absent and empty the same way.
-    :class:`AnchorError` when the file is not UTF-8 (not written).
+
+@dataclass(frozen=True)
+class AnchorRemoval:
+    """What removing AgentChat did to SOUL.md.
+
+    ``removed``: this agent's block is gone (the rest of the file as it was).
+    ``absent``: no file, or no AgentChat block in it. Left as they are, on
+    purpose: ``hand_edited`` (the block is not a text AgentChat placed — the
+    user's), ``other_agent`` (``claimed``'s block), ``several_blocks``,
+    ``handle_unknown`` (this profile's handle is not known, so whose block it
+    is cannot be told), ``edited_meanwhile`` (the file kept changing under the
+    write). ``failed``: it could not be read or written. ``detail`` is the
+    sentence for the person, naming the path."""
+
+    outcome: RemovalOutcome
+    path: Path
+    claimed: str | None
+    detail: str
+
+    @property
+    def removed(self) -> bool:
+        return self.outcome == "removed"
+
+    @property
+    def left(self) -> bool:
+        """A block is still in the file on purpose; ``detail`` says why and what to do."""
+        return self.outcome in ("hand_edited", "other_agent", "several_blocks", "handle_unknown", "edited_meanwhile")
+
+
+def remove_soul_anchor(
+    *,
+    handle: str | None,
+    identity_line: str | None = None,
+    template: str | None = None,
+    soul_path: Path | None = None,
+) -> AnchorRemoval:
+    """Remove the identity block AgentChat placed for ``handle`` from SOUL.md.
+
+    The block goes only when it is this agent's by the kit's strict reading
+    (``anchor.owner`` is ``handle``: its handle line, or, without one, its
+    whole text is exactly a text AgentChat served). A block edited by hand,
+    another agent's block, several blocks, or any block while ``handle`` is
+    not known are left as they are, and :attr:`AnchorRemoval.detail` says so.
+    ``identity_line`` and ``template`` are the served texts as Hermes places
+    them, when in hand (the cached copy): they let a block of the served text
+    without a handle line be recognised; without them only a handle line or
+    one of the lines served before is.
+
+    The rest of the file is kept as it was (its line breaks, whether it ends
+    with one, a byte-order mark, its mode, a symlink); the write is atomic and
+    is not made if the file changed since it was read (the decision is made
+    again, :data:`REMOVE_ATTEMPTS` times at most). A file left empty is kept:
+    Hermes treats absent and empty the same way. A file that is not UTF-8 is
+    not written. Never raises.
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
-    existing = read_soul(target)
-    if existing is None:
-        return False
-    from agentchatme.integration import anchor
+    bare = normalize_handle(handle) if handle else ""
+    by_hand = "remove it by hand if you no longer want it"
 
-    stripped = anchor.remove(existing)
-    if stripped == existing:
-        return False
-    write_text_atomic(target, stripped)
-    logger.info("SOUL.md anchor removed from %s", target)
-    return True
+    def result(outcome: RemovalOutcome, detail: str, claimed: str | None = None) -> AnchorRemoval:
+        return AnchorRemoval(outcome, target, claimed, detail)
+
+    def failed(why: str) -> AnchorRemoval:
+        return result(
+            "failed",
+            f"could not remove the AgentChat block from {target}: {why}; remove it by hand (the lines from "
+            f"`{ANCHOR_START}` to `{ANCHOR_END}`) if you no longer want it",
+        )
+
+    try:
+        anchor = _kit()
+    except (AnchorError, ImportError) as exc:
+        return failed(str(exc))
+    try:
+        for _ in range(REMOVE_ATTEMPTS):
+            try:
+                text = read_soul(target)
+            except AnchorError as exc:
+                return failed(str(exc))
+            except OSError as exc:
+                return failed(f"it could not be read ({exc})")
+            if text is None:
+                return result("absent", f"{target} does not exist")
+            body = _without_bom(text)
+            found = anchor.find(body, template=template)
+            if found is None:
+                return result("absent", f"no AgentChat block in {target}")
+            # As the kit's ``decide``: taking the block out shows whether another one is left.
+            if anchor.find(body[: found.start] + body[found.end :]) is not None:
+                return result(
+                    "several_blocks",
+                    f"left the AgentChat blocks in {target}: there is more than one; remove them by hand if you "
+                    "no longer want them",
+                )
+            claimed = anchor.owner(found, handle=bare or None, identity_line=identity_line, template=template)
+            if claimed is None:
+                return result("hand_edited", f"left your edited AgentChat block in {target}; {by_hand}")
+            if not bare:
+                return result(
+                    "handle_unknown",
+                    f"left the AgentChat block in {target}: this profile's AgentChat handle is not known, so "
+                    f"whether the block is this agent's cannot be told; {by_hand}",
+                    claimed,
+                )
+            if claimed != bare:
+                return result(
+                    "other_agent",
+                    f"left @{claimed}'s AgentChat block in {target}: it is another agent's, not @{bare}'s; {by_hand}",
+                    claimed,
+                )
+            try:
+                write_text_atomic(target, anchor.remove(text), unless_changed_from=text)
+            except _ChangedMeanwhile:
+                continue
+            except OSError as exc:
+                return failed(f"it could not be written ({exc})")
+            logger.info("SOUL.md identity line for @%s removed from %s", bare, target)
+            return result("removed", f"removed the identity line for @{bare} from {target}", bare)
+        return result(
+            "edited_meanwhile",
+            f"left the AgentChat block in {target}: the file kept changing while it was being removed; {by_hand}",
+        )
+    except Exception as exc:
+        return failed(str(exc))

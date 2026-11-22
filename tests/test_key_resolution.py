@@ -354,7 +354,7 @@ class TestLogout:
         save_key(ONE)
         clone = _hermes_profile_create(root, "he2", clone_all=True)
         monkeypatch.setattr(profile_scope, "resolve_hermes_home", lambda: clone)
-        monkeypatch.setattr(cli, "_uninstall_soul_anchor", lambda: None)
+        monkeypatch.setattr(cli, "_uninstall_soul_anchor", lambda _identity: None)
         monkeypatch.setattr(cli, "_uninstall_secrets_registration", lambda: None)
         monkeypatch.setattr(cli, "_uninstall_mcp_registration", lambda: None)
         assert cli._dispatch_logout(argparse.Namespace()) == 0
@@ -366,6 +366,130 @@ class TestLogout:
     def test_logout_with_nothing(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
         assert cli._dispatch_logout(argparse.Namespace()) == 0
         assert "Nothing to clear" in capsys.readouterr().out
+
+
+class TestLogoutWithAGatewayRunning:
+    """A running gateway keeps the socket it opened with the key: logout says
+    so, and how to stop it, when a gateway lives for the account (the
+    ``doctor`` / ``status`` rule: a fresh record, its pid alive, the lock held)."""
+
+    def _quiet(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(cli, "_uninstall_soul_anchor", lambda _identity: None)
+        monkeypatch.setattr(cli, "_uninstall_secrets_registration", lambda: None)
+        monkeypatch.setattr(cli, "_uninstall_mcp_registration", lambda: None)
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="the leader lock is fcntl, POSIX-only")
+    def test_a_live_gateway_for_the_account_is_said(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import os
+        import time
+
+        from agentchatme_hermes.leader_lock import (
+            lock_path_for,
+            release_leader_lock,
+            try_acquire_ws_leader_lock,
+        )
+        from agentchatme_hermes.profile_scope import account_fingerprint
+        from agentchatme_hermes.ws_health import health_path_for, write_ws_health
+
+        home = profile_home()
+        save_key(ONE)
+        self._quiet(monkeypatch)
+        lock = lock_path_for(hermes_home=home, account_fingerprint=account_fingerprint(cli._api_base(), ONE))
+        health = health_path_for(lock)
+        note = (
+            f"The running gateway (pid {os.getpid()}) still holds @alice's AgentChat connection, so this profile "
+            "is still woken and gated, now without the hosted tools: restart it (`hermes gateway restart`) so it "
+            "stops serving this profile."
+        )
+
+        write_ws_health(handle="alice", state="connected", path=health)
+        assert cli._dispatch_logout(argparse.Namespace()) == 0
+        assert note not in capsys.readouterr().out, "the lock is free: no gateway lives behind the record"
+
+        fd = try_acquire_ws_leader_lock(lock)
+        assert fd is not None
+        try:
+            save_key(ONE)
+            write_ws_health(handle="alice", state="connected", path=health, now=time.time() - 3600)
+            assert cli._dispatch_logout(argparse.Namespace()) == 0
+            assert note not in capsys.readouterr().out, "a stale record is not a live gateway"
+
+            save_key(ONE)
+            write_ws_health(handle="alice", state="connected", path=health)
+            assert cli._dispatch_logout(argparse.Namespace()) == 0
+            out = capsys.readouterr().out
+        finally:
+            release_leader_lock(fd)
+        assert "AgentChat key removed from this profile" in out
+        assert out.rstrip().endswith(note)
+        assert ONE not in out
+
+    def test_without_a_gateway_nothing_is_said(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        save_key(ONE)
+        self._quiet(monkeypatch)
+        assert cli._dispatch_logout(argparse.Namespace()) == 0
+        assert "still holds" not in capsys.readouterr().out
+
+    def test_a_named_profile_names_its_restart(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from agentchatme_hermes import profile_scope, ws_health
+
+        home = profile_home() / "profiles" / "growth"
+        home.mkdir(parents=True)
+        monkeypatch.setattr(profile_scope, "resolve_hermes_home", lambda: home)
+        save_key(ONE, home=home, handle="growth-bot")
+        self._quiet(monkeypatch)
+        seen: list[tuple[str, Path | None]] = []
+
+        def live(api_base: str, key: str, hermes_home: Path | None = None) -> dict[str, Any]:
+            seen.append((key, hermes_home))
+            return {"pid": 4242, "handle": "growth-bot", "state": "connected"}
+
+        monkeypatch.setattr(ws_health, "live_health", live)
+        assert cli._dispatch_logout(argparse.Namespace()) == 0
+        out = capsys.readouterr().out
+        assert seen == [(ONE, home)], "read with the key, before it is removed"
+        assert (
+            "The running gateway (pid 4242) still holds @growth-bot's AgentChat connection, so this profile is "
+            "still woken and gated, now without the hosted tools: restart it (`hermes -p growth gateway restart`, "
+            "or `hermes gateway restart` when the default profile's gateway serves this profile too) so it stops "
+            "serving this profile."
+        ) in out
+
+    @pytest.mark.parametrize("profile", ["default", "growth"])
+    def test_the_wizard_logout_says_it_and_names_the_profile(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], profile: str
+    ) -> None:
+        from agentchatme_hermes import (
+            mcp_registration,
+            profile_scope,
+            secrets_registration,
+            wizard,
+            ws_health,
+        )
+
+        home = profile_home() if profile == "default" else profile_home() / "profiles" / profile
+        home.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setattr(profile_scope, "resolve_hermes_home", lambda: home)
+        monkeypatch.setattr(wizard, "resolve_hermes_home", lambda: home)
+        save_key(ONE, home=home)
+        monkeypatch.setattr(secrets_registration, "uninstall_block", lambda *a, **k: False)
+        monkeypatch.setattr(mcp_registration, "uninstall_entry", lambda *a, **k: False)
+        monkeypatch.setattr(
+            ws_health, "live_health", lambda *_a, **_k: {"pid": 77, "handle": "alice", "state": "connected"}
+        )
+        info: list[str] = []
+        done: list[str] = []
+        wizard._logout_flow(lambda *_a: True, info.append, done.append, lambda *_a: None)
+        assert key_store.read_store(home).status == "missing"
+        assert [line for line in info if "still holds @alice's AgentChat connection" in line] != []
+        cmd = "hermes agentchat" if profile == "default" else f"hermes -p {profile} agentchat"
+        assert done == [f"Logged out. Run `{cmd}` to reconfigure."]
 
 
 class TestDoctorFixKeepsAKeyTheToolsWouldLose:

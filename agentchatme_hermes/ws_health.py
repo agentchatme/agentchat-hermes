@@ -276,3 +276,62 @@ def bad_cycle_run(recent: Any) -> tuple[int, dict[str, Any] | None]:
         run += 1
         newest = newest or cycle
     return run, newest
+
+
+# ─── whether the gateway behind a record lives (doctor, status, logout) ─────
+
+
+def live_health(api_base: str, api_key: str, hermes_home: Path | None = None) -> Any:
+    """This account's health record, only while the gateway that writes it
+    lives: fresh (≤ 150 s), not ``stopped``, its pid alive, and the leader
+    lock beside it held (where the lock can be probed). A gateway stopped or
+    killed leaves a fresh record saying ``connected`` behind it (Hermes has no
+    shutdown hook for a plugin; the receiver marks ``stopped`` at exit only
+    when the interpreter exits cleanly), so freshness alone is not enough.
+    ``None`` otherwise. Never raises."""
+    try:
+        from .leader_lock import describe_lock_holder, lock_path_for
+        from .profile_scope import account_fingerprint, resolve_hermes_home, resolve_setting
+
+        lock_dir_raw = (resolve_setting("AGENTCHATME_LOCK_DIR") or "").strip()
+        lock_path = lock_path_for(
+            hermes_home=hermes_home if hermes_home is not None else resolve_hermes_home(),
+            account_fingerprint=account_fingerprint(api_base, api_key),
+            lock_dir=Path(lock_dir_raw).expanduser() if lock_dir_raw else None,
+        )
+        health = read_ws_health(health_path_for(lock_path))
+        if health is None or health["state"] == "stopped":
+            return None
+        if health_age_seconds(health) > HEALTH_STALE_AFTER_SECONDS:
+            return None
+        if pid_alive(health["pid"]) is not True:
+            return None
+        lock = describe_lock_holder(lock_path)
+        if lock in ("free", "not present"):
+            return None
+        return health
+    except Exception:
+        return None
+
+
+def pid_alive(pid: int) -> bool | None:
+    """Whether a process with ``pid`` exists here; ``None`` when that cannot be
+    told (Windows without ``psutil``: ``os.kill`` there would end the process)."""
+    try:
+        import importlib
+
+        psutil: Any = importlib.import_module("psutil")
+        return bool(psutil.pid_exists(pid))
+    except ImportError:
+        pass
+    if os.name == "nt":
+        return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # it exists, owned by another user
+    except OSError:
+        return None
+    return True

@@ -24,8 +24,9 @@ What the wizard owns:
   ``SOUL.md``, the served manual as the ``agentchat:agentchat`` skill, the key
   source and the hosted MCP server in ``config.yaml``;
 * logout: the key file and any ``.env`` key line removed, the identity line
-  stripped, our ``secrets.agentchat`` and ``mcp_servers.agentchat`` entries
-  removed.
+  AgentChat placed for this profile's agent removed (a block edited by hand
+  or another agent's is left, and said), our ``secrets.agentchat`` and
+  ``mcp_servers.agentchat`` entries removed.
 
 The non-interactive ``hermes agentchat <register|login|recover|status|logout>``
 subcommands stay in ``cli.py``. This module is only the no-argument
@@ -38,13 +39,15 @@ import os
 from typing import TYPE_CHECKING, Any, Literal
 
 from . import credentials, key_store, signup
-from .config import ENV_API_BASE, ENV_HANDLE, resolve_key
+from .config import ENV_API_BASE, ENV_HANDLE, cli_prefix, resolve_key
 from .placement import (
+    gateway_still_serving,
     place_identity_and_tools,
+    profile_identity,
     resolve_texts,
 )
 from .profile_scope import resolve_hermes_home
-from .soul_anchor import AnchorError, remove_soul_anchor
+from .soul_anchor import remove_soul_anchor
 from .turn import identity_line as render_identity_line
 from .turn import identity_line_template as render_identity_line_template
 
@@ -335,10 +338,12 @@ def _replace_key_branch(
 def _logout_flow(
     prompt_yes_no: Any, print_info: Any, print_success: Any, save_env_value: Any
 ) -> None:
-    """Clear saved credentials + strip the SOUL.md anchor.
+    """Clear saved credentials, then remove our placements: the identity line
+    AgentChat placed in SOUL.md for this profile's agent (a block edited by
+    hand, another agent's or several are left, and said), the key source, the
+    hosted-tools entry.
 
-    Verbatim 0.1.x confirmation copy; 0.2.0 adds the anchor strip after
-    the env clear.
+    Verbatim 0.1.x confirmation copy.
     """
     print()
     if not prompt_yes_no(
@@ -350,8 +355,13 @@ def _logout_flow(
         print_info("Cancelled. Existing credentials retained.")
         return
 
+    # Who this profile is, read while its key is still here: only the block
+    # AgentChat placed for that agent leaves SOUL.md.
+    home = resolve_hermes_home()
+    identity = profile_identity(home, api_base=_api_base())
+    gateway_note = gateway_still_serving(home, api_base=_api_base())
     try:
-        credentials.clear_credentials()
+        credentials.clear_credentials(home)
     except key_store.KeyStoreError as exc:
         print_info(f"The key was not removed: {exc}")
         return
@@ -364,16 +374,16 @@ def _logout_flow(
     except Exception as exc:
         logger.warning("logout: secrets.agentchat removal failed: %s", exc)
 
-    # Strip the SOUL.md identity line so the agent loses its AgentChat
-    # awareness across all contexts. Idempotent — no-op when absent.
-    try:
-        removed = remove_soul_anchor()
-        if removed:
-            _step("Identity line removed from SOUL.md")
-    except (OSError, AnchorError) as exc:
-        # Non-fatal — credentials are cleared, the anchor's just stuck.
-        # User can delete the block manually if it matters.
-        logger.warning("logout: SOUL.md anchor strip failed: %s", exc)
+    # The identity line, so the agent loses its AgentChat awareness in every
+    # context: only the block AgentChat placed for this agent. Non-fatal (the
+    # key is gone already); idempotent.
+    removal = remove_soul_anchor(
+        handle=identity.handle, identity_line=identity.identity_line, template=identity.template
+    )
+    if removal.removed:
+        _step(f"SOUL.md: {removal.detail}")
+    elif removal.outcome != "absent":
+        print_info(f"SOUL.md: {removal.detail}.")
 
     # Remove our hosted-tools entry (a hand-managed one is left alone).
     try:
@@ -384,7 +394,9 @@ def _logout_flow(
     except Exception as exc:
         logger.warning("logout: mcp_servers.agentchat removal failed: %s", exc)
 
-    print_success("Logged out. Run `hermes agentchat` to reconfigure.")
+    if gateway_note is not None:
+        print_info(f"{gateway_note}.")
+    print_success(f"Logged out. Run `{cli_prefix(home)}` to reconfigure.")
 
 
 # ─── flows ─────────────────────────────────────────────────────────────────

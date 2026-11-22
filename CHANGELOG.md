@@ -2,6 +2,47 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **A block you edited inside the AgentChat markers is left on every path.** Setup (`register`, `login`, `recover`, the
+  wizard) and `doctor --fix` used to put the served identity line back over a hand-edited block. So a block that
+  `logout` kept was overwritten at the next `login` or reinstall. The user's words are now replaced only once they
+  delete the block themselves. Setup leaves the block with a warning: "…was edited by hand, so it is left; to have the
+  served line, delete that block, then run `hermes agentchat doctor --fix`". `doctor --fix` leaves it with the same
+  remedy, and so do the gateway's log line and `status`. The full policy:
+  - This agent's own block is brought to the served line by every writing path.
+  - Another agent's block is replaced by setup (said: the profile becomes this agent), refused by `doctor --fix`, and
+    left by the gateway and `logout`.
+  - Several blocks are left by every path, with a warning from setup.
+  - A placement is decided on the text it replaces: a block written while it runs is not overwritten (the file is read
+    again before the rename, and the decision is made again).
+
+### Fixed
+
+- **`logout` removes only the identity block AgentChat placed for this agent.** It stripped any AgentChat block from
+  SOUL.md, so logging out deleted a block a person wrote inside the markers, or another agent's block. Removal now uses
+  the same strict rule as the refresh (the SDK kit's `anchor.owner`): the block goes only when it is this profile's
+  agent's, meaning its handle line names that agent, or, without one, its whole text is exactly a text AgentChat served
+  (the served line and template cached for the key are used when present). The handle is the one the key file names
+  (or `AGENTCHATME_HANDLE` for a profile set up before 0.6), read before the key is removed.
+  - A block edited by hand, another agent's block, several blocks, or any block when the profile's handle is not known
+    are left as they are. `logout` and the wizard's logout say so ("left your edited AgentChat block in …/SOUL.md; remove
+    it by hand if you no longer want it").
+  - The write stays atomic and keeps the file's line breaks, a missing final newline, a byte-order mark, the mode and a
+    symlink. It is not made over an edit saved while it runs (the file is read again before the rename, and the
+    decision is made again). A SOUL.md that is not UTF-8 is never written; that is a warning, and the key is still
+    removed.
+- **`logout` says when a running gateway still serves the account.** A gateway keeps the socket it opened with the
+  key, so after `logout` the agent was still woken and gated, now without the hosted tools, and nothing said so.
+  When a gateway lives for the account (the rule `doctor` and `status` use: a fresh health record, its pid alive, the
+  leader lock held), `logout` and the wizard's logout now say: "The running gateway (pid …) still holds @x's AgentChat
+  connection, …: restart it (`hermes gateway restart`) so it stops serving this profile". A named profile gets
+  `hermes -p <name> gateway restart`, or `hermes gateway restart` when the default profile's gateway serves it too.
+- **The wizard's logout names the profile.** "Run `hermes agentchat` to reconfigure" now gives `hermes -p <name>
+  agentchat` in a named profile.
+
 ## [0.6.2] — 2026-11-22
 
 Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): the SOUL.md refresh no longer rewrites a block a person wrote (it follows the SDK kit's strict rule), only the gateway writes it, and the documented upgrade command works (Hermes takes `--ref` as a full commit SHA; resolve the tag with `git ls-remote https://github.com/agentchatme/agentchat-hermes.git 'refs/tags/v0.6.2^{}' | cut -f1`). Needs `agentchatme>=1.8.0,<2` (was 1.6.1) in `pyproject.toml`, both `plugin.yaml` files and the git-clone shim (which
