@@ -547,7 +547,7 @@ def _how(result: ManualSyncResult) -> str:
 def describe_repair(before: ManualCheck, result: ManualSyncResult) -> str:
     """One sync by the wizard's placement or ``doctor --fix``, saying what the
     file was before when the sync changed it: ``was stale (have 2.4.0, served
-    2.4.3) → 2.4.3 placed from the bundled copy …``, ``was tampered (…) →
+    2.4.4) → 2.4.4 placed from the bundled copy …``, ``was tampered (…) →
     restored: …``, ``was missing → …``."""
     if result.error == _INLINE_SHELL_REFUSED or not result.written:
         return describe_result(result)

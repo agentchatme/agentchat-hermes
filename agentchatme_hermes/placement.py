@@ -178,7 +178,7 @@ def place_manual(
 
     One sync through the SDK kit (a download when the file is not the announced
     manual); the detail says what the file was when the sync changed it
-    (``was stale (…) → 2.4.3 placed …``, ``was tampered (…) → restored: …``).
+    (``was stale (…) → 2.4.4 placed …``, ``was tampered (…) → restored: …``).
     A manual not at the announced version is a warning, never a
     failed placement: the agent reads the file it has (the old one, or the
     bundled copy) and the gateway keeps trying; only no manual at all fails.

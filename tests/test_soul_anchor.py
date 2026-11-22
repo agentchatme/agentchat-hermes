@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import pytest
 from agentchatme.integration import anchor
 
-from agentchatme_hermes import soul_anchor
+from agentchatme_hermes import manual, soul_anchor
 from agentchatme_hermes.soul_anchor import (
     ANCHOR_END,
     ANCHOR_START,
@@ -32,6 +32,9 @@ from agentchatme_hermes.soul_anchor import (
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+# The manual the package bundles: what the served texts in these tests announce.
+BUNDLED_MANUAL_VERSION = manual.bundled_version()
 
 
 def _line(handle: str = "alice") -> str:
@@ -689,7 +692,7 @@ class TestDoctorLines:
         monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
         texts = {
             "version": "1", "runtime": "hermes",
-            "manual": {"url": "https://agentchat.me/skill.md", "version": "2.4.3"},
+            "manual": {"url": "https://agentchat.me/skill.md", "version": BUNDLED_MANUAL_VERSION},
             "wake_instruction": "w", "invite_prompt": "i",
             "identity_line": _line(), "identity_line_template": _line("<handle>"),
         }
@@ -714,7 +717,7 @@ class _TextsClient:
 
         self.served = {
             "version": "1", "runtime": "hermes",
-            "manual": {"url": "https://agentchat.me/skill.md", "version": "2.4.3"},
+            "manual": {"url": "https://agentchat.me/skill.md", "version": BUNDLED_MANUAL_VERSION},
             "wake_instruction": "w", "invite_prompt": "i",
             "identity_line": identity_line, "identity_line_template": template,
         }
@@ -917,7 +920,7 @@ class TestEveryPath:
         monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
         texts = {
             "version": "1", "runtime": "hermes",
-            "manual": {"url": "https://agentchat.me/skill.md", "version": "2.4.3"},
+            "manual": {"url": "https://agentchat.me/skill.md", "version": BUNDLED_MANUAL_VERSION},
             "wake_instruction": "w", "invite_prompt": "i",
             "identity_line": _line(), "identity_line_template": _line("<handle>"),
         }
