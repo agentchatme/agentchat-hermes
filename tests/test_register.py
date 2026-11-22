@@ -144,6 +144,13 @@ _SERVED_TEMPLATE = (
 )
 
 
+def _owner(soul: Path, handle: str | None = None) -> str | None:
+    from agentchatme.integration import anchor
+
+    found = anchor.find(soul.read_text(encoding="utf-8"))
+    return None if found is None else anchor.owner(found, handle=handle)
+
+
 class TestReconcileSoulAnchor:
     def _runtime(
         self,
@@ -190,7 +197,7 @@ class TestReconcileSoulAnchor:
             _register._reconcile_soul_anchor(runtime)
             content = soul.read_text(encoding="utf-8")
             assert line in content and content.count(soul_anchor.ANCHOR_START) == 1
-            assert soul_anchor.read_anchor_handle(soul_path=soul, template=template) == "ops"
+            assert _owner(soul) == "ops", "the handle line carries it"
             # Refresh again with the same serving: recognised, current, untouched.
             with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
                 _register._reconcile_soul_anchor(runtime)
@@ -208,20 +215,24 @@ class TestReconcileSoulAnchor:
     def test_block_from_0_3_0_is_refreshed_under_a_reworded_serving(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """An unmarked 0.3.0 block, served text already reworded: the served
-        template recognises it, the refresh adds the handle line."""
+        """An unmarked block an earlier release wrote, word for word a line
+        AgentChat served before (the kit's EARLIER_IDENTITY_LINES), the served
+        text since reworded: this agent's; the refresh adds the handle line."""
+        from agentchatme.integration import anchor
+
         from agentchatme_hermes import _register, soul_anchor
         from agentchatme_hermes.soul_anchor import ANCHOR_END, ANCHOR_START
 
         soul = tmp_path / "SOUL.md"
-        soul.write_text(f"{ANCHOR_START}\n{_served_line('ops')}\n{ANCHOR_END}\n", encoding="utf-8")
+        older = anchor.EARLIER_IDENTITY_LINES[0].replace("<handle>", "ops")
+        soul.write_text(f"{ANCHOR_START}\n{older}\n{ANCHOR_END}\n", encoding="utf-8")
         monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
         line = "New wording: @ops, reachable on AgentChat."
         _register._reconcile_soul_anchor(
             self._runtime("ops", tmp_path, line=line, template="New wording: @<handle>, reachable on AgentChat.")
         )
         content = soul.read_text(encoding="utf-8")
-        assert line in content and _served_line("ops") not in content
+        assert line in content and older not in content
         assert soul_anchor.render_handle_marker("ops") in content
 
     def test_backfills_when_absent(
@@ -232,7 +243,7 @@ class TestReconcileSoulAnchor:
         soul = tmp_path / "SOUL.md"
         monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
         _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
-        assert soul_anchor.read_anchor_handle(soul_path=soul) == "ops"
+        assert _owner(soul) == "ops"
         assert _served_line("ops") in soul.read_text(encoding="utf-8")
 
     def test_without_texts_places_nothing_and_says_so(
@@ -271,7 +282,7 @@ class TestReconcileSoulAnchor:
         assert len(listeners) == 1 and not soul.exists()
         state["line"] = _served_line("ops")
         listeners[0](object())
-        assert soul_anchor.read_anchor_handle(soul_path=soul) == "ops"
+        assert _owner(soul) == "ops"
 
     def test_mismatch_is_an_error_and_file_is_left_alone(
         self,
@@ -289,8 +300,34 @@ class TestReconcileSoulAnchor:
         with caplog.at_level(logging.ERROR, logger="agentchatme_hermes._register"):
             _register._reconcile_soul_anchor(self._runtime("operations", tmp_path))
         assert soul.read_text() == before
-        messages = [rec.getMessage() for rec in caplog.records]
-        assert any("IDENTITY MISMATCH" in m and "@growth" in m and "@operations" in m for m in messages)
+        messages = [rec.getMessage() for rec in caplog.records if "IDENTITY MISMATCH" in rec.getMessage()]
+        assert len(messages) == 1
+        said = messages[0]
+        assert "@growth's AgentChat block" in said and "authenticates as @operations" in said
+        # The key has been in the key file since 0.5.4, and either side may be the wrong one.
+        assert "AGENTCHAT_API_KEY" not in said
+        assert "Fix the key (`hermes agentchat login`) or remove that block" in said
+        assert "`hermes agentchat doctor --fix` places @operations's" in said
+
+    def test_mismatch_names_the_profile_flag_for_a_named_profile(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from agentchatme_hermes import _register, soul_anchor
+
+        home = tmp_path / ".hermes" / "profiles" / "growth"
+        home.mkdir(parents=True)
+        soul = home / "SOUL.md"
+        soul_anchor.write_soul_anchor(_served_line("ops"), handle="ops", soul_path=soul)
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        with caplog.at_level(logging.ERROR, logger="agentchatme_hermes._register"):
+            _register._reconcile_soul_anchor(self._runtime("growth", home))
+        (said,) = [r.getMessage() for r in caplog.records if "IDENTITY MISMATCH" in r.getMessage()]
+        assert "profile=growth" in said
+        assert "Fix the key (`hermes -p growth agentchat login`) or remove that block" in said
+        assert "`hermes -p growth agentchat doctor --fix`" in said
 
     def test_matching_anchor_is_quiet(
         self,
@@ -311,23 +348,54 @@ class TestReconcileSoulAnchor:
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert soul.read_text() == before
 
-    def test_pre_v3_block_with_matching_handle_is_refreshed(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    def test_the_users_words_naming_the_handle_are_left_alone_and_said(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """Same handle, older text → the served identity line replaces it."""
+        """The lab repro: a block with no handle line whose words name @ops but
+        are not a text AgentChat served is the user's. Before, the loose
+        reading found @ops in it and replaced it with the served line."""
         from agentchatme_hermes import _register, soul_anchor
         from agentchatme_hermes.soul_anchor import ANCHOR_END, ANCHOR_START
 
         soul = tmp_path / "SOUL.md"
-        soul.write_text(
-            f"# Mine\n\n{ANCHOR_START}\n## On AgentChat\n\nYou are **@ops** on AgentChat — "
-            f"old blurb.\n{ANCHOR_END}\n",
-            encoding="utf-8",
+        mine = (
+            f"# Mine\n\n{ANCHOR_START}\n## On AgentChat\n\nYou are **@ops** on AgentChat — my own "
+            f"notes about how I like to answer.\n{ANCHOR_END}\n"
         )
+        soul.write_text(mine, encoding="utf-8")
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
+            _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
+            _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
+        assert soul.read_text(encoding="utf-8") == mine
+        said = [r.getMessage() for r in caplog.records if "edited by hand" in r.getMessage()]
+        assert len(said) == 1, "said once, not on every texts change"
+        assert "`hermes agentchat doctor --fix` puts the served identity line for @ops back" in said[0]
+
+    def test_one_word_changed_is_left_alone(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from agentchatme_hermes import _register, soul_anchor
+        from agentchatme_hermes.soul_anchor import ANCHOR_END, ANCHOR_START
+
+        soul = tmp_path / "SOUL.md"
+        edited = _served_line("ops").replace("decide per card", "decide per thread")
+        soul.write_text(f"{ANCHOR_START}\n{edited}\n{ANCHOR_END}\n", encoding="utf-8")
+        before = soul.read_bytes()
         monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
         _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
-        assert soul_anchor.anchor_is_current(_served_line("ops"), soul_path=soul) is True
-        assert "# Mine" in soul.read_text(encoding="utf-8")
+        assert soul.read_bytes() == before
+
+    def test_the_exact_served_text_without_a_handle_line_is_reshaped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import _register, soul_anchor
+        from agentchatme_hermes.soul_anchor import ANCHOR_END, ANCHOR_START
+
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(f"# Mine\n\n{ANCHOR_START}\n{_served_line('ops')}\n{ANCHOR_END}\n", encoding="utf-8")
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
+        content = soul.read_text(encoding="utf-8")
+        assert soul_anchor.render_handle_marker("ops") in content and content.startswith("# Mine\n\n")
 
     def test_hand_edited_block_is_left_alone(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -341,6 +409,40 @@ class TestReconcileSoulAnchor:
         monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
         _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
         assert soul.read_text(encoding="utf-8") == before
+
+    @pytest.mark.parametrize("ending", ["\r\n", ""], ids=["crlf", "no-final-newline"])
+    def test_a_refresh_keeps_line_breaks_and_the_end_of_the_file(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ending: str
+    ) -> None:
+        from agentchatme_hermes import _register, soul_anchor
+        from agentchatme_hermes.soul_anchor import ANCHOR_END, ANCHOR_START
+
+        soul = tmp_path / "SOUL.md"
+        eol = "\r\n" if ending else "\n"
+        old = eol.join([ANCHOR_START, soul_anchor.render_handle_marker("ops"), "an older served line for @ops", ANCHOR_END])
+        soul.write_bytes(f"# Mine{eol}{eol}{old}{eol}{eol}after{ending}".encode())
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
+        data = soul.read_bytes().decode("utf-8")
+        assert _served_line("ops") in data and data.endswith(f"after{ending}")
+        if ending:
+            assert "\n" not in data.replace("\r\n", "")
+
+    def test_several_blocks_are_left_alone_and_said(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agentchatme_hermes import _register, soul_anchor
+        from agentchatme_hermes.soul_anchor import ANCHOR_END, ANCHOR_START
+
+        soul = tmp_path / "SOUL.md"
+        block = soul_anchor.render_anchor_block("an older served line for @ops", handle="ops")
+        soul.write_text(f"{block}\n\n{ANCHOR_START}\nmine\n{ANCHOR_END}\n", encoding="utf-8")
+        before = soul.read_bytes()
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
+            _register._reconcile_soul_anchor(self._runtime("ops", tmp_path))
+        assert soul.read_bytes() == before
+        assert any("more than one AgentChat block" in r.getMessage() for r in caplog.records)
 
 
 class TestReconcileKeyStore:
@@ -732,7 +834,7 @@ class TestWithoutTheKit:
         monkeypatch.setattr(integration, "ReceiveLoop", OldReceiveLoop)
         problem = kit_problem()
         assert problem is not None and "without could not process" in problem and KIT_REQUIREMENT in problem
-        assert KIT_REQUIREMENT == "agentchatme>=1.6.1"
+        assert KIT_REQUIREMENT == "agentchatme>=1.8.0"
 
     @pytest.mark.parametrize(
         ("installed", "said"),
@@ -749,7 +851,7 @@ class TestWithoutTheKit:
         problem = kit.manual_retry_problem()
         assert (problem is not None) is said
         if said:
-            assert installed in problem and "agentchatme>=1.6.1" in problem
+            assert installed in problem and "agentchatme>=1.8.0" in problem
 
     def test_the_plugin_and_its_cli_import_without_the_kit(self) -> None:
         import os
@@ -838,3 +940,82 @@ class TestKeyReachesTheHostedToolsOnly:
         watcher = _register.ActivationWatcher(hermes_home=tmp_path, profile="default", gateway_mode=True)
         assert watcher.try_activate() == "active"
         assert order == ["secrets", "mcp"]
+
+
+class TestGatewayOnlyReconcile:
+    """SOUL.md follows the manual's rule (``runtime.keeps_placements_current``):
+    only a gateway-mode process refreshes or backfills it by itself. A plain
+    ``doctor`` or ``status`` (any process that is not the gateway) reports it
+    as found and writes nothing; placement on request stays the CLI's."""
+
+    def _activate(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, soul: Path, *, gateway: bool) -> None:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register, soul_anchor
+
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        runtime = SimpleNamespace(
+            identity=SimpleNamespace(handle="ops"),
+            hermes_home=tmp_path,
+            gateway_mode_requested=gateway,
+            identity_line=lambda: _served_line("ops"),
+            identity_line_template=lambda: _SERVED_TEMPLATE,
+        )
+        monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: SimpleNamespace(api_base="https://api.example.test"))
+        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)
+        monkeypatch.setattr(_register, "_reconcile_key_store", lambda cfg: None)
+        monkeypatch.setattr(_register, "_reconcile_secrets_block", lambda rt: None)
+        monkeypatch.setattr(_register, "_reconcile_mcp_registration", lambda rt: None)
+        watcher = _register.ActivationWatcher(hermes_home=tmp_path, profile="default", gateway_mode=gateway)
+        assert watcher.try_activate() == "active"
+
+    def test_a_stale_block_of_ours_is_reported_not_rewritten_then_refreshed_by_the_gateway(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import cli, soul_anchor
+
+        soul = tmp_path / "SOUL.md"
+        soul_anchor.write_soul_anchor("an older served line for @ops", handle="ops", soul_path=soul)
+        before = soul.read_bytes()
+
+        # `hermes agentchat doctor` / `status`: the activation in that process writes nothing ...
+        self._activate(monkeypatch, tmp_path, soul, gateway=False)
+        assert soul.read_bytes() == before
+        lines: list[tuple[str, str]] = []
+        cli._doctor_soul_checks(
+            handle="ops", identity_line=_served_line("ops"), template=_SERVED_TEMPLATE, cmd="hermes agentchat",
+            ok=lambda line: lines.append(("ok", line)), warn=lambda line: lines.append(("warn", line)),
+            fail=lambda line: lines.append(("fail", line)),
+        )
+        assert lines and lines[0][0] == "warn" and "is not the served one" in lines[0][1]
+        status = cli._identity_line_status(handle="ops", identity_line=_served_line("ops"), template=_SERVED_TEMPLATE, home=tmp_path)
+        assert status is not None and status.startswith("not the served one (@ops, an older text)")
+        assert soul.read_bytes() == before, "... and reports it as found"
+
+        # The gateway keeps it current.
+        self._activate(monkeypatch, tmp_path, soul, gateway=True)
+        assert _served_line("ops") in soul.read_text(encoding="utf-8")
+        status = cli._identity_line_status(handle="ops", identity_line=_served_line("ops"), template=_SERVED_TEMPLATE, home=tmp_path)
+        assert status is not None and status.startswith("served (@ops)")
+
+    def test_no_backfill_outside_the_gateway(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        self._activate(monkeypatch, tmp_path, soul, gateway=False)
+        assert not soul.exists()
+        self._activate(monkeypatch, tmp_path, soul, gateway=True)
+        assert _owner(soul) == "ops"
+
+    def test_the_manual_and_soul_md_share_one_rule(self) -> None:
+        """runtime.keeps_placements_current gates both: the follower's manual
+        sync and the SOUL.md reconcile. A runtime that does not say is a reader."""
+        import inspect as _inspect
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register, runtime
+        from agentchatme_hermes.runtime import keeps_placements_current
+
+        assert keeps_placements_current(SimpleNamespace(gateway_mode_requested=True)) is True
+        assert keeps_placements_current(SimpleNamespace(gateway_mode_requested=False)) is False
+        assert keeps_placements_current(SimpleNamespace()) is False
+        assert "keeps_placements_current(self)" in _inspect.getsource(runtime.Runtime.start)
+        assert "keeps_placements_current(runtime)" in _inspect.getsource(_register.ActivationWatcher.try_activate)

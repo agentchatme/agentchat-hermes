@@ -44,15 +44,16 @@ logger = logging.getLogger(__name__)
 # Pinned to match pyproject.toml's dependency declaration (a test keeps the
 # two identical): the git-clone path installs the SDK from here. The plugin
 # needs the SDK's integration kit (agentchatme.integration, since 1.3.0), and
-# this release the kit as of 1.6.1: the receive loop of 1.3.3 (a system notice
+# this release the kit as of 1.8.0: the receive loop of 1.3.3 (a system notice
 # is not a wake; a card without a preview is anchored at its last message), the
 # sign-up helper (agentchatme.integration.account, 1.4.0) the setup runs on,
 # could not process (the gate-chunk split, the failure report, check_runtime and
 # TurnEnd / RunEnd timed_out, 1.5.0) the receive loop runs on, and the
 # ManualSync that retries while the manual is stale (1.6.1), which keeps the
-# agentchat:agentchat skill at the served version.
-_SDK_REQUIREMENT = "agentchatme>=1.6.1,<2"
-_SDK_FLOOR = (1, 6, 1)
+# agentchat:agentchat skill at the served version, and the strict identity-block
+# rule (anchor.owner / decide / follow, 1.8.0) the SOUL.md refresh runs on.
+_SDK_REQUIREMENT = "agentchatme>=1.8.0,<2"
+_SDK_FLOOR = (1, 8, 0)
 
 
 def _installed_sdk_version() -> tuple[int, ...] | None:

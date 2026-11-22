@@ -11,7 +11,6 @@ from agentchatme.types import Texts
 from fake_keys import PREFIX, api_key
 
 from agentchatme_hermes import placement
-from agentchatme_hermes.soul_anchor import read_anchor_handle
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -19,13 +18,32 @@ if TYPE_CHECKING:
 LINE = "I am @alice on AgentChat (api.agentchat.me). Peers reach me there."
 
 
+def read_anchor_handle(*, soul_path: Path) -> str | None:
+    """The strict owner of the block in ``soul_path`` (the kit's ``anchor.owner``)."""
+    from agentchatme.integration import anchor
+
+    found = anchor.find(soul_path.read_text(encoding="utf-8"))
+    return None if found is None else anchor.owner(found)
+
+
 class TestAnchorAndSkill:
     def test_place_anchor_writes_the_served_identity_line(self, tmp_path: Path) -> None:
         soul = tmp_path / "SOUL.md"
         step = placement.place_anchor(handle="@Alice", identity_line=LINE, soul_path=soul)
-        assert step.status == "ok" and not step.failed
+        assert step.status == "changed" and not step.failed and "placed" in step.detail
         assert read_anchor_handle(soul_path=soul) == "alice"
         assert LINE in soul.read_text(encoding="utf-8")
+        again = placement.place_anchor(handle="alice", identity_line=LINE, soul_path=soul)
+        assert again.status == "ok" and "the served text" in again.detail
+
+    def test_doctor_fix_never_replaces_another_agents_block(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        placement.place_anchor(handle="bob", identity_line="I am @bob on AgentChat.", soul_path=soul)
+        before = soul.read_bytes()
+        step = placement.place_anchor(handle="alice", identity_line=LINE, soul_path=soul, replace_other=False)
+        assert step.failed and "@bob's" in step.detail and soul.read_bytes() == before
+        login = placement.place_anchor(handle="alice", identity_line=LINE, soul_path=soul)
+        assert login.status == "changed" and "was @bob's" in login.detail
 
     def test_place_anchor_without_texts_is_skipped_not_failed(self, tmp_path: Path) -> None:
         soul = tmp_path / "SOUL.md"

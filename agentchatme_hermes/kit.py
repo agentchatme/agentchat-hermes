@@ -21,8 +21,11 @@ import importlib
 # the receive loop could not start (:func:`kit_problem` checks that by
 # capability); 1.6.1 is the ``ManualSync`` that retries while the manual is not
 # the served one (5 min doubling to 1 h), so a failed download does not wait
-# for the next texts change (:func:`manual_retry_problem`, a doctor warning).
-KIT_MIN_VERSION = "1.6.1"
+# for the next texts change (:func:`manual_retry_problem`, a doctor warning);
+# 1.8.0 is the strict identity-block rule (``anchor.owner`` / ``decide`` /
+# ``follow``) the SOUL.md refresh and ``doctor`` run on
+# (:func:`.soul_anchor.anchor_kit_problem`, a doctor warning).
+KIT_MIN_VERSION = "1.8.0"
 KIT_REQUIREMENT = f"agentchatme>={KIT_MIN_VERSION}"
 _MANUAL_RETRY_FLOOR = (1, 6, 1)
 

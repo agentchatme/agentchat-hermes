@@ -57,6 +57,21 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+def keeps_placements_current(runtime: Any) -> bool:
+    """The one rule for which Hermes processes keep placed files current by
+    themselves — the manual (``plugin-data/agentchat/manual/SKILL.md``) and the
+    SOUL.md identity block: a gateway-mode process (``hermes gateway run``, as
+    :func:`.leader_lock.is_hermes_gateway_process` decides at ``register()``;
+    the leader, a gateway that lost the election, a gateway with the
+    integration off). Every other process — a session, a one-shot, ``status``,
+    ``doctor`` without ``--fix``, any other command — reads those files and
+    writes nothing, so what it reports is the file as found. Placement on
+    request (register / login / recover / the wizard, ``doctor --fix``) is
+    explicit and not governed by this rule. ``False`` for a runtime that does
+    not say (a test double)."""
+    return getattr(runtime, "gateway_mode_requested", False) is True
+
+
 # A gateway-class process that lost the leader election keeps trying.
 # When the leader for this account exits (crash, restart, profile
 # migration) the next attempt wins and this process takes over the live
@@ -273,7 +288,7 @@ class Runtime:
                     and self.integration_enabled
                     and self._try_acquire_leader()
                 )
-                if not self._is_leader and self._gateway_mode_requested:
+                if not self._is_leader and keeps_placements_current(self):
                     # A gateway with no receive loop for this account (another
                     # process is the leader, or the integration is off): one
                     # sync against the texts just loaded, off this thread.

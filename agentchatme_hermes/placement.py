@@ -38,7 +38,7 @@ from .client_identity import hermes_client_identity
 from .manual import BUNDLED_MANUAL_PATH
 from .mcp_registration import McpRegistrationError, install_entry
 from .profile_scope import resolve_hermes_home
-from .soul_anchor import AnchorError, normalize_handle, write_soul_anchor
+from .soul_anchor import AnchorError, place_soul_anchor
 from .state import state_dir_for_account
 from .texts import load_texts
 from .turn import identity_line as render_identity_line
@@ -138,15 +138,29 @@ def resolve_texts(
 
 
 def place_anchor(
-    *, handle: str, identity_line: str | None, soul_path: Path | None = None
+    *,
+    handle: str,
+    identity_line: str | None,
+    soul_path: Path | None = None,
+    template: str | None = None,
+    replace_other: bool = True,
 ) -> PlacementStep:
+    """The served identity line in SOUL.md, on request (:func:`.soul_anchor.place_soul_anchor`):
+    this agent's block brought to the served line, one placed where there is
+    none, a block edited by hand put back; another agent's block replaced only
+    with ``replace_other`` (login, the wizard), refused otherwise (``doctor --fix``).
+    The detail says what it was. Never raises."""
     if identity_line is None:
         return PlacementStep("anchor", "skipped", TEXTS_UNAVAILABLE_DETAIL)
     try:
-        path = write_soul_anchor(identity_line, handle=handle, soul_path=soul_path)
+        placement = place_soul_anchor(
+            identity_line, handle=handle, soul_path=soul_path, template=template, replace_other=replace_other
+        )
     except (AnchorError, OSError) as exc:
         return PlacementStep("anchor", "failed", f"could not write the identity line to SOUL.md: {exc}")
-    return PlacementStep("anchor", "ok", f"identity line for @{normalize_handle(handle)} in {path}")
+    if not placement.ok:
+        return PlacementStep("anchor", "failed", placement.detail)
+    return PlacementStep("anchor", "changed" if placement.wrote else "ok", placement.detail)
 
 
 def place_manual(
@@ -253,12 +267,23 @@ def place_identity_and_tools(
     soul_path: Path | None = None,
     served_manual: Any = None,
     hermes_home: Path | None = None,
+    identity_template: str | None = None,
+    replace_other_agent: bool = True,
 ) -> list[PlacementStep]:
     """Anchor, manual, the key source, tools — in that order (the tools' entry
     needs the key source). ``served_manual`` is the texts' announcement
-    (``texts.manual``), ``None`` when no texts are in hand. Never raises."""
+    (``texts.manual``), ``None`` when no texts are in hand; ``identity_template``
+    the served template (recognises a block an earlier release wrote);
+    ``replace_other_agent`` False keeps another agent's block (``doctor --fix``).
+    Never raises."""
     return [
-        place_anchor(handle=handle, identity_line=identity_line, soul_path=soul_path),
+        place_anchor(
+            handle=handle,
+            identity_line=identity_line,
+            soul_path=soul_path,
+            template=identity_template,
+            replace_other=replace_other_agent,
+        ),
         place_manual(served_manual, api_base=api_base, hermes_home=hermes_home),
         place_secrets(),
         place_mcp(api_base),

@@ -122,9 +122,12 @@ def register(ctx: Any) -> None:
     # The manual is registered unconditionally as the ``agentchat:agentchat``
     # skill: this profile's kept-current file. Only the gateway writes it
     # (from the bundled copy when missing; local only, no network); every
-    # other process registers it as it is (see manual.py). Tools are not
-    # registered here: they are the hosted MCP server declared in the
-    # profile's config.yaml (see mcp_registration).
+    # other process registers it as it is (see manual.py). ``gateway_mode``
+    # is the same flag the runtime is built with, so this and
+    # runtime.keeps_placements_current (the follower's manual sync, the
+    # SOUL.md reconcile) are one decision. Tools are not registered here:
+    # they are the hosted MCP server declared in the profile's config.yaml
+    # (see mcp_registration).
     _register_surface(ctx, hermes_home, place=gateway_mode)
 
     watcher = ActivationWatcher(
@@ -283,7 +286,13 @@ class ActivationWatcher:
             # Not refused, not silent: the same agent in two profiles (or a
             # leftover copy of the key) is said where the operator looks.
             logger.warning("agentchat plugin: profile=%s — %s", self._profile, note)
-        _reconcile_soul_anchor_when_texts_arrive(runtime)
+        # SOUL.md is kept current by the gateway only (the rule the manual
+        # follows: runtime.keeps_placements_current); every other process
+        # reports it as found. Placement on request is the CLI's own step.
+        from .runtime import keeps_placements_current
+
+        if keeps_placements_current(runtime):
+            _reconcile_soul_anchor_when_texts_arrive(runtime)
         _reconcile_key_store(config)
         _reconcile_secrets_block(runtime)
         _reconcile_mcp_registration(runtime)
@@ -502,106 +511,133 @@ def _reconcile_soul_anchor_when_texts_arrive(runtime: Any) -> None:
         _reconcile_soul_anchor(runtime)
 
 
+_said_about_soul: set[tuple[str, str, str]] = set()
+
+
+def _say_once(path: Any, outcome: str, detail: str, message: str, *args: Any) -> None:
+    """A warning about SOUL.md said once per process for the same state (the
+    reconcile runs on every texts change)."""
+    key = (str(path), outcome, detail)
+    if key in _said_about_soul:
+        return
+    _said_about_soul.add(key)
+    logger.warning(message, *args)
+
+
 def _reconcile_soul_anchor(runtime: Any) -> None:
-    """Backfill the SOUL.md identity anchor, and flag an identity mismatch.
+    """Keep this agent's SOUL.md identity block at the served line; backfill it
+    when there is none; flag an identity mismatch. Run only in a gateway-mode
+    process (:func:`.runtime.keeps_placements_current`, the manual's rule):
+    everywhere else SOUL.md is reported as found and never written.
 
-    The wizard writes the anchor on register/login (``cli.py``). This
-    is the non-wizard path: a user who set ``AGENTCHAT_API_KEY``
-    directly (env var, a profile ``.env`` from before 0.6, container secrets,
-    scripted setup) reaches the plugin's startup with a valid runtime +
-    resolved handle but no anchor in SOUL.md. We write it on their
-    behalf — with the identity line the server serves for this agent
-    (``runtime.identity_line()``); without texts there is nothing to
-    place yet, and the runtime calls again when they arrive.
+    The rule for whose block it is, and the write, are the SDK kit's
+    (``anchor.follow``, strict): only this agent's own block — its handle line,
+    or, without one, a text AgentChat served word for word — is brought to the
+    served line, atomically, the rest of the file kept byte for byte. A block
+    whose words merely name ``@handle`` was edited by hand: it is the user's,
+    left alone, and said (``hermes agentchat doctor --fix`` puts the served
+    line back when asked). With no block at all the served line is placed
+    (the non-wizard path: a key set in the environment, a container, a
+    profile upgraded from before v3).
 
-    When an anchor IS present we leave the file alone — a user who
-    hand-edited the block made an explicit choice. But if the anchor
-    names a *different* handle than the key authenticates as, this
-    profile believes it is one agent while the server sees another.
-    That is never intentional, and it is exactly how one fleet ended up
-    with a profile labelled *Growth* sending as *Operations*. We log at
-    ERROR and leave the anchor untouched: rewriting it would hide the
-    credential mix-up; ``hermes agentchat doctor`` reports it too.
+    When the block is another agent's, this profile believes it is one agent
+    while the server sees another — how one fleet ended up with a profile
+    labelled *Growth* sending as *Operations*. Logged at ERROR and left as it
+    is: rewriting it would hide the credential mix-up; ``doctor`` reports it.
 
-    Non-fatal — anchor failures are logged, not raised. The plugin's
-    primary mechanics (WS, tools, skill) work independent of SOUL.md.
+    Without texts there is nothing to place yet; the runtime calls again when
+    they arrive. Non-fatal: failures are logged, not raised.
     """
     try:
-        from .soul_anchor import (
-            AnchorError,
-            anchor_is_current,
-            has_anchor,
-            read_anchor_handle,
-            resolve_soul_path,
-            write_soul_anchor,
-        )
+        from .soul_anchor import AnchorError, follow_soul, place_soul_anchor
     except ImportError:
         logger.debug("agentchatme_hermes.soul_anchor not importable; skipping backfill")
         return
 
+    label = profile_label(runtime.hermes_home)
     identity_line = runtime.identity_line() if callable(getattr(runtime, "identity_line", None)) else None
     if not isinstance(identity_line, str) or not identity_line.strip():
         logger.info(
             "agentchat plugin: identity line not placed yet for profile=%s — /v1/texts "
             "unreachable and nothing cached; it is placed when the server answers",
-            profile_label(runtime.hermes_home),
+            label,
         )
         return
-    # The served template recognises a block an earlier release wrote
-    # without a handle line, whatever the current wording is.
+    # The served template: a block an earlier release wrote without a handle
+    # line is this agent's when its text is that template, filled in, exactly.
     template_fn = getattr(runtime, "identity_line_template", None)
     template = template_fn() if callable(template_fn) else None
     if not isinstance(template, str):
         template = None
+    actual = runtime.identity.handle
 
     try:
-        if has_anchor():
-            anchored = read_anchor_handle(template=template)
-            actual = runtime.identity.handle
-            if anchored is not None and anchored != actual:
-                logger.error(
-                    "agentchat plugin: IDENTITY MISMATCH for profile=%s — "
-                    "%s says this agent is @%s but AGENTCHAT_API_KEY "
-                    "authenticates as @%s. This profile is configured with "
-                    "another agent's key (or another agent's SOUL.md). Fix "
-                    "the key with `hermes agentchat login` in this profile, "
-                    "or re-run `hermes agentchat register`. Messages this "
-                    "profile sends will be attributed to @%s.",
-                    profile_label(runtime.hermes_home),
-                    resolve_soul_path(),
-                    anchored,
-                    actual,
-                    actual,
-                )
-                return
-            if anchored is not None and anchor_is_current(identity_line, template=template) is False:
-                # Our own block from an older release: same handle, other
-                # text. The served identity line is the one every
-                # integration places; refresh it. A hand-edited block
-                # (``anchored is None``) is the user's and is left alone.
-                path = write_soul_anchor(identity_line, handle=actual)
-                logger.info(
-                    "agentchat plugin: SOUL.md identity line refreshed to the served "
-                    "text (handle=@%s, path=%s)",
-                    actual,
-                    path,
-                )
+        result = follow_soul(handle=actual, identity_line=identity_line, template=template)
+    except AnchorError as exc:
+        _say_once("", "kit", str(exc), "agentchat plugin: SOUL.md identity line not followed for profile=%s — %s", label, exc)
+        return
+    path = result.path
+    outcome = result.outcome
+    if outcome == "updated":
+        logger.info("agentchat plugin: SOUL.md — %s (handle=@%s)", result.detail, actual)
+    elif outcome == "unchanged" or outcome == "setup_offer":
+        logger.debug("agentchat plugin: SOUL.md — %s", result.detail)
+    elif outcome == "absent":
+        try:
+            placement = place_soul_anchor(identity_line, handle=actual, template=template)
+        except AnchorError as exc:
+            logger.warning("agentchat plugin: SOUL.md identity line not placed for profile=%s — %s", label, exc)
             return
-        path = write_soul_anchor(identity_line, handle=runtime.identity.handle)
-        logger.info(
-            "agentchat plugin: SOUL.md identity anchor backfilled for "
-            "non-wizard install path (handle=@%s, path=%s)",
-            runtime.identity.handle,
+        if placement.ok:
+            logger.info(
+                "agentchat plugin: SOUL.md identity anchor backfilled for non-wizard install path "
+                "(handle=@%s, path=%s)",
+                actual,
+                placement.path,
+            )
+        else:
+            logger.warning("agentchat plugin: SOUL.md identity line not placed for profile=%s — %s", label, placement.detail)
+    elif outcome == "other_agent":
+        from .config import cli_prefix
+
+        cmd = cli_prefix(runtime.hermes_home)
+        logger.error(
+            "agentchat plugin: IDENTITY MISMATCH for profile=%s — %s holds @%s's AgentChat block, but "
+            "this profile's saved key authenticates as @%s: the key or that block is another agent's. "
+            "Fix the key (`%s login`) or remove that block (then `%s doctor --fix` places @%s's). "
+            "Until then, messages this profile sends are attributed to @%s.",
+            label,
             path,
+            result.claimed,
+            actual,
+            cmd,
+            cmd,
+            actual,
+            actual,
         )
-    except (AnchorError, OSError) as exc:
-        logger.warning(
-            "agentchat plugin: SOUL.md anchor backfill failed (%s). The "
-            "agent will lack AgentChat awareness outside AgentChat-"
-            "triggered turns. Run `hermes agentchat login` to invoke the "
-            "wizard's anchor write, or hand-edit SOUL.md.",
-            exc,
+    elif outcome == "hand_edited":
+        _say_once(
+            path,
+            outcome,
+            result.detail,
+            "agentchat plugin: SOUL.md — %s. It is yours: not refreshed. `hermes agentchat doctor --fix` "
+            "puts the served identity line for @%s back in its place (your edit is replaced).",
+            result.detail,
+            actual,
         )
+    elif outcome == "several_blocks":
+        _say_once(
+            path,
+            outcome,
+            result.detail,
+            "agentchat plugin: SOUL.md — %s: one write would remove the others. Remove the extra blocks by "
+            "hand; the gateway then keeps the one left current.",
+            result.detail,
+        )
+    elif outcome == "edited_meanwhile":
+        logger.info("agentchat plugin: SOUL.md — %s; tried again on the next texts change", result.detail)
+    else:
+        logger.warning("agentchat plugin: SOUL.md identity line not followed for profile=%s — %s", label, result.detail)
 
 
 def _reconcile_key_store(config: Any) -> None:

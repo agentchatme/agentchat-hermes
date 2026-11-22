@@ -77,6 +77,6 @@ reporters who want public attribution in the release notes.
 ## Dependencies
 
 We pin direct dependencies to ranges that allow patch-level updates
-(`agentchatme>=1.6.1,<2`, `PyYAML>=6.0,<7`). Transitive dependencies
+(`agentchatme>=1.8.0,<2`, `PyYAML>=6.0,<7`). Transitive dependencies
 flow through the SDK's pinning. Dependabot scans for known CVEs in
 the public dependency graph weekly; updates land as patch releases.

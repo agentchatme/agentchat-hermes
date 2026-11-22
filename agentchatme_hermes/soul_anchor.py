@@ -22,39 +22,56 @@ with markers that scope what we own — the pattern nvm, conda and pyenv use
 for their blocks in ``~/.bashrc``: scoped, idempotent, removable,
 user-content-preserving.
 
-Recognising our own block
-─────────────────────────
-The block's text and its parsing are the SDK kit's
+Whose block it is
+─────────────────
+The block's text, its parsing and the rule for whose it is are the SDK kit's
 (``agentchatme.integration.anchor``, one copy for every integration, pinned by
 the shared conformance cases): the fences, a one-line handle comment
-(``<!-- agentchat:handle ops -->``) so a block is recognised whatever the
-served wording becomes, recognition of unmarked blocks by the served
-``identity_line_template`` and by the wordings earlier releases wrote, and
-the legacy ``agentchat-skill`` markers. A block in none of these shapes was
-hand-edited and is the user's: left alone, and ``doctor`` says so. This
-module only picks the file (the profile's ``SOUL.md``) and reads and writes it.
+(``<!-- agentchat:handle ops -->``), the legacy ``agentchat-skill`` markers.
+A block is this agent's only when it carries this agent's handle line, or
+when, without one, its whole text is EXACTLY a text AgentChat served (the
+served line, the served template filled in, one of the lines served before):
+``anchor.owner``, strict. A block that merely mentions ``@handle`` in the
+user's own words is not ours to rewrite. The loose reading (the template's
+words anywhere in the block) is for display only.
 
 Lifecycle
 ─────────
-write   — the wizard and ``cli`` after the API key has been validated
-          against ``/v1/agents/me``; the activation path backfills it.
-refresh — an anchor from an older release (different text, same handle)
-          is rewritten to the served text by the activation path and
-          ``doctor --fix``; a hand-edited block is left alone.
+refresh — the activation path, on every texts change: ``anchor.follow``
+          brings this agent's own block to the served line and leaves every
+          other block alone (another agent's is an IDENTITY MISMATCH; one
+          edited by hand is the user's; several blocks are left as they are).
+          With no block at all, the line is placed (the backfill).
+place   — the wizard and ``register`` / ``login`` / ``recover`` after the key
+          is validated, and ``doctor --fix``: an explicit request, so a block
+          edited by hand is put back to the served line, and (``login`` and
+          the wizard only) another agent's block is replaced by this one's.
+          ``doctor --fix`` never replaces another agent's block.
 remove  — ``hermes agentchat logout``.
 orphan  — if the user uninstalls the package without running ``logout``,
           the block stays in SOUL.md. Documented in the README.
+
+Every write keeps the file as it was around the block: its line breaks
+(CRLF stays CRLF), whether it ends with one, a byte-order mark, its mode, a
+symlink (the file it points to is replaced). It is atomic (a temp file
+beside it, then a rename), and a file that is not UTF-8 is not written.
 """
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
+import secrets
+import stat
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from collections.abc import Iterable
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
+
+# The kit release with the strict owner reading and ``follow`` (``anchor.owner``,
+# ``decide``, ``follow``).
+ANCHOR_KIT_REQUIREMENT = "agentchatme>=1.8.0"
 
 # The kit's markers (shared with every integration, so a workspace that ends
 # up with two integrations sees one canonical block, not two); equal to
@@ -118,146 +135,286 @@ def resolve_soul_path() -> Path:
     return hermes_home / "SOUL.md"
 
 
-def write_soul_anchor(identity_line: str, *, handle: str, soul_path: Path | None = None) -> Path:
-    """Idempotently upsert the AgentChat identity block into SOUL.md.
-
-    Mechanics:
-    * Resolves SOUL.md (uses provided ``soul_path`` for tests).
-    * Refuses a line that does not name ``@handle`` before writing.
-    * Creates the file (and parent dirs) if missing.
-    * Replaces the first block in place and removes any other (current or
-      legacy); appends the block after a blank line when there is none
-      (``agentchatme.integration.anchor.replace``).
-    * Reads the file back and checks the block names ``@<handle>``.
-
-    Returns:
-        The :class:`Path` of the file that was written.
-
-    Raises:
-        AnchorError: handle or line empty, or post-write verify failed.
-        OSError: filesystem write failed (caller decides whether to
-            surface as user-facing failure or log-and-continue).
-    """
-    target = soul_path if soul_path is not None else resolve_soul_path()
-    trimmed = normalize_handle(handle)
-    # Checked before anything is written: a line that names nobody (or
-    # somebody else) must not reach the system prompt.
-    block = render_anchor_block(identity_line, handle=trimmed)
-
-    target.parent.mkdir(parents=True, exist_ok=True)
-    existing = target.read_text(encoding="utf-8") if target.exists() else ""
+def _kit() -> Any:
+    """The kit's anchor module, with the strict reading; :class:`AnchorError`
+    when the installed kit predates it."""
     from agentchatme.integration import anchor
 
-    target.write_text(anchor.replace(existing, block), encoding="utf-8")
-
-    found = anchor.find(target.read_text(encoding="utf-8"))
-    if found is None or found.handle != trimmed or f"@{trimmed}" not in found.body:
+    if not all(callable(getattr(anchor, name, None)) for name in ("owner", "decide", "follow")):
         raise AnchorError(
-            f"write_soul_anchor: handle @{trimmed} did not land in {target} — remove the "
-            "agentchat block manually and re-run.",
+            f"the installed agentchatme has no strict identity-block reading (anchor.follow); "
+            f"{ANCHOR_KIT_REQUIREMENT} is needed to place or refresh the identity line"
         )
-
-    logger.info("SOUL.md anchor upserted for @%s at %s", trimmed, target)
-    return target
+    return anchor
 
 
-def has_anchor(*, soul_path: Path | None = None) -> bool:
-    """Return ``True`` if the AgentChat fenced block is present in SOUL.md.
-
-    Used by the non-interactive activation path
-    (:func:`_register._reconcile_soul_anchor`) to decide whether to
-    backfill an anchor at plugin startup. If our markers are present
-    we leave the file alone — even when the user has hand-edited the
-    block content, that's their explicit choice and we don't touch it.
-
-    Marker presence is checked, not block validity. A file that
-    contains only ``<!-- agentchat:start -->`` (broken half-write,
-    say) still returns ``True`` — the user can fix it manually or
-    re-run the wizard to upsert a fresh block in place.
-    """
-    target = soul_path if soul_path is not None else resolve_soul_path()
-    from agentchatme.integration import anchor
-
-    content = _read(target)
-    return content is not None and anchor.find(content) is not None
-
-
-def _read(path: Path) -> str | None:
+def anchor_kit_problem() -> str | None:
+    """``None`` when the kit has the strict reading; otherwise what ``doctor`` says."""
     try:
-        return path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-
-
-def read_anchor_handle(
-    *,
-    soul_path: Path | None = None,
-    template: str | None = None,
-    templates: Iterable[str] = (),
-) -> str | None:
-    """Return the handle named inside the fenced block, or ``None``.
-
-    The block's own handle line wins; without one (a block written by an
-    earlier release) the served ``template`` (and any further ``templates``)
-    and the wordings earlier releases wrote are tried. ``None`` when the
-    file or the block is absent, or the block was hand-edited into a shape
-    not recognised. Used at plugin start to detect a profile whose SOUL.md
-    says one identity while its API key authenticates as another — the
-    mix-up behind the September 2026 fleet incident, where a profile
-    labelled *Growth* was sending as *Operations*.
-    """
-    target = soul_path if soul_path is not None else resolve_soul_path()
-    content = _read(target)
-    if content is None:
-        return None
-    # The kit always tries the handle line and the earlier wordings; each
-    # served template is one more way to recognise an unmarked block.
-    from agentchatme.integration import anchor
-
-    candidates: list[str | None] = [t for t in (template, *templates) if t]
-    for candidate in candidates or [None]:
-        found = anchor.find(content, template=candidate)
-        if found is None:
-            return None
-        if found.handle is not None:
-            return found.handle
+        _kit()
+    except AnchorError as exc:
+        return str(exc)
+    except ImportError as exc:
+        return f"the SDK kit is not importable ({exc})"
     return None
 
 
-def anchor_is_current(
-    identity_line: str, *, soul_path: Path | None = None, template: str | None = None
-) -> bool | None:
-    """``True`` when the block's text is exactly ``identity_line``.
+def read_soul(path: Path) -> str | None:
+    """The file's text exactly (line breaks and a byte-order mark kept), or
+    ``None`` when there is no file. :class:`AnchorError` when it is not UTF-8
+    (decoding it would destroy its bytes); :class:`OSError` when it cannot be
+    read."""
+    try:
+        data = Path(path).read_bytes()
+    except FileNotFoundError:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise AnchorError(f"{path} is not UTF-8 text; the AgentChat block is not read or written there") from exc
 
-    ``False`` for a recognised block with other text (safe to refresh);
-    ``None`` when there is no block, or the block names no handle we
-    recognise (a hand-edited block is the user's, and is left alone).
+
+def _without_bom(text: str) -> str:
+    return text[1:] if text.startswith("\ufeff") else text
+
+
+def write_text_atomic(path: Path, text: str) -> None:
+    """Replace the file at ``path`` (through a symlink: the file it points to)
+    with ``text`` as UTF-8: a temp file beside it (created exclusively, the
+    file's mode), flushed, then renamed over it. A reader sees the old file or
+    the new one, never part of one; a failure leaves the old file as it was."""
+    target = Path(path)
+    if target.is_symlink():
+        target = target.resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = stat.S_IMODE(os.stat(target).st_mode)
+    except FileNotFoundError:
+        mode = 0o644
+    if target.exists() and not os.access(target, os.W_OK):
+        raise PermissionError(f"{target} is not writable")
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    try:
+        fd = os.open(tmp, flags, mode)
+        with os.fdopen(fd, "wb", closefd=True) as handle:
+            handle.write(text.encode("utf-8"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        with contextlib.suppress(OSError):
+            os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
+
+
+# ─── refresh (the activation path) ──────────────────────────────────────────
+
+
+def follow_soul(
+    *, handle: str, identity_line: str, template: str | None = None, soul_path: Path | None = None
+) -> Any:
+    """The kit's ``anchor.follow`` on SOUL.md: this agent's own block brought to
+    the served line, every other block left as it is, never a block created.
+    Returns the kit's ``FollowResult`` (``outcome``: ``updated``, ``unchanged``,
+    ``absent``, ``hand_edited``, ``other_agent``, ``several_blocks``,
+    ``edited_meanwhile``, ``failed``). Never raises but :class:`AnchorError`
+    for a kit without it."""
+    target = soul_path if soul_path is not None else resolve_soul_path()
+    return _kit().follow(target, handle=handle, identity_line=identity_line, template=template)
+
+
+# ─── state (doctor) ─────────────────────────────────────────────────────────
+
+SoulOutcome = Literal[
+    "unchanged",
+    "updated",
+    "absent",
+    "hand_edited",
+    "other_agent",
+    "several_blocks",
+    "setup_offer",
+    "failed",
+    "unreadable",
+    "unverified",
+]
+
+
+@dataclass(frozen=True)
+class SoulState:
+    """What the identity block in SOUL.md is, for ``doctor``. ``outcome`` is the
+    kit's ``decide`` outcome (``updated``: a refresh would change it), or
+    ``unreadable`` (not UTF-8, or unreadable), or ``unverified`` (no served
+    texts in hand: ``claimed`` is the strict owner where it can be told)."""
+
+    outcome: SoulOutcome
+    path: Path
+    claimed: str | None
+    named: str | None
+    detail: str
+
+
+def inspect_soul(
+    *,
+    handle: str | None,
+    identity_line: str | None,
+    template: str | None = None,
+    soul_path: Path | None = None,
+) -> SoulState:
+    """The identity block's state. Read-only. With the served line and this
+    agent's handle: the kit's ``decide``; without them: ``find`` and the strict
+    ``owner``. Never raises but :class:`AnchorError` for a kit without it."""
+    target = soul_path if soul_path is not None else resolve_soul_path()
+    anchor = _kit()
+    try:
+        text = read_soul(target)
+    except (AnchorError, OSError) as exc:
+        return SoulState("unreadable", target, None, None, str(exc))
+    if text is None:
+        return SoulState("absent", target, None, None, f"{target} does not exist")
+    body = _without_bom(text)
+    if handle and identity_line:
+        decision = anchor.decide(body, handle=handle, identity_line=identity_line, template=template)
+        return SoulState(
+            decision.outcome, target, decision.claimed, decision.named, decision.detail.replace("the file", str(target))
+        )
+    found = anchor.find(body, template=template)
+    if found is None:
+        return SoulState("absent", target, None, None, f"no AgentChat block in {target}")
+    claimed = anchor.owner(found, handle=handle, identity_line=identity_line, template=template)
+    return SoulState("unverified", target, claimed, found.handle, f"the AgentChat block in {target}")
+
+
+# ─── place (wizard, register / login / recover, doctor --fix) ───────────────
+
+PlacementOutcome = Literal["unchanged", "updated", "placed", "restored", "replaced_other", "refused", "failed"]
+
+
+@dataclass(frozen=True)
+class AnchorPlacement:
+    outcome: PlacementOutcome
+    path: Path
+    detail: str
+
+    @property
+    def ok(self) -> bool:
+        return self.outcome not in ("refused", "failed")
+
+    @property
+    def wrote(self) -> bool:
+        return self.outcome in ("updated", "placed", "restored", "replaced_other")
+
+
+def place_soul_anchor(
+    identity_line: str,
+    *,
+    handle: str,
+    soul_path: Path | None = None,
+    template: str | None = None,
+    replace_other: bool = False,
+) -> AnchorPlacement:
+    """Place the served identity line for ``handle`` in SOUL.md, on request.
+
+    This agent's own block is brought to the served line (``anchor.follow``);
+    no block (or no file) gets one; a block edited by hand is put back to the
+    served line (the request is the user's); another agent's block is
+    replaced only with ``replace_other`` (``login`` and the wizard: this
+    profile becomes this agent), else refused (``doctor --fix``). Several
+    blocks are refused (one write would remove the others). The new text is
+    read back and must be this agent's block with the served line.
+
+    Raises :class:`AnchorError` when the line does not name ``@handle`` (before
+    anything is written) or the kit has no strict reading.
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
-    from agentchatme.integration import anchor
+    bare = normalize_handle(handle)
+    block = render_anchor_block(identity_line, handle=bare)
+    anchor = _kit()
 
-    content = _read(target)
-    found = anchor.find(content, template=template) if content is not None else None
-    if found is None or found.handle is None:
-        return None
-    return found.body.strip() == identity_line.strip()
+    result = anchor.follow(target, handle=bare, identity_line=identity_line, template=template)
+    if result.outcome == "updated":
+        return AnchorPlacement("updated", target, f"identity line for @{bare} refreshed to the served text in {target}")
+    if result.outcome == "unchanged":
+        return AnchorPlacement("unchanged", target, f"identity line for @{bare} in {target} (the served text)")
+    if result.outcome in ("failed", "edited_meanwhile"):
+        return AnchorPlacement("failed", target, result.detail)
+    if result.outcome == "several_blocks":
+        return AnchorPlacement(
+            "refused",
+            target,
+            f"{target} holds more than one AgentChat block — nothing written; remove the extra blocks by hand, "
+            "then run this again",
+        )
+    if result.outcome == "other_agent" and not replace_other:
+        return AnchorPlacement(
+            "refused",
+            target,
+            f"the AgentChat block in {target} is @{result.claimed}'s, not @{bare}'s — not replaced: fix the key "
+            "(`hermes agentchat login`) or remove that block",
+        )
+
+    try:
+        text = read_soul(target)
+    except AnchorError as exc:
+        return AnchorPlacement("failed", target, str(exc))
+    except OSError as exc:
+        return AnchorPlacement("failed", target, f"could not read {target}: {exc}")
+    try:
+        write_text_atomic(target, anchor.replace(text or "", block))
+    except OSError as exc:
+        return AnchorPlacement("failed", target, f"could not write the identity line to {target}: {exc}")
+
+    try:
+        back = read_soul(target)
+    except (AnchorError, OSError):
+        back = None
+    # Landed = the kit reads this agent's block, in the current shape, with the served line.
+    landed = back is not None and (
+        anchor.decide(_without_bom(back), handle=bare, identity_line=identity_line, template=template).outcome
+        == "unchanged"
+    )
+    if not landed:
+        return AnchorPlacement(
+            "failed", target, f"{target} did not read back with the served identity line for @{bare} after the write"
+        )
+    if result.outcome == "hand_edited":
+        return AnchorPlacement(
+            "restored", target, f"the AgentChat block in {target} was edited by hand; it now is @{bare}'s served identity line"
+        )
+    if result.outcome == "other_agent":
+        return AnchorPlacement(
+            "replaced_other", target, f"the AgentChat block in {target} was @{result.claimed}'s; it now is @{bare}'s"
+        )
+    return AnchorPlacement("placed", target, f"identity line for @{bare} placed in {target}")
+
+
+def write_soul_anchor(identity_line: str, *, handle: str, soul_path: Path | None = None) -> Path:
+    """Place the identity line as ``login`` does (:func:`place_soul_anchor`
+    with ``replace_other``); the path written. :class:`AnchorError` when it
+    could not be placed."""
+    placement = place_soul_anchor(identity_line, handle=handle, soul_path=soul_path, replace_other=True)
+    if not placement.ok:
+        raise AnchorError(placement.detail)
+    logger.info("SOUL.md identity line for @%s: %s", normalize_handle(handle), placement.outcome)
+    return placement.path
+
+
+# ─── remove (logout) ────────────────────────────────────────────────────────
 
 
 def remove_soul_anchor(*, soul_path: Path | None = None) -> bool:
     """Idempotently strip the AgentChat identity block from SOUL.md.
 
-    Returns:
-        ``True`` if a block was found and removed, ``False`` if the file or
-        the block was absent.
-
-    Notes:
-        If the file becomes empty after stripping, it is left as an empty
-        file (not deleted) — Hermes treats absent and empty the same way.
-        Removing the file might surprise a user who hand-wrote other
-        content there; an empty file is the safer default.
+    Returns ``True`` if a block was found and removed, ``False`` if the file or
+    the block was absent. The rest of the file is kept as it was (its line
+    breaks, whether it ends with one); the write is atomic. A file left empty
+    is kept (not deleted): Hermes treats absent and empty the same way.
+    :class:`AnchorError` when the file is not UTF-8 (not written).
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
-    existing = _read(target)
+    existing = read_soul(target)
     if existing is None:
         return False
     from agentchatme.integration import anchor
@@ -265,6 +422,6 @@ def remove_soul_anchor(*, soul_path: Path | None = None) -> bool:
     stripped = anchor.remove(existing)
     if stripped == existing:
         return False
-    target.write_text(stripped, encoding="utf-8")
+    write_text_atomic(target, stripped)
     logger.info("SOUL.md anchor removed from %s", target)
     return True

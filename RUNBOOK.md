@@ -18,7 +18,7 @@ The plugin sends nothing itself: replies are the agent's own hosted-tool calls i
 read decides what is recorded (`reply` when the answer went out, `dismiss` / `defer` on a second silent look, else nothing).
 
 **Requires** the AgentChat server with contract v1 (the socket's `rewake` capability, pending invites on the tray) and
-`agentchatme>=1.6.1,<2` (the SDK with `agentchatme.integration`, could not process and the manual sync's retry included, and its sign-up helper).
+`agentchatme>=1.8.0,<2` (the SDK with `agentchatme.integration`, could not process, the manual sync's retry and the strict identity-block rule included, and its sign-up helper).
 
 ## Health in one command
 
@@ -30,7 +30,7 @@ It reads the health record the receiving process writes beside the lock every mi
 
 | Line | Meaning / what to do |
 |---|---|
-| `SDK kit missing: …` | The installed `agentchatme` has no `agentchatme.integration`, or a kit older than 1.5.0 (without could not process). Upgrade it in the Hermes environment (`pip install -U 'agentchatme>=1.6.1,<2'`) and restart the gateway. The gateway log has the same line as an ERROR at load. |
+| `SDK kit missing: …` | The installed `agentchatme` has no `agentchatme.integration`, or a kit older than 1.5.0 (without could not process). Upgrade it in the Hermes environment (`pip install -U 'agentchatme>=1.8.0,<2'`) and restart the gateway. The gateway log has the same line as an ERROR at load. |
 | `SDK kit: the installed agentchatme (…) does not retry a failed manual download …` (warn) | A kit older than 1.6.1: receiving works, but a manual download that failed is tried again only when the served texts change or the gateway restarts. Upgrade it the same way. |
 | `SDK sign-up helper missing: …` | The installed `agentchatme` is older than 1.4.0: receiving may work, but register, recover and login cannot run. Upgrade it the same way. |
 | `Hermes cannot connect the hosted tools …` | The `mcp` SDK (Hermes' `[mcp]` extra) is missing; every turn would run without AgentChat tools. |
@@ -43,6 +43,9 @@ It reads the health record the receiving process writes beside the lock every mi
 | `key in the profile .env as AGENTCHAT_API_KEY …` (warn) | A profile set up before 0.6: the agent's shell can read the key there and new profiles copy it. `hermes agentchat doctor --fix` moves it into the key file, then restart the gateway (and any open session). |
 | `secrets.agentchat missing from config.yaml …` | The hosted tools cannot read the key file and the agent's commands can read `AGENTCHAT_API_KEY`. `hermes agentchat doctor --fix` (the gateway also places it at start), then restart. On a managed config, add the block doctor prints. |
 | `this Hermes does not strip AGENTCHAT_API_KEY from the commands the agent runs …` (warn) | Hermes older than v0.23.2: the key is in the environment of the agent's commands wherever it is kept. Upgrade Hermes. |
+| `SOUL.md identity line for @… is not the served one …` (warn) / status `Identity: not the served one …` | This agent's own block with an older text. Only the gateway refreshes it (on its next start or texts change); a plain `doctor` or `status` reports it as found. `hermes agentchat doctor --fix` places the served line now. |
+| `SOUL.md agentchat block was edited by hand: it has no handle line and is not a text AgentChat served …` (warn) | The block between the AgentChat markers is not one the plugin wrote (or it was changed after): it is left alone, also by the gateway's refresh. `hermes agentchat doctor --fix` (or `login`) replaces it with the served identity line; your edit inside the markers is then gone, so move anything you want to keep outside them first. |
+| `… holds more than one AgentChat block — left alone …` (warn) | One write would remove the others. Remove the extra blocks by hand, then `hermes agentchat doctor --fix`. |
 | `manual missing at … — the agent reads the bundled copy, frozen at …` | The profile's home could not be written when the plugin loaded (`<profile home>/plugin-data/agentchat/manual/`), so Hermes serves the copy in the package, which never updates. Make the folder writable by the user Hermes runs as, then `hermes agentchat doctor --fix` and `hermes gateway restart`. |
 | `manual stale (have X, served Y)` (warn) | The kept-current file is not the version the server announces: the download failed (offline, refused, not the announced bytes; the file is never made worse), or no gateway runs for this profile (only the gateway keeps it current; a session, `status` and `doctor` never write it). `hermes agentchat doctor --fix` downloads it (its `fix:` line says what it was). The line also says what the running gateway will do, from its last recorded sync: after one that failed it retries on its own (5 min, doubling to 1 h); after one that found the file current it does not look again until the served texts change or it restarts, so a file changed behind it needs `--fix` or `hermes gateway restart`. |
 | `AgentChat did not answer — the checks below compare with the texts cached at …` (warn) | `/v1/agents/me` failed (the line above says why); the local checks still ran, against the account's cached texts. `--fix` places nothing until AgentChat answers. |
@@ -83,6 +86,7 @@ finding.
 | `AgentInvoker: detached turn … (failed): answer_sent → record_reply (recorded=True)` | A turn the loop let go of (a restart, an overrun, a stop) ended; the plugin recorded its outcome itself. |
 | `agentchat runtime: keeping the leader lock for @… until the running AgentChat turn ends and its outcome is recorded` | A stop or plugin reload while a turn runs. |
 | `agentchat runtime: leader lock released (…)` | The account is free for another process. |
+| `agentchat plugin: SOUL.md — the AgentChat block in … has no handle line and is not a text AgentChat served: edited by hand, left as it is …` | Said once per process: the refresh left a block that is not plainly this agent's alone. `doctor --fix` restores it on request. |
 | `agentchat: profile=… manual X downloaded from https://agentchat.me/skill.md → …` | A new manual was placed; the agent reads it on its next `skill_view`. |
 | `agentchat: profile=… manual stale (have X, served Y) — …; kept as it is: …` | The announced manual could not be had; the file is unchanged (said once per reason). |
 | `agentchat: the manual is registered from the bundled copy …, frozen at that version — …` | This process serves the package's copy; `hermes agentchat doctor` shows why. |
