@@ -487,6 +487,17 @@ class TestLoopHealth:
         receiver._receive_loop = None
         assert receiver.worker_status()["loop"]["recent_cycles"][-1]["outcome"] == "empty", "kept across a restart"
 
+    def test_the_health_record_carries_hermes_reading_of_the_hosted_tools(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """doctor runs in another process: what the gateway's Hermes says about
+        mcp_servers.agentchat reaches it through the record."""
+        inv = AgentInvoker(config=SimpleNamespace(), identity=AgentIdentity(handle="me"), runtime=SimpleNamespace())
+        section = {"status": "failed", "error": "All connection attempts failed", "tools": 0}
+        monkeypatch.setattr(inv, "hosted_tools_status", lambda: section)
+        receiver = _receiver(tmp_path, inv)
+        assert receiver.worker_status()["hosted_tools"] == section
+
     def test_the_debounce_setting_is_the_loops_quiet_window(self) -> None:
         from agentchatme_hermes.receiver import _quiet_window
 

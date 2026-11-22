@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from . import manual as manual_module
@@ -49,8 +50,6 @@ from .texts import load_texts
 from .turn import identity_line as render_identity_line
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from agentchatme.types import Texts
 
 logger = logging.getLogger(__name__)
@@ -375,14 +374,49 @@ def gateway_still_serving(home: Path, *, api_base: str) -> str | None:
     except Exception:
         logger.debug("placement: gateway liveness not read", exc_info=True)
         return None
-    restart = (
-        "`hermes gateway restart`"
-        if label == "default"
-        else f"`hermes -p {label} gateway restart`, or `hermes gateway restart` when the default profile's gateway "
-        "serves this profile too"
-    )
+    restart = _gateway_restart_command(home, label, health.get("pid"))
     return (
         f"The running gateway (pid {health['pid']}) still holds @{health['handle']}'s AgentChat connection, so this "
         f"profile is still woken and gated, now without the hosted tools: restart it ({restart}) so it stops "
         "serving this profile"
+    )
+
+
+def default_gateway_pid(home: Path) -> int | None:
+    """The pid of the default profile's running gateway when ``home`` is a named
+    profile (Hermes' own check, ``gateway.status.get_running_pid`` scoped to the
+    root's ``gateway.pid``, read-only), else ``None``: not a named profile, no
+    such gateway, or a Hermes without that check. Never raises."""
+    from .profile_scope import hermes_root_of
+
+    try:
+        root = hermes_root_of(Path(home))
+        if root == Path(home):
+            return None
+        from gateway.status import get_running_pid  # type: ignore[import-not-found]
+
+        pid = get_running_pid(root / "gateway.pid", cleanup_stale=False)
+    except Exception:
+        logger.debug("placement: the default profile's gateway pid not read", exc_info=True)
+        return None
+    return pid if isinstance(pid, int) else None
+
+
+def _gateway_restart_command(home: Path, label: str, pid: object) -> str:
+    """The restart that frees the gateway holding this profile's socket. The
+    default profile's gateway, and a gateway that multiplexes profiles (it is
+    the default profile's: the pid the health record names), restart with
+    `hermes gateway restart`; `hermes -p <name> gateway restart` on a profile
+    such a gateway serves reconnects only Hermes' own adapters, not this
+    socket. Only a named profile with a gateway of its own takes `-p`."""
+    if label == "default":
+        return "`hermes gateway restart`"
+    host = default_gateway_pid(home)
+    if host is not None and host == pid:
+        return "`hermes gateway restart`: the default profile's gateway serves this profile"
+    if host is not None:
+        return f"`hermes -p {label} gateway restart`: this profile's own gateway"
+    return (
+        f"`hermes gateway restart` when the default profile's gateway serves this profile, "
+        f"else `hermes -p {label} gateway restart`"
     )

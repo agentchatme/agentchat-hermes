@@ -770,3 +770,134 @@ def test_gateway_marks_its_process() -> None:
     spec = importlib.util.find_spec("gateway.run")
     assert spec is not None and spec.origin is not None
     assert "_HERMES_GATEWAY" in Path(spec.origin).read_text(encoding="utf-8")
+
+
+# ─── a parked hosted tools server (MS-F19) ──────────────────────────────────
+
+
+def test_hermes_mcp_status_and_reconnect_request_surface() -> None:
+    """``hosted_tools`` reads ``get_mcp_status()`` rows and asks ``reconnect_mcp_server(name)``."""
+    discovery = _import("tools.mcp_tool_discovery")
+    loop = _import("tools.mcp_tool_loop")
+    assert {"configured"} <= _params(discovery.get_mcp_status)
+    assert list(_params(loop.reconnect_mcp_server)) == ["server_name"]
+    assert loop.reconnect_mcp_server("agentchat") is False, "no connection held: nothing to wake"
+
+
+class _McpStub:
+    """A Streamable HTTP MCP server on localhost: ``initialize``, ``tools/list``
+    with one ``agentchat_inbox`` tool, ``ping``. JSON answers, no SSE stream
+    (``GET`` is 405, which the client allows)."""
+
+    def __init__(self, port: int) -> None:
+        stub = self
+        self.methods: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *_args: Any) -> None:
+                return
+
+            def _send(self, code: int, body: Any = None, headers: dict[str, str] | None = None) -> None:
+                data = b"" if body is None else json.dumps(body).encode()
+                self.send_response(code)
+                if body is not None:
+                    self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                for key, value in (headers or {}).items():
+                    self.send_header(key, value)
+                self.end_headers()
+                if data:
+                    self.wfile.write(data)
+
+            def do_HEAD(self) -> None:
+                self._send(405)
+
+            def do_GET(self) -> None:
+                self._send(405)
+
+            def do_DELETE(self) -> None:
+                self._send(200)
+
+            def do_POST(self) -> None:
+                length = int(self.headers.get("content-length") or 0)
+                message = json.loads(self.rfile.read(length) or b"{}")
+                method = message.get("method")
+                stub.methods.append(str(method))
+                if "id" not in message:
+                    self._send(202)
+                    return
+                if method == "initialize":
+                    result: Any = {
+                        "protocolVersion": (message.get("params") or {}).get("protocolVersion", "2025-06-18"),
+                        "capabilities": {"tools": {"listChanged": False}},
+                        "serverInfo": {"name": "agentchat-stub", "version": "1"},
+                    }
+                    self._send(200, {"jsonrpc": "2.0", "id": message["id"], "result": result}, {"mcp-session-id": "stub"})
+                    return
+                if method == "tools/list":
+                    tool = {"name": "agentchat_inbox", "description": "The tray.", "inputSchema": {"type": "object", "properties": {}}}
+                    self._send(200, {"jsonrpc": "2.0", "id": message["id"], "result": {"tools": [tool]}})
+                    return
+                if method == "ping":
+                    self._send(200, {"jsonrpc": "2.0", "id": message["id"], "result": {}})
+                    return
+                self._send(200, {"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "not here"}})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, name="mcp-stub", daemon=True)
+
+    def __enter__(self) -> _McpStub:
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _free_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+def test_a_parked_hosted_tools_server_comes_back_on_the_reconnect_request(_hermes_home: Path) -> None:
+    """The gateway starts while the hosted tools server cannot be reached:
+    Hermes' own MCP client tries three times and parks it (tools dropped,
+    waiting for a reconnect request or its timed self-probe). The server
+    comes back; :func:`hosted_tools.request_reconnect` (what the runtime does
+    when it activates and a held turn does) brings the tools back at once,
+    and a held turn starts."""
+    pytest.importorskip("mcp.client.streamable_http")
+    from agentchatme_hermes import hosted_tools
+
+    discovery = _import("tools.mcp_tool_discovery")
+    lifecycle = _import("tools.mcp_tool_lifecycle")
+    port = _free_port()
+    (_hermes_home / "config.yaml").write_text(
+        f"mcp_servers:\n  agentchat:\n    url: http://127.0.0.1:{port}/mcp\n    connect_timeout: 30\n",
+        encoding="utf-8",
+    )
+    hosted_tools._gates.clear()
+    try:
+        discovery.discover_mcp_tools()  # nothing listens: three refused attempts, then parked
+        state = hosted_tools.hosted_server_state()
+        assert state is not None and state.parked, f"Hermes parked the server: {state}"
+        assert hosted_tools.hosted_tool_names() == []
+        assert hosted_tools.describe_cause(state).startswith("Hermes parked mcp_servers.agentchat")
+        with _McpStub(port) as stub:
+            asked = hosted_tools.request_reconnect(key=str(_hermes_home), reason="the contract test")
+            assert asked.outcome == "requested"
+            assert hosted_tools.wait_for_hosted_tools(timeout_s=30.0, key=str(_hermes_home)) is True
+            assert "mcp__agentchat__agentchat_inbox" in (hosted_tools.hosted_tool_names() or [])
+            after = hosted_tools.hosted_server_state()
+            assert after is not None and after.status == "connected"
+            assert "tools/list" in stub.methods
+            again = hosted_tools.request_reconnect(key=str(_hermes_home), reason="the contract test")
+            assert again.outcome == "not_parked", "a connected server is never asked to reconnect"
+    finally:
+        lifecycle.shutdown_mcp_servers()

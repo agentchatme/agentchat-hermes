@@ -368,6 +368,60 @@ class TestLogout:
         assert "Nothing to clear" in capsys.readouterr().out
 
 
+class TestProfileAwareHints:
+    """R2-F05: hints name the profile (`hermes -p <name> agentchat …`)."""
+
+    def test_status_without_a_key_in_a_named_profile(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from agentchatme_hermes import profile_scope
+
+        home = profile_home() / "profiles" / "ms63"
+        home.mkdir(parents=True)
+        monkeypatch.setattr(profile_scope, "resolve_hermes_home", lambda: home)
+        assert cli._dispatch_status(argparse.Namespace()) == 0
+        assert (
+            "No AgentChat key configured. Run `hermes -p ms63 agentchat register` or `hermes -p ms63 agentchat login`."
+        ) in capsys.readouterr().out
+
+    def test_the_command_line_key_warning_names_the_profile(self) -> None:
+        line = cli._argv_key_warning("hermes -p ms63 agentchat")
+        assert "hermes -p ms63 agentchat login --api-key-file <path>" in line
+        assert "hermes agentchat login" not in line
+
+
+class TestGitCopiesInSeveralProfiles:
+    """T5-F07: Hermes installs one plugin package for every profile; a second
+    profile's git install fails ("Two workspace members are both named
+    `agentchatme-hermes`") and its copy stays, disabled."""
+
+    def _copy(self, home: Path) -> None:
+        plugin = home / "plugins" / "agentchat"
+        plugin.mkdir(parents=True)
+        (plugin / "plugin.yaml").write_text("name: agentchat\nversion: 0.6.3\n", encoding="utf-8")
+
+    def test_two_profiles_with_a_copy_get_the_remedy(self) -> None:
+        root = profile_home()
+        ms63 = root / "profiles" / "ms63"
+        self._copy(root)
+        self._copy(ms63)
+        (root / "profiles" / "other").mkdir(parents=True)
+        for here in (root, ms63):
+            line = cli._git_copies_line(here) or ""
+            assert line.startswith("agentchat is installed from git in 2 profiles (default, ms63).")
+            assert "Two workspace members are both named `agentchatme-hermes`" in line
+            assert line.endswith(
+                "Keep the copy in default; in ms63: `hermes -p ms63 plugins remove agentchat`, then "
+                "`hermes -p ms63 plugins enable agentchat` (enable uses the package already installed)"
+            )
+
+    def test_one_copy_says_nothing(self) -> None:
+        root = profile_home()
+        self._copy(root)
+        assert cli._git_copies_line(root) is None
+        assert cli._git_copies_line(root / "profiles" / "ms63") is None
+
+
 class TestLogoutWithAGatewayRunning:
     """A running gateway keeps the socket it opened with the key: logout says
     so, and how to stop it, when a gateway lives for the account (the
@@ -434,10 +488,22 @@ class TestLogoutWithAGatewayRunning:
         assert cli._dispatch_logout(argparse.Namespace()) == 0
         assert "still holds" not in capsys.readouterr().out
 
-    def test_a_named_profile_names_its_restart(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    @pytest.mark.parametrize(
+        ("host_pid", "restart"),
+        [
+            # MS-F17: a multiplexing gateway (the default profile's) holds the socket:
+            # `hermes -p growth gateway restart` reconnects only Hermes' adapters there.
+            (4242, "restart it (`hermes gateway restart`: the default profile's gateway serves this profile)"),
+            (1111, "restart it (`hermes -p growth gateway restart`: this profile's own gateway)"),
+            (None, "restart it (`hermes gateway restart` when the default profile's gateway serves this profile, "
+                   "else `hermes -p growth gateway restart`)"),
+        ],
+        ids=["served-by-the-default-gateway", "own-gateway", "cannot-tell"],
+    )
+    def test_a_named_profile_names_the_restart_that_frees_it(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], host_pid: int | None, restart: str
     ) -> None:
-        from agentchatme_hermes import profile_scope, ws_health
+        from agentchatme_hermes import placement, profile_scope, ws_health
 
         home = profile_home() / "profiles" / "growth"
         home.mkdir(parents=True)
@@ -451,15 +517,37 @@ class TestLogoutWithAGatewayRunning:
             return {"pid": 4242, "handle": "growth-bot", "state": "connected"}
 
         monkeypatch.setattr(ws_health, "live_health", live)
+        asked: list[Path] = []
+        monkeypatch.setattr(placement, "default_gateway_pid", lambda h: asked.append(h) or host_pid)
         assert cli._dispatch_logout(argparse.Namespace()) == 0
         out = capsys.readouterr().out
         assert seen == [(ONE, home)], "read with the key, before it is removed"
+        assert asked == [home]
         assert (
             "The running gateway (pid 4242) still holds @growth-bot's AgentChat connection, so this profile is "
-            "still woken and gated, now without the hosted tools: restart it (`hermes -p growth gateway restart`, "
-            "or `hermes gateway restart` when the default profile's gateway serves this profile too) so it stops "
-            "serving this profile."
+            f"still woken and gated, now without the hosted tools: {restart} so it stops serving this profile."
         ) in out
+
+    def test_the_default_gateway_pid_is_hermes_scoped_check(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import types as _types
+
+        from agentchatme_hermes.placement import default_gateway_pid
+
+        calls: list[tuple[Any, bool]] = []
+        status = _types.ModuleType("gateway.status")
+        status.get_running_pid = lambda pid_path=None, *, cleanup_stale=True: calls.append((pid_path, cleanup_stale)) or 4242  # type: ignore[attr-defined]
+        package = _types.ModuleType("gateway")
+        package.__path__ = []  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "gateway", package)
+        monkeypatch.setitem(sys.modules, "gateway.status", status)
+        root = tmp_path / ".hermes"
+        assert default_gateway_pid(root / "profiles" / "growth") == 4242
+        assert calls == [(root / "gateway.pid", False)], "the root's files, read-only"
+        assert default_gateway_pid(root) is None, "the default profile itself"
+        monkeypatch.setitem(sys.modules, "gateway.status", None)
+        assert default_gateway_pid(root / "profiles" / "growth") is None, "no Hermes: cannot tell"
 
     @pytest.mark.parametrize("profile", ["default", "growth"])
     def test_the_wizard_logout_says_it_and_names_the_profile(

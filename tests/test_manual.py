@@ -1108,6 +1108,42 @@ class TestOffline:
         assert "WS leader lock" in out, "and the lock check"
         assert manual_path(home).read_bytes() == OLD, "nothing placed offline"
 
+    def test_offline_the_identity_block_is_compared_with_the_cached_texts(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """MS-F18: doctor compares with the cached texts, so the block is read
+        against them for the saved handle (as status does), not "not verified"."""
+        from key_files import save_key
+
+        from agentchatme_hermes import soul_anchor
+
+        key = api_key("offline-soul")
+        save_key(key, handle="me")
+        _cache_texts(monkeypatch, home, key, BUNDLE_ANNOUNCED)
+        soul = home / "SOUL.md"
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        soul_anchor.write_soul_anchor("I am @me on AgentChat.", handle="me", soul_path=soul)
+        serve(monkeypatch, {"/v1/agents/me": connect_error("dns"), "/v1/texts": connect_error("dns")})
+        monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)
+        monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)
+        cli._dispatch_doctor(argparse.Namespace(fix=False))
+        out = capsys.readouterr().out
+        assert "[ok]   SOUL.md identity line present (@me, served text)" in out
+        assert "cannot verify its text" not in out
+
+    def test_offline_a_running_gateway_without_our_runtime_is_said_as_such(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """MS-F18: the gateway runs; AgentChat's runtime in it does not hold the
+        socket yet — not "gateway is not running" next to "gateway running"."""
+        self._setup(monkeypatch, home)
+        monkeypatch.setattr(cli, "_gateway_running", lambda *_a: "pid 2882455, Hermes' gateway lock for this profile")
+        cli._dispatch_doctor(argparse.Namespace(fix=False))
+        out = capsys.readouterr().out
+        assert "[ok]   Hermes gateway running (pid 2882455" in out
+        assert "the gateway runs, but AgentChat's runtime in it has not started for this account" in out
+        assert "gateway is not running" not in out and "gateway has not run since" not in out
+
     def test_status_still_shows_the_manual(
         self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
