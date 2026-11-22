@@ -306,41 +306,226 @@ class TestInspect:
 # ───────────────────────── remove (logout) ─────────────────────────
 
 
+def _remove(soul: Path, handle: str | None = "alice", **texts: str | None) -> soul_anchor.AnchorRemoval:
+    return remove_soul_anchor(handle=handle, soul_path=soul, **texts)
+
+
 class TestRemove:
-    def test_strips_the_block_and_keeps_the_rest(self, tmp_path: Path) -> None:
+    """Removing AgentChat takes out only the block AgentChat placed for this
+    agent (the kit's strict ``owner`` is this handle); every other block is
+    left, byte for byte, and the result says so."""
+
+    # ── ours: removed ──
+
+    def test_our_current_block_is_removed_and_the_rest_kept(self, tmp_path: Path) -> None:
         soul = tmp_path / "SOUL.md"
         soul.write_text("# Persona\nBe kind.\n", encoding="utf-8")
         write_soul_anchor(_line(), handle="alice", soul_path=soul)
-        assert remove_soul_anchor(soul_path=soul) is True
+        removal = _remove(soul, identity_line=_line())
+        assert (removal.outcome, removal.claimed, removal.removed, removal.left) == ("removed", "alice", True, False)
+        assert removal.detail == f"removed the identity line for @alice from {soul}"
         assert soul.read_text(encoding="utf-8") == "# Persona\nBe kind.\n"
-        assert remove_soul_anchor(soul_path=soul) is False
+        assert _remove(soul).outcome == "absent"
 
-    def test_absent_file_or_block(self, tmp_path: Path) -> None:
+    def test_our_stale_block_is_removed_without_the_served_texts(self, tmp_path: Path) -> None:
+        """An older text under our handle line: ours by its handle line, whatever
+        the served line is now (or when it is not in hand)."""
         soul = tmp_path / "SOUL.md"
-        assert remove_soul_anchor(soul_path=soul) is False
-        soul.write_text("# only mine\n", encoding="utf-8")
-        assert remove_soul_anchor(soul_path=soul) is False
+        soul.write_text("# Persona\n", encoding="utf-8")
+        write_soul_anchor(_line_v2(), handle="alice", soul_path=soul)
+        assert _remove(soul).outcome == "removed"
+        assert soul.read_text(encoding="utf-8") == "# Persona\n"
+
+    def test_the_handle_is_compared_as_the_server_writes_it(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        write_soul_anchor(_line(), handle="alice", soul_path=soul)
+        assert _remove(soul, handle="@Alice ").outcome == "removed"
+
+    def test_an_exact_older_served_text_without_a_handle_line_is_removed(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        older = anchor.EARLIER_IDENTITY_LINES[0].replace("<handle>", "alice")
+        soul.write_text(f"# Mine\n\n{ANCHOR_START}\n{older}\n{ANCHOR_END}\n", encoding="utf-8")
+        assert _remove(soul).outcome == "removed"
+        assert soul.read_text(encoding="utf-8") == "# Mine\n"
+
+    def test_the_served_text_in_the_old_shape_is_removed_with_the_texts_in_hand(self, tmp_path: Path) -> None:
+        """No handle line, the served line word for word: ours when the served
+        line (or template) is in hand; without it, it cannot be told from the
+        user's words and is left."""
+        soul = tmp_path / "SOUL.md"
+        text = f"# Mine\n\n{ANCHOR_START}\n{_line_v2()}\n{ANCHOR_END}\n"
+        soul.write_text(text, encoding="utf-8")
+        assert _remove(soul).outcome == "hand_edited"
+        assert soul.read_text(encoding="utf-8") == text
+        assert _remove(soul, template=TEMPLATE_V2).outcome == "removed"
+        soul.write_text(text, encoding="utf-8")
+        assert _remove(soul, identity_line=_line_v2()).outcome == "removed"
+        assert soul.read_text(encoding="utf-8") == "# Mine\n"
+
+    def test_a_legacy_block_of_ours_is_removed(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        older = anchor.EARLIER_IDENTITY_LINES[1].replace("<handle>", "alice")
+        soul.write_text(
+            f"# Mine\n\n{anchor.LEGACY_START_MARKER}\n{older}\n{anchor.LEGACY_END_MARKER}\n", encoding="utf-8"
+        )
+        assert _remove(soul).outcome == "removed"
+        assert soul.read_text(encoding="utf-8") == "# Mine\n"
 
     def test_only_the_block_leaves_an_empty_file(self, tmp_path: Path) -> None:
         soul = tmp_path / "SOUL.md"
         write_soul_anchor(_line(), handle="alice", soul_path=soul)
-        assert remove_soul_anchor(soul_path=soul) is True
+        assert _remove(soul).outcome == "removed"
         assert soul.exists() and soul.read_text(encoding="utf-8") == ""
 
-    def test_crlf_and_no_final_newline_are_kept(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("ending", ["", "\r\n"])
+    def test_crlf_the_end_of_the_file_and_a_bom_are_kept(self, tmp_path: Path, ending: str) -> None:
         soul = tmp_path / "SOUL.md"
         block = "\r\n".join([ANCHOR_START, render_handle_marker("alice"), _line().replace("\n", "\r\n"), ANCHOR_END])
-        soul.write_bytes(f"# Persona\r\n\r\n{block}\r\n\r\nafter".encode())
-        assert remove_soul_anchor(soul_path=soul) is True
-        assert soul.read_bytes() == b"# Persona\r\n\r\nafter"
+        soul.write_bytes(f"\ufeff# Persona\r\n\r\n{block}\r\n\r\nafter{ending}".encode())
+        assert _remove(soul).outcome == "removed"
+        assert soul.read_bytes() == f"\ufeff# Persona\r\n\r\nafter{ending}".encode()
 
-    def test_not_utf8_raises_and_is_not_written(self, tmp_path: Path) -> None:
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX modes")
+    def test_the_write_is_atomic_and_keeps_the_mode(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text("# Mine\n", encoding="utf-8")
+        soul.chmod(0o640)
+        write_soul_anchor(_line(), handle="alice", soul_path=soul)
+        assert _remove(soul).outcome == "removed"
+        assert (soul.stat().st_mode & 0o777) == 0o640
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["SOUL.md"], "no temp file left"
+
+    def test_a_symlink_stays_a_symlink(self, tmp_path: Path) -> None:
+        real = tmp_path / "persona.md"
+        real.write_text("# Persona\n", encoding="utf-8")
+        soul = tmp_path / "SOUL.md"
+        try:
+            soul.symlink_to(real)
+        except (OSError, NotImplementedError):
+            pytest.skip("no symlinks here")
+        write_soul_anchor(_line(), handle="alice", soul_path=soul)
+        assert _remove(soul).outcome == "removed"
+        assert soul.is_symlink() and real.read_text(encoding="utf-8") == "# Persona\n"
+
+    # ── not ours: left, and said ──
+
+    def test_a_hand_edited_block_is_left(self, tmp_path: Path) -> None:
+        """The OpenClaw lab case: the user's own words inside the markers (they
+        even name @alice). Not a text AgentChat placed: removing AgentChat
+        leaves it."""
+        soul = tmp_path / "SOUL.md"
+        mine = f"# Me\n\n{ANCHOR_START}\nI am @alice on AgentChat, and I keep my own notes here.\n{ANCHOR_END}\n"
+        soul.write_text(mine, encoding="utf-8")
+        removal = _remove(soul, identity_line=_line(), template=_line("<handle>"))
+        assert (removal.outcome, removal.removed, removal.left) == ("hand_edited", False, True)
+        assert removal.detail == (
+            f"left your edited AgentChat block in {soul}; remove it by hand if you no longer want it"
+        )
+        assert soul.read_text(encoding="utf-8") == mine
+
+    def test_one_word_changed_in_a_served_text_is_left(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        edited = _line().replace("decide per card", "decide per thread")
+        soul.write_text(f"{ANCHOR_START}\n{edited}\n{ANCHOR_END}\n", encoding="utf-8")
+        before = soul.read_bytes()
+        assert _remove(soul, identity_line=_line(), template=_line("<handle>")).outcome == "hand_edited"
+        assert soul.read_bytes() == before
+
+    def test_another_agents_block_is_left(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        write_soul_anchor(_line("bob"), handle="bob", soul_path=soul)
+        before = soul.read_bytes()
+        removal = _remove(soul, identity_line=_line())
+        assert (removal.outcome, removal.claimed, removal.left) == ("other_agent", "bob", True)
+        assert removal.detail == (
+            f"left @bob's AgentChat block in {soul}: it is another agent's, not @alice's; "
+            "remove it by hand if you no longer want it"
+        )
+        assert soul.read_bytes() == before
+
+    def test_another_agents_older_served_text_is_left(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        older = anchor.EARLIER_IDENTITY_LINES[0].replace("<handle>", "bob")
+        soul.write_text(f"{ANCHOR_START}\n{older}\n{ANCHOR_END}\n", encoding="utf-8")
+        before = soul.read_bytes()
+        assert _remove(soul).outcome == "other_agent"
+        assert soul.read_bytes() == before
+
+    def test_several_blocks_are_left(self, tmp_path: Path) -> None:
+        """Even when the first is ours: one write would take the other too."""
+        soul = tmp_path / "SOUL.md"
+        ours = render_anchor_block(_line(), handle="alice")
+        soul.write_text(f"{ours}\n\n# Mine\n\n{ANCHOR_START}\nmy notes\n{ANCHOR_END}\n", encoding="utf-8")
+        before = soul.read_bytes()
+        removal = _remove(soul, identity_line=_line())
+        assert (removal.outcome, removal.left) == ("several_blocks", True)
+        assert "remove them by hand" in removal.detail
+        assert soul.read_bytes() == before
+
+    def test_with_the_handle_not_known_any_block_is_left(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        write_soul_anchor(_line(), handle="alice", soul_path=soul)
+        before = soul.read_bytes()
+        for handle in (None, "", "  "):
+            removal = _remove(soul, handle=handle)
+            assert (removal.outcome, removal.claimed, removal.left) == ("handle_unknown", "alice", True)
+            assert "this profile's AgentChat handle is not known" in removal.detail
+        assert soul.read_bytes() == before
+
+    # ── the file ──
+
+    def test_absent_file_or_block(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        assert _remove(soul).outcome == "absent"
+        assert not soul.exists(), "nothing is created"
+        soul.write_text("# only mine\n", encoding="utf-8")
+        assert _remove(soul).outcome == "absent"
+        assert soul.read_text(encoding="utf-8") == "# only mine\n"
+
+    def test_not_utf8_fails_and_is_not_written(self, tmp_path: Path) -> None:
         soul = tmp_path / "SOUL.md"
         soul.write_bytes(b"# caf\xe9\n<!-- agentchat:start -->\nx\n<!-- agentchat:end -->\n")
         before = soul.read_bytes()
-        with pytest.raises(AnchorError):
-            remove_soul_anchor(soul_path=soul)
+        removal = _remove(soul)
+        assert (removal.outcome, removal.removed, removal.left) == ("failed", False, False)
+        assert "not UTF-8" in removal.detail and "remove it by hand" in removal.detail
         assert soul.read_bytes() == before
+
+    def test_an_edit_made_during_the_write_is_kept(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The user saves SOUL.md between the read and the rename: nothing is
+        written over it; the decision is made again on what is there now."""
+        soul = tmp_path / "SOUL.md"
+        soul.write_text("# Persona\n", encoding="utf-8")
+        write_soul_anchor(_line(), handle="alice", soul_path=soul)
+        real_still = soul_anchor._still
+        edits = iter(["# Persona\nA line I just added.\n"])
+
+        def user_saves_once(target: Path, expected: str) -> bool:
+            edit = next(edits, None)
+            if edit is not None:
+                soul.write_text(soul.read_text(encoding="utf-8").replace("# Persona\n", edit), encoding="utf-8")
+            return real_still(target, expected)
+
+        monkeypatch.setattr(soul_anchor, "_still", user_saves_once)
+        assert _remove(soul).outcome == "removed"
+        assert soul.read_text(encoding="utf-8") == "# Persona\nA line I just added.\n"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["SOUL.md"], "no temp file left"
+
+    def test_a_file_that_keeps_changing_is_left(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        soul = tmp_path / "SOUL.md"
+        write_soul_anchor(_line(), handle="alice", soul_path=soul)
+        saves = iter(range(100))
+
+        def user_keeps_saving(target: Path, expected: str) -> bool:
+            soul.write_text(soul.read_text(encoding="utf-8") + f"edit {next(saves)}\n", encoding="utf-8")
+            return False
+
+        monkeypatch.setattr(soul_anchor, "_still", user_keeps_saving)
+        removal = _remove(soul)
+        assert (removal.outcome, removal.left) == ("edited_meanwhile", True)
+        text = soul.read_text(encoding="utf-8")
+        assert render_handle_marker("alice") in text and text.endswith(f"edit {soul_anchor.REMOVE_ATTEMPTS - 1}\n")
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["SOUL.md"], "no temp file left"
 
 
 # ───────────────────────── the kit ─────────────────────────
@@ -511,3 +696,193 @@ class TestDoctorLines:
         out = capsys.readouterr().out
         assert f"  Identity:      not the served one (@alice, an older text) — {soul}" in out
         assert soul.read_bytes() == before, "status writes nothing"
+
+
+# ───────────────────────── logout: only our block leaves ─────────────────────────
+
+
+class _TextsClient:
+    """A sync SDK client double serving the texts once (to seed the cache)."""
+
+    def __init__(self, identity_line: str, template: str) -> None:
+        from types import SimpleNamespace
+
+        self.served = {
+            "version": "1", "runtime": "hermes",
+            "manual": {"url": "https://agentchat.me/skill.md", "version": "2.4.3"},
+            "wake_instruction": "w", "invite_prompt": "i",
+            "identity_line": identity_line, "identity_line_template": template,
+        }
+        self.texts = SimpleNamespace(get=self._get)
+
+    def _get(self, *, runtime: str, opts: object = None) -> object:
+        from agentchatme.types import Texts
+
+        return Texts.model_validate(self.served)
+
+
+class TestLogout:
+    """``hermes agentchat logout`` and the wizard's logout: the handle (and the
+    cached served texts) are read before the key goes, and only the block
+    AgentChat placed for that agent leaves SOUL.md."""
+
+    def _profile(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path, Path]:
+        from agentchatme_hermes import cli, mcp_registration, secrets_registration
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        soul = home / "SOUL.md"
+        monkeypatch.setattr(soul_anchor, "resolve_soul_path", lambda: soul)
+        monkeypatch.setattr(cli, "_uninstall_secrets_registration", lambda: None)
+        monkeypatch.setattr(cli, "_uninstall_mcp_registration", lambda: None)
+        monkeypatch.setattr(secrets_registration, "uninstall_block", lambda *a, **k: False)
+        monkeypatch.setattr(mcp_registration, "uninstall_entry", lambda *a, **k: False)
+        return home, soul
+
+    def _logout(self) -> int:
+        import argparse
+
+        from agentchatme_hermes import cli
+
+        return cli._dispatch_logout(argparse.Namespace())
+
+    def test_our_block_is_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from fake_keys import api_key
+        from key_files import save_key
+
+        home, soul = self._profile(tmp_path, monkeypatch)
+        save_key(api_key("logout-ours"), home=home)
+        soul.write_text("# Persona\n", encoding="utf-8")
+        write_soul_anchor(_line_v2(), handle="alice", soul_path=soul)  # ours, an older text
+        assert self._logout() == 0
+        assert f"SOUL.md: removed the identity line for @alice from {soul}." in capsys.readouterr().out
+        assert soul.read_text(encoding="utf-8") == "# Persona\n"
+
+    def test_a_hand_edited_block_is_left_and_said(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from fake_keys import api_key
+        from key_files import save_key
+
+        home, soul = self._profile(tmp_path, monkeypatch)
+        save_key(api_key("logout-mine"), home=home)
+        mine = f"# Me\n\n{ANCHOR_START}\nI am @alice on AgentChat, and I keep my own notes here.\n{ANCHOR_END}\n"
+        soul.write_text(mine, encoding="utf-8")
+        assert self._logout() == 0
+        out = capsys.readouterr().out
+        assert (
+            f"SOUL.md: left your edited AgentChat block in {soul}; remove it by hand if you no longer want it." in out
+        )
+        assert "AgentChat key removed from this profile" in out
+        assert soul.read_text(encoding="utf-8") == mine
+
+    def test_another_agents_block_is_left_and_said(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from fake_keys import api_key
+        from key_files import save_key
+
+        home, soul = self._profile(tmp_path, monkeypatch)
+        save_key(api_key("logout-other"), home=home)
+        write_soul_anchor(_line("bob"), handle="bob", soul_path=soul)
+        before = soul.read_bytes()
+        assert self._logout() == 0
+        assert f"SOUL.md: left @bob's AgentChat block in {soul}: it is another agent's, not @alice's" in (
+            capsys.readouterr().out
+        )
+        assert soul.read_bytes() == before
+
+    def test_the_served_text_in_the_old_shape_is_ours_by_the_cached_texts(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No handle line, the served line word for word: told from the user's
+        words by the texts cached for the key, read before the key goes."""
+        from fake_keys import api_key
+        from key_files import DEFAULT_BASE, save_key
+
+        from agentchatme_hermes.state import state_dir_for_account
+        from agentchatme_hermes.texts import load_texts
+
+        home, soul = self._profile(tmp_path, monkeypatch)
+        key = api_key("logout-cached")
+        save_key(key, home=home)
+        state_dir = state_dir_for_account(hermes_home=home, api_base=DEFAULT_BASE, api_key=key)
+        assert load_texts(_TextsClient(_line_v2(), TEMPLATE_V2), state_dir=state_dir) is not None
+        soul.write_text(f"# Mine\n\n{ANCHOR_START}\n{_line_v2()}\n{ANCHOR_END}\n", encoding="utf-8")
+        assert self._logout() == 0
+        assert soul.read_text(encoding="utf-8") == "# Mine\n"
+
+    def test_a_profile_set_up_before_0_6_is_known_by_its_handle_setting(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fake_keys import api_key
+
+        from agentchatme_hermes.config import ENV_API_KEY, ENV_HANDLE
+
+        home, soul = self._profile(tmp_path, monkeypatch)
+        (home / ".env").write_text(f"{ENV_API_KEY}={api_key('logout-env')}\n{ENV_HANDLE}=alice\n", encoding="utf-8")
+        monkeypatch.setenv(ENV_HANDLE, "alice")
+        write_soul_anchor(_line(), handle="alice", soul_path=soul)
+        assert self._logout() == 0
+        assert soul.read_text(encoding="utf-8") == ""
+
+    def test_with_no_handle_known_the_block_is_left(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from fake_keys import api_key
+
+        from agentchatme_hermes.config import ENV_API_KEY, ENV_HANDLE
+
+        home, soul = self._profile(tmp_path, monkeypatch)
+        monkeypatch.delenv(ENV_HANDLE, raising=False)
+        (home / ".env").write_text(f"{ENV_API_KEY}={api_key('logout-nohandle')}\n", encoding="utf-8")
+        write_soul_anchor(_line(), handle="alice", soul_path=soul)
+        before = soul.read_bytes()
+        assert self._logout() == 0
+        assert "this profile's AgentChat handle is not known" in capsys.readouterr().out
+        assert soul.read_bytes() == before
+
+    def test_a_soul_md_that_cannot_be_read_is_a_warning_not_a_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from fake_keys import api_key
+        from key_files import save_key
+
+        home, soul = self._profile(tmp_path, monkeypatch)
+        save_key(api_key("logout-bytes"), home=home)
+        soul.write_bytes(b"# caf\xe9\n<!-- agentchat:start -->\nx\n<!-- agentchat:end -->\n")
+        assert self._logout() == 0
+        captured = capsys.readouterr()
+        assert "Warning: could not remove the AgentChat block from" in captured.err
+        assert "AgentChat key removed from this profile" in captured.out
+
+    @pytest.mark.parametrize("whose", ["ours", "mine", "bob"])
+    def test_the_wizard_logout_removes_only_ours(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], whose: str
+    ) -> None:
+        from fake_keys import api_key
+        from key_files import save_key, saved
+
+        from agentchatme_hermes import wizard
+
+        home, soul = self._profile(tmp_path, monkeypatch)
+        save_key(api_key(f"wizard-{whose}"), home=home)
+        if whose == "mine":
+            soul.write_text(f"{ANCHOR_START}\nI am @alice on AgentChat, and these are my words.\n{ANCHOR_END}\n", encoding="utf-8")
+        else:
+            write_soul_anchor(_line(whose if whose == "bob" else "alice"), handle="bob" if whose == "bob" else "alice", soul_path=soul)
+        before = soul.read_bytes()
+        info: list[str] = []
+        wizard._logout_flow(lambda *_a: True, info.append, lambda _m: None, lambda *_a: None)
+        assert saved(home) is None, "the key is gone"
+        out = capsys.readouterr().out
+        if whose == "ours":
+            assert soul.read_text(encoding="utf-8") == ""
+            assert f"SOUL.md: removed the identity line for @alice from {soul}" in out
+            assert info == []
+        else:
+            assert soul.read_bytes() == before
+            assert len(info) == 1 and info[0].startswith("SOUL.md: left ") and "remove it by hand" in info[0]

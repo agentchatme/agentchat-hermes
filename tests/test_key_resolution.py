@@ -354,7 +354,7 @@ class TestLogout:
         save_key(ONE)
         clone = _hermes_profile_create(root, "he2", clone_all=True)
         monkeypatch.setattr(profile_scope, "resolve_hermes_home", lambda: clone)
-        monkeypatch.setattr(cli, "_uninstall_soul_anchor", lambda: None)
+        monkeypatch.setattr(cli, "_uninstall_soul_anchor", lambda _identity: None)
         monkeypatch.setattr(cli, "_uninstall_secrets_registration", lambda: None)
         monkeypatch.setattr(cli, "_uninstall_mcp_registration", lambda: None)
         assert cli._dispatch_logout(argparse.Namespace()) == 0

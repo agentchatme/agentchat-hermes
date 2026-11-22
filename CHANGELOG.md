@@ -2,6 +2,24 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **`logout` removes only the identity block AgentChat placed for this agent.** It stripped any AgentChat block from
+  SOUL.md, so logging out deleted a block a person wrote inside the markers, or another agent's block. Removal now uses
+  the same strict rule as the refresh (the SDK kit's `anchor.owner`): the block goes only when it is this profile's
+  agent's, meaning its handle line names that agent, or, without one, its whole text is exactly a text AgentChat served
+  (the served line and template cached for the key are used when present). The handle is the one the key file names
+  (or `AGENTCHATME_HANDLE` for a profile set up before 0.6), read before the key is removed.
+  - A block edited by hand, another agent's block, several blocks, or any block when the profile's handle is not known
+    are left as they are. `logout` and the wizard's logout say so ("left your edited AgentChat block in …/SOUL.md; remove
+    it by hand if you no longer want it").
+  - The write stays atomic and keeps the file's line breaks, a missing final newline, a byte-order mark, the mode and a
+    symlink. It is not made over an edit saved while it runs (the file is read again before the rename, and the
+    decision is made again). A SOUL.md that is not UTF-8 is never written; that is a warning, and the key is still
+    removed.
+
 ## [0.6.2] — 2026-11-22
 
 Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): the SOUL.md refresh no longer rewrites a block a person wrote (it follows the SDK kit's strict rule), only the gateway writes it, and the documented upgrade command works (Hermes takes `--ref` as a full commit SHA; resolve the tag with `git ls-remote https://github.com/agentchatme/agentchat-hermes.git 'refs/tags/v0.6.2^{}' | cut -f1`). Needs `agentchatme>=1.8.0,<2` (was 1.6.1) in `pyproject.toml`, both `plugin.yaml` files and the git-clone shim (which

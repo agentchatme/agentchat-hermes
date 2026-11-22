@@ -19,7 +19,8 @@ Surfaces:
   (restrictions, inbox mode, paused-by-owner, etc.), where the key is and
   whether the manual is the served one.
 * **``logout``** — remove the key file and any key line from the profile
-  ``.env``, strip the identity line from SOUL.md, remove our
+  ``.env``, the identity line AgentChat placed in SOUL.md for this profile's
+  agent (a block edited by hand or another agent's is left, and said), our
   ``secrets.agentchat`` and ``mcp_servers.agentchat`` entries.
 * **``doctor``** — check every placement (key, identity line, manual,
   the key source, hosted tools) plus the lock and the daemon's health;
@@ -72,10 +73,12 @@ from .config import (
 )
 from .placement import (
     PlacementStep,
+    ProfileIdentity,
     place_identity_and_tools,
+    profile_identity,
     resolve_texts,
 )
-from .soul_anchor import AnchorError, remove_soul_anchor
+from .soul_anchor import remove_soul_anchor
 from .wizard import _mask_key
 
 if TYPE_CHECKING:
@@ -1354,11 +1357,14 @@ def _dispatch_logout(_args: argparse.Namespace) -> int:
     if not has_file and resolution.held_key is None and credentials.env_file_key(home) is None:
         _printline("No AgentChat key was configured. Nothing to clear.")
         return _EXIT_OK
+    # Who this profile is, read while its key is still here: only the block
+    # AgentChat placed for that agent leaves SOUL.md.
+    identity = profile_identity(home, api_base=_api_base())
     try:
         removed_file, removed_lines = credentials.clear_credentials(home)
     except key_store.KeyStoreError as exc:
         return _exit_with(f"The key was not removed: {exc}")
-    _uninstall_soul_anchor()
+    _uninstall_soul_anchor(identity)
     _uninstall_secrets_registration()
     _uninstall_mcp_registration()
     where = []
@@ -1828,21 +1834,20 @@ def _uninstall_mcp_registration() -> None:
         _printline("Hosted-tools entry mcp_servers.agentchat removed from config.yaml")
 
 
-def _uninstall_soul_anchor() -> None:
-    """Strip the AgentChat identity block from SOUL.md (idempotent)."""
-    try:
-        removed = remove_soul_anchor()
-    except (OSError, AnchorError) as exc:
-        sys.stderr.write(
-            f"Warning: could not remove the AgentChat block from SOUL.md "
-            f"({exc}). You can delete the block between "
-            "`<!-- agentchat:start -->` and `<!-- agentchat:end -->` "
-            "manually if needed.\n"
-        )
+def _uninstall_soul_anchor(identity: ProfileIdentity) -> None:
+    """Remove the identity block AgentChat placed for this profile's agent from
+    SOUL.md; any other block (edited by hand, another agent's, several) is left
+    and said. Idempotent."""
+    removal = remove_soul_anchor(
+        handle=identity.handle, identity_line=identity.identity_line, template=identity.template
+    )
+    if removal.outcome == "absent":
+        return
+    if removal.outcome == "failed":
+        sys.stderr.write(f"Warning: {removal.detail}.\n")
         sys.stderr.flush()
         return
-    if removed:
-        _printline("Identity anchor removed from ~/.hermes/SOUL.md")
+    _printline(f"SOUL.md: {removal.detail}.")
 
 
 # ───────────────────────── prompts ─────────────────────────

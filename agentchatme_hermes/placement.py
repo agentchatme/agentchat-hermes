@@ -26,6 +26,11 @@
 
 Every placer is idempotent and reports what it did; the wizard prints the
 report, the activation path logs it, ``doctor --fix`` runs it again.
+
+Removing AgentChat (``logout``) takes out only what is this profile's: the
+identity line goes only when the block is the one AgentChat placed for this
+profile's agent (:func:`profile_identity` says who that is, read before the
+key is removed; :func:`.soul_anchor.remove_soul_anchor` decides).
 """
 from __future__ import annotations
 
@@ -288,3 +293,56 @@ def place_identity_and_tools(
         place_secrets(),
         place_mcp(api_base),
     ]
+
+
+# ─── removal (logout) ──────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class ProfileIdentity:
+    """Who a profile is configured as, from this machine alone: what removing
+    AgentChat compares SOUL.md's block with. ``handle`` ``None``: not known (no
+    key file names one, no ``AGENTCHATME_HANDLE``); ``identity_line`` and
+    ``template``: the served texts cached for the profile's key, as Hermes
+    places them, ``None`` when nothing is cached."""
+
+    handle: str | None
+    identity_line: str | None = None
+    template: str | None = None
+
+
+def profile_identity(home: Path, *, api_base: str) -> ProfileIdentity:
+    """Who ``home``'s profile is configured as — read BEFORE logout removes the
+    key: the handle its key file names (a copied key file too: it names the
+    agent this profile held the key of), else ``AGENTCHATME_HANDLE`` (a profile
+    set up before 0.6); the served identity line and template cached for the
+    key it holds. No network. Never raises."""
+    from .config import ENV_HANDLE, resolve_key
+    from .profile_scope import resolve_setting
+    from .texts import cached_texts
+    from .turn import identity_line_template as render_identity_line_template
+
+    try:
+        resolution = resolve_key(home)
+    except Exception:
+        logger.debug("placement: key resolution raised", exc_info=True)
+        return ProfileIdentity(None)
+    stored = resolution.store.key
+    raw = (stored.handle if stored is not None else "") or ""
+    if not raw.strip():
+        try:
+            raw = resolve_setting(ENV_HANDLE) or ""
+        except Exception:
+            raw = ""
+    handle = raw.strip().lstrip("@").lower() or None
+    api_key = resolution.held_key or (stored.api_key if stored is not None else None)
+    if not api_key:
+        return ProfileIdentity(handle)
+    try:
+        texts, _ = cached_texts(state_dir_for_account(hermes_home=home, api_base=api_base, api_key=api_key))
+    except Exception:
+        logger.debug("placement: cached texts unreadable", exc_info=True)
+        texts = None
+    if texts is None:
+        return ProfileIdentity(handle)
+    return ProfileIdentity(handle, render_identity_line(texts), render_identity_line_template(texts))

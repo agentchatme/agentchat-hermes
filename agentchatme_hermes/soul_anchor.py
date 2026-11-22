@@ -47,7 +47,12 @@ place   — the wizard and ``register`` / ``login`` / ``recover`` after the key
           edited by hand is put back to the served line, and (``login`` and
           the wizard only) another agent's block is replaced by this one's.
           ``doctor --fix`` never replaces another agent's block.
-remove  — ``hermes agentchat logout``.
+remove  — ``hermes agentchat logout`` (and the wizard's logout): only the
+          block AgentChat placed for this profile's agent — ``anchor.owner``
+          (strict) is this profile's handle. A block edited by hand, another
+          agent's, or several blocks are left as they are, and the step says
+          so: removing AgentChat never takes the user's words, or another
+          agent's identity, out of their file.
 orphan  — if the user uninstalls the package without running ``logout``,
           the block stays in SOUL.md. Documented in the README.
 
@@ -178,11 +183,26 @@ def _without_bom(text: str) -> str:
     return text[1:] if text.startswith("\ufeff") else text
 
 
-def write_text_atomic(path: Path, text: str) -> None:
+class _ChangedMeanwhile(Exception):
+    """The file is no longer the text a write was decided on (nothing written)."""
+
+
+def _still(target: Path, expected: str) -> bool:
+    try:
+        return target.read_bytes() == expected.encode("utf-8")
+    except FileNotFoundError:
+        return False
+
+
+def write_text_atomic(path: Path, text: str, *, unless_changed_from: str | None = None) -> None:
     """Replace the file at ``path`` (through a symlink: the file it points to)
     with ``text`` as UTF-8: a temp file beside it (created exclusively, the
     file's mode), flushed, then renamed over it. A reader sees the old file or
-    the new one, never part of one; a failure leaves the old file as it was."""
+    the new one, never part of one; a failure leaves the old file as it was.
+
+    With ``unless_changed_from`` (the text the write was decided on), the file
+    is read again right before the rename, and if it is no longer that text
+    (or is gone) nothing is written: :class:`_ChangedMeanwhile`."""
     target = Path(path)
     if target.is_symlink():
         target = target.resolve()
@@ -203,6 +223,8 @@ def write_text_atomic(path: Path, text: str) -> None:
             os.fsync(handle.fileno())
         with contextlib.suppress(OSError):
             os.chmod(tmp, mode)
+        if unless_changed_from is not None and not _still(target, unless_changed_from):
+            raise _ChangedMeanwhile(str(target))
         os.replace(tmp, target)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -403,25 +425,142 @@ def write_soul_anchor(identity_line: str, *, handle: str, soul_path: Path | None
 
 # ─── remove (logout) ────────────────────────────────────────────────────────
 
+REMOVE_ATTEMPTS = 3
+"""Decisions in all (the first, and the ones made again after the file changed
+under the write) before a removal leaves the file for now."""
 
-def remove_soul_anchor(*, soul_path: Path | None = None) -> bool:
-    """Idempotently strip the AgentChat identity block from SOUL.md.
+RemovalOutcome = Literal[
+    "removed",
+    "absent",
+    "hand_edited",
+    "other_agent",
+    "several_blocks",
+    "handle_unknown",
+    "edited_meanwhile",
+    "failed",
+]
 
-    Returns ``True`` if a block was found and removed, ``False`` if the file or
-    the block was absent. The rest of the file is kept as it was (its line
-    breaks, whether it ends with one); the write is atomic. A file left empty
-    is kept (not deleted): Hermes treats absent and empty the same way.
-    :class:`AnchorError` when the file is not UTF-8 (not written).
+
+@dataclass(frozen=True)
+class AnchorRemoval:
+    """What removing AgentChat did to SOUL.md.
+
+    ``removed``: this agent's block is gone (the rest of the file as it was).
+    ``absent``: no file, or no AgentChat block in it. Left as they are, on
+    purpose: ``hand_edited`` (the block is not a text AgentChat placed — the
+    user's), ``other_agent`` (``claimed``'s block), ``several_blocks``,
+    ``handle_unknown`` (this profile's handle is not known, so whose block it
+    is cannot be told), ``edited_meanwhile`` (the file kept changing under the
+    write). ``failed``: it could not be read or written. ``detail`` is the
+    sentence for the person, naming the path."""
+
+    outcome: RemovalOutcome
+    path: Path
+    claimed: str | None
+    detail: str
+
+    @property
+    def removed(self) -> bool:
+        return self.outcome == "removed"
+
+    @property
+    def left(self) -> bool:
+        """A block is still in the file on purpose; ``detail`` says why and what to do."""
+        return self.outcome in ("hand_edited", "other_agent", "several_blocks", "handle_unknown", "edited_meanwhile")
+
+
+def remove_soul_anchor(
+    *,
+    handle: str | None,
+    identity_line: str | None = None,
+    template: str | None = None,
+    soul_path: Path | None = None,
+) -> AnchorRemoval:
+    """Remove the identity block AgentChat placed for ``handle`` from SOUL.md.
+
+    The block goes only when it is this agent's by the kit's strict reading
+    (``anchor.owner`` is ``handle``: its handle line, or, without one, its
+    whole text is exactly a text AgentChat served). A block edited by hand,
+    another agent's block, several blocks, or any block while ``handle`` is
+    not known are left as they are, and :attr:`AnchorRemoval.detail` says so.
+    ``identity_line`` and ``template`` are the served texts as Hermes places
+    them, when in hand (the cached copy): they let a block of the served text
+    without a handle line be recognised; without them only a handle line or
+    one of the lines served before is.
+
+    The rest of the file is kept as it was (its line breaks, whether it ends
+    with one, a byte-order mark, its mode, a symlink); the write is atomic and
+    is not made if the file changed since it was read (the decision is made
+    again, :data:`REMOVE_ATTEMPTS` times at most). A file left empty is kept:
+    Hermes treats absent and empty the same way. A file that is not UTF-8 is
+    not written. Never raises.
     """
     target = soul_path if soul_path is not None else resolve_soul_path()
-    existing = read_soul(target)
-    if existing is None:
-        return False
-    from agentchatme.integration import anchor
+    bare = normalize_handle(handle) if handle else ""
+    by_hand = "remove it by hand if you no longer want it"
 
-    stripped = anchor.remove(existing)
-    if stripped == existing:
-        return False
-    write_text_atomic(target, stripped)
-    logger.info("SOUL.md anchor removed from %s", target)
-    return True
+    def result(outcome: RemovalOutcome, detail: str, claimed: str | None = None) -> AnchorRemoval:
+        return AnchorRemoval(outcome, target, claimed, detail)
+
+    def failed(why: str) -> AnchorRemoval:
+        return result(
+            "failed",
+            f"could not remove the AgentChat block from {target}: {why}; remove it by hand (the lines from "
+            f"`{ANCHOR_START}` to `{ANCHOR_END}`) if you no longer want it",
+        )
+
+    try:
+        anchor = _kit()
+    except (AnchorError, ImportError) as exc:
+        return failed(str(exc))
+    try:
+        for _ in range(REMOVE_ATTEMPTS):
+            try:
+                text = read_soul(target)
+            except AnchorError as exc:
+                return failed(str(exc))
+            except OSError as exc:
+                return failed(f"it could not be read ({exc})")
+            if text is None:
+                return result("absent", f"{target} does not exist")
+            body = _without_bom(text)
+            found = anchor.find(body, template=template)
+            if found is None:
+                return result("absent", f"no AgentChat block in {target}")
+            # As the kit's ``decide``: taking the block out shows whether another one is left.
+            if anchor.find(body[: found.start] + body[found.end :]) is not None:
+                return result(
+                    "several_blocks",
+                    f"left the AgentChat blocks in {target}: there is more than one; remove them by hand if you "
+                    "no longer want them",
+                )
+            claimed = anchor.owner(found, handle=bare or None, identity_line=identity_line, template=template)
+            if claimed is None:
+                return result("hand_edited", f"left your edited AgentChat block in {target}; {by_hand}")
+            if not bare:
+                return result(
+                    "handle_unknown",
+                    f"left the AgentChat block in {target}: this profile's AgentChat handle is not known, so "
+                    f"whether the block is this agent's cannot be told; {by_hand}",
+                    claimed,
+                )
+            if claimed != bare:
+                return result(
+                    "other_agent",
+                    f"left @{claimed}'s AgentChat block in {target}: it is another agent's, not @{bare}'s; {by_hand}",
+                    claimed,
+                )
+            try:
+                write_text_atomic(target, anchor.remove(text), unless_changed_from=text)
+            except _ChangedMeanwhile:
+                continue
+            except OSError as exc:
+                return failed(f"it could not be written ({exc})")
+            logger.info("SOUL.md identity line for @%s removed from %s", bare, target)
+            return result("removed", f"removed the identity line for @{bare} from {target}", bare)
+        return result(
+            "edited_meanwhile",
+            f"left the AgentChat block in {target}: the file kept changing while it was being removed; {by_hand}",
+        )
+    except Exception as exc:
+        return failed(str(exc))
