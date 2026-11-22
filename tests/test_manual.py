@@ -995,16 +995,16 @@ class TestReadOnly:
         register_skill(_Ctx(), hermes_home=home, place=False)
         lines = _Lines()
         lines.run(home, BUNDLE_ANNOUNCED)
-        assert any(w.startswith("manual stale (have 2.4.0, served 2.4.3)") for w in lines.of("warn"))
-        assert cli._manual_line(home, BUNDLE_ANNOUNCED).startswith("stale (have 2.4.0, served 2.4.3)")
+        assert any(w.startswith(f"manual stale (have 2.4.0, served {BUNDLE_VERSION})") for w in lines.of("warn"))
+        assert cli._manual_line(home, BUNDLE_ANNOUNCED).startswith(f"stale (have 2.4.0, served {BUNDLE_VERSION})")
         assert target.read_bytes() == OLD, "a plain doctor or status changes nothing"
 
     @pytest.mark.parametrize(
         ("content", "said"),
         [
-            (OLD, "was stale (have 2.4.0, served 2.4.3) → 2.4.3 placed from the bundled copy (the served version)"),
-            (BUNDLE + b"\nedited\n", "was tampered (have 2.4.3, but its sha256 is not the served text's) → restored: 2.4.3 placed"),
-            (None, "was missing → 2.4.3 placed from the bundled copy"),
+            (OLD, f"was stale (have 2.4.0, served {BUNDLE_VERSION}) → {BUNDLE_VERSION} placed from the bundled copy (the served version)"),
+            (BUNDLE + b"\nedited\n", f"was tampered (have {BUNDLE_VERSION}, but its sha256 is not the served text's) → restored: {BUNDLE_VERSION} placed"),
+            (None, f"was missing → {BUNDLE_VERSION} placed from the bundled copy"),
         ],
         ids=["stale", "tampered", "missing"],
     )
@@ -1017,15 +1017,15 @@ class TestReadOnly:
         assert step.status == "changed" and step.detail.startswith(said), step.detail
         assert target.read_bytes() == BUNDLE
         again = placement.place_manual(BUNDLE_ANNOUNCED, api_base=API, hermes_home=home)
-        assert (again.status, again.detail) == ("ok", f"current (2.4.3) — {target}")
+        assert (again.status, again.detail) == ("ok", f"current ({BUNDLE_VERSION}) — {target}")
 
     def test_an_unsafe_file_is_restored_and_said(self, home: Path) -> None:
         target = manual_path(home)
         target.parent.mkdir(parents=True)
-        target.write_bytes(_body("2.4.3", _shell("id")))
+        target.write_bytes(_body(BUNDLE_VERSION or "?", _shell("id")))
         step = placement.place_manual(BUNDLE_ANNOUNCED, api_base=API, hermes_home=home)
-        assert step.status == "changed" and step.detail.startswith("was unsafe (have 2.4.3: it carries inline shell")
-        assert "→ restored: 2.4.3 placed" in step.detail and target.read_bytes() == BUNDLE
+        assert step.status == "changed" and step.detail.startswith(f"was unsafe (have {BUNDLE_VERSION}: it carries inline shell")
+        assert f"→ restored: {BUNDLE_VERSION} placed" in step.detail and target.read_bytes() == BUNDLE
 
     def test_doctor_fix_says_what_it_repaired(
         self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -1043,8 +1043,8 @@ class TestReadOnly:
         register_skill(_Ctx(), hermes_home=home, place=False)
         cli._dispatch_doctor(argparse.Namespace(fix=True))
         out = capsys.readouterr().out
-        assert "[ok]   fix: manual changed — was stale (have 2.4.0, served 2.4.3) → 2.4.3 placed from the bundled copy" in out
-        assert f"[ok]   manual current (2.4.3) — {target}" in out
+        assert f"[ok]   fix: manual changed — was stale (have 2.4.0, served {BUNDLE_VERSION}) → {BUNDLE_VERSION} placed from the bundled copy" in out
+        assert f"[ok]   manual current ({BUNDLE_VERSION}) — {target}" in out
 
 
 class TestGatewayServesTheBundle:
@@ -1103,7 +1103,7 @@ class TestOffline:
         assert rc >= 1 and "[fail] Could not reach /v1/agents/me: dns" in out
         assert "[warn] AgentChat did not answer — the checks below compare with the texts cached at " in out
         assert "[warn] --fix skipped: nothing is placed until AgentChat answers for this key" in out
-        assert f"[warn] manual stale (have 2.4.0, served 2.4.3) — {manual_path(home)}" in out
+        assert f"[warn] manual stale (have 2.4.0, served {BUNDLE_VERSION}) — {manual_path(home)}" in out
         assert "SOUL.md identity line missing" in out, "the anchor check still runs"
         assert "WS leader lock" in out, "and the lock check"
         assert manual_path(home).read_bytes() == OLD, "nothing placed offline"
@@ -1151,7 +1151,7 @@ class TestOffline:
         assert cli._dispatch_status(argparse.Namespace()) == 1
         captured = capsys.readouterr()
         assert "Status fetch failed: dns" in captured.err
-        assert f"  Manual:        stale (have 2.4.0, served 2.4.3) — {manual_path(home)}" in captured.out
+        assert f"  Manual:        stale (have 2.4.0, served {BUNDLE_VERSION}) — {manual_path(home)}" in captured.out
         assert "AgentChat did not answer" in captured.out and "  Key:           " in captured.out
 
     def test_nothing_cached_is_said(self, home: Path, monkeypatch: pytest.MonkeyPatch) -> None:

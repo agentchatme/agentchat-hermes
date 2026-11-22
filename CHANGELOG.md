@@ -46,6 +46,10 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ### Changed
 
+- **The bundled manual is 2.4.4 (the first-install floor).** It is `https://agentchat.me/skill.md` byte for byte,
+  sha256 `7826ac17…`. Its install section now gives Hermes' install from `refs/heads/stable` with `hermes plugins
+  install --ref`, and covers OpenClaw's install questions and its reinstall. The package's copy is used only when
+  there is no file and nothing verified can be had. The gateway keeps the profile's manual at the served version.
 - **The README installs with Hermes, pinned to a release:**
 
   ```bash
