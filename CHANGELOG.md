@@ -34,6 +34,14 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
     symlink. It is not made over an edit saved while it runs (the file is read again before the rename, and the
     decision is made again). A SOUL.md that is not UTF-8 is never written; that is a warning, and the key is still
     removed.
+- **`logout` says when a running gateway still serves the account.** A gateway keeps the socket it opened with the
+  key, so after `logout` the agent was still woken and gated, now without the hosted tools, and nothing said so.
+  When a gateway lives for the account (the rule `doctor` and `status` use: a fresh health record, its pid alive, the
+  leader lock held), `logout` and the wizard's logout now say: "The running gateway (pid …) still holds @x's AgentChat
+  connection, …: restart it (`hermes gateway restart`) so it stops serving this profile". A named profile gets
+  `hermes -p <name> gateway restart`, or `hermes gateway restart` when the default profile's gateway serves it too.
+- **The wizard's logout names the profile.** "Run `hermes agentchat` to reconfigure" now gives `hermes -p <name>
+  agentchat` in a named profile.
 
 ## [0.6.2] — 2026-11-22
 

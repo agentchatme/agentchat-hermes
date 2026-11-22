@@ -49,7 +49,6 @@ releases up to 0.5.3 kept it.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import sys
 import time
@@ -74,6 +73,7 @@ from .config import (
 from .placement import (
     PlacementStep,
     ProfileIdentity,
+    gateway_still_serving,
     place_identity_and_tools,
     profile_identity,
     resolve_texts,
@@ -1357,9 +1357,11 @@ def _dispatch_logout(_args: argparse.Namespace) -> int:
     if not has_file and resolution.held_key is None and credentials.env_file_key(home) is None:
         _printline("No AgentChat key was configured. Nothing to clear.")
         return _EXIT_OK
-    # Who this profile is, read while its key is still here: only the block
-    # AgentChat placed for that agent leaves SOUL.md.
+    # Read while the key is still here: who this profile is (only the block
+    # AgentChat placed for that agent leaves SOUL.md), and whether a running
+    # gateway holds the account's socket (it keeps it until it restarts).
     identity = profile_identity(home, api_base=_api_base())
+    gateway_note = gateway_still_serving(home, api_base=_api_base())
     try:
         removed_file, removed_lines = credentials.clear_credentials(home)
     except key_store.KeyStoreError as exc:
@@ -1381,6 +1383,8 @@ def _dispatch_logout(_args: argparse.Namespace) -> int:
             f"{_ENV_API_KEY} is still set in this process's environment (the shell or the "
             "service): unset it there too."
         )
+    if gateway_note is not None:
+        _printline(f"{gateway_note}.")
     return _EXIT_OK
 
 
@@ -2185,65 +2189,10 @@ def _health_worker(api_base: str, api_key: str) -> Any:
 
 
 def _live_health(api_base: str, api_key: str, hermes_home: Path | None = None) -> Any:
-    """This account's health record, only while the gateway that writes it
-    lives: fresh (≤ 150 s), not ``stopped``, its pid alive, and the leader
-    lock beside it held (where the lock can be probed). A gateway stopped or
-    killed leaves a fresh record saying ``connected`` behind it (Hermes has no
-    shutdown hook for a plugin; the receiver marks ``stopped`` at exit only
-    when the interpreter exits cleanly), so freshness alone is not enough.
-    ``None`` otherwise. Never raises."""
-    try:
-        from .leader_lock import describe_lock_holder, lock_path_for
-        from .profile_scope import account_fingerprint, resolve_hermes_home, resolve_setting
-        from .ws_health import (
-            HEALTH_STALE_AFTER_SECONDS,
-            health_age_seconds,
-            health_path_for,
-            read_ws_health,
-        )
+    """This account's health record while its gateway lives (:func:`.ws_health.live_health`)."""
+    from .ws_health import live_health
 
-        lock_dir_raw = (resolve_setting("AGENTCHATME_LOCK_DIR") or "").strip()
-        lock_path = lock_path_for(
-            hermes_home=hermes_home if hermes_home is not None else resolve_hermes_home(),
-            account_fingerprint=account_fingerprint(api_base, api_key),
-            lock_dir=Path(lock_dir_raw).expanduser() if lock_dir_raw else None,
-        )
-        health = read_ws_health(health_path_for(lock_path))
-        if health is None or health["state"] == "stopped":
-            return None
-        if health_age_seconds(health) > HEALTH_STALE_AFTER_SECONDS:
-            return None
-        if _pid_alive(health["pid"]) is not True:
-            return None
-        lock = describe_lock_holder(lock_path)
-        if lock in ("free", "not present"):
-            return None
-        return health
-    except Exception:
-        return None
-
-
-def _pid_alive(pid: int) -> bool | None:
-    """Whether a process with ``pid`` exists here; ``None`` when that cannot be
-    told (Windows without ``psutil``: ``os.kill`` there would end the process)."""
-    try:
-        import importlib
-
-        psutil: Any = importlib.import_module("psutil")
-        return bool(psutil.pid_exists(pid))
-    except ImportError:
-        pass
-    if os.name == "nt":
-        return None
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # it exists, owned by another user
-    except OSError:
-        return None
-    return True
+    return live_health(api_base, api_key, hermes_home)
 
 
 def _print_local_status(resolution: KeyResolution, *, worker: Any, manual: str, identity: str | None = None) -> None:

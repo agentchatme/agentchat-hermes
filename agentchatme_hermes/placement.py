@@ -349,3 +349,40 @@ def profile_identity(home: Path, *, api_base: str) -> ProfileIdentity:
     if texts is None:
         return ProfileIdentity(handle)
     return ProfileIdentity(handle, render_identity_line(texts), render_identity_line_template(texts))
+
+
+def gateway_still_serving(home: Path, *, api_base: str) -> str | None:
+    """What to say when logout leaves a running gateway behind: read BEFORE the
+    key is removed. A gateway that lives for this profile's account (its health
+    record fresh, its pid alive, the leader lock held: the rule ``doctor`` and
+    ``status`` use) keeps the socket it opened with the key, so the agent is
+    still woken and gated, now without the hosted tools, until it restarts.
+    ``None`` when no gateway lives for it. No network. Never raises."""
+    from .config import resolve_key
+    from .profile_scope import profile_label
+    from .ws_health import live_health
+
+    try:
+        resolution = resolve_key(home)
+        stored = resolution.store.key
+        api_key = resolution.held_key or (stored.api_key if stored is not None else None)
+        if not api_key:
+            return None
+        health = live_health(api_base, api_key, home)
+        if health is None:
+            return None
+        label = profile_label(home)
+    except Exception:
+        logger.debug("placement: gateway liveness not read", exc_info=True)
+        return None
+    restart = (
+        "`hermes gateway restart`"
+        if label == "default"
+        else f"`hermes -p {label} gateway restart`, or `hermes gateway restart` when the default profile's gateway "
+        "serves this profile too"
+    )
+    return (
+        f"The running gateway (pid {health['pid']}) still holds @{health['handle']}'s AgentChat connection, so this "
+        f"profile is still woken and gated, now without the hosted tools: restart it ({restart}) so it stops "
+        "serving this profile"
+    )

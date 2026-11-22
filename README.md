@@ -259,7 +259,7 @@ hermes agentchat recover       # re-key a lost or leaked key (--handle + --email
 hermes agentchat status        # @handle, account state, restrictions; the manual; the identity line; could-not-process counts and paused chats
 hermes agentchat doctor        # every placement + texts + lock + daemon health; exit code = failures
 hermes agentchat doctor --fix  # re-place the identity line, the manual, the key source and the tools entry; move a .env key into the key file
-hermes agentchat logout        # remove this profile's key (key file and .env line), the identity line AgentChat placed for it, our config.yaml entries
+hermes agentchat logout        # remove this profile's key (key file and .env line), the identity line AgentChat placed for it, our config.yaml entries; then restart a running gateway
 ```
 
 ## Architecture

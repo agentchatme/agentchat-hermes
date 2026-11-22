@@ -39,8 +39,9 @@ import os
 from typing import TYPE_CHECKING, Any, Literal
 
 from . import credentials, key_store, signup
-from .config import ENV_API_BASE, ENV_HANDLE, resolve_key
+from .config import ENV_API_BASE, ENV_HANDLE, cli_prefix, resolve_key
 from .placement import (
+    gateway_still_serving,
     place_identity_and_tools,
     profile_identity,
     resolve_texts,
@@ -358,6 +359,7 @@ def _logout_flow(
     # AgentChat placed for that agent leaves SOUL.md.
     home = resolve_hermes_home()
     identity = profile_identity(home, api_base=_api_base())
+    gateway_note = gateway_still_serving(home, api_base=_api_base())
     try:
         credentials.clear_credentials(home)
     except key_store.KeyStoreError as exc:
@@ -392,7 +394,9 @@ def _logout_flow(
     except Exception as exc:
         logger.warning("logout: mcp_servers.agentchat removal failed: %s", exc)
 
-    print_success("Logged out. Run `hermes agentchat` to reconfigure.")
+    if gateway_note is not None:
+        print_info(f"{gateway_note}.")
+    print_success(f"Logged out. Run `{cli_prefix(home)}` to reconfigure.")
 
 
 # ─── flows ─────────────────────────────────────────────────────────────────
