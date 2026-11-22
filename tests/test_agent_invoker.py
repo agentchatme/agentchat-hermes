@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -527,7 +528,11 @@ class TestCheckRuntime:
 
         inv = AgentInvoker(config=SimpleNamespace(), identity=AgentIdentity(handle="me"), runtime=SimpleNamespace(hermes_home=None))
         monkeypatch.setattr(invoker_module, "build_call_model", never)
-        ready = await inv.check_runtime()  # outside Hermes: its config helpers do not import
+        # Hermes' config helpers do not import (as outside Hermes). Forced, so
+        # the nightly legs, which install Hermes, take the same branch.
+        monkeypatch.setitem(sys.modules, "hermes_cli.config", None)
+        monkeypatch.setitem(sys.modules, "hermes_cli.runtime_provider", None)
+        ready = await inv.check_runtime()
         assert ready.ready is False and ready.reason == "Hermes' config helpers are unavailable: a turn has no model of its own"
         monkeypatch.setattr(inv, "_resolve_turn_runtime", lambda: ("claude-sonnet-4-6", {}, "the profile's model or provider could not be resolved for a turn"))
         assert (await inv.check_runtime()).reason == "the profile's model or provider could not be resolved for a turn"
