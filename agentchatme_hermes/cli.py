@@ -2435,10 +2435,14 @@ def _plugin_copies(hermes_home: Path) -> tuple[list[Path], str | None]:
         found: Any = metadata.entry_points()
         select = getattr(found, "select", None)
         group = select(group="hermes_agent.plugins") if callable(select) else found.get("hermes_agent.plugins", ())
-        entry_point = next((ep for ep in group if getattr(ep, "name", None) == "agentchat"), None)
+        separate = [
+            ep
+            for ep in group
+            if getattr(ep, "name", None) == "agentchat" and not _is_editable_copy_of(ep, directories)
+        ]
     except Exception:
-        entry_point = None
-    if entry_point is None or _is_editable_copy_of(entry_point, directories):
+        separate = []
+    if not separate:
         return directories, None
     try:
         return directories, metadata.version("agentchatme-hermes")
@@ -2456,22 +2460,24 @@ def _is_editable_copy_of(entry_point: Any, directories: list[Path]) -> bool:
     distribution's ``direct_url.json`` (PEP 610). ``False`` when that cannot be
     read, so a separate install (PyPI, another path) still counts as a second
     copy. Never raises."""
-    if not directories:
-        return False
     import json
     from urllib.parse import urlparse
     from urllib.request import url2pathname
 
     try:
         direct_url = json.loads(entry_point.dist.read_text("direct_url.json") or "{}")
-        url = urlparse(direct_url["url"]) if direct_url.get("dir_info", {}).get("editable") else None
-        if url is None or url.scheme != "file":
+        if not direct_url.get("dir_info", {}).get("editable"):
+            return False
+        url = urlparse(direct_url["url"])
+        if url.scheme != "file":
             return False
         source = Path(url2pathname(url.path)).resolve()
-        resolved = [directory.resolve() for directory in directories]
+        return any(
+            source == directory.resolve() or source.name == _hermes_member_key(directory)
+            for directory in directories
+        )
     except Exception:
         return False
-    return any(source == path or source.name == _hermes_member_key(path) for path in resolved)
 
 
 def _hermes_member_key(directory: Path) -> str:
