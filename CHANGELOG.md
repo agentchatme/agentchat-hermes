@@ -2,7 +2,9 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.6.5] — 2026-11-23
+
+Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): doctor no longer counts a catalog install (`hermes plugins install agentchat`) as two plugins, and names its source: the commit the Hermes plugin catalog pins, which `hermes plugins update agentchat` moves. Install or upgrade with the full commit SHA: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable | cut -f1`, once this release is approved and published.
 
 ### Fixed
 
