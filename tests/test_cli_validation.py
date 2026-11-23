@@ -462,6 +462,116 @@ class TestDoctorTwoPlugins:
         assert "agentchat plugins in this profile" not in out
         assert "plugins remove" not in out
 
+    _PIN = "0002d3991addc89d6018a366a23f61b17a12b4dd"
+
+    @staticmethod
+    def _install_record(home: Any, record: Any, *, name: str = "agentchat") -> None:
+        """Hermes' installer-owned record of the plugins dir (``plugins/.install-metadata.json``)."""
+        import json
+
+        (home / "plugins" / ".install-metadata.json").write_text(json.dumps({name: record}), encoding="utf-8")
+
+    def _catalog_record(self, *, pin: str | None = None) -> dict[str, Any]:
+        """What ``hermes plugins install agentchat`` writes (v0.23.2 and main);
+        ``pin`` is empty for an install with ``--ref`` off the catalog's pin."""
+        return {
+            "catalog": {
+                "name": "agentchat",
+                "pin": self._PIN if pin is None else pin,
+                "repo": "https://github.com/agentchatme/agentchat-hermes",
+                "sha": self._PIN,
+                "tier": "community",
+            },
+            "pinned": True,
+            "revision": self._PIN,
+            "source": "https://github.com/agentchatme/agentchat-hermes",
+        }
+
+    def test_a_catalog_install_says_it_is_from_the_catalog(
+        self, monkeypatch: Any, capsys: Any, tmp_path: Any
+    ) -> None:
+        ours = self._directory_plugin(tmp_path, "agentchat", "name: agentchat\n")
+        self._install_record(tmp_path, self._catalog_record())
+        self._entry_points(monkeypatch, [])
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert (
+            f"[ok]   installed as a directory plugin at {ours} (from the Hermes plugin catalog at 0002d399, "
+            "not a PyPI release; `hermes plugins update agentchat` moves it to the catalog's current pin)"
+        ) in out
+        assert "GitHub main" not in out
+        assert "--ref" not in out
+
+    def test_a_catalog_install_off_the_pin_says_so(self, monkeypatch: Any, capsys: Any, tmp_path: Any) -> None:
+        self._directory_plugin(tmp_path, "agentchat", "name: agentchat\n")
+        self._install_record(tmp_path, self._catalog_record(pin=""))
+        self._entry_points(monkeypatch, [])
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert (
+            "(from the Hermes plugin catalog at 0002d399, installed with --ref off the catalog's pin, "
+            "not a PyPI release; `hermes plugins update agentchat` moves it to the catalog's current pin)"
+        ) in out
+
+    def test_an_earlier_catalog_record_shape(self, monkeypatch: Any, capsys: Any, tmp_path: Any) -> None:
+        """Earlier Hermes kept the catalog name on the record itself; Hermes still reads it."""
+        self._directory_plugin(tmp_path, "agentchat", "name: agentchat\n")
+        record = {"catalog_name": "agentchat", "catalog_tier": "community", "pinned": True, "revision": self._PIN.upper()}
+        self._install_record(tmp_path, record)
+        self._entry_points(monkeypatch, [])
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "(from the Hermes plugin catalog at 0002d399, not a PyPI release;" in out
+
+    def test_a_catalog_install_in_a_profile_names_the_profile(
+        self, monkeypatch: Any, capsys: Any, tmp_path: Any
+    ) -> None:
+        home = tmp_path / "profiles" / "work"
+        self._directory_plugin(home, "agentchat", "name: agentchat\n")
+        self._install_record(home, self._catalog_record())
+        self._entry_points(monkeypatch, [])
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        out = self._doctor(monkeypatch, capsys, home)
+        assert "`hermes -p work plugins update agentchat` moves it" in out
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            "absent",
+            "unreadable",
+            "another-plugin",  # a record for a different directory
+            "git-url",  # `hermes plugins install <url>`: no catalog fields
+            "no-catalog-name",
+        ],
+    )
+    def test_any_other_install_keeps_the_git_line(
+        self, monkeypatch: Any, capsys: Any, tmp_path: Any, record: str
+    ) -> None:
+        import json
+
+        ours = self._directory_plugin(tmp_path, "agentchat", "name: agentchat\n")
+        git_url ={"pinned": False, "revision": self._PIN, "source": "https://github.com/agentchatme/agentchat-hermes"}
+        if record == "unreadable":
+            (tmp_path / "plugins" / ".install-metadata.json").write_bytes(b"{\xff")
+        elif record == "another-plugin":
+            self._install_record(tmp_path, self._catalog_record(), name="weather")
+        elif record == "git-url":
+            self._install_record(tmp_path, git_url)
+        elif record == "no-catalog-name":
+            self._install_record(tmp_path, {**git_url, "catalog": {"sha": self._PIN, "pin": self._PIN}})
+        # The tree is the repo's to write: Hermes never trusts the in-tree copy alone.
+        (ours / ".hermes-catalog.json").write_text(json.dumps({"catalog_name": "agentchat", "sha": self._PIN}))
+        self._entry_points(monkeypatch, [])
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert f"[ok]   installed as a directory plugin at {ours} (a git clone (GitHub main unless" in out
+        assert "plugin catalog" not in out
+
+    def test_a_catalog_install_next_to_a_pip_copy(self, monkeypatch: Any, capsys: Any, tmp_path: Any) -> None:
+        self._directory_plugin(tmp_path, "agentchat", "name: agentchat\n")
+        self._install_record(tmp_path, self._catalog_record())
+        self._entry_points(monkeypatch, ["agentchat"])
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "[warn] 2 agentchat plugins in this profile" in out
+        assert "(from the Hermes plugin catalog at 0002d399, not a PyPI release;" in out
+        assert "and agentchatme-hermes 0.5.1 from pip" in out
+
     def test_an_editable_install_of_the_directory_is_one_copy(self, monkeypatch: Any, tmp_path: Any) -> None:
         from agentchatme_hermes import cli
 

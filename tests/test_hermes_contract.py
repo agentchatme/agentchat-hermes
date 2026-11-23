@@ -326,6 +326,37 @@ def test_doctor_names_a_plugin_directorys_snapshot_as_hermes_does(_hermes_home: 
         assert cli._hermes_member_key(directory) == member_key(directory)
 
 
+@pytest.mark.parametrize("shape", ["at-pin", "with-ref", "top-level"])
+def test_doctor_reads_a_catalog_install_record_as_hermes_does(_hermes_home: Path, shape: str) -> None:
+    """``doctor`` names a catalog install from Hermes' installer-owned record
+    (``plugins/.install-metadata.json``); Hermes' own reader of that record
+    (``plugins_cmd_catalog.read_catalog_sidecar``) must see the same entry and
+    commit. ``top-level`` is the earlier record, which Hermes still reads."""
+    from agentchatme_hermes import cli
+
+    sha = "0002d3991addc89d6018a366a23f61b17a12b4dd"
+    repo = "https://github.com/agentchatme/agentchat-hermes"
+    record: dict[str, Any] = {"pinned": True, "revision": sha, "source": repo}
+    if shape == "top-level":
+        record.update(catalog_name="agentchat", catalog_tier="community")
+    else:
+        pin = sha if shape == "at-pin" else ""
+        record["catalog"] = {"name": "agentchat", "repo": repo, "tier": "community", "sha": sha, "pin": pin}
+    directory = _hermes_home / "plugins" / "agentchat"
+    directory.mkdir(parents=True)
+    (_hermes_home / "plugins" / ".install-metadata.json").write_text(json.dumps({"agentchat": record}))
+
+    line = cli._catalog_install_line(directory, _hermes_home)
+    hermes = _import("hermes_cli.plugins_cmd_catalog").read_catalog_sidecar(directory)
+    assert hermes is not None
+    assert hermes["catalog_name"] == "agentchat"
+    assert hermes["sha"] == sha
+    assert line is not None
+    assert line.startswith(f"from the Hermes plugin catalog at {sha[:8]}")
+    assert ("off the catalog's pin" in line) is (hermes["pin"] == "")
+    assert "`hermes plugins update agentchat`" in line
+
+
 def test_hermes_unload_stops_our_runtime(tmp_path: Path) -> None:
     """A plugin reload/disable runs ``ctx.on_unload``: our hook stops the
     runtime (socket, worker, lock) and forgets it."""

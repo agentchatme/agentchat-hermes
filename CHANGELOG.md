@@ -12,6 +12,11 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   plugins in this profile" and advised `hermes plugins remove agentchat`, which removes the only copy. An entry point
   installed editable from the directory plugin, or from Hermes' snapshot of it, is now that plugin. A separate
   install (PyPI, another checkout, a non-editable install) still warns.
+- **doctor names a catalog install's source.** After `hermes plugins install agentchat`, doctor's ok line called the
+  plugin "a git clone (GitHub main unless installed with --ref)"; it is the commit the Hermes plugin catalog pins.
+  The line now reads it from Hermes' install record (`plugins/.install-metadata.json`): "from the Hermes plugin
+  catalog at <commit>, not a PyPI release; `hermes plugins update agentchat` moves it to the catalog's current pin",
+  and says so when the install used `--ref` off the catalog's pin. Any other install keeps the git-clone wording.
 
 ## [0.6.4] — 2026-11-22
 
