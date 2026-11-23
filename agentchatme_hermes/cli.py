@@ -623,7 +623,8 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     if directory_copies:
         # Hermes scans plugins/ in sorted order and the later same-named copy wins.
         loaded = directory_copies[-1]
-        clone = (
+        catalog = _catalog_install_line(loaded, hermes_home) if len(directory_copies) == 1 else None
+        clone = catalog or (
             "a git clone (GitHub main unless installed with --ref) or a copy left there, "
             "not a PyPI release"
         )
@@ -2492,6 +2493,47 @@ def _hermes_member_key(directory: Path) -> str:
     digest = hashlib.sha256(str(resolved).encode()).hexdigest()[:16]
     name = re.sub(r"[^a-z0-9._-]+", "-", resolved.name.lower()).strip("-.") or "plugin"
     return f"{name}-{digest}"
+
+
+_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
+
+
+def _catalog_install_line(directory: Path, hermes_home: Path) -> str | None:
+    """How doctor names a directory plugin Hermes installed from its plugin
+    catalog (``hermes plugins install agentchat``), or ``None`` for any other
+    install. Read, as Hermes reads it, from the installer-owned record
+    (``plugins/.install-metadata.json``, keyed by the directory's name): its
+    ``catalog`` block (``name``; ``sha``, the commit checked out; ``pin``,
+    empty when installed with ``--ref`` off the catalog's pin), or the
+    top-level ``catalog_name`` and ``revision`` of earlier releases. Never
+    from the tree, which the repo controls. ``hermes plugins update`` re-pins
+    a catalog install to the catalog's current pin. Never raises."""
+    import json
+
+    from .profile_scope import profile_label
+
+    try:
+        record = json.loads((directory.parent / ".install-metadata.json").read_text(encoding="utf-8-sig"))[
+            directory.name
+        ]
+        block = record.get("catalog")
+        if isinstance(block, dict):
+            name, sha, off_pin = block.get("name"), block.get("sha"), block.get("pin") == ""
+        else:
+            name, sha, off_pin = record.get("catalog_name"), record.get("revision"), False
+    except Exception:
+        return None
+    if not isinstance(name, str) or not name:
+        return None
+    sha = sha.lower() if isinstance(sha, str) else ""
+    label = profile_label(hermes_home)
+    flag = "" if label == "default" else f" -p {label}"
+    return (
+        "from the Hermes plugin catalog"
+        + (f" at {sha[:8]}" if _COMMIT_SHA.fullmatch(sha) else "")
+        + (", installed with --ref off the catalog's pin" if off_pin else "")
+        + f", not a PyPI release; `hermes{flag} plugins update {name}` moves it to the catalog's current pin"
+    )
 
 
 def _profile_cmd() -> str:
