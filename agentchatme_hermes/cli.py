@@ -2419,11 +2419,13 @@ def _plugin_copies(hermes_home: Path) -> tuple[list[Path], str | None]:
     ``plugins/`` (a ``hermes plugins install`` git clone, or a copy left
     there), sorted the way Hermes scans them (the last one is the one it
     loads), and the version of the pip distribution when its ``agentchat``
-    entry point is installed (else ``None``). A directory's name is its
-    manifest's ``name:`` (``plugin.yaml`` or ``plugin.yml``), or the
-    directory name when the manifest has none, as in Hermes. Hermes keeps a
-    directory plugin and drops an entry point with the same name, so with
-    both present the pip package never runs. Never raises.
+    entry point is installed from a separate copy (else ``None``). A
+    directory's name is its manifest's ``name:`` (``plugin.yaml`` or
+    ``plugin.yml``), or the directory name when the manifest has none, as in
+    Hermes. Hermes keeps a directory plugin and drops an entry point with the
+    same name, so with both present the pip package never runs. An entry
+    point installed editable from one of these directories is that directory,
+    not a second copy (``_is_editable_copy_of``). Never raises.
     """
     directories = _agentchat_directories(hermes_home / "plugins")
 
@@ -2433,15 +2435,63 @@ def _plugin_copies(hermes_home: Path) -> tuple[list[Path], str | None]:
         found: Any = metadata.entry_points()
         select = getattr(found, "select", None)
         group = select(group="hermes_agent.plugins") if callable(select) else found.get("hermes_agent.plugins", ())
-        has_entry_point = any(getattr(ep, "name", None) == "agentchat" for ep in group)
+        separate = [
+            ep
+            for ep in group
+            if getattr(ep, "name", None) == "agentchat" and not _is_editable_copy_of(ep, directories)
+        ]
     except Exception:
-        has_entry_point = False
-    if not has_entry_point:
+        separate = []
+    if not separate:
         return directories, None
     try:
         return directories, metadata.version("agentchatme-hermes")
     except metadata.PackageNotFoundError:
         return directories, "(version unknown)"
+
+
+def _is_editable_copy_of(entry_point: Any, directories: list[Path]) -> bool:
+    """Whether the entry point's distribution is an editable install of one of
+    ``directories``. A catalog or git install (``hermes plugins install``) also
+    installs this package into Hermes' environment, editable, from a snapshot
+    Hermes' package manager takes of the directory
+    (``<generation>/workspace/plugin-sources/<_hermes_member_key(directory)>``);
+    an editable install of the directory itself counts too. Read from the
+    distribution's ``direct_url.json`` (PEP 610). ``False`` when that cannot be
+    read, so a separate install (PyPI, another path) still counts as a second
+    copy. Never raises."""
+    import json
+    from urllib.parse import urlparse
+    from urllib.request import url2pathname
+
+    try:
+        direct_url = json.loads(entry_point.dist.read_text("direct_url.json") or "{}")
+        if not direct_url.get("dir_info", {}).get("editable"):
+            return False
+        url = urlparse(direct_url["url"])
+        if url.scheme != "file":
+            return False
+        source = Path(url2pathname(url.path)).resolve()
+        return any(
+            source == directory.resolve() or source.name == _hermes_member_key(directory)
+            for directory in directories
+        )
+    except Exception:
+        return False
+
+
+def _hermes_member_key(directory: Path) -> str:
+    """The name Hermes' package manager gives the snapshot of a plugin
+    directory (``pm/workspace.py`` ``_member_key``; v0.23.2 and ``main``): the
+    directory name lowercased, runs of other characters as ``-``, then the
+    first 16 hex digits of the sha256 of its resolved path. The contract suite
+    checks it against Hermes'."""
+    import hashlib
+
+    resolved = directory.resolve()
+    digest = hashlib.sha256(str(resolved).encode()).hexdigest()[:16]
+    name = re.sub(r"[^a-z0-9._-]+", "-", resolved.name.lower()).strip("-.") or "plugin"
+    return f"{name}-{digest}"
 
 
 def _profile_cmd() -> str:
