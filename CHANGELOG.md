@@ -2,6 +2,17 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **doctor no longer counts a catalog install twice.** `hermes plugins install agentchat` clones the plugin into
+  `plugins/agentchat/` and also installs its package into Hermes' environment, editable, from a snapshot Hermes
+  takes of that directory. doctor counted the package as a second, pip-installed copy: it warned "2 agentchat
+  plugins in this profile" and advised `hermes plugins remove agentchat`, which removes the only copy. An entry point
+  installed editable from the directory plugin, or from Hermes' snapshot of it, is now that plugin. A separate
+  install (PyPI, another checkout, a non-editable install) still warns.
+
 ## [0.6.4] — 2026-11-22
 
 Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): the agent answers again after a gateway start without network (the plugin asks Hermes to reconnect the hosted tools it parked); the documented install works on a Hermes set up by its installer, and resolves the newest approved release (`stable`); logout names the restart that frees a profile in a multiplexed gateway; doctor's offline lines agree; the bundled manual is 2.4.4. Install or upgrade with the full commit SHA: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable | cut -f1`, once this release is approved and published.

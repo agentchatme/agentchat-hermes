@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from fake_keys import api_key
 from key_files import save_key
 
@@ -326,12 +327,19 @@ class TestDoctorTwoPlugins:
     so upgrading the pip package silently changes nothing."""
 
     @staticmethod
-    def _entry_points(monkeypatch: Any, names: list[str], *, as_dict: bool = False) -> None:
-        """``entry_points()`` as 3.10+ returns it (``.select``), or as 3.9's dict."""
+    def _entry_points(
+        monkeypatch: Any, names: list[str], *, as_dict: bool = False, direct_url: dict[str, Any] | None = None
+    ) -> None:
+        """``entry_points()`` as 3.10+ returns it (``.select``), or as 3.9's dict.
+        ``direct_url``: the distribution's ``direct_url.json`` (PEP 610), else none."""
+        import json
         from importlib import metadata
         from types import SimpleNamespace
 
-        eps = [SimpleNamespace(name=n) for n in names]
+        def read_text(filename: str) -> str | None:
+            return json.dumps(direct_url) if filename == "direct_url.json" and direct_url else None
+
+        eps = [SimpleNamespace(name=n, dist=SimpleNamespace(read_text=read_text)) for n in names]
 
         class _Found:
             def select(self, *, group: str) -> list[Any]:
@@ -428,3 +436,73 @@ class TestDoctorTwoPlugins:
         self._entry_points(monkeypatch, ["agentchat"])
         out = self._doctor(monkeypatch, capsys, tmp_path)
         assert "directory plugin" not in out
+
+    @staticmethod
+    def _snapshot_of(home: Any, directory: Any) -> Any:
+        """Where Hermes' package manager installs a plugin directory's package from
+        (``plugin-sources/<dir name>-<sha256(resolved dir)[:16]>``, as on a v0.23.2 box)."""
+        import hashlib
+
+        digest = hashlib.sha256(str(directory.resolve()).encode()).hexdigest()[:16]
+        return home / "installs" / "5b04" / "environments" / "cd55" / "workspace" / "plugin-sources" / f"agentchat-{digest}"
+
+    def test_a_catalog_install_is_one_copy(self, monkeypatch: Any, capsys: Any, tmp_path: Any) -> None:
+        """``hermes plugins install agentchat`` clones the directory and installs its
+        package editable from Hermes' snapshot of it: one plugin, not two."""
+        from agentchatme_hermes import cli
+
+        ours = self._directory_plugin(tmp_path, "agentchat", "name: agentchat\n")
+        snapshot = self._snapshot_of(tmp_path, ours)
+        self._entry_points(
+            monkeypatch, ["agentchat"], direct_url={"url": snapshot.as_uri(), "dir_info": {"editable": True}}
+        )
+        assert cli._plugin_copies(tmp_path) == ([ours], None)
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert f"[ok]   installed as a directory plugin at {ours}" in out
+        assert "agentchat plugins in this profile" not in out
+        assert "plugins remove" not in out
+
+    def test_an_editable_install_of_the_directory_is_one_copy(self, monkeypatch: Any, tmp_path: Any) -> None:
+        from agentchatme_hermes import cli
+
+        ours = self._directory_plugin(tmp_path, "agentchat", "name: agentchat\n")
+        backup = self._directory_plugin(tmp_path, "agentchat.bak", "name: agentchat\n")
+        self._entry_points(monkeypatch, ["agentchat"], direct_url={"url": ours.as_uri(), "dir_info": {"editable": True}})
+        assert cli._plugin_copies(tmp_path) == ([ours, backup], None)
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "pypi-wheel",
+            "index",  # pip writes no direct_url.json for an index install
+            "other-checkout-editable",
+            "directory-not-editable",  # `pip install plugins/agentchat`: a copy in site-packages
+            "other-directory-snapshot",  # another profile's clone
+        ],
+    )
+    def test_a_separate_pip_install_still_warns(
+        self, monkeypatch: Any, capsys: Any, tmp_path: Any, source: str
+    ) -> None:
+        from agentchatme_hermes import cli
+
+        ours = self._directory_plugin(tmp_path, "agentchat", "name: agentchat\n")
+        direct_url: dict[str, Any] | None = {
+            "pypi-wheel": {
+                "url": "https://files.pythonhosted.org/packages/agentchatme_hermes-0.6.4-py3-none-any.whl",
+                "archive_info": {},
+            },
+            "index": None,
+            "other-checkout-editable": {
+                "url": (tmp_path / "src" / "agentchat-hermes").as_uri(),
+                "dir_info": {"editable": True},
+            },
+            "directory-not-editable": {"url": ours.as_uri(), "dir_info": {}},
+            "other-directory-snapshot": {
+                "url": self._snapshot_of(tmp_path, tmp_path / "profiles" / "work" / "plugins" / "agentchat").as_uri(),
+                "dir_info": {"editable": True},
+            },
+        }[source]
+        self._entry_points(monkeypatch, ["agentchat"], direct_url=direct_url)
+        assert cli._plugin_copies(tmp_path) == ([ours], "0.5.1")
+        out = self._doctor(monkeypatch, capsys, tmp_path)
+        assert "[warn] 2 agentchat plugins in this profile" in out

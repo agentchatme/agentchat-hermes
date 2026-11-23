@@ -312,6 +312,20 @@ def test_doctor_finds_a_stray_agentchat_skill_through_hermes(_hermes_home: Path)
     assert stray.exists()
 
 
+def test_doctor_names_a_plugin_directorys_snapshot_as_hermes_does(_hermes_home: Path) -> None:
+    """A catalog or git install also installs the plugin's package, editable,
+    from a snapshot Hermes' package manager takes of the directory, named
+    ``pm.workspace._member_key(directory)``. ``doctor`` tells that install from
+    a second copy by this name."""
+    from agentchatme_hermes import cli
+
+    member_key = _import("pm.workspace")._member_key
+    for name in ("agentchat", "AgentChat copy.bak"):
+        directory = _hermes_home / "plugins" / name
+        directory.mkdir(parents=True)
+        assert cli._hermes_member_key(directory) == member_key(directory)
+
+
 def test_hermes_unload_stops_our_runtime(tmp_path: Path) -> None:
     """A plugin reload/disable runs ``ctx.on_unload``: our hook stops the
     runtime (socket, worker, lock) and forgets it."""

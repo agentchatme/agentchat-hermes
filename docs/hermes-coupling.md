@@ -108,6 +108,12 @@ the new text and the skill stays registered.
 |---|---|---|---|
 | `hermes_cli.plugins_install_scan.scan_plugin` / `should_allow_plugin_install` (older releases: `tools.plugin_guard`), `tools.skills_guard.scan_skill` / `should_allow_install` | `.github/scripts/hermes-install-scan.py`, run by `hermes-main` | What `hermes plugins install` and `hermes skills install` call on a clone or a downloaded skill: `dangerous` is refused (`--force` does not override), a plugin's `caution` asks to confirm. The nightly scans this tree as a clone holds it and the served manual, so a finding that would block or question an install shows within a day. Two findings need no Hermes and are checked on every PR (`tests/test_install_scan_hygiene.py`): invisible characters in any text file, and an inline-shell snippet in Python source (written with the `\x60` escape, this plugin's own guard included). | **Upstream ask:** a public scan entry point (`hermes plugins scan <dir>`). |
 
+## How Hermes installs the plugin's package — internal, nightly
+
+| Surface | Where | Why | Public replacement |
+|---|---|---|---|
+| A catalog or git install (`hermes plugins install`) also installs this package into Hermes' environment, editable, from a snapshot of the plugin directory: `<generation>/workspace/plugin-sources/<pm.workspace._member_key(directory)>`, the directory name and the first 16 hex digits of the sha256 of its resolved path (seen on v0.23.2 and `main`) | `cli._is_editable_copy_of`, `cli._hermes_member_key` (`doctor`) | That install carries the `hermes_agent.plugins: agentchat` entry point, which Hermes drops next to the directory plugin. `doctor` counts it as the directory itself, not a second copy, when its `direct_url.json` (PEP 610) names the directory or its snapshot. If Hermes renames the snapshot, the false "2 agentchat plugins" warning comes back; nothing else breaks. `test_doctor_names_a_plugin_directorys_snapshot_as_hermes_does` checks the name against Hermes'. | **Upstream ask:** record the member in the install sidecar (`plugins/.install-metadata.json`), or a public read of which plugin owns an entry point. |
+
 ## The key
 
 The key lives in the profile's own key file (`key_store.py`), not in `.env`: Hermes loads `.env` into its process
