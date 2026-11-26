@@ -334,10 +334,10 @@ def delete_store(home: Path) -> bool:
 
 @dataclass(frozen=True)
 class Holder:
-    """Another profile home on this Hermes root that holds the same key."""
+    """Another profile home on this Hermes root whose key file holds the same key."""
 
     home: Path
-    where: Literal["key file", ".env"]
+    where: Literal["key file"] = "key file"
 
 
 def profile_homes(root: Path) -> list[Path]:
@@ -349,22 +349,28 @@ def profile_homes(root: Path) -> list[Path]:
     return homes
 
 
-def other_holders(home: Path, api_key: str, *, root: Path, env_names: tuple[str, ...]) -> list[Holder]:
-    """Every *other* profile of ``root`` whose key file or ``.env`` holds ``api_key``.
+def other_holders(home: Path, api_key: str, *, root: Path) -> list[Holder]:
+    """Every *other* profile of ``root`` whose AgentChat key file holds ``api_key``.
 
-    Read-only, and nothing read is kept or shown: values are compared and
-    dropped.
+    Only this plugin's own key files are read (``<profile>/agentchat/
+    credentials.json``), never another profile's settings or ``.env``.
+    Nothing read is kept or shown: values are compared and dropped.
     """
-    from .profile_scope import dotenv_value
+    return [
+        Holder(candidate)
+        for candidate in profile_homes(root)
+        if not same_home(candidate, home) and _holds_same_key(candidate, api_key)
+    ]
 
-    found: list[Holder] = []
-    for candidate in profile_homes(root):
-        if same_home(candidate, home):
-            continue
-        if _holds_same_key(candidate, api_key):
-            found.append(Holder(candidate, "key file"))
-            continue
-        env_file = candidate / ".env"
-        if any((dotenv_value(env_file, name) or "").strip() == api_key for name in env_names):
-            found.append(Holder(candidate, ".env"))
-    return found
+
+def holds_fingerprint(home: Path, key_fingerprint: str) -> bool:
+    """Does ``home``'s key file (a regular file of yours) hold a key with this :func:`fingerprint`?"""
+    path = store_path(home)
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if _ownership_problem(path, st) is not None:
+        return False
+    record = _parse(path)
+    return isinstance(record, StoredKey) and fingerprint(record.api_key) == key_fingerprint

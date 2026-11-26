@@ -2,6 +2,48 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The plugin reads no `.env` file** (Nous catalog review, ask 1). Every setting and a pre-0.6 key come from Hermes'
+  `agent.secret_scope.get_secret` in the profile's own scope; lines are removed and written only with Hermes'
+  `remove_env_value` / `save_env_value`, for the profile the process runs for, and only from `hermes agentchat`
+  (never from the gateway). The key file and the key source stay the source of truth.
+  - With a key file, **the key file decides**: a different `AGENTCHAT_API_KEY` in `.env` or the environment is not
+    used — 0.6.5 started nothing for such a profile; it now runs as the key file's agent, and `doctor` says the key file
+    decides.
+  - **One key is one agent through key files only.** A key another profile's key file holds is refused as a copy, and
+    the copy's hosted tools get no key (found in each process in the profile's scope; the key source reads only our
+    files). Two profiles that both hold one key only in `.env` (set up before 0.6, neither moved) are not detected until
+    one of them saves it.
+  - A key found only under the pre-v3 `AGENTCHATME_API_KEY` (the August build) is copied into the key file at
+    activation in **every** profile, as before, now under a per-account lock (`<hermes root>/agentchat-locks/adopt-…`):
+    of two profiles holding one key, the first to activate adopts it and the second is refused as its copy.
+  - `doctor --fix` moves a pre-0.6 key into the key file and removes its `.env` line through Hermes; a key no `.env`
+    line holds (set by the shell or a service) is not moved, and an `AGENTCHAT_API_KEY` move is undone.
+- **Profile scope with public Hermes names only** (Nous catalog review, ask 2). `register()` captures the context
+  Hermes loaded the plugin in, and every thread and cycle runs in a fresh copy of it (`profile_scope.ProfileScope`);
+  on a multiplexed gateway each entry point binds the profile's secrets for its call with
+  `set_secret_scope` + `refresh_installed_secret_scope`, which keeps the launch profile's environment-only keys
+  (systemd `Environment=`, `op run`, `docker -e`). `gateway.run._profile_runtime_scope`,
+  `GatewayTurnMixin._standalone_launch_scope` and the hand-built scope (with its `hermes_cli.env_loader`,
+  `tools.terminal_scope` and `tui_gateway` imports) are gone. Needs Hermes 0.23.2 or later. Known limits, documented
+  in `docs/hermes-coupling.md`: no public way to bind the launch profile's terminal policy; the captured context
+  carries the loader's in-load flag.
+- **No private MCP reconnect.** The plugin no longer calls `tools.mcp_tool_loop.reconnect_mcp_server`. A hosted tools
+  server Hermes parked (a gateway started offline) comes back at Hermes' own probe — after 5 minutes, then at longer
+  intervals up to an hour — or at once with `/reload-mcp` in a chat the gateway serves, or `hermes gateway restart`;
+  the log line and `doctor` say so.
+- **One API-base resolver.** `doctor`, the wizard and the gateway all use `AGENTCHATME_API_BASE`, else the base the
+  key file was saved with, else the default (`doctor` and the wizard ignored the key file's).
+
+### Fixed
+
+- **The runtime check no longer fails every time on a multiplexed gateway.** It resolved the turns' provider outside
+  the profile's scope, where Hermes' `get_secret` fails closed, so every check reported the runtime broken (with a
+  traceback in the log). It now runs in the profile's scope like the gate call and the turn.
+
 ## [0.6.5] — 2026-11-23
 
 Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): doctor no longer counts a catalog install (`hermes plugins install agentchat`) as two plugins, and names its source: the commit the Hermes plugin catalog pins, which `hermes plugins update agentchat` moves. Install or upgrade with the full commit SHA: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable | cut -f1`, once this release is approved and published.

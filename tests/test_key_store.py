@@ -178,17 +178,24 @@ class TestDelete:
 
 
 class TestOtherHolders:
-    def test_finds_key_files_and_dotenv_copies_never_itself(self, tmp_path: Path) -> None:
+    def test_finds_key_files_only_never_itself(self, tmp_path: Path) -> None:
+        """Another profile's settings or ``.env`` are never read: only this
+        plugin's own key files say which profile holds a key."""
         root = _home(tmp_path)
         a, b, c = (root / "profiles" / n for n in ("a", "b", "c"))
         for p in (a, b, c):
             p.mkdir(parents=True)
         key = api_key("shared")
         key_store.write_store(root, api_key=key, handle="x", api_base="https://a.test")
+        key_store.write_store(b, api_key=api_key("different"), handle="y", api_base="https://a.test")
         (a / ".env").write_text(f"OTHER=1\nAGENTCHAT_API_KEY={key}\n", encoding="utf-8")
-        (b / ".env").write_text(f"AGENTCHAT_API_KEY={api_key('different')}\n", encoding="utf-8")
-        found = key_store.other_holders(c, key, root=root, env_names=("AGENTCHAT_API_KEY",))
-        assert [(h.home, h.where) for h in found] == [(root, "key file"), (a, ".env")]
-        assert key_store.other_holders(root, key, root=root, env_names=("AGENTCHAT_API_KEY",)) == [
-            key_store.Holder(a, ".env")
-        ]
+        found = key_store.other_holders(c, key, root=root)
+        assert [(h.home, h.where) for h in found] == [(root, "key file")]
+        assert key_store.other_holders(root, key, root=root) == []
+
+    def test_holds_fingerprint(self, tmp_path: Path) -> None:
+        root = _home(tmp_path)
+        key_store.write_store(root, api_key=api_key("k"), handle="x", api_base="https://a.test")
+        assert key_store.holds_fingerprint(root, key_store.fingerprint(api_key("k")))
+        assert not key_store.holds_fingerprint(root, key_store.fingerprint(api_key("other")))
+        assert not key_store.holds_fingerprint(tmp_path / "none", key_store.fingerprint(api_key("k")))

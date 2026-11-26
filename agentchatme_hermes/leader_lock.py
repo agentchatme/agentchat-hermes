@@ -69,14 +69,16 @@ import contextlib
 import logging
 import os
 import sys
+import time
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     # Module-level import is purely for the type-checker — gives mypy
     # the ``flock``/``LOCK_*`` symbols without running the real import
     # on Windows. Runtime callsites still lazy-import below.
     import fcntl  # noqa: F401
+    from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -172,16 +174,23 @@ def _argv_matches_gateway_run(argv: list[str]) -> bool:
 LOCK_DIRNAME = "agentchat-locks"
 
 
+# The per-account lock files: ``ws`` is the socket's leader lock (held for the
+# process's life); ``adopt`` is held for the moment a profile moves a key
+# found only under the pre-v3 name into its key file (:mod:`.credentials`).
+LockPurpose = Literal["ws", "adopt"]
+
+
 def lock_path_for(
     *,
     hermes_home: Path,
     account_fingerprint: str,
     lock_dir: Path | None = None,
+    purpose: LockPurpose = "ws",
 ) -> Path:
-    """Resolve the leader-lock file for one account on this machine.
+    """Resolve a per-account lock file on this machine.
 
-    ``<hermes root>/agentchat-locks/ws-<fingerprint>.lock`` by default,
-    where the root is the directory that owns every profile
+    ``<hermes root>/agentchat-locks/<purpose>-<fingerprint>.lock`` by
+    default, where the root is the directory that owns every profile
     (``~/.hermes`` for ``~/.hermes/profiles/<name>``). Keeping the file
     under the root rather than under the profile is deliberate: two
     profiles sharing one key must share one lock. ``lock_dir`` overrides
@@ -190,7 +199,7 @@ def lock_path_for(
     from .profile_scope import hermes_root_of
 
     base = lock_dir if lock_dir is not None else hermes_root_of(hermes_home) / LOCK_DIRNAME
-    return base / f"ws-{account_fingerprint}.lock"
+    return base / f"{purpose}-{account_fingerprint}.lock"
 
 
 def legacy_lock_path() -> Path:
@@ -240,15 +249,7 @@ def try_acquire_ws_leader_lock(path: Path) -> int | None:
 
     target = path
     try:
-        # The lock directory is ours (``agentchat-locks/``), so creating
-        # it is in scope — unlike the Hermes home itself. 0700: the
-        # directory sits beside profile ``.env`` files.
-        target.parent.mkdir(parents=True, exist_ok=True)
-        if target.parent.name == LOCK_DIRNAME:
-            os.chmod(target.parent, 0o700)
-        # Open RW + create-if-missing. Mode 0600 so the API key
-        # adjacent in the Hermes home isn't loosened by lock-file mode bits.
-        fd = os.open(target, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = _open_lock_file(target)
     except OSError:
         logger.exception(
             "leader_lock: cannot open %s — falling back to CLI mode "
@@ -276,6 +277,69 @@ def try_acquire_ws_leader_lock(path: Path) -> int | None:
         return None
 
     return fd
+
+
+def _open_lock_file(target: Path) -> int:
+    """Open (creating) a lock file in our lock directory; raises ``OSError``."""
+    # The lock directory is ours (``agentchat-locks/``), so creating it is in
+    # scope — unlike the Hermes home itself. 0700: it sits in the Hermes root.
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.parent.name == LOCK_DIRNAME:
+        os.chmod(target.parent, 0o700)
+    # Open RW + create-if-missing. Mode 0600 so the key adjacent in the
+    # Hermes home isn't loosened by lock-file mode bits.
+    return os.open(target, os.O_RDWR | os.O_CREAT, 0o600)
+
+
+HeldLock = Literal["held", "busy", "unavailable"]
+
+
+@contextlib.contextmanager
+def held_lock(path: Path, *, timeout_s: float = 10.0, poll_s: float = 0.05) -> Iterator[HeldLock]:
+    """Hold an exclusive ``flock`` on ``path`` for the block.
+
+    Yields ``"held"`` while held; ``"busy"`` when another holder kept it
+    past ``timeout_s`` (the caller does not do its step now);
+    ``"unavailable"`` when no lock can be had here at all (no ``fcntl`` —
+    Windows, never a gateway — or the lock directory cannot be written), so
+    there is nothing to exclude with and the caller decides. ``flock`` locks
+    belong to the open file, so two profiles of one multiplexed gateway
+    exclude each other as two processes do.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        yield "unavailable"
+        return
+    try:
+        fd = _open_lock_file(path)
+    except OSError:
+        logger.warning("leader_lock: cannot open %s", path, exc_info=True)
+        yield "unavailable"
+        return
+    deadline = time.monotonic() + timeout_s
+    state: HeldLock = "busy"
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined, unused-ignore]
+                state = "held"
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(poll_s)
+            except OSError:
+                logger.warning("leader_lock: flock failed on %s", path, exc_info=True)
+                state = "unavailable"
+                break
+        yield state
+    finally:
+        if state == "held":
+            with contextlib.suppress(OSError):
+                fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined, unused-ignore]
+        with contextlib.suppress(OSError):
+            os.close(fd)
 
 
 def release_leader_lock(fd: int) -> None:

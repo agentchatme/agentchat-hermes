@@ -468,13 +468,23 @@ class TestReconcileKeyStore:
 
         home = tmp_path / ".hermes"
         home.mkdir()
-        env = home / ".env"
-        env.write_text(f"{ENV_API_KEY_LEGACY}={api_key('old')}\n", encoding="utf-8")
-        _register._reconcile_key_store(self._config(home, api_key("old"), ENV_API_KEY_LEGACY))
+        assert _register._adopt_legacy_key(self._config(home, api_key("old"), ENV_API_KEY_LEGACY)) == "go"
         read = key_store.read_store(home)
         assert read.usable and read.key is not None and read.key.api_key == api_key("old")
-        # Not mirrored into .env any more (0.5.3 wrote AGENTCHAT_API_KEY there).
-        assert env.read_text(encoding="utf-8") == f"{ENV_API_KEY_LEGACY}={api_key('old')}\n"
+        assert not (home / ".env").exists(), "never mirrored into .env (0.5.3 wrote AGENTCHAT_API_KEY there)"
+
+    def test_a_legacy_key_another_profile_saved_is_not_adopted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agentchatme_hermes import _register, key_source, key_store
+        from agentchatme_hermes.config import ENV_API_KEY_LEGACY
+
+        monkeypatch.setattr(key_source, "source_supported", lambda: True)
+        root = tmp_path / ".hermes"
+        named = root / "profiles" / "clone"
+        key_store.write_store(root, api_key=api_key("old"), handle="a", api_base="https://api.agentchat.me")
+        assert _register._adopt_legacy_key(self._config(named, api_key("old"), ENV_API_KEY_LEGACY)) == "copy"
+        assert key_store.read_store(named).status == "missing"
 
     def test_a_dotenv_key_is_left_where_it_is(self, tmp_path: Path) -> None:
         from agentchatme_hermes import _register, key_store
@@ -608,7 +618,7 @@ class TestActivationWatcher:
         configs: list[Any] = [None, SimpleNamespace(api_base="https://api.example.test")]
         monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: configs.pop(0))
         runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path)
-        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)
+        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None, scope=None: runtime)
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
         monkeypatch.setattr(_register, "_reconcile_key_store", lambda cfg: None)
         monkeypatch.setattr(_register, "_reconcile_secrets_block", lambda rt: None)
@@ -636,7 +646,7 @@ class TestActivationWatcher:
         runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path)
         outcomes: list[Any] = [None, None, runtime]
         monkeypatch.setattr(
-            _register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: outcomes.pop(0)
+            _register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None, scope=None: outcomes.pop(0)
         )
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
         monkeypatch.setattr(_register, "_reconcile_key_store", lambda cfg: None)
@@ -680,6 +690,91 @@ class TestActivationWatcher:
         assert started == []
 
 
+class TestActivationInTheProfilesScope:
+    """Every activation attempt — the one ``register()`` makes and each the
+    watcher thread makes — runs in the profile's scope, with its secrets bound
+    on a multiplexed gateway (``profile_scope.ProfileScope``)."""
+
+    def _quiet(self, monkeypatch: pytest.MonkeyPatch, home: Path) -> list[Any]:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register
+
+        started: list[Any] = []
+
+        def start(cfg: Any, **kw: Any) -> Any:
+            started.append((cfg, kw.get("scope")))
+            return SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=home)
+
+        monkeypatch.setattr(_register, "_try_start_runtime", start)
+        for name in ("_reconcile_soul_anchor", "_reconcile_key_store", "_reconcile_secrets_block", "_reconcile_mcp_registration"):
+            monkeypatch.setattr(_register, name, lambda *_a: None)
+        return started
+
+    def test_an_attempt_reads_the_key_in_the_profiles_scope(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from hermes_doubles import FakeSecretScope
+
+        from agentchatme_hermes._register import ActivationWatcher
+        from agentchatme_hermes.profile_scope import ProfileScope
+
+        home = tmp_path / ".hermes" / "profiles" / "ops"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("AGENTCHAT_API_KEY", api_key("the_launch_profiles"))
+        fake = FakeSecretScope(multiplex=True, by_home={home: {"AGENTCHAT_API_KEY": api_key("ops")}})
+        fake.install(monkeypatch)
+        started = self._quiet(monkeypatch, home)
+        scope = ProfileScope.capture(home)
+        watcher = ActivationWatcher(hermes_home=home, profile="ops", gateway_mode=True, scope=scope)
+        assert watcher.attempt() == "active"
+        (config, passed), = started
+        assert config.api_key == api_key("ops"), "this profile's key, never the launch profile's"
+        assert passed is scope, "the runtime's threads run in the same scope"
+        assert fake.binds == [str(home)] and fake.bound.get() is None
+
+    def test_a_scope_that_cannot_be_entered_fails_the_attempt_said_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from hermes_doubles import FakeSecretScope
+
+        from agentchatme_hermes._register import ActivationWatcher
+
+        home = tmp_path / ".hermes"
+        fake = FakeSecretScope(multiplex=True)
+        fake.install(monkeypatch)
+        fake.fail_set = RuntimeError("hosted scope")
+        started = self._quiet(monkeypatch, home)
+        watcher = ActivationWatcher(hermes_home=home, profile="default", gateway_mode=True)
+        with caplog.at_level(logging.ERROR, logger="agentchatme_hermes._register"):
+            assert watcher.attempt() == "failed"
+            assert watcher.attempt() == "failed"
+        assert started == []
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1 and "scope could not be entered" in errors[0]
+        from agentchatme_hermes import _register
+
+        assert watcher.next_delay() > _register.ACTIVATION_RETRY_S, "backs off like any failed attempt"
+
+    def test_the_watcher_thread_attempts_in_the_scope(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        import threading
+
+        from agentchatme_hermes import _register
+        from agentchatme_hermes._register import ActivationWatcher
+
+        home = tmp_path / ".hermes"
+        watcher = ActivationWatcher(hermes_home=home, profile="default", gateway_mode=True)
+        attempted = threading.Event()
+        monkeypatch.setattr(_register, "ACTIVATION_RETRY_S", 0.01)
+        monkeypatch.setattr(watcher, "attempt", lambda: attempted.set() or "closed")
+        watcher.start()
+        assert attempted.wait(5.0)
+        assert watcher._thread is not None and watcher._thread.name == "agentchat-activation"
+        watcher._thread.join(5.0)
+
+
 class _UnloadCtx:
     """A plugin context with Hermes' ``on_unload``: records the callbacks."""
 
@@ -709,7 +804,7 @@ class TestUnload:
         monkeypatch.setattr(
             _register, "load_config", lambda *, hermes_home=None: SimpleNamespace(api_base="https://api.example.test")
         )
-        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)
+        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None, scope=None: runtime)
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
         monkeypatch.setattr(_register, "_reconcile_key_store", lambda cfg: None)
         monkeypatch.setattr(_register, "_reconcile_secrets_block", lambda rt: None)
@@ -747,7 +842,7 @@ class TestUnload:
         watcher = ActivationWatcher(hermes_home=tmp_path / ".hermes", profile="default", gateway_mode=True)
         runtime = SimpleNamespace(identity=SimpleNamespace(handle="ops"), hermes_home=tmp_path, stop=MagicMock())
 
-        def start_while_unloading(cfg: Any, *, gateway_mode: bool, host_llm: Any = None) -> Any:
+        def start_while_unloading(cfg: Any, *, gateway_mode: bool, host_llm: Any = None, scope: Any = None) -> Any:
             watcher.close()  # the unload lands while this attempt starts the runtime
             return runtime
 
@@ -931,7 +1026,7 @@ class TestKeyReachesTheHostedToolsOnly:
         monkeypatch.setattr(
             _register, "load_config", lambda *, hermes_home=None: SimpleNamespace(api_base="https://api.agentchat.me")
         )
-        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)
+        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None, scope=None: runtime)
         monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: None)
         monkeypatch.setattr(_register, "_reconcile_key_store", lambda cfg: None)
         monkeypatch.setattr(
@@ -965,7 +1060,7 @@ class TestGatewayOnlyReconcile:
             identity_line_template=lambda: _SERVED_TEMPLATE,
         )
         monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: SimpleNamespace(api_base="https://api.example.test"))
-        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)
+        monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None, scope=None: runtime)
         monkeypatch.setattr(_register, "_reconcile_key_store", lambda cfg: None)
         monkeypatch.setattr(_register, "_reconcile_secrets_block", lambda rt: None)
         monkeypatch.setattr(_register, "_reconcile_mcp_registration", lambda rt: None)

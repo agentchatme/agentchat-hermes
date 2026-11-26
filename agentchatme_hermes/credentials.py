@@ -1,35 +1,48 @@
 """Saving, moving and clearing this profile's key: one path for the wizard and the CLI.
 
 * :func:`save_credentials` — register / login / recover: the key file first
-  (:mod:`.key_store`), read back; only then is the profile ``.env``'s key
-  line removed, so there is never a moment with no saved copy. If the key
-  file cannot be written — or Hermes could not read it for the hosted tools
-  (:func:`key_bridge`) — a key the server just issued is not dropped: it is
-  saved in the profile ``.env`` as before and the caller says so.
-* :func:`move_env_key` — ``doctor --fix``: the ``.env`` key moves into the
-  key file; the ``.env`` line is removed only when it holds exactly the key
-  that was moved.
-* :func:`clear_credentials` — logout: the key file and the ``.env`` key lines.
+  (:mod:`.key_store`), read back; only then are the key settings removed from
+  the profile ``.env``, so there is never a moment with no saved copy. If the
+  key file cannot be written — or Hermes could not read it for the hosted
+  tools (:func:`key_bridge`) — a key the server just issued is not dropped: it
+  is saved in the profile ``.env`` with Hermes' own writer and the caller says so.
+* :func:`move_env_key` — ``doctor --fix``: a key found in this profile's
+  settings moves into the key file, and its ``.env`` line is removed.
+* :func:`adopt_legacy_key` — activation: a key found only under the pre-v3
+  name ``AGENTCHATME_API_KEY`` is copied into the key file (the hosted tools
+  read ``AGENTCHAT_API_KEY``); the ``.env`` line stays for ``doctor --fix``.
+* :func:`clear_credentials` — logout: the key file and the key settings.
 
-Lines are removed with Hermes' own ``remove_env_value`` (its write lock and
-cache) when Hermes is importable and the file is the active profile's; else
-by :func:`remove_env_lines`, which drops only the named lines and leaves every
-other byte of the file as it was.
+This module never opens a ``.env`` file. The key is read from the profile's
+settings as Hermes resolves them (:func:`.config.settings_key`); lines are
+removed and written only with Hermes' ``remove_env_value`` /
+``save_env_value``, and only for the profile the process runs for
+(``get_env_path()`` in this profile's home). Hermes loads the profile ``.env``
+over the shell's exports, so a key setting that ``remove_env_value`` finds in
+no ``.env`` line came from the environment (a shell export, a service's
+``Environment=``).
+
+Moving a key is a check (no other profile's key file holds it) and a write;
+both happen under the per-account ``adopt`` lock (:func:`.leader_lock.held_lock`
+on ``<hermes root>/agentchat-locks/adopt-<fingerprint>.lock``), so two
+profiles holding the same key — a ``.env`` copied by ``hermes profile
+create`` — cannot both take it, even at one multiplexed gateway's boot: the
+second finds the first's key file and is refused as its copy.
 """
 from __future__ import annotations
 
-import contextlib
 import logging
-import os
-import secrets
-import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import TYPE_CHECKING, Callable, Literal
 
 from . import key_store, profile_scope
 from .config import ENV_API_KEY, ENV_API_KEY_LEGACY, ENV_HANDLE
-from .profile_scope import dotenv_value
+
+if TYPE_CHECKING:
+    from contextlib import AbstractContextManager
+
+    from .leader_lock import HeldLock
 
 logger = logging.getLogger(__name__)
 
@@ -94,11 +107,11 @@ def save_credentials(
 
     * The key file, when Hermes can read it for the hosted tools
       (``use_key_file``, from :func:`key_bridge`): written and read back, then
-      any key line in the profile ``.env`` is removed.
+      the key settings are removed from the profile ``.env``.
     * Otherwise, or when the key file cannot be written: the profile ``.env``
-      as before, checked by reading it back (Hermes refuses ``.env`` writes on
-      a managed install without raising), and the old key file — another
-      key now — is removed so the two cannot disagree.
+      with Hermes' writer, after Hermes' write lock allows it (a managed
+      install refuses ``.env`` writes without raising), and the old key file
+      — another key now — is removed so the two cannot disagree.
     * When ``.env`` refuses the write too: the key file after all (a key in a
       file the tools cannot read yet beats a key saved nowhere), and the
       caller says ``secrets.agentchat`` must be added by hand.
@@ -114,7 +127,7 @@ def save_credentials(
         except key_store.KeyStoreError as exc:
             reason = str(exc)
         else:
-            return SaveOutcome(path, remove_env_key_lines(home), None)
+            return SaveOutcome(path, remove_key_settings(home), None)
     if _save_env_fallback(api_key, home):
         try:
             key_store.delete_store(home)
@@ -130,24 +143,32 @@ def save_credentials(
         ) from exc
     return SaveOutcome(
         path,
-        remove_env_key_lines(home),
+        remove_key_settings(home),
         f"the profile .env could not be written, so the key is in the key file, but {reason}",
         tools_need_block=True,
     )
 
 
 def _save_env_fallback(api_key: str, home: Path) -> bool:
-    """Write the key to the profile ``.env`` with Hermes' writer; ``True`` when it is there."""
+    """Write the key to this profile's ``.env`` with Hermes' writer; ``True`` when it is there.
+
+    Only for the profile the process runs for, and only when Hermes'
+    ``.env`` write lock allows the name (``require_env_writable``: a managed
+    install refuses, and ``save_env_value`` would refuse without raising).
+    """
     try:
-        from hermes_cli.config import save_env_value
+        from hermes_cli.config import require_env_writable, save_env_value
     except ImportError:
         return False
+    if not _edits_this_profile(home):
+        return False
     try:
+        require_env_writable(ENV_API_KEY, "set")
         save_env_value(ENV_API_KEY, api_key)
     except Exception:
         logger.warning("credentials: Hermes refused the .env write", exc_info=True)
         return False
-    return env_values(Path(home) / ".env", ENV_API_KEY) == [api_key]
+    return True
 
 
 @dataclass(frozen=True)
@@ -158,194 +179,217 @@ class MoveOutcome:
     detail: str = ""
 
 
-def env_file_key(home: Path) -> tuple[str, str] | None:
-    """``(key, variable name)`` from the profile's own ``.env`` file, or ``None``."""
-    env_file = Path(home) / ".env"
-    for name in ENV_KEY_NAMES:
-        value = (dotenv_value(env_file, name) or "").strip()
-        if value:
-            return value, name
-    return None
-
-
-def env_values(env_file: Path, name: str) -> list[str]:
-    """Every value ``name`` is given in the dotenv file (a name may repeat), in order."""
-    try:
-        text = env_file.read_text(encoding="utf-8-sig")
-    except OSError:
-        return []
-    values: list[str] = []
-    for line in text.splitlines():
-        if _line_key(line) != name:
-            continue
-        values.append(_line_value(line))
-    return values
-
-
-def _line_value(line: str) -> str:
-    stripped = line.strip()
-    if stripped.startswith("export "):
-        stripped = stripped[len("export ") :].lstrip()
-    value = stripped.partition("=")[2].strip()
-    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-        return value[1:-1]
-    return value.split(" #", 1)[0].strip()
-
-
-def move_env_key(*, handle: str, api_base: str, home: Path | None = None) -> MoveOutcome:
-    """Move the profile ``.env``'s key into the key file (``doctor --fix``).
+def move_env_key(
+    *, handle: str, api_base: str, home: Path | None = None, lock_dir: Path | None = None
+) -> MoveOutcome:
+    """Move the key in this profile's settings into the key file (``doctor --fix``).
 
     Moves nothing when it is not certain which key is this profile's: the
-    ``.env`` gives it several values (both names, or one name twice), or
-    another profile on this machine holds the same key — moving it would
-    make this profile that agent and the other one a refused copy.
+    two names hold different keys, or another profile's key file holds the
+    same key (moving it would make this profile that agent). When no
+    ``.env`` line held an ``AGENTCHAT_API_KEY`` key it came from the
+    environment: the key-file write is undone and that is said (a key the
+    shell or the service sets keeps working from there). A key found only
+    under the pre-v3 name stays in the key file either way: the hosted tools
+    read ``AGENTCHAT_API_KEY``, which only the key file supplies.
     """
+    from .config import cli_prefix
+
+    home = home if home is not None else profile_scope.resolve_hermes_home()
+    cmd = cli_prefix(home)
+    canonical = (profile_scope.resolve_setting(ENV_API_KEY) or "").strip()
+    legacy = (profile_scope.resolve_setting(ENV_API_KEY_LEGACY) or "").strip()
+    if canonical and legacy and canonical != legacy:
+        return MoveOutcome(
+            False,
+            detail=(
+                f"this profile's settings hold two different AgentChat keys ({ENV_API_KEY} and "
+                f"{ENV_API_KEY_LEGACY}): remove the wrong one first"
+            ),
+        )
+    api_key = canonical or legacy
+    if not api_key:
+        return MoveOutcome(False, detail="no key in this profile's settings")
+    remover = _hermes_remover(home)
+    if remover is None:
+        return MoveOutcome(
+            False,
+            detail=f"Hermes cannot edit this profile's .env from this process — run `{cmd} doctor --fix`",
+        )
+    with _key_lock(home, api_base=api_base, api_key=api_key, lock_dir=lock_dir) as lock:
+        if lock == "busy":
+            return MoveOutcome(False, detail="another profile is saving the same key right now — run this again")
+        refused = _claimed_elsewhere(home, api_key)
+        if refused is not None:
+            return MoveOutcome(False, detail=refused)
+        try:
+            path = key_store.write_store(home, api_key=api_key, handle=handle, api_base=api_base)
+        except key_store.KeyStoreError as exc:
+            return MoveOutcome(False, detail=f"the key stays where it is: {exc}")
+    names = tuple(name for name, value in ((ENV_API_KEY, canonical), (ENV_API_KEY_LEGACY, legacy)) if value)
+    removed = remove_key_settings(home, names, remover=remover)
+    left = tuple(name for name in names if name not in removed)
+    if canonical and ENV_API_KEY in left and not removed:
+        # Not in the profile .env: the shell or the service sets it. Undo.
+        try:
+            key_store.delete_store(home)
+        except key_store.KeyStoreError as exc:
+            logger.warning("credentials: the key file written for the move was not removed: %s", exc)
+        return MoveOutcome(
+            False,
+            detail=(
+                f"{ENV_API_KEY} is set in this process's environment (the shell or the service), "
+                f"not in the profile .env — nothing moved: `{cmd} login --api-key-file <file>` saves "
+                "it in the key file, then unset it there"
+            ),
+        )
+    detail = (
+        f"{' and '.join(left)} {'is' if len(left) == 1 else 'are'} set in the environment (the shell "
+        "or the service), not in the profile .env: unset it there"
+        if left
+        else ""
+    )
+    return MoveOutcome(True, path, removed, detail)
+
+
+@dataclass(frozen=True)
+class AdoptOutcome:
+    """What :func:`adopt_legacy_key` did. ``copy``: another profile's key file
+    holds the key (``owner``): this profile is that agent's copy."""
+
+    status: Literal["adopted", "copy", "busy", "unsupported", "failed"]
+    path: Path | None = None
+    owner: Path | None = None
+    detail: str = ""
+
+
+def adopt_legacy_key(
+    *, home: Path, api_key: str, api_base: str, lock_dir: Path | None = None
+) -> AdoptOutcome:
+    """Copy a key found only under the pre-v3 name into this profile's key file.
+
+    The hosted tools authenticate with ``AGENTCHAT_API_KEY``, which Hermes
+    gets from the key file through the plugin's secret source; a profile set
+    up by a release before v3 has only ``AGENTCHATME_API_KEY``. Done at
+    activation in every profile, under the per-account lock: only when no
+    other profile's key file holds the key, so of two profiles holding the
+    same key the first to activate takes it (at a multiplexed boot, the
+    launch profile) and the second is refused as its copy. The ``.env`` line
+    is left for ``doctor --fix`` (never edited from a gateway).
+    """
+    from .key_source import source_supported
+
+    if not source_supported():
+        return AdoptOutcome(
+            "unsupported",
+            detail="this Hermes has no secret sources, so the hosted tools cannot read a key file",
+        )
+    with _key_lock(home, api_base=api_base, api_key=api_key, lock_dir=lock_dir) as lock:
+        if lock == "busy":
+            return AdoptOutcome("busy", detail="another profile is saving the same key right now")
+        holders = key_store.other_holders(home, api_key, root=profile_scope.hermes_root_of(home))
+        if holders:
+            return AdoptOutcome("copy", owner=holders[0].home)
+        try:
+            path = key_store.write_store(home, api_key=api_key, handle="", api_base=api_base)
+        except key_store.KeyStoreError as exc:
+            return AdoptOutcome("failed", detail=str(exc))
+    return AdoptOutcome("adopted", path=path)
+
+
+def _key_lock(
+    home: Path, *, api_base: str, api_key: str, lock_dir: Path | None
+) -> AbstractContextManager[HeldLock]:
+    """The per-account ``adopt`` lock for ``api_key`` (beside the socket's leader lock)."""
+    from .leader_lock import held_lock, lock_path_for
+
+    return held_lock(
+        lock_path_for(
+            hermes_home=home,
+            account_fingerprint=profile_scope.account_fingerprint(api_base, api_key),
+            lock_dir=lock_dir,
+            purpose="adopt",
+        )
+    )
+
+
+def _claimed_elsewhere(home: Path, api_key: str) -> str | None:
+    """Why ``api_key`` must not be saved for ``home``: another profile's key file holds it."""
     from .config import cli_prefix
     from .profile_scope import hermes_root_of, profile_label
 
-    home = home if home is not None else profile_scope.resolve_hermes_home()
-    found = env_file_key(home)
-    if found is None:
-        return MoveOutcome(False, detail="no key in the profile .env")
-    api_key, _name = found
-    env_file = Path(home) / ".env"
-    values = {v.strip() for name in ENV_KEY_NAMES for v in env_values(env_file, name) if v.strip()}
-    if len(values) > 1:
-        return MoveOutcome(
-            False,
-            detail=(
-                "the profile .env holds more than one AgentChat key (AGENTCHAT_API_KEY and "
-                "AGENTCHATME_API_KEY, or a name given twice): remove the wrong lines first"
-            ),
-        )
-    holders = key_store.other_holders(home, api_key, root=hermes_root_of(home), env_names=ENV_KEY_NAMES)
-    if holders:
-        others = ", ".join(f"profile {profile_label(h.home)}, in its {h.where}" for h in holders)
-        return MoveOutcome(
-            False,
-            detail=(
-                f"another profile holds the same key ({others}): one key is one agent, and moving "
-                "it would make this profile that agent. Run `"
-                + "` / `".join(f"{cli_prefix(h.home)} logout" for h in holders)
-                + "` in the profile that should not be it, then run this again"
-            ),
-        )
-    try:
-        path = key_store.write_store(home, api_key=api_key, handle=handle, api_base=api_base)
-    except key_store.KeyStoreError as exc:
-        return MoveOutcome(False, detail=f"the key stays in the profile .env: {exc}")
-    removed = remove_env_key_lines(home, only_value=api_key)
-    return MoveOutcome(True, path, removed)
+    holders = key_store.other_holders(home, api_key, root=hermes_root_of(home))
+    if not holders:
+        return None
+    others = ", ".join(f"profile {profile_label(h.home)}" for h in holders)
+    return (
+        f"another profile's key file holds the same key ({others}): one key is one agent, and "
+        "saving it here would make this profile that agent. Run `"
+        + "` / `".join(f"{cli_prefix(h.home)} logout" for h in holders)
+        + "` in the profile that should not be it, then run this again"
+    )
 
 
 def clear_credentials(home: Path | None = None) -> tuple[bool, tuple[str, ...]]:
-    """Logout: remove the key file and the ``.env`` key and handle lines.
+    """Logout: remove the key file and the key and handle settings from the profile ``.env``.
 
     Returns ``(key file removed, .env lines removed)``.
     """
+    from .config import forget_copy
+
     home = home if home is not None else profile_scope.resolve_hermes_home()
     removed_file = key_store.delete_store(home)
-    removed_lines = remove_env_key_lines(home, names=(*ENV_KEY_NAMES, ENV_HANDLE))
+    removed_lines = remove_key_settings(home, (*ENV_KEY_NAMES, ENV_HANDLE))
+    forget_copy(home)
     return removed_file, removed_lines
 
 
-def remove_env_key_lines(
+def remove_key_settings(
     home: Path,
-    *,
-    only_value: str | None = None,
     names: tuple[str, ...] = ENV_KEY_NAMES,
+    *,
+    remover: Callable[[str], object] | None = None,
 ) -> tuple[str, ...]:
-    """Remove ``names`` from the profile's ``.env``; with ``only_value``, only lines holding it.
+    """Remove ``names`` from this profile's ``.env`` with Hermes' ``remove_env_value``.
 
-    Returns the names removed. Never raises: a line that could not be
-    removed is logged and the caller's doctor run shows it again.
+    Returns the names a line was removed for. Hermes removes every line of a
+    name, and clears it from this process's environment. Nothing is removed
+    for another profile's home, or outside Hermes. Never raises: a line that
+    could not be removed is logged and the next doctor run shows it again.
     """
-    env_file = Path(home) / ".env"
-    # With ``only_value``, a name goes only when every line of it holds that
-    # value: Hermes' remover takes every line of the name at once.
-    targets = tuple(
-        name
-        for name in names
-        if _defines(env_file, name)
-        and (only_value is None or all(v.strip() == only_value for v in env_values(env_file, name)))
-    )
-    if not targets:
+    remove = remover if remover is not None else _hermes_remover(home)
+    if remove is None:
         return ()
-    hermes_remove = _hermes_remover(home)
     removed: list[str] = []
-    for name in targets:
+    for name in names:
         try:
-            if hermes_remove is not None:
-                hermes_remove(name)
-            else:
-                remove_env_lines(env_file, (name,))
+            found = remove(name)
         except Exception:
-            logger.warning("credentials: could not remove %s from %s", name, env_file, exc_info=True)
+            logger.warning("credentials: could not remove %s from the profile .env", name, exc_info=True)
             continue
-        if not _defines(env_file, name):
+        if found is True:
             removed.append(name)
     return tuple(removed)
+
+
+def _edits_this_profile(home: Path) -> bool:
+    """Do Hermes' ``.env`` writers edit ``home``'s file in this process?"""
+    try:
+        from hermes_cli.config import get_env_path
+    except Exception:
+        return False
+    try:
+        return key_store.same_home(Path(get_env_path()).parent, home)
+    except Exception:
+        return False
 
 
 def _hermes_remover(home: Path) -> Callable[[str], object] | None:
     """Hermes' ``remove_env_value`` when it edits ``home``'s ``.env``, else ``None``."""
     try:
-        from hermes_cli.config import get_env_path, remove_env_value
+        from hermes_cli.config import remove_env_value
     except Exception:
         return None
-    try:
-        if not key_store.same_home(Path(get_env_path()).parent, home):
-            return None
-    except Exception:
+    if not _edits_this_profile(home):
         return None
     return remove_env_value if callable(remove_env_value) else None
-
-
-def _defines(env_file: Path, name: str) -> bool:
-    try:
-        text = env_file.read_text(encoding="utf-8-sig")
-    except OSError:
-        return False
-    return any(_line_key(line) == name for line in text.splitlines())
-
-
-def _line_key(line: str) -> str | None:
-    stripped = line.strip()
-    if not stripped or stripped.startswith("#"):
-        return None
-    if stripped.startswith("export "):
-        stripped = stripped[len("export ") :].lstrip()
-    key, sep, _value = stripped.partition("=")
-    return key.strip() if sep else None
-
-
-def remove_env_lines(env_file: Path, names: tuple[str, ...]) -> bool:
-    """Drop every line assigning one of ``names``; keep every other byte.
-
-    Atomic (temporary file + rename) and keeps the file's mode. ``True`` when
-    a line was removed.
-    """
-    try:
-        raw = env_file.read_bytes()
-        mode = stat.S_IMODE(os.stat(env_file).st_mode)
-    except FileNotFoundError:
-        return False
-    text = raw.decode("utf-8")
-    lines = text.splitlines(keepends=True)
-    kept = [line for line in lines if _line_key(line.lstrip("\ufeff")) not in names]
-    if len(kept) == len(lines):
-        return False
-    tmp = env_file.with_name(f".{env_file.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
-    try:
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), mode)
-        try:
-            os.write(fd, "".join(kept).encode("utf-8"))
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(tmp, env_file)
-    except OSError:
-        with contextlib.suppress(OSError):
-            tmp.unlink()
-        raise
-    return True

@@ -271,6 +271,7 @@ class TestProfileScopedConfig:
     ) -> None:
         _isolated(monkeypatch, AGENTCHATME_API_KEY=api_key("x"))
         home = tmp_path / ".hermes" / "profiles" / "growth"
+        monkeypatch.setenv("HERMES_HOME", str(home))  # the profile in scope, as Hermes runs it
         cfg = load_config(hermes_home=home)
         assert cfg is not None
         assert cfg.hermes_home == home
@@ -278,6 +279,7 @@ class TestProfileScopedConfig:
 
     def test_lock_dir_setting(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         _isolated(monkeypatch, AGENTCHATME_API_KEY=api_key("x"))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("AGENTCHATME_LOCK_DIR", str(tmp_path / "run"))
         cfg = load_config(hermes_home=tmp_path)
         assert cfg is not None
@@ -289,6 +291,7 @@ class TestProfileScopedConfig:
         from agentchatme_hermes.profile_scope import account_fingerprint
 
         _isolated(monkeypatch, AGENTCHATME_API_KEY=api_key("x"))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         cfg = load_config(hermes_home=tmp_path)
         assert cfg is not None
         assert cfg.account_fingerprint == account_fingerprint(DEFAULT_API_BASE, api_key("x"))
@@ -300,6 +303,7 @@ class TestProfileScopedConfig:
         from agentchatme_hermes.profile_scope import set_setting_resolver_for_tests
 
         _isolated(monkeypatch, AGENTCHATME_API_KEY="launch-profile-key")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         set_setting_resolver_for_tests(
             lambda name: {"AGENTCHATME_API_KEY": "growth-key"}.get(name)
         )
@@ -309,6 +313,49 @@ class TestProfileScopedConfig:
             set_setting_resolver_for_tests(None)
         assert cfg is not None
         assert cfg.api_key == "growth-key"
+
+    def test_another_profiles_settings_are_never_read_for_this_home(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """``get_secret`` answers for the profile in scope only: asked about
+        another home, only that home's key file counts."""
+        _isolated(monkeypatch, AGENTCHAT_API_KEY=api_key("this_profiles"))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "a"))
+        assert load_config(hermes_home=tmp_path / "b") is None
+
+
+class TestApiBase:
+    def test_the_setting_then_the_key_files_base_then_the_default(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes.config import resolve_api_base
+
+        _isolated(monkeypatch)
+        assert resolve_api_base() == DEFAULT_API_BASE
+        assert resolve_api_base("http://stored.example/") == "http://stored.example"
+        monkeypatch.setenv("AGENTCHATME_API_BASE", "https://set.example/")
+        assert resolve_api_base("http://stored.example") == "https://set.example"
+
+    def test_an_invalid_base_is_an_error_or_given_back(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes.config import resolve_api_base
+
+        _isolated(monkeypatch, AGENTCHATME_API_BASE="ftp://nope/")
+        with pytest.raises(ConfigError, match="AGENTCHATME_API_BASE"):
+            resolve_api_base()
+        assert resolve_api_base(strict=False) == "ftp://nope"
+
+    def test_the_cli_and_the_wizard_use_the_key_files_base(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """One resolver: ``doctor`` and the wizard talk to the server the key was saved for."""
+        from key_files import save_key
+
+        from agentchatme_hermes import cli, wizard
+
+        _isolated(monkeypatch)
+        save_key(api_key("x"), api_base="http://127.0.0.1:9")
+        assert cli._api_base() == "http://127.0.0.1:9"
+        assert wizard._api_base() == "http://127.0.0.1:9"
 
 
 # ───────────────────────── key names ─────────────────────────
