@@ -680,7 +680,7 @@ class TestDispatchAllow:
         save_key(api_key("allow"))
         self._wire(monkeypatch, "yes", allow.ALLOWED_LINE, outcome="applying")
         assert cli._dispatch_allow(argparse.Namespace()) == 0
-        assert capsys.readouterr().out.splitlines()[0] == "AgentChat tools allowed; it takes effect within about two minutes."
+        assert capsys.readouterr().out.splitlines()[0] == "AgentChat tools allowed; it takes effect within about three minutes."
 
     def test_a_yes_being_applied_exits_0(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import argparse
@@ -805,7 +805,7 @@ class TestDoctorToolsSwitch:
         from agentchatme_hermes import allow
 
         [(level, line)] = self._lines(monkeypatch, allow.Switch("applying", _allowance("missing", None)))
-        assert level == "warn" and "within about two minutes" in line
+        assert level == "warn" and "within about three minutes" in line
 
     def test_a_trust_changed_by_hand_says_restart_to_apply(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from agentchatme_hermes import allow

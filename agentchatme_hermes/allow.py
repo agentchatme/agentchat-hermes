@@ -31,18 +31,22 @@ applied in two steps, because Hermes keeps a connected server's tier until
 the server is connected again and its config watcher (about once a minute)
 only adds and removes servers by name: the entry is removed (the watcher
 drops the server), then written with ``trust: full`` once Hermes runs no
-``agentchat`` server for this profile any more (:func:`server_runtime`; the
-watcher then connects it fresh). The gateway does the second step
-(:func:`start_completion`); the decision is recorded first, so a crash
-between the steps completes at the next start. About two minutes. When the
-gateway keeps the earlier connection past :data:`DROP_TIMEOUT_S` nothing is
-written (the old tier would stay in use): the decision stays pending, the
-record says so (``stalled``), ``doctor``, ``status`` and the health record
-say "restart the gateway to apply", and this process stops trying after
-:data:`MAX_APPLY_ATTEMPTS`. A pending ``trust: full`` that cannot be written
-(a read-only or package-managed ``config.yaml``) is given up after
-:data:`MAX_WRITE_FAILURES` attempts: the switch reads "not allowed yet" with
-the operator's route, never "being applied" for ever.
+``agentchat`` server for this profile any more (:func:`server_runtime`: not
+connected, connecting, parked or between sessions of a transport reconnect)
+and at least one watcher tick plus margin (:data:`TICK_WAIT_S`) has passed
+since the removal; the watcher then connects it fresh. The gateway does the
+second step (:func:`start_completion`); the decision is recorded first, so a
+crash between the steps completes at the next start. Two to three minutes.
+When the gateway keeps the earlier connection past :data:`DROP_TIMEOUT_S`
+nothing is written (the old tier would stay in use): the decision stays
+pending, the record says so (``stalled``), ``doctor``, ``status`` and the
+health record say "restart the gateway to apply", and this process stops
+trying after :data:`MAX_APPLY_ATTEMPTS`. A pending ``trust: full`` that cannot
+be written (a read-only or package-managed ``config.yaml``) is tried again,
+but counted once per start of a Hermes process, and given up at the
+:data:`MAX_WRITE_FAILURES`-th start that fails: a yes over an ``untrusted``
+entry gets that entry back (the read-only tools keep working), and the switch
+says why and names the operator's route — never "being applied" for ever.
 
 Entries an earlier release wrote are left as they are (no ``trust`` key reads
 as ``full``), apart from the client header :mod:`.mcp_registration` adds once.
@@ -103,9 +107,10 @@ logger = logging.getLogger(__name__)
 COMMAND = "agentchat"
 QUESTION = "Allow {who} to use AgentChat tools on its own?"
 # Hermes' config watcher drops a removed server and connects an added one on
-# its housekeeping tick (60 s): the two steps of a yes over a connected
-# untrusted server take two ticks (contract-tested).
-APPLY_WORDS = "it takes effect within about two minutes"
+# its housekeeping tick (60 s, contract-tested): the second step of a yes over
+# a connected untrusted server writes at least TICK_WAIT_S (90 s) after the
+# removal, and the next tick connects it — 90 to 150 s.
+APPLY_WORDS = "it takes effect within about three minutes"
 
 # ─── the words ─────────────────────────────────────────────────────────────
 
@@ -312,6 +317,13 @@ def describe(switch: Switch, handle: str | None, *, cmd: str = "hermes agentchat
             f"not allowed yet — {agent} has no AgentChat tools until the person allows them: send "
             f"/agentchat allow in a chat with it, or run {cmd} allow"
         )
+    if switch.state == "not_allowed" and switch.gave_up:
+        return (
+            f"not allowed — trust: full was decided but could not be written to config.yaml ({switch.gave_up}), "
+            f"so the entry is back with trust: untrusted: {agent} can read AgentChat but does not answer on its "
+            f"own; once config.yaml is writable send /agentchat allow in a chat with it, or an operator who builds "
+            "config.yaml declares mcp_servers.agentchat with trust: full there"
+        )
     if switch.state == "not_allowed":
         hand = " (trust changed by hand in config.yaml: a running gateway uses it once it reconnects)" if switch.hand_edited else ""
         return (
@@ -481,6 +493,7 @@ def write_record(
     stalled: bool = False,
     write_failures: int = 0,
     gave_up: str | None = None,
+    decided_at: float | None = None,
 ) -> bool:
     """Record how this profile's entry was decided: ``asked`` (a person:
     ``decision`` yes / no), ``carried_over`` (the one-time carry-over),
@@ -488,9 +501,11 @@ def write_record(
     release line first looked). ``pending``: ``trust: full`` is decided but
     not written yet (a yes being applied, a carry-over not placed yet);
     ``stalled``: the running gateway kept the earlier connection, so it was not
-    written (a restart applies it); ``write_failures``: attempts that could
-    not write it; ``gave_up``: why it was given up after
-    :data:`MAX_WRITE_FAILURES` of them. ``False`` (logged) when the record
+    written (a restart applies it); ``write_failures``: starts of a Hermes
+    process at which it could not be written; ``gave_up``: why it was given up
+    after :data:`MAX_WRITE_FAILURES` of them; ``decided_at``: when a pending
+    ``trust: full`` was decided (epoch seconds; for a yes over a connected
+    entry, when the entry was removed). ``False`` (logged) when the record
     could not be written."""
     from .state import write_json_atomic
 
@@ -509,6 +524,8 @@ def write_record(
         record["write_failures"] = write_failures
     if gave_up:
         record["gave_up"] = gave_up
+    if decided_at is not None:
+        record["decided_at"] = decided_at
     try:
         write_json_atomic(record_path(home), record)
     except OSError as exc:
@@ -536,9 +553,15 @@ def _rewrite(home: Path, record: dict[str, Any], **changes: Any) -> bool:
         "stalled": record.get("stalled") is True,
         "write_failures": _failures(record),
         "gave_up": record.get("gave_up") if isinstance(record.get("gave_up"), str) else None,
+        "decided_at": _decided_at(record),
     }
     fields.update(changes)
     return write_record(home, **fields)
+
+
+def _decided_at(record: dict[str, Any] | None) -> float | None:
+    when = record.get("decided_at") if record is not None else None
+    return float(when) if isinstance(when, (int, float)) and not isinstance(when, bool) else None
 
 
 def clear_pending(home: Path) -> None:
@@ -549,34 +572,60 @@ def clear_pending(home: Path) -> None:
         _rewrite(home, record, pending=False, stalled=False, write_failures=0)
 
 
+# Pending decisions (home, when decided) whose failed write was counted by
+# this process already: a failure counts once per start of a Hermes process.
+_failures_counted: set[tuple[str, float | None]] = set()
+
+
 def note_write_failure(home: Path, detail: str, *, api_base: str | None = None) -> bool:
     """A pending ``trust: full`` that could not be written (a read-only or
-    package-managed ``config.yaml``): counted in the record, and given up at
-    the :data:`MAX_WRITE_FAILURES`-th attempt — the decision is no longer
-    pending, the reason is kept, and the switch reads "not allowed yet" with
-    the operator's route instead of "being applied" for ever. ``True`` when
-    given up now."""
+    package-managed ``config.yaml``). Tried again while this process runs (a
+    transient failure clears itself), but counted once per start of a Hermes
+    process, so a person's yes is never given up within minutes; at the
+    :data:`MAX_WRITE_FAILURES`-th start that fails it is given up: no longer
+    pending, the reason kept. A yes over an ``untrusted`` entry (removed in its
+    first step) gets that entry back, so the read-only tools keep working; the
+    switch says why and names the operator's route. ``True`` when given up
+    now."""
     record = read_record(home)
     if not _pending(record):
         return False
     assert record is not None
+    counted = (str(home), _decided_at(record))
+    if counted in _failures_counted:
+        logger.debug("allow: the allowed AgentChat tools could not be written (%s); counted once this start", detail)
+        return False
+    _failures_counted.add(counted)
     failures = _failures(record) + 1
     if failures < MAX_WRITE_FAILURES:
         _rewrite(home, record, write_failures=failures)
         logger.warning(
-            "agentchat plugin: the allowed AgentChat tools could not be written (%s) — tried again at the next "
-            "start (attempt %d of %d)",
+            "agentchat plugin: the allowed AgentChat tools could not be written (%s) — tried again while Hermes "
+            "runs and at its next start; given up if it still fails at %d starts (this start: %d)",
             detail,
-            failures,
             MAX_WRITE_FAILURES,
+            failures,
         )
         return False
-    _rewrite(home, record, pending=False, stalled=False, trust=None, write_failures=failures, gave_up=detail)
+    trust: TrustState | None = None
+    restored = ""
+    if record.get("how") == "asked":
+        # The first step removed our untrusted entry: put it back.
+        from .mcp_registration import install_entry
+
+        try:
+            if install_entry(api_base=api_base or _api_base(home), decision="no").outcome in ("added", "present"):
+                trust = "untrusted"
+                restored = " mcp_servers.agentchat is back with trust: untrusted (the read-only tools work)."
+        except Exception as exc:
+            restored = f" The untrusted entry could not be written back either ({exc})."
+    _rewrite(home, record, pending=False, stalled=False, trust=trust, write_failures=failures, gave_up=detail)
     logger.warning(
-        "agentchat plugin: the allowed AgentChat tools could not be written after %d attempts (%s) — given up: "
-        "the AgentChat tools are not allowed for this profile. %s",
+        "agentchat plugin: the allowed AgentChat tools could not be written at %d starts (%s) — given up: the "
+        "AgentChat tools are not allowed for this profile.%s %s",
         failures,
         detail,
+        restored,
         operator_route(api_base),
     )
     return True
@@ -610,23 +659,24 @@ def first_placement(home: Path, *, entry: EntryState, legacy_key_set: bool) -> D
         return None
     if not legacy_key_set:
         return None
-    if not write_record(home, how="carried_over", trust="full", pending=True):
+    if not write_record(home, how="carried_over", trust="full", pending=True, decided_at=time.time()):
         return None  # not recorded: not carried over (it would not be once only)
     return "carried_over"
 
 
 # ─── a pending yes: the second step, in the gateway ────────────────────────
 
-# How long the gateway waits for Hermes to drop the earlier connection; one
-# config-watcher tick (60 s, contract-tested) plus a margin, for a status
-# that cannot tell (:func:`server_runtime` ``unknown``); how long it then
-# waits for the tools to be registered again.
+# How long the gateway waits for Hermes to drop the earlier connection; the
+# least time between the removal and the write: one config-watcher tick (60 s,
+# contract-tested) plus a margin, so the watcher has run whatever the status
+# says; how long it then waits for the tools to be registered again.
 DROP_TIMEOUT_S = 180.0
 TICK_WAIT_S = 90.0
 CONNECT_TIMEOUT_S = 150.0
 POLL_S = 2.0
 # Timed-out waits after which this process stops trying (a restart applies
-# it); attempts that could not write the entry before it is given up.
+# it); starts of a Hermes process that could not write the entry before it is
+# given up.
 MAX_APPLY_ATTEMPTS = 3
 MAX_WRITE_FAILURES = 3
 
@@ -671,43 +721,53 @@ def server_runtime(api_base: str) -> Runtime:
     """Whether Hermes still runs an ``agentchat`` MCP server for this profile.
 
     Hermes' own status (``get_mcp_status``) read for our entry, so it answers
-    after the entry left ``config.yaml`` too, in the current registry scope —
-    under a gateway serving several profiles each profile's own (its home's
-    key), so one profile never waits on another's server; a single-profile
-    process has one scope. ``held``: connected, connecting (a connect in
-    flight uses the config it began with), lazily registered, or parked (a
-    parked server stays registered and probes itself: it would come back with
-    its old tier). ``gone``: Hermes holds nothing under the name. ``unknown``:
-    not readable, or failed with a connect error — a first connect that
-    failed leaves no server, one that connected and then failed keeps it, and
+    after the entry left ``config.yaml`` too, and its reconnect state
+    (``mcp_server_reconnecting``), both in the current registry scope — under a
+    gateway serving several profiles each profile's own (its home's key), so
+    one profile never waits on another's server; a single-profile process has
+    one scope. ``held``: connected, connecting (a connect in flight uses the
+    config it began with), lazily registered, parked (a parked server stays
+    registered and probes itself: it would come back with its old tier), or
+    between sessions of a transport reconnect (its task retries with the
+    config it began with; the status shows it as ``configured``). ``gone``:
+    Hermes holds nothing under the name and nothing is reconnecting.
+    ``unknown``: not readable, or failed with a connect error — a first
+    connect that failed leaves no server, one that parked on it keeps it, and
     the status does not tell them apart. Never raises."""
-    from .hosted_tools import hosted_server_state
+    from .hosted_tools import hosted_server_reconnecting, hosted_server_state
     from .mcp_registration import server_entry
 
     state = hosted_server_state(entry=server_entry(api_base))
     if state is None:
         return "unknown"
-    if state.status == "configured":
-        return "gone"
     if state.status in ("connected", "connecting", "lazy"):
         return "held"
     if state.status == "failed" and state.error is None:
         return "held"
+    reconnecting = hosted_server_reconnecting()
+    if reconnecting:
+        return "held"
+    if state.status == "configured" and reconnecting is False:
+        return "gone"
     return "unknown"
 
 
 def _wait_for_drop(home: Path, *, api_base: str, stop: threading.Event) -> bool | None:
     """Until Hermes runs no ``agentchat`` server for this profile
-    (:func:`server_runtime` ``gone``), or — while its status cannot tell —
-    until :data:`TICK_WAIT_S` passed, by which time the config watcher dropped
-    any server it ran (the entry was removed before this began). ``True``:
+    (:func:`server_runtime` not ``held``) and at least :data:`TICK_WAIT_S` has
+    passed since the entry was removed (the record's ``decided_at``; this wait's
+    start when it has none): by then the config watcher has run at least once
+    and dropped any server it ran, so neither a status that cannot tell nor a
+    moment between a reconnect's attempts is taken for a drop. ``True``:
     dropped; ``False``: still held after :data:`DROP_TIMEOUT_S`; ``None``:
     stopped, or the decision is no longer pending (a logout, a no)."""
     started = time.monotonic()
+    decided = _decided_at(read_record(home))
+    before = max(0.0, time.time() - decided) if decided is not None else 0.0
     while True:
         runtime = server_runtime(api_base)
         waited = time.monotonic() - started
-        if runtime == "gone" or (runtime == "unknown" and waited >= TICK_WAIT_S):
+        if runtime != "held" and before + waited >= TICK_WAIT_S:
             return True
         if waited >= DROP_TIMEOUT_S:
             return False

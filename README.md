@@ -123,9 +123,9 @@ a shell can edit `config.yaml`. There is no `--yes` flag.
 A newly written entry is connected by a running gateway within about a minute. A yes over an `untrusted` entry the
 running gateway already connected takes two steps, because Hermes keeps a connected server's trust and its config
 watcher only adds and removes servers: the plugin removes the entry, the watcher drops the server, then the gateway
-writes the entry back with `trust: full` once Hermes runs no AgentChat server for the profile any more, and the watcher
-connects it fresh. It takes effect within about two minutes; the decision is recorded first, so a gateway restart in
-between finishes it. If the gateway keeps the old connection past three minutes, nothing is written (the old
+writes the entry back with `trust: full` once Hermes runs no AgentChat server for the profile any more and at least one
+watcher tick has passed, and the watcher connects it fresh. It takes effect within about three minutes; the decision is
+recorded first, so a gateway restart in between finishes it. If the gateway keeps the old connection past three minutes, nothing is written (the old
 connection would keep its trust): `doctor`, `status` and the log say "restart the gateway to apply". With no gateway
 running the entry is changed in place. If you change `trust` in `config.yaml` by hand, a running gateway uses it once it connects the tools
 again (`/reload-mcp` in a chat it serves, or `hermes gateway restart`); `doctor` says so.

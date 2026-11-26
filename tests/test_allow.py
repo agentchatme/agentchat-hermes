@@ -311,7 +311,7 @@ class TestSwitch:
                 allow.Switch("allowed", _allowance("ours", "full", "trust"), {"how": "asked", "trust": "untrusted"}),
                 "trust changed by hand there",
             ),
-            (allow.Switch("applying", _allowance("missing", None)), "within about two minutes"),
+            (allow.Switch("applying", _allowance("missing", None)), "within about three minutes"),
             (allow.Switch("not_allowed_yet", _allowance("missing", None)), "@alice has no AgentChat tools until the person allows them"),
             (allow.Switch("not_allowed", _allowance("ours", "untrusted")), "@alice can read AgentChat but does not answer on its own"),
             (allow.Switch("disabled"), "disabled"),
@@ -402,7 +402,9 @@ class TestCompletePending:
     @pytest.fixture(autouse=True)
     def _fresh_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(allow, "_timed_out", {})
+        monkeypatch.setattr(allow, "_failures_counted", set())
         monkeypatch.setattr(allow, "POLL_S", 0.0)
+        monkeypatch.setattr(allow, "TICK_WAIT_S", 0.0)  # the tests that need the tick set it
         # The entry as step one left it: removed.
         monkeypatch.setattr(mcp_registration, "inspect_entry", lambda *, api_base: "missing")
 
@@ -477,18 +479,39 @@ class TestCompletePending:
         assert allow.complete_pending(tmp_path, api_base="x", wait=True) is True
         assert log == ["held", "held", "held", "gone", "write yes", "none", "connected"]
 
-    def test_a_status_that_cannot_tell_waits_one_watcher_tick(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        placed = self._placement(monkeypatch)
-        allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True)
-        self._runtime(monkeypatch, "unknown")
-        monkeypatch.setattr(allow, "TICK_WAIT_S", 0.2)
-        monkeypatch.setattr(allow, "POLL_S", 0.01)
-        monkeypatch.setattr(hosted_tools, "hosted_tool_names", lambda: ["mcp__agentchat__agentchat_inbox"])
+    @pytest.mark.parametrize("reading", ["gone", "unknown"])
+    def test_never_written_before_a_watcher_tick_since_the_removal(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reading: str
+    ) -> None:
+        """Not even when the status says gone: a server between a transport
+        reconnect's attempts can read that way. One tick plus margin since the
+        entry was removed (the record's decided_at), whatever the status says."""
         import time as _time
 
+        placed = self._placement(monkeypatch)
+        allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True, decided_at=_time.time())
+        self._runtime(monkeypatch, reading)
+        monkeypatch.setattr(allow, "TICK_WAIT_S", 0.3)
+        monkeypatch.setattr(allow, "POLL_S", 0.01)
+        monkeypatch.setattr(hosted_tools, "hosted_tool_names", lambda: ["mcp__agentchat__agentchat_inbox"])
         started = _time.monotonic()
         assert allow.complete_pending(tmp_path, api_base="x", wait=True) is True
-        assert _time.monotonic() - started >= 0.2 and placed == ["yes"]
+        assert _time.monotonic() - started >= 0.25 and placed == ["yes"]
+
+    def test_a_removal_long_ago_is_written_at_once(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """A gateway restarted between the steps: the tick has long passed."""
+        import time as _time
+
+        placed = self._placement(monkeypatch)
+        allow.write_record(
+            tmp_path, how="asked", trust="full", decision="yes", pending=True, decided_at=_time.time() - 600
+        )
+        self._runtime(monkeypatch, "gone")
+        monkeypatch.setattr(allow, "TICK_WAIT_S", 90.0)
+        monkeypatch.setattr(hosted_tools, "hosted_tool_names", lambda: ["mcp__agentchat__agentchat_inbox"])
+        started = _time.monotonic()
+        assert allow.complete_pending(tmp_path, api_base="x", wait=True) is True
+        assert _time.monotonic() - started < 5.0 and placed == ["yes"]
 
     def test_a_server_never_dropped_is_not_written_and_says_restart(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -544,18 +567,24 @@ class TestCompletePending:
         record = allow.read_record(tmp_path)
         assert placed == [] and record is not None and record["pending"] is False
 
-    def test_a_failed_write_stays_pending_then_is_given_up(
+    def test_a_failed_write_counts_once_per_start_then_is_given_up(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
-        """A read-only or package-managed config.yaml: a few attempts, then
-        "not allowed yet" with the operator's route — never "being applied"
-        for ever."""
-        self._placement(monkeypatch, outcome="failed")
-        allow.write_record(tmp_path, how="carried_over", trust="full", pending=True)
-        for attempt in range(1, allow.MAX_WRITE_FAILURES):
-            assert allow.complete_pending(tmp_path, api_base="x", wait=False) is False
+        """A read-only or package-managed config.yaml: tried again while Hermes
+        runs (a transient failure clears itself) but counted once per start,
+        so the minute retries never give a decision up; given up at the third
+        start that fails, then "not allowed yet" with the operator's route."""
+        placed = self._placement(monkeypatch, outcome="failed")
+        allow.write_record(tmp_path, how="carried_over", trust="full", pending=True, decided_at=1.0)
+        for start in range(1, allow.MAX_WRITE_FAILURES):
+            monkeypatch.setattr(allow, "_failures_counted", set())  # a new start of Hermes
+            for _minute in range(5):
+                assert allow.complete_pending(tmp_path, api_base="x", wait=False) is False
             record = allow.read_record(tmp_path)
-            assert record is not None and record["pending"] is True and record["write_failures"] == attempt
+            assert record is not None and record["pending"] is True and record["write_failures"] == start
+        assert len(placed) == 5 * (allow.MAX_WRITE_FAILURES - 1), "tried every time"
+        assert any("at its next start" in r.getMessage() for r in caplog.records)
+        monkeypatch.setattr(allow, "_failures_counted", set())
         assert allow.complete_pending(tmp_path, api_base="x", wait=False) is False
         record = allow.read_record(tmp_path)
         assert record is not None and record["pending"] is False and record["gave_up"] == "d"
@@ -565,6 +594,43 @@ class TestCompletePending:
         assert "could not be written to config.yaml (d)" in allow.describe(switch, "alice")
         assert any("given up" in r.getMessage() and "trust: full" in r.getMessage() for r in caplog.records)
         assert allow.first_placement(tmp_path, entry="missing", legacy_key_set=True) is None
+
+    def test_a_transient_failure_is_written_on_the_next_try(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        self._placement(monkeypatch, outcome="failed")
+        allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True, decided_at=1.0)
+        assert allow.complete_pending(tmp_path, api_base="x", wait=False) is False
+        placed = self._placement(monkeypatch, outcome="added")
+        assert allow.complete_pending(tmp_path, api_base="x", wait=False) is True
+        assert placed == ["yes"]
+
+    def test_a_given_up_yes_gets_its_untrusted_entry_back(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The first step removed the person's untrusted entry: giving the yes up
+        puts it back, so the read-only tools keep working."""
+        self._placement(monkeypatch, outcome="failed")
+        restored: list[Any] = []
+        monkeypatch.setattr(
+            mcp_registration,
+            "install_entry",
+            lambda *, api_base, decision=None: restored.append(decision)
+            or mcp_registration.EntryPlacement("added", "untrusted", False),
+        )
+        allow.write_record(
+            tmp_path, how="asked", trust="full", decision="yes", pending=True, decided_at=1.0,
+            write_failures=allow.MAX_WRITE_FAILURES - 1,
+        )
+        assert allow.complete_pending(tmp_path, api_base="x", wait=False) is False
+        assert restored == ["no"]
+        record = allow.read_record(tmp_path)
+        assert record is not None and record["pending"] is False and record["trust"] == "untrusted"
+        assert record["gave_up"] == "d" and record["decision"] == "yes"
+        switch = allow.Switch("not_allowed", _allowance("ours", "untrusted"), record)
+        words = allow.describe(switch, "alice")
+        assert "could not be written to config.yaml (d)" in words and "trust: untrusted" in words
+        assert "declares mcp_servers.agentchat with trust: full" in words
+        assert not switch.hand_edited
+        assert any("back with trust: untrusted" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.parametrize(
         ("row", "runtime"),
@@ -581,8 +647,19 @@ class TestCompletePending:
     def test_server_runtime(self, monkeypatch: pytest.MonkeyPatch, row: Any, runtime: str) -> None:
         asked: list[Any] = []
         monkeypatch.setattr(hosted_tools, "hosted_server_state", lambda entry=None: asked.append(entry) or row)
+        monkeypatch.setattr(hosted_tools, "hosted_server_reconnecting", lambda: False)
         assert allow.server_runtime("https://api.agentchat.me") == runtime
         assert asked and asked[0]["url"].startswith("https://api.agentchat.me"), "read for our entry, not config.yaml's"
+
+    @pytest.mark.parametrize(("reconnecting", "runtime"), [(True, "held"), (False, "gone"), (None, "unknown")])
+    def test_a_server_between_reconnects_is_held(
+        self, monkeypatch: pytest.MonkeyPatch, reconnecting: Any, runtime: str
+    ) -> None:
+        """Mid transport-reconnect Hermes' status says configured; its reconnect
+        state says otherwise (and when it cannot be read, nothing is taken for gone)."""
+        monkeypatch.setattr(hosted_tools, "hosted_server_state", lambda entry=None: hosted_tools.ServerState("configured"))
+        monkeypatch.setattr(hosted_tools, "hosted_server_reconnecting", lambda: reconnecting)
+        assert allow.server_runtime("https://api.agentchat.me") == runtime
 
     def test_start_completion_runs_once(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         release = threading.Event()
@@ -705,7 +782,7 @@ class TestSlashCommand:
         placed = self._wire(monkeypatch, tmp_path, state="not_allowed", allowance=_allowance(), outcome="applying")
         reply = self._run(tmp_path, _Chat("allow"))
         assert placed == ["yes", "completion"], "the gateway finishes the second step"
-        assert reply == "AgentChat tools allowed for @alice; it takes effect within about two minutes."
+        assert reply == "AgentChat tools allowed for @alice; it takes effect within about three minutes."
 
     def test_allow_with_no_gateway_running_is_changed_in_place(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         placed = self._wire(monkeypatch, tmp_path, state="not_allowed", allowance=_allowance(), outcome="allowed", gateway=False)
@@ -786,7 +863,7 @@ class TestSlashCommand:
         chat = _Chat("allow")
         reply = self._run(tmp_path, chat)
         assert chat.asked == [] and placed == ["completion"]
-        assert "within about two minutes" in reply
+        assert "within about three minutes" in reply
 
     @pytest.mark.parametrize(
         ("state", "allowance", "reply"),

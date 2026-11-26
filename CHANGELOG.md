@@ -106,10 +106,10 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   answer. Entries an earlier release wrote (no `trust` key, which Hermes reads as `full`) are left as they are.
 - **A yes over a connected `untrusted` entry takes two steps** while a gateway runs: Hermes keeps a connected server's
   trust and its config watcher only adds and removes servers, so the plugin records the decision, removes the entry
-  (the watcher drops the server), and the gateway writes it back with `trust: full` once Hermes' own status shows no
-  `agentchat` server for that profile (each profile's own on a gateway serving several; a status that cannot tell waits
-  one watcher tick plus margin), and the watcher connects it fresh. Within about two minutes; a gateway restart in
-  between finishes it. A gateway that keeps the old connection past three minutes gets nothing written (the old
+  (the watcher drops the server), and the gateway writes it back with `trust: full` once Hermes shows no `agentchat`
+  server for that profile — its status, and its reconnect state for a connection between sessions — and at least one
+  watcher tick plus margin (90 s) has passed since the removal (each profile's own server on a gateway serving several),
+  and the watcher connects it fresh. Within about three minutes; a gateway restart in between finishes it. A gateway that keeps the old connection past three minutes gets nothing written (the old
   connection would keep its trust): the decision stays pending, `doctor` fails with "restart the gateway to apply",
   `status` and the health record say so, and the gateway stops trying after three such waits. The decision and the
   entry are read again right before the write, so a logout or a no meanwhile is never written over. With no gateway
@@ -120,8 +120,10 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   at `doctor --fix`, recorded first in `<profile home>/agentchat/mcp-entry.json` so it never happens again (a copied
   `.env` line nobody verified gets nothing); `doctor --fix` removes the key's old `.env` line only after that entry
   landed. The log and `doctor` say "carried over from your setup under an earlier release". A carry-over (or a yes)
-  that cannot be written — a read-only or package-managed `config.yaml` — is given up after three attempts: the switch
-  then reads "not allowed yet" with the operator's route, never "being applied" for ever.
+  that cannot be written — a read-only or package-managed `config.yaml` — is tried again while Hermes runs, counted
+  once per start of a Hermes process, and given up at the third start that fails: a carry-over then reads "not allowed
+  yet" with the operator's route; a yes over an `untrusted` entry gets that entry back (the read-only tools keep
+  working) and says why — never "being applied" for ever.
 - **No AgentChat work while the tools are not allowed.** Before any gate call or turn the receive loop's readiness
   check reads the switch: the entry's tier, else `approvals.mode: off` or the gateway's own `--yolo`. Not allowed means
   no gate call, no turn and nothing recorded (the socket still acknowledges delivery). When the pause ends, or a cycle

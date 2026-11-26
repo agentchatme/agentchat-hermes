@@ -1517,6 +1517,9 @@ class _McpStub:
         stub = self
         self.methods: list[str] = []
         self.tools = tools
+        # Set: every request is answered 503 and the connection closed (the
+        # server went away for a live client: its keepalive fails).
+        self.down = False
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -1550,6 +1553,10 @@ class _McpStub:
                 message = json.loads(self.rfile.read(length) or b"{}")
                 method = message.get("method")
                 stub.methods.append(str(method))
+                if stub.down:
+                    self.close_connection = True
+                    self._send(503, {"error": "down"}, {"connection": "close"})
+                    return
                 if "id" not in message:
                     self._send(202)
                     return
@@ -1677,9 +1684,10 @@ def test_a_yes_over_a_connected_untrusted_server_is_applied_in_two_steps(
     it, so the plugin removes the entry (the reconcile, one housekeeping tick,
     drops the server), and the gateway's second step — waiting on its own
     thread — writes it back full only once Hermes runs no agentchat server for
-    the profile (its own status for the name, not "no tools registered"); the
-    next tick connects it fresh, with the new tier: two ticks, about two
-    minutes. The real discovery path, a localhost server."""
+    the profile (its own status and reconnect state for the name, not "no
+    tools registered") and a watcher tick plus margin has passed since the
+    removal; the next tick connects it fresh, with the new tier: 90 to 150 s.
+    The real discovery path, a localhost server."""
     pytest.importorskip("mcp.client.streamable_http")
     from fake_keys import api_key
 
@@ -1692,6 +1700,7 @@ def test_a_yes_over_a_connected_untrusted_server_is_applied_in_two_steps(
     monkeypatch.setattr(allow, "inspect_allowance", reg.inspect_allowance)  # the real file, not the unit suite's stand-in
     monkeypatch.setattr(allow, "gateway_lives", lambda home, *, api_base: True)  # this process is the gateway
     monkeypatch.setattr(allow, "POLL_S", 0.05)
+    monkeypatch.setattr(allow, "TICK_WAIT_S", 1.0)  # the watcher's tick is driven by hand here
     monkeypatch.setattr(placement, "resolve_hermes_home", lambda: _hermes_home)
     monkeypatch.setenv("AGENTCHAT_API_KEY", api_key("contract_" + "0" * 32))
     port = _free_port()
@@ -1776,6 +1785,47 @@ def test_a_parked_server_is_waited_for_like_a_connected_one(
         assert discovery.reconcile_mcp_servers_with_config()["removed"] == ["agentchat"]
         assert allow.server_runtime(api_base) == "gone"
         assert allow.TICK_WAIT_S > 60, "one housekeeping tick (contract-tested: 60 s) plus margin"
+    finally:
+        lifecycle.shutdown_mcp_servers()
+
+
+def test_a_server_between_reconnects_is_not_taken_for_dropped(
+    _hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live connection whose server goes away: Hermes' keepalive fails and
+    the task reconnects with the config it began with (session gone, not
+    parked, not connecting, no connect error) — its status reads
+    ``configured``, as if dropped. Its reconnect state says it is not: held
+    until the watcher's tick tears it down. The real transport, a localhost
+    server that starts answering 503."""
+    pytest.importorskip("mcp.client.streamable_http")
+    from agentchatme_hermes import allow, hosted_tools
+
+    discovery = _import("tools.mcp_tool_discovery")
+    lifecycle = _import("tools.mcp_tool_lifecycle")
+    monkeypatch.setattr(_import("tools.approval_prompt"), "request_elicitation_consent", lambda *a, **k: "decline")
+    assert callable(getattr(discovery, "mcp_server_reconnecting", None)), "the guarded read is there"
+    port = _free_port()
+    api_base = f"http://127.0.0.1:{port}"
+    entry = f"mcp_servers:\n  agentchat:\n    url: {api_base}/mcp\n    trust: untrusted\n    keepalive_interval: 5\n"
+    (_hermes_home / "config.yaml").write_text("model:\n  default: x\n" + entry, encoding="utf-8")
+    try:
+        with _McpStub(port) as stub:
+            discovery.discover_mcp_tools()
+            assert hosted_tools.wait_for_hosted_tools(timeout_s=30.0) is True
+            assert allow.server_runtime(api_base) == "held"
+            stub.down = True  # the next keepalive fails: Hermes reconnects
+
+            def mid_reconnect() -> bool:
+                state = hosted_tools.hosted_server_state(entry={"url": f"{api_base}/mcp"})
+                return state is not None and state.status == "configured" and hosted_tools.hosted_server_reconnecting() is True
+
+            assert _eventually(mid_reconnect, timeout=30.0), "Hermes' status reads configured while it reconnects"
+            (_hermes_home / "config.yaml").write_text("model:\n  default: x\n", encoding="utf-8")  # step one
+            assert allow.server_runtime(api_base) == "held", "still Hermes' task, with the untrusted config"
+            assert discovery.reconcile_mcp_servers_with_config()["removed"] == ["agentchat"]
+            assert hosted_tools.hosted_server_reconnecting() is False
+            assert allow.server_runtime(api_base) == "gone"
     finally:
         lifecycle.shutdown_mcp_servers()
 

@@ -124,6 +124,26 @@ def hosted_server_state(entry: Mapping[str, Any] | None = None) -> ServerState |
     return ServerState(status="missing")
 
 
+def hosted_server_reconnecting() -> bool | None:
+    """Whether Hermes' connection to ``mcp_servers.agentchat`` in the current
+    profile scope connected once in this process and is now between sessions
+    (a transport reconnect after a dropped session: its task alive, retrying
+    with the config it began with). ``get_mcp_status`` shows that state as
+    ``configured``. ``None`` when not readable (not Hermes, or a Hermes that
+    moved ``tools.mcp_tool_discovery.mcp_server_reconnecting``, which is not on
+    Hermes' published plugin API: a guarded read, ``docs/hermes-coupling.md``).
+    Reads Hermes' cached state, never connects. Never raises."""
+    try:
+        from tools.mcp_tool_discovery import mcp_server_reconnecting
+    except Exception:
+        return None
+    try:
+        return bool(mcp_server_reconnecting(MCP_SERVER_NAME))
+    except Exception as exc:
+        _warn_once(f"hosted_tools: Hermes' MCP reconnect state raised ({exc!r}) — not known")
+        return None
+
+
 def _cmd() -> str:
     """``hermes agentchat`` for the profile in scope (``hermes -p NAME agentchat``)."""
     try:

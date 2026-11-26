@@ -41,6 +41,7 @@ key is removed; :func:`.soul_anchor.remove_soul_anchor` decides).
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -329,7 +330,7 @@ def _begin_two_step_yes(api_base: str, home: Path) -> PlacementStep | None:
         return None
     if current.entry != "ours" or current.trust != "untrusted" or not gateway_lives(home, api_base=api_base):
         return None
-    if not write_record(home, how="asked", trust="full", decision="yes", pending=True):
+    if not write_record(home, how="asked", trust="full", decision="yes", pending=True, decided_at=time.time()):
         return PlacementStep("mcp", "failed", "the decision could not be recorded, so nothing was changed")
     try:
         uninstall_entry(api_base=api_base)

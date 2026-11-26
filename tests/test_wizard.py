@@ -138,7 +138,7 @@ class TestEditMenuAllow:
             placement, "place_mcp", lambda api_base, decision=None: PlacementStep("mcp", "changed", "d", "applying")
         )
         wizard._allow_tools_flow("alice", print_info=lambda t: None, print_warning=lambda t: None)
-        assert "within about two minutes" in capsys.readouterr().out
+        assert "within about three minutes" in capsys.readouterr().out
 
     def test_the_flow_asks_nothing_when_nobody_can_answer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from agentchatme_hermes import allow, placement, wizard

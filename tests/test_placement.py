@@ -257,7 +257,7 @@ class TestMcpStep:
         log = self._connected_untrusted(monkeypatch, tmp_path, gateway=True)
         step = placement.place_mcp("https://api.example.test", decision="yes")
         assert (step.status, step.outcome) == ("changed", "applying")
-        assert "within about two minutes" in step.detail
+        assert "within about three minutes" in step.detail
         assert log == ["removed"]
         record = allow.read_record(tmp_path)
         assert record is not None and (record["decision"], record["trust"], record["pending"]) == ("yes", "full", True)
