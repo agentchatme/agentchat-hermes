@@ -2,9 +2,10 @@
 
 Skipped unless Hermes is importable (the unit suite runs without it). The
 scheduled ``hermes-main`` workflow installs hermes-agent from its main branch,
-and from its latest release, and runs the whole suite with each, so a Hermes
-change that breaks one of these couplings shows within a day instead of at the
-next release, and a break on the release users run shows too. What each one is
+its latest release and the floor release (``requires_hermes``), and runs the
+whole suite with each, so a Hermes change that breaks one of these couplings
+shows within a day instead of at the next release, and a break on the release
+users run, or on the oldest one the plugin accepts, shows too. What each one is
 for, and which public hook would replace it, is ``docs/hermes-coupling.md``.
 
 Nothing here reaches a network service: the model is a localhost stub and
@@ -365,9 +366,11 @@ def test_live_texts_reaches_each_profile_through_ctx_get_config(
 def test_our_config_schema_is_one_boolean_setting_hermes_shows() -> None:
     """The manifest's ``config_schema`` as Hermes parses, validates and renders
     it (the Desktop form, ``hermes plugins config``, the settings offer at
-    ``hermes plugins install``)."""
+    ``hermes plugins install``). ``hermes_cli.plugins_settings`` names the
+    form's fields on every release (a module up to v0.23.3, a package
+    re-exporting ``fields`` since v0.23.4)."""
     manifest_mod = _import("hermes_cli.plugins_manifest")
-    fields_mod = _import("hermes_cli.plugins_settings.fields")
+    fields_mod = _import("hermes_cli.plugins_settings")
 
     parsed = manifest_mod.parse_manifest_file(_REPO / "plugin.yaml", _REPO, "user", "")
     assert parsed is not None and set(parsed.config_schema) == {"live_texts"}
@@ -424,11 +427,11 @@ def test_hermes_reads_our_floor_and_skips_the_plugin_below_it(monkeypatch: pytes
     validate = _import("hermes_cli.plugin_validate")
 
     parsed = manifest_mod.parse_manifest_file(_REPO / "plugin.yaml", _REPO, "user", "")
-    assert parsed is not None and parsed.requires_hermes == ">=0.23.4"
+    assert parsed is not None and parsed.requires_hermes == ">=0.23.2"
     assert validate._requires_hermes_spec_valid(parsed.requires_hermes)
-    monkeypatch.setattr(manifest_mod, "running_hermes_version", lambda: "0.23.3")
-    assert manifest_mod.requires_hermes_error(parsed) == "requires hermes >=0.23.4, running 0.23.3"
-    for running in ("0.23.4", "0.24.0", "unknown"):
+    monkeypatch.setattr(manifest_mod, "running_hermes_version", lambda: "0.23.1")
+    assert manifest_mod.requires_hermes_error(parsed) == "requires hermes >=0.23.2, running 0.23.1"
+    for running in ("0.23.2", "0.23.4", "0.24.0", "unknown"):
         monkeypatch.setattr(manifest_mod, "running_hermes_version", lambda running=running: running)
         assert manifest_mod.requires_hermes_error(parsed) is None, running
 
@@ -457,7 +460,7 @@ def test_dropping_the_manifest_copy_of_the_sdk_widens_nothing(tmp_path: Path) ->
     plugins_cmd = _import("hermes_cli.plugins_cmd")
 
     manifest = (_REPO / "plugin.yaml").read_text(encoding="utf-8")
-    floor = 'requires_hermes: ">=0.23.4"\n'
+    floor = 'requires_hermes: ">=0.23.2"\n'
     assert floor in manifest
     previous = manifest.replace(floor, f"pip_dependencies:\n  - {_pyproject_sdk_requirement()}\n")
     trees = {}
@@ -1059,7 +1062,11 @@ def _load_plugins(home: Path, *, routed: bool) -> Any:
     scope the gateway binds for it (``gateway.run._profile_runtime_scope``)."""
     plugins = _import("hermes_cli.plugins")
     constants = _import("hermes_constants")
-    manager = plugins.PluginManager(scope_key=constants.hermes_home_key(home), owner_home=home)
+    # As the release's own ``get_plugin_manager`` builds a profile's manager:
+    # with the home it was named by since v0.23.4 (``owner_home``), from the
+    # scope key alone before.
+    owner = {"owner_home": home} if "owner_home" in _params(plugins.PluginManager) else {}
+    manager = plugins.PluginManager(scope_key=constants.hermes_home_key(home), **owner)
 
     def load() -> None:
         if routed:
@@ -1332,19 +1339,26 @@ def test_gateway_marks_its_process() -> None:
 def test_hermes_mcp_status_surface_and_the_parked_remedy() -> None:
     """``hosted_tools`` reads ``get_mcp_status()`` rows (read only, diagnostics).
     Its remedy for a parked server is true of this Hermes: a parked server
-    probes itself after 300 s, backing off to an hour, and ``/reload-mcp`` is a
-    command a chat on the gateway can send."""
+    probes itself after 300 s — again every 300 s on v0.23.2, backing off to
+    an hour since v0.23.3 — and ``/reload-mcp`` is a command a chat on the
+    gateway can send."""
     from agentchatme_hermes import hosted_tools
 
     discovery = _import("tools.mcp_tool_discovery")
     assert {"configured"} <= _params(discovery.get_mcp_status)
     mcp_tool = _import("tools.mcp_tool")
     assert mcp_tool._PARKED_RETRY_INTERVAL == 300
-    assert mcp_tool._PARKED_PROBE_BACKOFF_MAX == 3600
+    remedy = hosted_tools.PARKED_REMEDY
+    assert "after 5 minutes" in remedy and "/reload-mcp" in remedy
+    if hasattr(mcp_tool, "_PARKED_PROBE_BACKOFF_MAX"):
+        assert mcp_tool._PARKED_PROBE_BACKOFF_MAX == 3600
+        assert "up to an hour" in remedy
+    else:
+        run = _import("tools.mcp_tool_server_run")
+        assert "timeout=_core._PARKED_RETRY_INTERVAL" in inspect.getsource(run), "a fixed 5-minute probe"
+        assert "every 5 minutes on Hermes v0.23.2" in remedy
     command = _import("hermes_cli.commands").resolve_command("reload-mcp")
     assert command is not None and not getattr(command, "cli_only", False)
-    assert "after 5 minutes" in hosted_tools.PARKED_REMEDY and "up to an hour" in hosted_tools.PARKED_REMEDY
-    assert "/reload-mcp" in hosted_tools.PARKED_REMEDY
 
 
 def _free_port() -> int:

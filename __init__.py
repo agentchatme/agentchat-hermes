@@ -18,7 +18,7 @@ The plugin's one Python dependency, the ``agentchatme`` SDK, is declared in
 pyproject.toml, and Hermes installs it: at install, reinstall and update it
 asks first (``--yes-deps`` answers yes when headless), installs it into its
 own environment before the plugin loads, and leaves the plugin disabled on a
-no (Hermes v0.23.4 and later, the ``requires_hermes`` floor in plugin.yaml).
+no (Hermes v0.23.2 and later, the ``requires_hermes`` floor in plugin.yaml).
 This file installs nothing. When the SDK is missing or older than this
 release needs, ``register()`` logs one error and ``hermes agentchat doctor``
 fails, both naming the command that installs it

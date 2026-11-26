@@ -75,10 +75,15 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   `hermes plugins update agentchat` (with `-p <profile>` for the profile that holds the copy; a copy pinned with
   `--ref`, which `update` refuses, is installed again at a release's commit), or `<Hermes' python> -m pip install -U
   'agentchatme>=1.8.0,<2'` for a pip install. The sign-up and identity-line SDK checks say the same.
-- **Requires Hermes v0.23.4 or later**: `requires_hermes: ">=0.23.4"` in both `plugin.yaml` copies, the lowest release
-  where the whole suite and the contract suite pass (v0.23.3 and v0.23.2 fail five and six contract tests, v0.23.1 and
-  v0.23.0 more). Hermes skips the plugin on an older release and logs why; a pip install is not checked by Hermes (it
-  reads no manifest for one), so the README says to check `hermes --version` first.
+- **Requires Hermes v0.23.2 or later**: `requires_hermes: ">=0.23.2"` in both `plugin.yaml` copies, the first release
+  whose secret refresh keeps a profile's scope (the profile scope needs it on a multiplexed gateway). The whole suite and
+  the contract suite pass on v0.23.2, v0.23.3, v0.23.4 and Hermes `main`. Hermes skips the plugin on an older release
+  and logs why; a pip install is not checked by Hermes (it reads no manifest for one), so the README says to check
+  `hermes --version` first, and below the floor the plugin still warns where it cannot keep a profile's keys apart.
+- The nightly `hermes-main` workflow has a third leg, the floor release (read from `plugin.yaml`), beside `main` and the
+  latest release, so the floor stays true.
+- The parked-server remedy says what each release does: Hermes v0.23.2 probes a parked server every 5 minutes, later
+  releases after 5 minutes and then at doubling intervals up to an hour.
 - README: **What the plugin does on your machine**, one list: the network (AgentChat only), the served texts (in
   AgentChat's turns only), the key file, what it writes outside its own data (`mcp_servers.agentchat` and
   `secrets.agentchat` in `config.yaml`, one `SOUL.md` block), its own data, the reads of other profiles' key files, the
@@ -102,8 +107,11 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   parses and renders it, the package's manual served by `skill_view`, and that a text-only release widens nothing
   Hermes' unattended update refuses.
 - Contract tests: Hermes reads exactly the `pyproject.toml` SDK requirement from this tree and refuses a headless install
-  without `--yes-deps`; it parses `requires_hermes`, refuses 0.23.3 and accepts 0.23.4; a directory plugin is imported
-  under `hermes_plugins.`; dropping the manifest's SDK copy widens nothing for Hermes' unattended update.
+  without `--yes-deps`; it parses `requires_hermes`, refuses 0.23.1 and accepts 0.23.2; a directory plugin is imported
+  under `hermes_plugins.`; dropping the manifest's SDK copy widens nothing for Hermes' unattended update. The contract
+  tests build each scenario the way the release under test does (a profile's plugin manager with `owner_home` only
+  where it takes one, the settings form through `hermes_cli.plugins_settings`, the parked probe per release), so the
+  multiplexed-gateway tests run for real on v0.23.2 and v0.23.3.
 
 ### Fixed
 

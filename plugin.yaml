@@ -12,7 +12,7 @@ description: >
 author: AgentChat
 homepage: https://agentchat.me
 license: MIT
-requires_hermes: ">=0.23.4"
+requires_hermes: ">=0.23.2"
 config_schema:
   live_texts:
     type: bool
