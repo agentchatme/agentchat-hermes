@@ -18,16 +18,21 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
     starts, and the gateway log and `doctor` say so (`doctor --fix` places the block).
   - **One key is one agent without reading another profile's `.env`.** A key another profile's key file holds is
     refused as a copy, and the copy's hosted tools get no key (found in each process in the profile's scope; the key
-    source reads only our files). A named profile that holds a key in its settings and was never set up as an agent
-    (no identity line in SOUL.md, no hosted-tools entry) is refused as a likely copy — `hermes -p <name> agentchat
-    login` if it is meant to be its own agent — and nothing is placed for it. Profiles one gateway resolves with the
-    same key are said to be one agent, the default profile first. Two set-up profiles that both hold one key only in
-    `.env`, on gateways of their own, are not detected until one of them saves it.
+    source reads only our files). On one gateway, a named profile never set up as an agent (no identity
+    line in SOUL.md, no hosted-tools entry) that holds the default profile's settings key is refused as its copy —
+    `hermes -p <name> agentchat login` if it is meant to be its own agent — and nothing is placed for it; without that
+    evidence such a profile (a key a container exports, no wizard) activates as before. Profiles one gateway resolves
+    with the same key are said to be one agent, the default profile first. No longer detected: a never-set-up `.env`
+    copy of a 0.5.x default profile on a gateway of its own, and two set-up profiles holding one key only in `.env` on
+    gateways of their own — telling them apart needed reading another profile's `.env`.
+  - A `config.yaml` Hermes cannot read refuses activation with its error (said once) and fails `doctor`;
+    `register()` never raises because of it.
   - A key found only under the pre-v3 `AGENTCHATME_API_KEY` (the August build) is copied into the key file at
-    activation **after the server accepted it** (as before; never a revoked key), in the default profile and in a
-    named profile set up as an agent, now under a per-account lock (`<hermes root>/agentchat-locks/adopt-…`, 2 s
-    wait): of two profiles holding one key, the first to adopt it is the agent; the other's runtime is stopped and it
-    is refused as its copy.
+    activation **after the server accepted it** (never a revoked key; its handle recorded) and before the socket
+    opens, in the default profile and in a named profile set up as an agent before (one that was not runs, and adopts
+    at its next start), now under a per-account lock (`<hermes root>/agentchat-locks/adopt-…`, 2 s wait): of two
+    profiles holding one key, the first to adopt it is the agent and the other is refused as its copy before it opens
+    the account's socket.
   - `doctor --fix` moves a pre-0.6 key into the key file and removes its `.env` line through Hermes; a key no `.env`
     line holds (set by the shell or a service) is not moved, and an `AGENTCHAT_API_KEY` move is undone.
 - **Profile scope with public Hermes names only** (Nous catalog review, ask 2). `register()` captures the context

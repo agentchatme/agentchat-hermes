@@ -272,6 +272,22 @@ class ActivationWatcher:
                     message,
                 )
             return "failed"
+        except Exception as exc:
+            # register() must never raise into Hermes' plugin load: anything a
+            # Hermes helper raised (an unreadable config.yaml, a changed API)
+            # is said once and the next attempt tries again.
+            self._failures += 1
+            message = f"{type(exc).__name__}: {exc}"
+            if message != self._scope_problem:
+                self._scope_problem = message
+                logger.error(
+                    "agentchat plugin: activation attempt failed for profile=%s (%s); the next "
+                    "attempt tries again",
+                    self._profile,
+                    message,
+                    exc_info=True,
+                )
+            return "failed"
 
     def try_activate(self) -> str:
         """One attempt in the calling scope. Returns ``"active"``,
@@ -303,6 +319,19 @@ class ActivationWatcher:
         if split is not None:
             # The socket and the gate would be one agent, the hosted tools another.
             return self._refused(split)
+        if getattr(config, "api_key_source", KEY_SOURCE_STORE) == ENV_API_KEY_LEGACY:
+            # Verified with the server, then copied into the key file under the
+            # per-account lock — before the runtime opens any socket, so a copy
+            # never holds the account's socket.
+            adopted = _adopt_legacy_key(config)
+            if adopted == "copy":
+                try:
+                    load_config(hermes_home=self._hermes_home)
+                except KeyRefused as exc:
+                    return self._refused(str(exc))
+            if adopted != "go":
+                self._failures += 1
+                return "failed"
 
         runtime = _try_start_runtime(
             config, gateway_mode=self._gateway_mode, host_llm=self._host_llm, scope=self._scope
@@ -317,22 +346,6 @@ class ActivationWatcher:
             _shutdown_runtime(runtime, profile=self._profile)
             return "closed"
 
-        if getattr(config, "api_key_source", KEY_SOURCE_STORE) == ENV_API_KEY_LEGACY:
-            # The server accepted the key (the runtime resolved its identity):
-            # only now is it copied into the key file — never a revoked key.
-            adopted = _adopt_legacy_key(config)
-            if adopted != "go":
-                # Another profile's key file holds it (this profile is its
-                # copy), or another profile is adopting it right now: this
-                # runtime must not keep the account's socket.
-                self._drop(runtime)
-                if adopted == "copy":
-                    try:
-                        load_config(hermes_home=self._hermes_home)
-                    except KeyRefused as exc:
-                        return self._refused(str(exc))
-                self._failures += 1
-                return "failed"
         self._failures = 0
 
         # Placement reconciliation. Wizard users (`hermes agentchat
@@ -378,25 +391,6 @@ class ActivationWatcher:
             self._refusal = message
             logger.error("agentchat plugin: not starting for profile=%s — %s", self._profile, message)
         return "refused"
-
-    def _drop(self, runtime: Runtime) -> None:
-        """Stop a runtime this attempt started and keep watching (not an unload)."""
-        from .runtime import forget_runtime
-
-        with self._state_lock:
-            if self._runtime is runtime:
-                self._runtime = None
-        try:
-            runtime.stop()
-        except Exception:
-            logger.exception("agentchat plugin: stopping the runtime raised")
-        finally:
-            forget_runtime(runtime)
-        logger.info(
-            "agentchat plugin: profile=%s — the runtime this attempt started is stopped (socket closed, "
-            "leader lock released)",
-            self._profile,
-        )
 
     def retry_schedule(self) -> str:
         """What :meth:`next_delay` does from here, in words, for the log."""
@@ -748,7 +742,12 @@ def _split_identity(config: Any) -> str | None:
     ``AGENTCHAT_API_KEY`` from the profile's settings instead: a different key
     there is another agent (:func:`.credentials.tools_key_conflict`, the line
     ``doctor`` shows too). The block is placed first when it is missing, as
-    every activation does.
+    every activation does; a block this activation places is used by the
+    hosted tools after Hermes applies secret sources again — the re-pull right
+    after plugin discovery when it is placed while the gateway loads plugins,
+    else the next gateway restart. A ``config.yaml`` Hermes cannot read is a
+    refusal with its error (said once), never an exception out of
+    ``register()``.
     """
     if getattr(config, "api_key_source", KEY_SOURCE_STORE) != KEY_SOURCE_STORE:
         return None
@@ -765,28 +764,72 @@ def _split_identity(config: Any) -> str | None:
 
 
 def _adopt_legacy_key(config: Any) -> Literal["go", "copy", "retry"]:
-    """A key found only under the pre-v3 name: copy it into the key file, once the
-    runtime has verified it with the server (:func:`.credentials.adopt_legacy_key`).
-    Never writes ``.env`` (``doctor --fix`` removes the old line).
+    """A key found only under the pre-v3 name: verify it with the server, then
+    copy it into the key file (:func:`.credentials.adopt_legacy_key`), before
+    the runtime starts. Never writes ``.env`` (``doctor --fix`` removes the old
+    line).
 
-    ``"copy"``: another profile's key file holds the key — this profile is that
-    agent's copy and must not start. ``"retry"``: another profile is adopting the
-    same key right now — start nothing until that is decided. ``"go"``: adopted,
-    or not adopted for another reason, which is said; the activation goes on, as
-    before 0.7 (the hosted tools then lack the key).
+    * The server must accept the key (``GET /v1/agents/me``, the wizard's
+      check): a revoked key is never saved. Unreachable or refused:
+      ``"retry"`` (the runtime would fail the same way).
+    * A named profile adopts only if it was set up as an agent before this
+      activation (:func:`.config.was_set_up_as_agent`): a ``.env`` that
+      ``hermes profile create`` copied must not take the default profile's
+      agent before the default profile starts. Said; ``"go"`` (it runs, and
+      its next start, set up by this one, adopts).
+    * ``"copy"``: another profile's key file holds the key — this profile is
+      that agent's copy and must not start. ``"retry"`` also when another
+      profile is adopting the same key right now. ``"go"``: adopted, or not
+      adopted for a reason that is said; the activation goes on, as before 0.7
+      (the hosted tools then lack the key).
     """
-    from .config import cli_prefix
+    from . import signup
+    from .config import cli_prefix, was_set_up_as_agent
     from .credentials import adopt_legacy_key
+    from .profile_scope import hermes_root_of
 
     home = getattr(config, "hermes_home", None)
     api_key = getattr(config, "api_key", None)
     if home is None or not isinstance(api_key, str):
         return "go"
     cmd = cli_prefix(home)
+    api_base = getattr(config, "api_base", "")
+    from .key_store import same_home
+
+    if not same_home(home, hermes_root_of(home)) and not was_set_up_as_agent(home):
+        logger.warning(
+            "agentchat plugin: only the pre-v3 name %s is set in profile %s, which was not set up as "
+            "an AgentChat agent before — the key is not copied into its key file now (a .env that "
+            "`hermes profile create` copied would take another profile's agent); the hosted tools "
+            "cannot authenticate until `%s doctor --fix` moves it, or this profile's next start does",
+            ENV_API_KEY_LEGACY,
+            profile_label(home),
+            cmd,
+        )
+        return "go"
+    try:
+        checked = signup.check_key(api_key, api_base=api_base)
+    except Exception as exc:
+        logger.info(
+            "agentchat plugin: the pre-v3 key could not be checked with AgentChat (%s) — tried again "
+            "shortly",
+            exc,
+        )
+        return "retry"
+    if not checked.ok:
+        logger.warning(
+            "agentchat plugin: AgentChat does not accept the key under the pre-v3 name %s (%s) — it is "
+            "not saved; run `%s login` with a current key",
+            ENV_API_KEY_LEGACY,
+            checked.message or checked.code,
+            cmd,
+        )
+        return "retry"
     outcome = adopt_legacy_key(
         home=home,
         api_key=api_key,
-        api_base=getattr(config, "api_base", ""),
+        api_base=api_base,
+        handle=checked.handle or "",
         lock_dir=getattr(config, "lock_dir", None),
     )
     if outcome.status == "copy":

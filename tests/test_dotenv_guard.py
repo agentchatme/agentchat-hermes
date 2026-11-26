@@ -51,3 +51,46 @@ def test_other_files_and_test_code_are_not_blocked(tmp_path: Path, _dotenv_guard
     env.write_text("A=1\n", encoding="utf-8")
     assert env.read_text(encoding="utf-8") == "A=1\n", "a test (or a Hermes double) may read it"
     assert _dotenv_guard == []
+
+
+def _module_function(source: str, *, filename: str, module: str) -> Any:
+    namespace: dict[str, Any] = {"__name__": module}
+    exec(compile(source, filename, "exec"), namespace)
+    return namespace["go"]
+
+
+def test_a_library_the_plugin_calls_is_blocked_too(tmp_path: Path, _dotenv_guard: list[str]) -> None:
+    """A third-party ``.env`` parser called by plugin code (directly or through
+    other code) still opens the file for the plugin."""
+    env = tmp_path / ".env"
+    env.write_text("A=1\n", encoding="utf-8")
+    library = _module_function(
+        _OPENS["open"], filename=str(tmp_path / "site-packages" / "fakedotenv" / "main.py"), module="fakedotenv.main"
+    )
+    namespace: dict[str, Any] = {"library": library}
+    exec(
+        compile("def go(path):\n    return library(path)\n", os.path.join(_PACKAGE_DIR, "_dotenv_guard_probe.py"), "exec"),
+        namespace,
+    )
+    with pytest.raises(OSError, match=r"the plugin opened a \.env file"):
+        namespace["go"](str(env))
+    assert _dotenv_guard == [str(env)]
+    _dotenv_guard.clear()
+    assert library(str(env)) == "A=1\n", "the same library called by a test is not the plugin"
+    assert _dotenv_guard == []
+
+
+def test_hermes_reading_its_own_dotenv_for_the_plugin_is_allowed(tmp_path: Path, _dotenv_guard: list[str]) -> None:
+    """``get_secret`` reads the profile's .env as Hermes: the plugin above it is not the reader."""
+    env = tmp_path / ".env"
+    env.write_text("A=1\n", encoding="utf-8")
+    hermes = _module_function(
+        _OPENS["read_text"], filename=str(tmp_path / "hermes-agent" / "agent" / "secret_scope.py"), module="agent.secret_scope"
+    )
+    namespace: dict[str, Any] = {"hermes": hermes}
+    exec(
+        compile("def go(path):\n    return hermes(path)\n", os.path.join(_PACKAGE_DIR, "_dotenv_guard_probe.py"), "exec"),
+        namespace,
+    )
+    assert namespace["go"](str(env)) == "A=1\n"
+    assert _dotenv_guard == []

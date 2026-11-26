@@ -26,8 +26,9 @@ file; a key found only under the pre-v3 name is moved at activation, once
 the server has accepted it (:func:`.credentials.adopt_legacy_key`), because
 the hosted tools read ``AGENTCHAT_API_KEY``. :func:`resolve_key` refuses a
 key this profile must not act as — one another profile's key file holds, or
-one a named profile that was never set up as an agent holds (``hermes
-profile create`` copies ``.env``) — with a sentence that says what to do.
+the default profile's key in a named profile never set up as an agent
+(``hermes profile create`` copies ``.env``) — with a sentence that says what
+to do.
 Behaviour knobs keep their ``AGENTCHATME_`` prefix and are read as before.
 
 Two knobs were renamed with the words (integration, wake); the old
@@ -268,9 +269,11 @@ def resolve_key(home: Path | None = None) -> KeyResolution:
        read). A key another profile's key file holds is that profile's agent:
        refused, and remembered for the key source (:func:`copy_of`), which
        then gives this profile's hosted tools no key. A named profile that
-       was never set up as an agent (:func:`was_set_up_as_agent`) is refused
-       as a likely copy. Profiles of this process resolving the same key are
-       said to share it (``shared_with``), the root profile first.
+       was never set up as an agent (:func:`was_set_up_as_agent`) holding
+       the key the default profile resolved from its settings in this
+       process is that profile's copy: refused. Profiles of this process
+       resolving the same key are said to share it (``shared_with``), the
+       root profile first.
 
     Raises :class:`~.profile_scope.ProfileScopeError` when called outside
     the profile's scope on a multiplexed gateway.
@@ -309,6 +312,7 @@ def resolve_key(home: Path | None = None) -> KeyResolution:
 
     found = settings_key() if _in_scope(home) else None
     if found is None:
+        _forget_settings_key(home)
         # Unset, or the copy's setting that the key source now supplies empty
         # (this process already found it): still refused while that profile
         # holds the key.
@@ -325,12 +329,16 @@ def resolve_key(home: Path | None = None) -> KeyResolution:
         _forget_settings_key(home)
         return _copy_refusal(home, store, owner, value, source=name)
     _forget_copy(home)
-    if not key_store.same_home(home, root) and not was_set_up_as_agent(home):
-        # A named profile that holds a key only in its settings and was never
-        # set up as an agent: what `hermes profile create` makes of the launch
-        # profile's .env. Refused as a likely copy, nothing placed for it.
+    if (
+        not key_store.same_home(home, root)
+        and _settings_key_of(root) == key_store.fingerprint(value)
+        and not was_set_up_as_agent(home)
+    ):
+        # The default profile resolved the same key in this process, and this
+        # named profile was never set up as an agent: what `hermes profile
+        # create` makes of the default profile's .env. Refused, nothing placed.
         _forget_settings_key(home)
-        return _never_set_up_refusal(home, store, value, source=name)
+        return _default_copy_refusal(home, store, value, root, source=name)
     notes: list[str] = []
     if name == ENV_API_KEY:
         legacy = _setting(ENV_API_KEY_LEGACY)
@@ -345,25 +353,25 @@ def resolve_key(home: Path | None = None) -> KeyResolution:
     return KeyResolution(value, name, store, notes=tuple(notes), held_key=value, shared_with=shared)
 
 
-def _never_set_up_refusal(
-    home: Path, store: key_store.StoreRead, value: str, *, source: str
+def _default_copy_refusal(
+    home: Path, store: key_store.StoreRead, value: str, root: Path, *, source: str
 ) -> KeyResolution:
     cmd = cli_prefix(home)
-    root_label = profile_label(hermes_root_of(home))
     return KeyResolution(
         None,
         source,
         store,
         refusal=(
-            f"This profile's settings hold an AgentChat key ({source}), but this profile was never set "
-            "up as an AgentChat agent (no identity line in its SOUL.md, no hosted-tools entry in its "
-            "config.yaml) — `hermes profile create` copies .env into new profiles, so the key is "
-            f"likely another profile's (profile {root_label}'s). One key is one agent. Run `{cmd} "
-            f"logout` to remove the copy from this profile, then `{cmd} register` to give this profile "
-            f"its own agent. If this profile is meant to be its own agent with this key, run `{cmd} "
-            "login` with it."
+            f"This profile's settings hold the same AgentChat key as the default profile ({root}), and "
+            "this profile was never set up as an AgentChat agent (no identity line in its SOUL.md, no "
+            "hosted-tools entry in its config.yaml) — `hermes profile create` copies .env into new "
+            "profiles. One key is one agent, and the default profile is that agent. Run "
+            f"`{cmd} logout` to remove the copy from this profile (the default profile keeps its key), "
+            f"then `{cmd} register` to give this profile its own agent. If this profile is meant to be "
+            f"its own agent with this key, run `{cmd} login` with it."
         ),
         held_key=value,
+        copy_of=root,
     )
 
 
@@ -483,6 +491,13 @@ def _remember_settings_key(home: Path, api_key: str) -> list[Path]:
         _settings_keys[_copy_key(home)] = (Path(home), fp)
         others = [h for key, (h, other_fp) in _settings_keys.items() if other_fp == fp and key != _copy_key(home)]
     return sorted(others, key=lambda h: (not key_store.same_home(h, hermes_root_of(h)), str(h)))
+
+
+def _settings_key_of(home: Path) -> str | None:
+    """The fingerprint of the key ``home`` resolved from its settings in this process."""
+    with _copies_lock:
+        found = _settings_keys.get(_copy_key(home))
+    return found[1] if found is not None else None
 
 
 def _forget_settings_key(home: Path) -> None:

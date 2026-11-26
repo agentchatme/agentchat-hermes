@@ -186,16 +186,22 @@ such a profile; it now runs as the key file's agent, and `doctor` says the key f
 cannot carry it (`secrets.agentchat` disabled or not placeable, or no secret sources): then Hermes' MCP client takes
 `AGENTCHAT_API_KEY` from the settings, and a different key there would make the hosted tools another agent than the
 socket — nothing starts for the profile (`credentials.tools_key_conflict`, the same line `doctor` fails on;
-`doctor --fix` places the block). Without a key file, the key is the profile's setting as Hermes resolves it
+`doctor --fix` places the block). A block that an activation places is used by the hosted tools once Hermes applies
+secret sources again: right away when it is placed while the gateway loads plugins (Hermes re-pulls them after
+discovery), else at the next gateway restart. A `config.yaml` Hermes cannot read refuses activation with its error
+(said once), and `doctor` fails on it; `register()` never raises because of it. Without a key file, the key is the profile's setting as Hermes resolves it
 (`get_secret`), and is refused when it is certainly or likely another profile's:
 
 - another profile's **key file** holds it — found in each process (in `register()`, in the profile's scope) for the
   key source, which then gives the copy's hosted tools an empty key (`fetch` reads only our key files and that finding);
-- a **named** profile that was never set up as an agent holds it (no identity line in its `SOUL.md`, no hosted-tools
-  entry in its `config.yaml`: `config.was_set_up_as_agent`, which reads those two files, never `.env`) — what
-  `hermes profile create` makes of the launch profile's `.env`. Its remedy also says `hermes -p <name> agentchat login`
-  if it is meant to be its own agent. Nothing is placed for it (no identity line, no `secrets.agentchat`, no tools
-  entry, so no hosted tools to mask).
+- a **named** profile that was never set up as an agent (no identity line in its `SOUL.md`, no hosted-tools entry in
+  its `config.yaml`: `config.was_set_up_as_agent`, which reads those two files, never `.env`) holds the key the
+  **default profile** resolved from its settings in this process — what `hermes profile create` makes of the default
+  profile's `.env`, on one gateway. Its remedy also says `hermes -p <name> agentchat login` if it is meant to be its
+  own agent. Nothing is placed for it (no identity line, no `secrets.agentchat`, no tools entry, so no hosted tools to
+  mask). Without that evidence a never-set-up named profile activates and is set up as before (a key a container or
+  a service exports, no wizard). Not caught any more: a never-set-up `.env` copy of a 0.5.x default profile served by
+  a gateway of its own — telling it apart needed reading the default profile's `.env`, which ask 1 removes.
 
 Profiles one process resolves with the same settings key (a multiplexed gateway, each in its own scope) are said to be
 one agent, the default profile first (`shared_with`, `where: settings`). Other profiles' `.env` files are never read,
@@ -203,12 +209,14 @@ so two set-up pre-0.6 profiles holding one key only in `.env`, on gateways of th
 of them saves it (`doctor --fix`, `login`).
 
 A key found only under the pre-v3 name `AGENTCHATME_API_KEY` (the August build) is copied into the key file — the
-hosted tools read `AGENTCHAT_API_KEY` — once the runtime has verified it with the server (its identity resolved, as
-before 0.7: a revoked key is never saved), in the default profile and in a named profile set up as an agent, under a
-per-account lock (`<hermes root>/agentchat-locks/adopt-<fingerprint>.lock`, beside the socket's leader lock, waited
-for 2 s at most) and only when no other profile's key file holds it. Of two profiles holding one key, the first to
-adopt it is the agent; the other's runtime is stopped and it is refused as the copy (a busy lock stops it too, and
-the next attempt decides). At a multiplexed boot the launch profile loads first, so the default profile normally wins.
+hosted tools read `AGENTCHAT_API_KEY` — once the server has accepted it (`GET /v1/agents/me`, the wizard's check: a
+revoked key is never saved; its handle is recorded) and before the runtime opens a socket, in the default profile
+and in a named profile set up as an agent before this activation, under a per-account lock (`<hermes
+root>/agentchat-locks/adopt-<fingerprint>.lock`, beside the socket's leader lock, waited for 2 s at most) and only
+when no other profile's key file holds it. Of two profiles holding one key, the first to adopt it is the agent; the
+other is refused as the copy before it opens the account's socket (a busy lock stops the attempt, and the next one
+decides). A named profile not set up before runs as before and adopts at its next start (this one sets it up), so
+it does not take the default profile's agent first. At a multiplexed boot the launch profile loads first, so the default profile normally wins.
 Remaining edge: a `--clone` or `--clone-all` copy of an August setup (its identity line copied too) on per-profile
 gateways that start in any order — whichever adopts first is the agent, and the other one's `doctor` names the fix
 (`hermes -p <the copy> agentchat logout`, then `register` it as its own agent; if the wrong one won, log that one out

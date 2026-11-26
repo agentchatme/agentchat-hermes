@@ -90,6 +90,8 @@ def key_bridge() -> tuple[bool, str]:
         enabled = inspect_source_enabled()
     except McpRegistrationError as exc:
         return False, str(exc)
+    except Exception as exc:  # Hermes' reader raised: an unreadable or invalid config.yaml
+        return False, f"Hermes could not read this profile's config.yaml ({type(exc).__name__}: {exc})"
     if enabled:
         return True, ""
     return False, step.detail
@@ -253,6 +255,10 @@ def move_env_key(
     return MoveOutcome(True, path, removed, detail)
 
 
+class ConfigUnreadable(RuntimeError):
+    """Hermes could not read this profile's ``config.yaml``: whether the key source is on is not known."""
+
+
 @dataclass(frozen=True)
 class AdoptOutcome:
     """What :func:`adopt_legacy_key` did. ``copy``: another profile's key file
@@ -265,17 +271,16 @@ class AdoptOutcome:
 
 
 def adopt_legacy_key(
-    *, home: Path, api_key: str, api_base: str, lock_dir: Path | None = None
+    *, home: Path, api_key: str, api_base: str, handle: str = "", lock_dir: Path | None = None
 ) -> AdoptOutcome:
     """Copy a key found only under the pre-v3 name into this profile's key file.
 
     The hosted tools authenticate with ``AGENTCHAT_API_KEY``, which Hermes
     gets from the key file through the plugin's secret source; a profile set
     up by a release before v3 has only ``AGENTCHATME_API_KEY``. Done at
-    activation, once the server has accepted the key (the runtime resolved
-    its identity), in the default profile and in a named profile set up as an
-    agent (:func:`.config.resolve_key` refuses one that never was), under the
-    per-account lock: only when no other profile's key file holds the key, so
+    activation, once the server has accepted the key (``handle`` is the one it
+    returned) and before the runtime opens a socket, in the default profile
+    and in a named profile set up as an agent, under the per-account lock: only when no other profile's key file holds the key, so
     of two profiles holding the same key the first to adopt it is the agent
     (at a multiplexed boot, the launch profile) and the second is refused as
     its copy. The ``.env`` line is left for ``doctor --fix`` (never edited
@@ -295,7 +300,7 @@ def adopt_legacy_key(
         if holders:
             return AdoptOutcome("copy", owner=holders[0].home)
         try:
-            path = key_store.write_store(home, api_key=api_key, handle="", api_base=api_base)
+            path = key_store.write_store(home, api_key=api_key, handle=handle, api_base=api_base)
         except key_store.KeyStoreError as exc:
             return AdoptOutcome("failed", detail=str(exc))
     return AdoptOutcome("adopted", path=path)
@@ -339,6 +344,8 @@ def source_carries_key() -> bool:
         return inspect_source_enabled()
     except McpRegistrationError:
         return False
+    except Exception as exc:  # Hermes' reader raised: an unreadable or invalid config.yaml
+        raise ConfigUnreadable(f"{type(exc).__name__}: {exc}") from exc
 
 
 def tools_key_conflict(home: Path, api_key: str) -> str | None:
@@ -349,8 +356,15 @@ def tools_key_conflict(home: Path, api_key: str) -> str | None:
     """
     from .config import cli_prefix
 
-    if source_carries_key():
-        return None
+    try:
+        if source_carries_key():
+            return None
+    except ConfigUnreadable as exc:
+        return (
+            f"Hermes could not read this profile's config.yaml ({exc}), so which key the hosted "
+            "tools would get is not known — fix the file; the gateway activates by itself once it "
+            f"reads, and `{cli_prefix(home)} doctor` checks it"
+        )
     try:
         theirs = (profile_scope.resolve_setting(ENV_API_KEY) or "").strip()
     except profile_scope.ProfileScopeError:

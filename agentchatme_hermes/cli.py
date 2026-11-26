@@ -1279,6 +1279,12 @@ def _doctor_secrets_checks(
     except McpRegistrationError as exc:
         warn(f"secrets.agentchat not checked — {exc}")
         return
+    except Exception as exc:  # Hermes' reader raised: an unreadable or invalid config.yaml
+        fail(
+            f"Hermes could not read this profile's config.yaml ({type(exc).__name__}: {exc}): "
+            "secrets.agentchat and the hosted tools entry cannot be checked — fix the file"
+        )
+        return
     if state == "ours":
         ok("secrets.agentchat in config.yaml: Hermes reads the key from the key file for the hosted "
            "tools and is told to keep AGENTCHAT_API_KEY out of the agent's commands")

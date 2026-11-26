@@ -135,23 +135,80 @@ _STDLIB_DIRS = tuple(
 
 
 _THIS_FILE = os.path.abspath(__file__)
+_TESTS_DIR = os.path.dirname(_THIS_FILE) + os.sep
+# Hermes' own top-level modules (its reads of .env are its own business),
+# known names plus whatever sits beside ``hermes_constants`` when Hermes is
+# installed. A module of these names is Hermes only outside site-packages'
+# third-party tree, which is told apart by the module name, not the path.
+_HERMES_MODULES = {
+    "agent", "cron", "gateway", "hermes_cli", "hermes_constants", "hermes_logging", "hermes_scope",
+    "hermes_state", "run_agent", "tools", "tui_gateway", "utils",
+}
+
+
+def _discover_hermes_modules() -> None:
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("hermes_constants")
+    except (ImportError, ValueError):
+        return
+    if spec is None or not spec.origin:
+        return
+    root = os.path.dirname(spec.origin)
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return
+    for entry in entries:
+        if entry.endswith(".py"):
+            _HERMES_MODULES.add(entry[:-3])
+        elif os.path.isfile(os.path.join(root, entry, "__init__.py")):
+            _HERMES_MODULES.add(entry)
+
+
+_discover_hermes_modules()
+
+
+def _frame_kind(frame: Any) -> str:
+    """``skip`` (this guard, the standard library, frozen code), ``plugin``,
+    ``tests``, ``hermes`` or ``other`` (third-party code)."""
+    filename = frame.f_code.co_filename
+    path = os.path.abspath(filename)
+    if filename.startswith("<") or path == _THIS_FILE or path.startswith(_STDLIB_DIRS):
+        return "skip"
+    if path.startswith(_PACKAGE_DIR + os.sep):
+        return "plugin"
+    if path.startswith(_TESTS_DIR):
+        return "tests"
+    module = str(frame.f_globals.get("__name__") or "")
+    if module.split(".", 1)[0] in _HERMES_MODULES:
+        return "hermes"
+    return "other"
 
 
 def _opened_by_the_plugin() -> bool:
-    """Is the nearest caller outside this guard and the standard library the plugin's own code?
+    """Did the plugin's own code open this file, directly or through a library it called?
 
-    Walks up from the caller, skipping the guard's own frames (this file),
-    the standard library (``pathlib``'s ``read_text`` → ``io.open``) and
-    frozen or generated code, so no call depth is assumed.
+    Walks up from the caller, skipping the guard's own frames, the standard
+    library and frozen code (no call depth is assumed). Blocked when the
+    nearest remaining frame is the plugin's, or third-party code with the
+    plugin anywhere above it (a ``.env`` parser the plugin called). Allowed
+    when the nearest is Hermes (its own reads, ``get_secret``'s overlay) or
+    a test or test double.
     """
+    nearest: str | None = None
     frame = sys._getframe(1)
     while frame is not None:
-        filename = frame.f_code.co_filename
-        path = os.path.abspath(filename)
-        if filename.startswith("<") or path == _THIS_FILE or path.startswith(_STDLIB_DIRS):
-            frame = frame.f_back
-            continue
-        return path.startswith(_PACKAGE_DIR + os.sep)
+        kind = _frame_kind(frame)
+        if kind != "skip":
+            if nearest is None:
+                nearest = kind
+                if nearest in ("plugin", "tests", "hermes"):
+                    return nearest == "plugin"
+            elif kind == "plugin":
+                return True
+        frame = frame.f_back
     return False
 
 

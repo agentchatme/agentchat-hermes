@@ -461,10 +461,13 @@ class TestReconcileKeyStore:
     def test_a_legacy_only_profile_gets_its_key_into_the_key_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from agentchatme_hermes import _register, key_source, key_store
+        from agentchatme.integration.account import CheckKeyResult
+
+        from agentchatme_hermes import _register, key_source, key_store, signup
         from agentchatme_hermes.config import ENV_API_KEY_LEGACY
 
         monkeypatch.setattr(key_source, "source_supported", lambda: True)
+        monkeypatch.setattr(signup, "check_key", lambda key, *, api_base: CheckKeyResult(ok=True, handle="old"))
 
         home = tmp_path / ".hermes"
         home.mkdir()
@@ -476,12 +479,17 @@ class TestReconcileKeyStore:
     def test_a_legacy_key_another_profile_saved_is_not_adopted(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from agentchatme_hermes import _register, key_source, key_store
+        from agentchatme.integration.account import CheckKeyResult
+        from key_files import set_up_as_agent
+
+        from agentchatme_hermes import _register, key_source, key_store, signup
         from agentchatme_hermes.config import ENV_API_KEY_LEGACY
 
         monkeypatch.setattr(key_source, "source_supported", lambda: True)
+        monkeypatch.setattr(signup, "check_key", lambda key, *, api_base: CheckKeyResult(ok=True, handle="old"))
         root = tmp_path / ".hermes"
         named = root / "profiles" / "clone"
+        set_up_as_agent(named)
         key_store.write_store(root, api_key=api_key("old"), handle="a", api_base="https://api.agentchat.me")
         assert _register._adopt_legacy_key(self._config(named, api_key("old"), ENV_API_KEY_LEGACY)) == "copy"
         assert key_store.read_store(named).status == "missing"

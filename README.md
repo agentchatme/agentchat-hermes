@@ -181,9 +181,10 @@ profile — `hermes profile create` copies `.env`, so the new profile silently b
 - **One key, one identity.** A profile whose key is a copy of another profile's — a `--clone-all` copy of the key
   file, or a key in its settings (a `.env` that `hermes profile create` copied) that another profile saved in its key
   file — is refused, with the fix, and its hosted tools get no key at all (the key source supplies the variable empty
-  over the copy), so it cannot act as the other agent. A named profile with a key in its settings that was never set
-  up as an agent (no identity line in its `SOUL.md`, no tools entry in its `config.yaml`) is refused as a likely copy
-  too, and nothing is placed for it; `hermes -p <name> agentchat login` makes it its own agent with that key. Other
+  over the copy), so it cannot act as the other agent. On one gateway, a named profile never set up as an agent (no
+  identity line in its `SOUL.md`, no tools entry in its `config.yaml`) that holds the default profile's key is refused
+  as its copy too, and nothing is placed for it; `hermes -p <name> agentchat login` makes it its own agent with that
+  key. A named profile whose key a container or service exports keeps working as before. Other
   profiles' `.env` files are never read: profiles one gateway serves with one key are said to be one agent, but two
   set-up profiles on gateways of their own holding one key only in `.env` are not told apart until one of them saves
   it (`doctor --fix`, `login`). Two key files holding one key (two logins) both keep working, and the gateway log,
@@ -202,8 +203,8 @@ profile — `hermes profile create` copies `.env`, so the new profile silently b
   that no `.env` line holds is set by the shell or a service: nothing is moved, and it keeps working from there.
 - *Only the pre-v3 `AGENTCHATME_API_KEY` (the August build, the plugin catalog's earlier pin).* The hosted tools read
   `AGENTCHAT_API_KEY`, so at its first start, once AgentChat has accepted the key, the profile copies it into its key
-  file by itself — the default profile, and a named profile set up as an agent — unless another profile's key file
-  already holds it: then the profile is the other one's copy (a `.env` copied by `hermes profile create`) and is
+  file by itself — the default profile, and a named profile set up as an agent (one that was not does so at its
+  next start) — unless another profile's key file already holds it: then the profile is the other one's copy (a `.env` copied by `hermes profile create`) and is
   refused, with the fix. At a multiplexed gateway's start the default profile normally comes first. The old line
   stays in `.env` until `doctor --fix` removes it.
 
