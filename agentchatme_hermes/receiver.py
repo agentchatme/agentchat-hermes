@@ -361,6 +361,9 @@ class Receiver:
         hosted_status = getattr(self._invoker, "hosted_tools_status", None)
         if callable(hosted_status):
             status["hosted_tools"] = hosted_status()
+        switch_status = getattr(self._invoker, "tools_allowed_status", None)
+        if callable(switch_status):
+            status["tools_allowed"] = switch_status()
         if self._restarting:
             status["state"] = "restart_wait"
             status["since"] = self._restart_since

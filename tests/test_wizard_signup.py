@@ -19,7 +19,7 @@ from fake_keys import api_key
 from key_files import saved
 from sdk_wire import Wire, answer, api_error, connect_error, serve
 
-from agentchatme_hermes import credentials, signup, wizard
+from agentchatme_hermes import allow, credentials, signup, wizard
 from agentchatme_hermes._version import __version__
 
 if TYPE_CHECKING:
@@ -76,19 +76,32 @@ class _Wizard:
         self.env: dict[str, str] = {}
         self.placed: list[str] = []
         self.waits: list[float] = []
+        # The one question (allow.decide) is its own test; here: its answer,
+        # and that it is asked before the key is saved.
+        self.tools = allow.SetupDecision("yes", allow.ALLOWED_LINE)
+        self.tools_decisions: list[Any] = []
+        self.asked_with_key_saved: list[bool] = []
         monkeypatch.delenv("AGENTCHATME_API_BASE", raising=False)
         monkeypatch.setattr(wizard, "resolve_texts", lambda **_kw: None)
-        monkeypatch.setattr(
-            wizard,
-            "place_identity_and_tools",
-            lambda *, handle, identity_line, api_base, served_manual=None, **_kw: self.placed.append(handle) or [],
-        )
+        monkeypatch.setattr(wizard, "_tools_decision", self._decide)
+        monkeypatch.setattr(wizard, "place_identity_and_tools", self._place)
         monkeypatch.setattr(signup, "_pause", self.waits.append)
         # A Hermes whose MCP client reads the key file (secret sources, secrets.agentchat).
         monkeypatch.setattr(credentials, "key_bridge", lambda: (True, ""))
 
     def save_env_value(self, key: str, value: str) -> None:
         self.env[key] = value
+
+    def _decide(self, handle: str) -> Any:
+        self.asked_with_key_saved.append(saved() is not None)
+        return self.tools
+
+    def _place(
+        self, *, handle: str, identity_line: Any, api_base: str, served_manual: Any = None, **kw: Any
+    ) -> list[Any]:
+        self.placed.append(handle)
+        self.tools_decisions.append(kw.get("tools_decision"))
+        return []
 
     @property
     def saved(self) -> tuple[str, str] | None:
@@ -639,3 +652,37 @@ class TestMenuRouting:
         wizard._replace_key_branch(existing_handle="alice", **menus.kwargs())
         assert menus.ran == []
         assert menus.choices[3].startswith("Cancel")
+
+
+class TestToolsQuestion:
+    """The one question comes after the server answered and before the key is
+    saved; the answer reaches the tools' entry; its line is shown."""
+
+    def test_register_asks_before_saving_and_places_the_answer(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        serve(monkeypatch, {sw.REGISTER: sw.code_sent(), sw.REGISTER_VERIFY: sw.registered("alice", _KEY)})
+        run = _Wizard(monkeypatch, _Person(["a@b.co", "alice", "", "123456"]))
+        assert run.register() is True
+        assert run.asked_with_key_saved == [False]
+        assert run.tools_decisions == ["yes"]
+        assert "✓ AgentChat tools allowed" in capsys.readouterr().out
+
+    def test_a_no_is_placed_and_said(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        serve(monkeypatch, {sw.REGISTER: sw.code_sent(), sw.REGISTER_VERIFY: sw.registered("alice", _KEY)})
+        person = _Person(["a@b.co", "alice", "", "123456"])
+        run = _Wizard(monkeypatch, person)
+        run.tools = allow.SetupDecision("no", allow.NOT_ALLOWED_LINE.format(who="@alice"))
+        assert run.register() is True
+        assert run.tools_decisions == ["no"]
+        assert person.said("info")[-1].startswith("AgentChat tools not allowed. @alice")
+
+    def test_nobody_asked_places_no_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        serve(monkeypatch, {sw.RECOVER: sw.code_sent("recover"), sw.RECOVER_VERIFY: sw.recovered("alice", _KEY)})
+        person = _Person(["a@b.co", "alice", "123456"])
+        run = _Wizard(monkeypatch, person)
+        run.tools = allow.SetupDecision(None, allow.AGENT_TERMINAL_LINE.format(who="@alice"))
+        assert run.recover() is True
+        assert run.asked_with_key_saved == [False]
+        assert run.tools_decisions == [None]
+        assert "/agentchat allow" in person.said("info")[-1]

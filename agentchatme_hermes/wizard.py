@@ -17,6 +17,11 @@ What the wizard owns:
 * the menus (register / paste a key / recover / skip, and the edit menu of a
   configured profile);
 * prompting, through Hermes' ``prompt`` / ``prompt_yes_no``;
+* the one question, before the key is saved: may the agent use the
+  AgentChat tools on its own (:func:`agentchatme_hermes.allow.decide`; Enter
+  is a yes, end of input and Ctrl-C a no; never asked in an agent's
+  terminal), and the same question in the edit menu while they are not
+  allowed;
 * saving: the key and the handle the server returned (never the one typed)
   in this profile's key file (:mod:`agentchatme_hermes.credentials`; never the
   profile ``.env``), then *placing the integration*
@@ -38,7 +43,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any, Literal
 
-from . import credentials, key_store, signup
+from . import allow, credentials, key_store, signup
 from .config import ENV_API_BASE, ENV_HANDLE, cli_prefix, resolve_key
 from .placement import (
     gateway_still_serving,
@@ -55,6 +60,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from agentchatme.integration.account import AccountAnswer, AccountQuestion
+
+    from .mcp_registration import Decision
 
 logger = logging.getLogger(__name__)
 
@@ -166,11 +173,11 @@ def _edit_menu(
     print_info(identity_line)
     print()
 
-    choices = [
-        "Keep current configuration",
-        "Replace the API key (paste a new one, register a new agent, or recover a lost key)",
-        "Logout (clear the saved key)",
-    ]
+    keep = "Keep current configuration"
+    allow_tools = f"Allow {allow.who(existing_handle)} to use AgentChat tools on its own"
+    replace = "Replace the API key (paste a new one, register a new agent, or recover a lost key)"
+    logout = "Logout (clear the saved key)"
+    choices = [keep, *([allow_tools] if _tools_not_allowed() else []), replace, logout]
     description = "ENTER to confirm a choice. ESC keeps the current configuration."
     idx = prompt_choice(
         "AgentChat is already configured. What would you like to do?",
@@ -178,11 +185,15 @@ def _edit_menu(
         default=0,
         description=description,
     )
-    _step(choices[idx])
+    picked = choices[idx]
+    _step(picked)
 
-    if idx == 0:
+    if picked == keep:
         return
-    if idx == 1:
+    if picked == allow_tools:
+        _allow_tools_flow(existing_handle, print_info=print_info, print_warning=print_warning)
+        return
+    if picked == replace:
         _replace_key_branch(
             existing_handle=existing_handle,
             prompt=prompt,
@@ -195,7 +206,7 @@ def _edit_menu(
             get_env_value=get_env_value,
         )
         return
-    if idx == 2:
+    if picked == logout:
         _logout_flow(prompt_yes_no, print_info, print_success, save_env_value)
 
 
@@ -437,10 +448,12 @@ def _paste_existing_key_flow(
         print_warning(f"The key was not saved. AgentChat answered: {checked.message or checked.code}")
         return False
 
+    tools = _tools_decision(checked.handle)
     if not _save_key(api_key, checked.handle, print_warning):
         return False
     _step(f"Key validated — you are @{checked.handle}")
-    _place_or_warn(checked.handle, api_key, print_warning)
+    _place_or_warn(checked.handle, api_key, print_warning, tools_decision=tools.decision)
+    _show_tools(tools, print_info)
     return True
 
 
@@ -482,10 +495,12 @@ def _register_new_agent_flow(
         return False
     api_key, server_handle = saved
 
+    tools = _tools_decision(server_handle)
     if not _save_key(api_key, server_handle, print_warning):
         return False
     _step(f"Registered as @{server_handle} (key {_mask_key(api_key)})")
-    _place_or_warn(server_handle, api_key, print_warning)
+    _place_or_warn(server_handle, api_key, print_warning, tools_decision=tools.decision)
+    _show_tools(tools, print_info)
     return True
 
 
@@ -536,10 +551,12 @@ def _recover_lost_key_flow(
         return False
     api_key, server_handle = saved
 
+    tools = _tools_decision(server_handle)
     if not _save_key(api_key, server_handle, print_warning):
         return False
     _step(f"Recovered @{server_handle} (new key {_mask_key(api_key)})")
-    _place_or_warn(server_handle, api_key, print_warning)
+    _place_or_warn(server_handle, api_key, print_warning, tools_decision=tools.decision)
+    _show_tools(tools, print_info)
     return True
 
 
@@ -669,7 +686,55 @@ def _save_key(api_key: str, handle: str, print_warning: Any) -> bool:
     return True
 
 
-def _place_or_warn(handle: str, api_key: str, print_warning: Any) -> None:
+def _tools_decision(handle: str) -> allow.SetupDecision:
+    """The one question, before the key is saved (:func:`.allow.decide`)."""
+    return allow.decide(
+        handle, api_base=_api_base(), tty=allow.stdin_is_tty(), cmd=cli_prefix(resolve_hermes_home())
+    )
+
+
+def _show_tools(tools: allow.SetupDecision, print_info: Any) -> None:
+    """The answer's line: a check mark for a yes or tools already allowed."""
+    if tools.decision == "yes" or tools.line == allow.ALREADY_ALLOWED_LINE:
+        _step(allow.ALLOWED_LINE)
+    else:
+        print_info(tools.line)
+
+
+def _tools_not_allowed() -> bool:
+    """Whether the edit menu offers the one question (the tools are not
+    allowed, or nobody allowed them yet)."""
+    from .mcp_registration import McpRegistrationError, inspect_allowance
+
+    try:
+        state = allow.state_of(inspect_allowance(api_base=_api_base()))
+    except McpRegistrationError:
+        return False
+    return state in ("not_allowed_yet", "not_allowed")
+
+
+def _allow_tools_flow(handle: str, *, print_info: Any, print_warning: Any) -> None:
+    """The edit menu's "Allow …": the one question, then the entry as answered."""
+    from .placement import place_mcp
+
+    tools = _tools_decision(handle)
+    if tools.decision is None:
+        _show_tools(tools, print_info)
+        return
+    step = place_mcp(_api_base(), decision=tools.decision)
+    if step.failed:
+        print_warning(f"AgentChat tools: nothing changed — {step.detail}")
+        return
+    _show_tools(tools, print_info)
+    if step.outcome == "allowed":
+        _step("Apply it in the running gateway: /reload-mcp in a chat it serves, or hermes gateway restart")
+    elif step.outcome == "added" and tools.decision == "yes":
+        _step("A running gateway connects them within about a minute")
+
+
+def _place_or_warn(
+    handle: str, api_key: str, print_warning: Any, *, tools_decision: Decision | None = None
+) -> None:
     """Place the identity line and the manual, register the hosted tools.
 
     The texts (the identity line, the manual's announcement) are fetched from
@@ -687,7 +752,10 @@ def _place_or_warn(handle: str, api_key: str, print_warning: Any) -> None:
         api_base=api_base,
         served_manual=texts.manual if texts is not None else None,
         identity_template=render_identity_line_template(texts) if texts is not None else None,
+        tools_decision=tools_decision,
     ):
+        if step.name == "mcp" and step.outcome == "missing":
+            continue  # the AgentChat tools line says it
         if step.needs_attention:
             print_warning(f"{step.name}: {step.detail}")
         else:

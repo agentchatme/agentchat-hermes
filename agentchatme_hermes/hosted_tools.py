@@ -271,7 +271,10 @@ def describe_cause(state: ServerState | None, reconnect: ReconnectResult | None 
     if state.status == "disabled":
         return "mcp_servers.agentchat is disabled in this profile's config.yaml — enable it, then `hermes gateway restart`"
     if state.status == "missing":
-        return f"mcp_servers.agentchat is not in this profile's config.yaml — `{cmd} doctor --fix` adds it"
+        return (
+            "mcp_servers.agentchat is not in this profile's config.yaml: AgentChat tools are not allowed yet "
+            f"— /agentchat allow in a chat with the agent, or `{cmd} allow`, adds it"
+        )
     if state.status == "connected":
         return (
             "Hermes reports mcp_servers.agentchat connected but no mcp__agentchat__ tool is registered for "
@@ -312,6 +315,31 @@ def hosted_tool_names() -> list[str] | None:
         _warn_once(f"hosted_tools: registry probe raised ({exc!r}) — not holding turns")
         return None
     return sorted(names)
+
+
+def hosted_tool_entry() -> object | None:
+    """Hermes' registry entry for one hosted tool (the reply tool, else the
+    first one registered) in the current profile scope, or ``None``. Its
+    identity says which registration this is: Hermes makes new entries when it
+    registers the server's tools again (``/reload-mcp``, a restart) and keeps
+    them across a transport reconnect (:class:`.allow.LiveTier`). Never raises."""
+    from .mcp_registration import REPLY_TOOL
+
+    try:
+        from tools.registry import registry
+    except Exception:
+        return None
+    get_entry = getattr(registry, "get_entry", None)
+    if not callable(get_entry):
+        return None
+    try:
+        entry = get_entry(f"{HOSTED_TOOL_NAME_PREFIX}{REPLY_TOOL}")
+        if entry is None:
+            names = hosted_tool_names() or []
+            entry = get_entry(names[0]) if names else None
+    except Exception:
+        return None
+    return entry  # type: ignore[no-any-return]
 
 
 _warned: set[str] = set()

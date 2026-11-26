@@ -623,6 +623,88 @@ class TestReadiness:
         assert _REAL_PROBE() == [], "outside the context the overlay is invisible"
 
 
+class TestToolsSwitch:
+    """No AgentChat work while the person has not allowed the tools: no gate
+    call, no turn (readiness says not ready before the hold); a restart to
+    apply is told apart by the registration Hermes holds."""
+
+    def _switch(self, monkeypatch: pytest.MonkeyPatch, trust: Any, *, entry: str = "ours", via: Any = None) -> list[Any]:
+        from agentchatme_hermes import allow
+        from agentchatme_hermes.mcp_registration import Allowance
+
+        box = [Allowance(entry, trust, via)]  # type: ignore[arg-type]
+        monkeypatch.setattr(allow, "inspect_allowance", lambda *, api_base: box[0])
+        return box
+
+    def _held(self, monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+        held: list[Any] = []
+        monkeypatch.setattr(invoker_module, "wait_for_hosted_tools", lambda **kw: held.append(kw) or True)
+        return held
+
+    @pytest.mark.parametrize(
+        ("entry", "trust", "words"),
+        [("missing", None, "not allowed yet"), ("ours", "untrusted", "are not allowed"), ("disabled", "full", "disabled")],
+    )
+    def test_paused_before_the_hold(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entry: str, trust: Any, words: str
+    ) -> None:
+        inv = _invoker(monkeypatch, home=tmp_path / "p1")
+        self._switch(monkeypatch, trust, entry=entry)
+        held = self._held(monkeypatch)
+        answer = inv.readiness()
+        assert answer.ready is False and words in (answer.reason or "")
+        assert held == [], "no 30 s hold, no gate call"
+
+    @pytest.mark.parametrize(("trust", "via"), [("full", "trust"), ("unset", "no_trust_key"), ("untrusted", "approvals_off")])
+    def test_allowed_goes_on_to_the_hold(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, trust: Any, via: Any) -> None:
+        inv = _invoker(monkeypatch, home=tmp_path / "p2")
+        self._switch(monkeypatch, trust, via=via)
+        held = self._held(monkeypatch)
+        assert inv.readiness().ready is True and len(held) == 1
+
+    def test_a_flip_on_a_connected_server_waits_for_a_reload(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        inv = _invoker(monkeypatch, home=tmp_path / "p3")
+        box = self._switch(monkeypatch, "untrusted")
+        self._held(monkeypatch)
+        registration = [object()]
+        monkeypatch.setattr(hosted_tools_module, "hosted_tool_entry", lambda: registration[0])
+        assert inv.readiness().ready is False  # not allowed; the registration is seen untrusted
+        from agentchatme_hermes.mcp_registration import Allowance
+
+        box[0] = Allowance("ours", "full", "trust")
+        answer = inv.readiness()
+        assert answer.ready is False and "not applied yet" in (answer.reason or "")
+        registration[0] = object()  # /reload-mcp: registered again, with the file's tier
+        assert inv.readiness().ready is True
+
+    def test_an_unreadable_config_does_not_pause(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        inv = _invoker(monkeypatch, home=tmp_path / "p4")
+        self._held(monkeypatch)
+        assert inv.readiness().ready is True  # no Hermes config here: Hermes' own gate decides
+        status = inv.tools_allowed_status()
+        assert status is not None and status["state"] == "unknown"
+
+    def test_the_status_and_one_line_per_change(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        inv = _invoker(monkeypatch, home=tmp_path / "p5")
+        box = self._switch(monkeypatch, None, entry="missing")
+        with caplog.at_level(logging.INFO, logger="agentchatme_hermes.agent_invoker"):
+            for _ in range(3):
+                inv.readiness()
+            status = inv.tools_allowed_status()
+            assert status is not None and status["state"] == "not_allowed_yet" and status["trust"] is None
+            from agentchatme_hermes.mcp_registration import Allowance
+
+            box[0] = Allowance("ours", "full", "trust")
+            self._held(monkeypatch)
+            inv.readiness()
+        lines = [r for r in caplog.records if "AgentChat tools" in r.getMessage()]
+        assert [r.levelno for r in lines] == [logging.WARNING, logging.INFO]
+        assert "/agentchat allow" in lines[0].getMessage() and "@me" in lines[0].getMessage()
+        assert inv.tools_allowed_status()["state"] == "allowed"  # type: ignore[index]
+
+
 # ─── start_turn ────────────────────────────────────────────────────────────
 
 

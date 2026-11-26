@@ -70,3 +70,83 @@ class TestKeyShapeText:
             if needle in text:
                 offenders.append(name)
         assert offenders == []
+
+
+# ─── the edit menu's one question ──────────────────────────────────────────
+
+
+class TestEditMenuAllow:
+    def _menu(self, monkeypatch: pytest.MonkeyPatch, *, not_allowed: bool, pick: str) -> tuple[list[str], list[str]]:
+        from agentchatme_hermes import wizard
+
+        shown: list[str] = []
+        flows: list[str] = []
+        monkeypatch.setattr(wizard, "_tools_not_allowed", lambda: not_allowed)
+        monkeypatch.setattr(wizard, "_allow_tools_flow", lambda handle, **kw: flows.append(f"allow {handle}"))
+        monkeypatch.setattr(wizard, "_logout_flow", lambda *a: flows.append("logout"))
+
+        def prompt_choice(question: str, choices: list[str], default: int = 0, description: str = "") -> int:
+            shown.extend(choices)
+            return next(i for i, c in enumerate(choices) if c.startswith(pick))
+
+        wizard._edit_menu(
+            existing_key=api_key("menu_key_00000000"),
+            existing_handle="alice",
+            prompt=None,
+            prompt_yes_no=None,
+            prompt_choice=prompt_choice,
+            print_info=lambda text: None,
+            print_success=lambda text: None,
+            print_warning=lambda text: None,
+            save_env_value=None,
+            get_env_value=None,
+        )
+        return shown, flows
+
+    def test_offered_while_not_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        shown, flows = self._menu(monkeypatch, not_allowed=True, pick="Allow")
+        assert shown[1] == "Allow @alice to use AgentChat tools on its own"
+        assert flows == ["allow alice"]
+
+    def test_not_offered_once_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        shown, flows = self._menu(monkeypatch, not_allowed=False, pick="Logout")
+        assert not any(c.startswith("Allow") for c in shown)
+        assert flows == ["logout"]
+
+    def test_the_flow_writes_the_answer(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        from agentchatme_hermes import allow, placement, wizard
+        from agentchatme_hermes.placement import PlacementStep
+
+        placed: list[object] = []
+        monkeypatch.setattr(wizard, "_tools_decision", lambda handle: allow.SetupDecision("yes", allow.ALLOWED_LINE))
+        monkeypatch.setattr(
+            placement, "place_mcp", lambda api_base, decision=None: placed.append(decision) or PlacementStep("mcp", "changed", "d", "allowed")
+        )
+        wizard._allow_tools_flow("alice", print_info=lambda t: None, print_warning=lambda t: None)
+        out = capsys.readouterr().out
+        assert placed == ["yes"]
+        assert "✓ AgentChat tools allowed" in out and "/reload-mcp" in out
+
+    def test_the_flow_asks_nothing_when_nobody_can_answer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import allow, placement, wizard
+
+        said: list[str] = []
+        monkeypatch.setattr(
+            wizard, "_tools_decision", lambda handle: allow.SetupDecision(None, allow.AGENT_TERMINAL_LINE.format(who="@alice"))
+        )
+        monkeypatch.setattr(placement, "place_mcp", lambda *a, **k: pytest.fail("nothing to write"))
+        wizard._allow_tools_flow("alice", print_info=said.append, print_warning=said.append)
+        assert said and "/agentchat allow" in said[0]
+
+    def test_not_allowed_reads_the_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import mcp_registration, wizard
+        from agentchatme_hermes.mcp_registration import Allowance
+
+        for allowance, offered in (
+            (Allowance("missing", None, None), True),
+            (Allowance("ours", "untrusted", None), True),
+            (Allowance("ours", "full", "trust"), False),
+            (Allowance("user_managed", "untrusted", None), True),
+        ):
+            monkeypatch.setattr(mcp_registration, "inspect_allowance", lambda *, api_base, a=allowance: a)
+            assert wizard._tools_not_allowed() is offered

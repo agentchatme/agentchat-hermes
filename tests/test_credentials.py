@@ -311,7 +311,7 @@ class TestLoginNeverWritesTheKeyToDotenv:
         env = _env(home, f"OPENAI_API_KEY=sk-other\nAGENTCHAT_API_KEY={api_key('old')}\n")
         _HermesEnv(home).install(monkeypatch)
         serve(monkeypatch, {"/v1/agents/me": answer(200, {"handle": "alice", "status": "active"})})
-        monkeypatch.setattr(cli, "_install_placement", lambda handle, *, api_base, api_key: [])
+        monkeypatch.setattr(cli, "_install_placement", lambda handle, *, api_base, api_key, tools_decision=None: [])
         monkeypatch.setattr(credentials, "key_bridge", lambda: (True, ""))
         monkeypatch.setattr(sys, "stdin", io.StringIO(f"{api_key('new')}\n"))
         monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)

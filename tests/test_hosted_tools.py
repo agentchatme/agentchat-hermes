@@ -334,7 +334,7 @@ class TestParked:
 
     def test_missing_entry_and_other_states_name_their_cause(self) -> None:
         S = hosted_tools.ServerState
-        assert "`hermes agentchat doctor --fix` adds it" in hosted_tools.describe_cause(S("missing"))
+        assert "not allowed yet — /agentchat allow in a chat with the agent, or `hermes agentchat allow`, adds it" in hosted_tools.describe_cause(S("missing"))
         assert "disabled" in hosted_tools.describe_cause(S("disabled"))
         assert "still connecting" in hosted_tools.describe_cause(S("connecting"))
         assert "mcp SDK" in hosted_tools.describe_cause(None)
@@ -384,7 +384,7 @@ class TestDoctorLines:
         assert (self._line({"status": "lazy", "tools": 31}) or ("", ""))[0] == "ok", "lazy: registered, connects on first use"
 
     def test_missing_and_disabled_name_their_cause(self) -> None:
-        assert "doctor --fix` adds it" in (self._line({"status": "missing"}) or ("", ""))[1]
+        assert "not allowed yet — /agentchat allow" in (self._line({"status": "missing"}) or ("", ""))[1]
         assert "disabled" in (self._line({"status": "disabled"}) or ("", ""))[1]
 
     def test_no_section_says_nothing(self) -> None:
@@ -401,3 +401,32 @@ class TestDoctorLines:
         assert "`hermes gateway restart` reconnects them at once" in line
         level, line = _describe_worker({"state": "idle", "loop": {"recent_cycles": [cycle] * 3}}, now=1000.0) or ("", "")
         assert level == "fail" and "`hermes gateway restart` reconnects them at once" in line
+
+    @pytest.mark.parametrize("state", ["not_allowed_yet", "not_allowed", "restart_to_apply", "disabled"])
+    def test_a_run_paused_by_the_switch_is_said_not_alarmed_on(self, state: str) -> None:
+        from agentchatme_hermes import allow
+        from agentchatme_hermes.cli import _describe_worker
+
+        cycle = {"outcome": "tools_unavailable", "failure": allow.reason(state), "at": "2026-11-26T10:00:00Z"}  # type: ignore[arg-type]
+        worker = {"state": "idle", "loop": {"recent_cycles": [cycle] * 5}, "tools_allowed": {"state": state}}
+        level, line = _describe_worker(worker, now=1000.0) or ("", "")
+        assert level == "warn" and line.startswith("The receive loop is paused: ")
+        assert allow.reason(state) in line  # type: ignore[arg-type]
+
+    def test_allowed_again_alarms_as_before(self) -> None:
+        from agentchatme_hermes.cli import _describe_worker
+
+        cycle = {"outcome": "tools_unavailable", "failure": "the hosted AgentChat tools are not registered in Hermes yet"}
+        worker = {"state": "idle", "loop": {"recent_cycles": [cycle] * 3}, "tools_allowed": {"state": "allowed"}}
+        assert (_describe_worker(worker, now=1000.0) or ("", ""))[0] == "fail"
+
+    def test_the_running_gateway_still_to_apply(self) -> None:
+        from agentchatme_hermes.cli import _describe_tools_allowed
+
+        assert _describe_tools_allowed({"tools_allowed": {"state": "restart_to_apply"}}) == (
+            "warn",
+            "AgentChat tools: allowed in config.yaml, but the running gateway connected them "
+            "before that — send /reload-mcp in a chat it serves, or run hermes gateway restart",
+        )
+        for section in (None, {"state": "allowed"}, {"state": "not_allowed"}, "x"):
+            assert _describe_tools_allowed({"tools_allowed": section}) is None

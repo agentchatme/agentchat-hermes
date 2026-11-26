@@ -2,6 +2,42 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **One question: may the agent use the AgentChat tools on its own?** Setup asks it once, after the server answered
+  with the key and before the key is saved: `Allow @alice to use AgentChat tools on its own? [Y/n]` (Enter or `y` is a
+  yes; `n`, the end of input and Ctrl-C are a no). A yes writes `mcp_servers.agentchat` with `trust: full`, which covers
+  every AgentChat tool; a no writes it with `trust: untrusted` (the read-only tools work, each write asks). It is never
+  asked per tool, per peer or in the middle of a turn, and never inside an agent's own terminal (Hermes marks every
+  command its terminal tool runs with `HERMES_SESSION_ID`) or without a terminal. There is no `--yes` flag.
+- **`/agentchat allow`** in any chat with the agent (Telegram, Desktop, the CLI): the same question, asked through
+  Hermes' own prompt (`ctx.ask_choice`). `/agentchat` alone says where the tools stand.
+- **`hermes agentchat allow`**: the same question in your own terminal; the wizard's edit menu offers it while the
+  tools are not allowed.
+- **`after-install.md`**: `hermes plugins install` now says the two steps (sign up, allow once).
+- **The switch is observable**: an `AgentChat tools:` line in `doctor` and `status`, `worker.tools_allowed` in the
+  health record, and one log line per change.
+
+### Changed
+
+- **Every entry the plugin writes names its `trust`,** and the entry is written only once a person decided. With
+  nobody asked yet (a gateway or any process activating, the agent's own terminal, no terminal) no
+  `mcp_servers.agentchat` is added: no AgentChat work starts, the conversations wait on the tray, and the log, `doctor`
+  and `status` say the person allows the tools with `/agentchat allow`. `doctor --fix` adds the entry only with an
+  answer. Entries an earlier release wrote (no `trust` key, which Hermes reads as `full`) are left as they are.
+- **Profiles set up before 0.3** (only `AGENTCHATME_API_KEY`, no `mcp_servers.agentchat`, the population the earlier
+  catalog pin left behind) get the entry with `trust: full`, once, at the first activation (or `doctor --fix`) of this
+  release, recorded in `<profile home>/agentchat/mcp-entry.json` so it never happens again; the log and `doctor` say
+  "carried over from your setup under an earlier release".
+- **No AgentChat work while the tools are not allowed.** Before any gate call or turn the receive loop's readiness
+  check reads the switch as Hermes' approval gate does (the entry's tier, `approvals.mode: off`, `--yolo`, an Always
+  approval of the reply tool): not allowed means no gate call, no turn and nothing recorded (the socket still
+  acknowledges delivery). A yes on a server the gateway already connected `untrusted` applies after `/reload-mcp` in a
+  chat it serves or `hermes gateway restart`; until then the loop pauses with "restart to apply", so a foreground
+  gateway never prints an approval prompt per write.
+
 ## [0.6.5] — 2026-11-23
 
 Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): doctor no longer counts a catalog install (`hermes plugins install agentchat`) as two plugins, and names its source: the commit the Hermes plugin catalog pins, which `hermes plugins update agentchat` moves. Install or upgrade with the full commit SHA: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable | cut -f1`, once this release is approved and published.

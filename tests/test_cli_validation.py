@@ -616,3 +616,267 @@ class TestDoctorTwoPlugins:
         assert cli._plugin_copies(tmp_path) == ([ours], "0.5.1")
         out = self._doctor(monkeypatch, capsys, tmp_path)
         assert "[warn] 2 agentchat plugins in this profile" in out
+
+
+# ─── the one switch: allow, doctor, status ─────────────────────────────────
+
+
+def _allowance(entry: str = "ours", trust: Any = "untrusted", via: Any = None) -> Any:
+    from agentchatme_hermes.mcp_registration import Allowance
+
+    return Allowance(entry, trust, via)  # type: ignore[arg-type]
+
+
+class TestAllowArgparse:
+    def test_allow_is_a_subcommand_without_a_yes_flag(self) -> None:
+        import argparse
+
+        from agentchatme_hermes.cli import _dispatch_allow, setup_argparse
+
+        parser = argparse.ArgumentParser(prog="hermes-agentchat")
+        setup_argparse(parser)
+        args = parser.parse_args(["allow"])
+        assert args.func is _dispatch_allow
+        for flag in ("--yes", "-y"):
+            with pytest.raises(SystemExit):
+                parser.parse_args(["allow", flag])
+
+
+class TestDispatchAllow:
+    def _wire(self, monkeypatch: pytest.MonkeyPatch, decision: Any, line: str, outcome: str = "added") -> list[Any]:
+        from agentchatme_hermes import allow, cli, placement
+        from agentchatme_hermes.placement import PlacementStep
+
+        placed: list[Any] = []
+        monkeypatch.setattr(cli, "_tools_decision", lambda handle: allow.SetupDecision(decision, line))
+        status = "failed" if outcome == "failed" else "changed" if outcome in ("added", "allowed") else "ok"
+        monkeypatch.setattr(
+            placement,
+            "place_mcp",
+            lambda api_base, decision=None: placed.append(decision) or PlacementStep("mcp", status, "the detail", outcome),
+        )
+        return placed
+
+    def test_a_yes(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        import argparse
+
+        from agentchatme_hermes import allow, cli
+
+        save_key(api_key("allow"))
+        placed = self._wire(monkeypatch, "yes", allow.ALLOWED_LINE)
+        assert cli._dispatch_allow(argparse.Namespace()) == 0
+        out = capsys.readouterr().out
+        assert placed == ["yes"]
+        assert out.splitlines() == ["AgentChat tools allowed.", "mcp: the detail"]
+
+    def test_a_yes_on_a_connected_server_says_how_to_apply(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import argparse
+
+        from agentchatme_hermes import allow, cli
+
+        save_key(api_key("allow"))
+        self._wire(monkeypatch, "yes", allow.ALLOWED_LINE, outcome="allowed")
+        assert cli._dispatch_allow(argparse.Namespace()) == 0
+        assert "/reload-mcp in a chat it serves, or `hermes gateway restart`" in capsys.readouterr().out
+
+    def test_a_no_exits_1(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        import argparse
+
+        from agentchatme_hermes import allow, cli
+
+        save_key(api_key("allow"))
+        placed = self._wire(monkeypatch, "no", allow.NOT_ALLOWED_LINE.format(who="@alice"))
+        assert cli._dispatch_allow(argparse.Namespace()) == 1
+        assert placed == ["no"]
+        assert "AgentChat tools not allowed." in capsys.readouterr().out
+
+    def test_nobody_asked_writes_nothing(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        import argparse
+
+        from agentchatme_hermes import allow, cli
+
+        save_key(api_key("allow"))
+        placed = self._wire(monkeypatch, None, allow.AGENT_TERMINAL_LINE.format(who="@alice"))
+        assert cli._dispatch_allow(argparse.Namespace()) == 1
+        assert placed == []
+        assert "/agentchat allow" in capsys.readouterr().out
+
+    def test_already_allowed_exits_0(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import argparse
+
+        from agentchatme_hermes import allow, cli
+
+        save_key(api_key("allow"))
+        placed = self._wire(monkeypatch, None, allow.ALREADY_ALLOWED_LINE)
+        assert cli._dispatch_allow(argparse.Namespace()) == 0 and placed == []
+
+    def test_a_failed_write(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        import argparse
+
+        from agentchatme_hermes import allow, cli
+
+        save_key(api_key("allow"))
+        self._wire(monkeypatch, "yes", allow.ALLOWED_LINE, outcome="failed")
+        assert cli._dispatch_allow(argparse.Namespace()) == 1
+        assert "nothing changed — the detail" in capsys.readouterr().err
+
+    def test_no_key_yet(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        import argparse
+
+        from agentchatme_hermes import cli
+
+        for name in ("AGENTCHAT_API_KEY", "AGENTCHATME_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        placed = self._wire(monkeypatch, "yes", "x")
+        assert cli._dispatch_allow(argparse.Namespace()) == 1
+        assert placed == [] and "No AgentChat key in this profile yet" in capsys.readouterr().err
+
+
+class TestDoctorToolsSwitch:
+    def _lines(self, monkeypatch: pytest.MonkeyPatch, allowance: Any, *, carried: bool = False) -> list[tuple[str, str]]:
+        from pathlib import Path
+
+        from agentchatme_hermes import allow, cli, mcp_registration
+
+        home = Path(".")
+        lines: list[tuple[str, str]] = []
+        monkeypatch.setattr(mcp_registration, "inspect_allowance", lambda *, api_base: allowance)
+        monkeypatch.setattr(allow, "carried_over", lambda h: carried)
+        cli._doctor_tools_switch(
+            home,
+            api_base="https://api.agentchat.me",
+            handle="alice",
+            cmd="hermes agentchat",
+            ok=lambda line: lines.append(("ok", line)),
+            warn=lambda line: lines.append(("warn", line)),
+        )
+        return lines
+
+    def test_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._lines(monkeypatch, _allowance("ours", "full", "trust")) == [("ok", "AgentChat tools: allowed (trust: full)")]
+
+    def test_carried_over(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._lines(monkeypatch, _allowance("ours", "full", "trust"), carried=True) == [
+            ("ok", "AgentChat tools: allowed (carried over from your setup under an earlier release)")
+        ]
+
+    def test_an_earlier_release_entry(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        [(level, line)] = self._lines(monkeypatch, _allowance("ours", "unset", "no_trust_key"))
+        assert level == "ok" and "no trust key, which Hermes reads as full" in line
+
+    def test_not_allowed_yet(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        [(level, line)] = self._lines(monkeypatch, _allowance("missing", None))
+        assert level == "warn"
+        assert line == (
+            "AgentChat tools: not allowed yet — @alice has no AgentChat tools until the person allows them: "
+            "send /agentchat allow in a chat with it, or run hermes agentchat allow"
+        )
+
+    def test_not_allowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        [(level, line)] = self._lines(monkeypatch, _allowance("ours", "untrusted"))
+        assert level == "warn" and "@alice can read AgentChat but does not answer on its own" in line
+
+    def test_an_always_approval_alone_is_a_warning(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        [(level, _line)] = self._lines(monkeypatch, _allowance("ours", "untrusted", "always_grant"))
+        assert level == "warn"
+
+    def test_disabled_is_said_once_above(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        assert self._lines(monkeypatch, _allowance("disabled", "full")) == []
+
+    def test_an_unreadable_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import mcp_registration
+
+        def boom(*, api_base: str) -> Any:
+            raise mcp_registration.McpRegistrationError("Hermes' config helpers are not importable here\nmcp_servers: ...")
+
+        lines: list[tuple[str, str]] = []
+        monkeypatch.setattr(mcp_registration, "inspect_allowance", boom)
+        from pathlib import Path
+
+        from agentchatme_hermes import cli
+
+        cli._doctor_tools_switch(
+            Path("."), api_base="x", handle=None, cmd="hermes agentchat",
+            ok=lambda line: lines.append(("ok", line)), warn=lambda line: lines.append(("warn", line)),
+        )
+        assert lines == [("warn", "AgentChat tools: not checked — this Hermes' config.yaml could not be read here")]
+
+
+class TestDoctorFixDecision:
+    def test_the_carry_over_is_decided_before_anything_else(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        from agentchatme_hermes import allow, cli, mcp_registration
+
+        monkeypatch.setattr(mcp_registration, "inspect_entry", lambda *, api_base: "missing")
+        monkeypatch.setattr(allow, "legacy_key_set", lambda: True)
+        monkeypatch.setattr(cli, "_tools_decision", lambda handle: pytest.fail("the person is not asked"))
+        decision = cli._doctor_tools_decision("alice", api_base="x", home=tmp_path)
+        assert decision.decision == "carried_over"
+
+    def test_otherwise_the_person_is_asked(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        from agentchatme_hermes import allow, cli, mcp_registration
+
+        monkeypatch.setattr(mcp_registration, "inspect_entry", lambda *, api_base: "missing")
+        monkeypatch.setattr(allow, "legacy_key_set", lambda: False)
+        monkeypatch.setattr(cli, "_tools_decision", lambda handle: allow.SetupDecision("yes", allow.ALLOWED_LINE))
+        assert cli._doctor_tools_decision("alice", api_base="x", home=tmp_path).decision == "yes"
+
+    def test_fix_passes_the_decision_to_the_placement(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        import argparse
+        import sys
+        import types as _types
+        from unittest.mock import MagicMock
+
+        from agentchatme_hermes import allow, cli, kit, mcp_registration, secrets_registration
+
+        save_key(api_key("fix"))
+        fake_client = MagicMock()
+        fake_client.get_me.return_value = {"handle": "alice", "status": "active"}
+        sdk = _types.ModuleType("agentchatme")
+        sdk.AgentChatClient = MagicMock(return_value=fake_client)  # type: ignore[attr-defined]
+        sdk.AgentChatClientIdentity = MagicMock  # type: ignore[attr-defined]
+        sdk.AgentChatError = Exception  # type: ignore[attr-defined]
+        sdk.UnauthorizedError = Exception  # type: ignore[attr-defined]
+        sdk.ConnectionError = ConnectionError  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "agentchatme", sdk)
+        monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)
+        monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)
+        monkeypatch.setattr(cli, "_doctor_identity_texts", lambda *a, **k: (None, None, None))
+        monkeypatch.setattr(kit, "kit_problem", lambda: None)
+        monkeypatch.setattr(mcp_registration, "inspect_entry_identity", lambda **_kw: ("ours", "current"))
+        monkeypatch.setattr(mcp_registration, "inspect_allowance", lambda *, api_base: _allowance("ours", "full", "trust"))
+        monkeypatch.setattr(secrets_registration, "inspect_block", lambda: "ours")
+        order: list[str] = []
+        monkeypatch.setattr(
+            cli, "_doctor_tools_decision",
+            lambda handle, *, api_base, home: order.append("decide") or allow.SetupDecision("yes", allow.ALLOWED_LINE),
+        )
+        monkeypatch.setattr(cli, "_fix_key", lambda *a, **k: order.append("fix_key") or [])
+        seen: list[Any] = []
+        monkeypatch.setattr(cli, "place_identity_and_tools", lambda **kw: seen.append(kw.get("tools_decision")) or [])
+        cli._dispatch_doctor(argparse.Namespace(fix=True))
+        out = capsys.readouterr().out
+        assert order == ["decide", "fix_key"], "decided before the old .env line can go"
+        assert seen == ["yes"]
+        assert "[ok]   fix: AgentChat tools allowed" in out
+        assert "[ok]   AgentChat tools: allowed (trust: full)" in out
+
+
+class TestStatusLine:
+    def test_the_line_reads_config_and_the_gateways_record(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Any) -> None:
+        from agentchatme_hermes import allow, cli, mcp_registration
+
+        monkeypatch.setattr(allow, "carried_over", lambda h: False)
+        monkeypatch.setattr(mcp_registration, "inspect_allowance", lambda *, api_base: _allowance("ours", "full", "trust"))
+        assert cli._tools_line(tmp_path, api_base="x", handle="alice", worker=None) == "allowed (trust: full)"
+        worker = {"tools_allowed": {"state": "restart_to_apply"}}
+        assert "/reload-mcp" in cli._tools_line(tmp_path, api_base="x", handle="alice", worker=worker)
+        monkeypatch.setattr(mcp_registration, "inspect_allowance", lambda *, api_base: _allowance("missing", None))
+        assert cli._tools_line(tmp_path, api_base="x", handle="alice", worker=worker).startswith("not allowed yet")
+
+    def test_status_prints_it(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from agentchatme_hermes import cli
+
+        cli._print_status({"handle": "alice", "status": "active"}, tools="allowed (trust: full)")
+        assert "  AgentChat tools: allowed (trust: full)" in capsys.readouterr().out

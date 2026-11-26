@@ -17,9 +17,11 @@ hosts it. This module is what only Hermes can say, as the loop's callbacks:
   same profile scope, no tools, a fixed prompt with no AgentChat or peer
   content, a few tokens, 45 s), its answer discarded; never a login or
   version check.
-* :meth:`AgentInvoker.readiness` — are the hosted ``mcp__agentchat__*``
-  tools registered in Hermes; a turn without them cannot look. Holds up to
-  30 s (:mod:`.hosted_tools`).
+* :meth:`AgentInvoker.readiness` — may the agent use the AgentChat tools on
+  its own (:mod:`.allow`: not while nobody allowed them, while they are not
+  allowed, or while the running gateway still holds the earlier tier), and
+  are the hosted ``mcp__agentchat__*`` tools registered in Hermes; a turn
+  without them cannot look. Holds up to 30 s (:mod:`.hosted_tools`).
 * :meth:`AgentInvoker.start_turn` — one turn: a transient ``AIAgent`` (the
   pattern Hermes' cron scheduler uses) on the kit's prompt plus where the
   manual is, in the profile's scope, under the time limit
@@ -83,6 +85,7 @@ from agentchatme.integration import (
 )
 
 from .config import (
+    DEFAULT_API_BASE,
     DEFAULT_GATE_TIMEOUT_S,
     DEFAULT_REPLY_GATE_ENABLED,
     DEFAULT_TURN_IDLE_S,
@@ -121,6 +124,7 @@ if TYPE_CHECKING:
 
     from agentchatme.integration import RunRequest, TurnHandle, TurnRequest
 
+    from .allow import State
     from .config import Config
     from .types import AgentIdentity
 
@@ -220,6 +224,12 @@ class AgentInvoker:
         self._session_db: Any = None
         self._resolved_hermes = False
 
+        # The one switch (:mod:`.allow`) as last read, for the health record,
+        # and the state last logged (one line per change).
+        self._switch_lock = threading.Lock()
+        self._switch: dict[str, Any] | None = None
+        self._switch_said: str | None = None
+
     # -- wiring ---------------------------------------------------------------
 
     @property
@@ -309,6 +319,56 @@ class AgentInvoker:
             "reconnect": reconnect_record(str(home)),
             "at": time.time(),
         }
+
+    def tools_allowed_status(self) -> dict[str, Any] | None:
+        """The switch for the health record (``doctor`` reads it from the
+        running gateway): ``state`` (:data:`.allow.State`), the entry's
+        ``trust``, what lets the writes through (``via``), when read. Read now
+        (``config.yaml`` and the tools registered in this process), so a change
+        shows within a minute even while no wake arrives."""
+        self._read_switch()
+        with self._switch_lock:
+            return dict(self._switch) if self._switch is not None else None
+
+    def _read_switch(self) -> State:
+        """Read the switch in the profile's scope, record it, log a change once
+        (the worker's readiness and the health record's writer both read it)."""
+        from .allow import PAUSED_STATES, describe, read_switch
+
+        home = self._home()
+        api_base = str(getattr(self._config, "api_base", "") or DEFAULT_API_BASE)
+        try:
+            with profile_context(home):
+                state, allowance = read_switch(home, api_base=api_base)
+        except Exception:
+            logger.debug("AgentInvoker: the tools switch could not be read", exc_info=True)
+            state, allowance = "unknown", None
+        with self._switch_lock:
+            self._switch = {
+                "state": state,
+                "trust": allowance.trust if allowance is not None else None,
+                "via": allowance.via if allowance is not None else None,
+                "at": time.time(),
+            }
+            changed = state != self._switch_said and state != "unknown"
+            previous = self._switch_said
+            if changed:
+                self._switch_said = state
+        if changed:
+            from .config import cli_prefix
+
+            handle = getattr(self._identity, "handle", None)
+            text = describe(state, allowance, handle, cmd=cli_prefix(home))
+            if state in PAUSED_STATES:
+                logger.warning(
+                    "agentchat plugin: AgentChat tools %s (profile=%s) — no AgentChat work starts; the "
+                    "messages wait on the tray",
+                    text,
+                    profile_label(home),
+                )
+            elif previous is not None:
+                logger.info("agentchat plugin: AgentChat tools %s (profile=%s)", text, profile_label(home))
+        return state
 
     def live_turns(self) -> int:
         """Turns not finished with (reply, invite, or a single-run run): a
@@ -456,7 +516,16 @@ class AgentInvoker:
             return model_call(prompt, cancel=cancel)
 
     def readiness(self) -> Readiness:
-        """Could a turn started now reach AgentChat? (a worker thread)"""
+        """Could a turn started now reach AgentChat? (a worker thread)
+
+        Not while the AgentChat tools are not allowed (:mod:`.allow`): nobody
+        allowed them yet, they are not allowed, or the running gateway still
+        holds the earlier tier — then no gate call is made and nothing is
+        recorded (the cards stay on the tray). Checked first, before the hold
+        for the tools, and again after it (the tools just registered may hold
+        the earlier tier)."""
+        from .allow import PAUSED_STATES, reason
+
         hung = self.hung_turns
         if hung >= MAX_HUNG_TURNS:
             # No turn could be admitted: do not spend a gate call on it.
@@ -464,6 +533,9 @@ class AgentInvoker:
                 ready=False,
                 reason=f"{hung} earlier turns overran and have not ended — no turn can start",
             )
+        state = self._read_switch()
+        if state in PAUSED_STATES:
+            return Readiness(ready=False, reason=reason(state))
         home = self._home()
         with profile_context(home):
             held = wait_for_hosted_tools(label="turn", stopped=self._stopped, key=str(home))
@@ -473,6 +545,9 @@ class AgentInvoker:
             return Readiness(
                 ready=False, reason="the hosted AgentChat tools are not registered in Hermes yet"
             )
+        state = self._read_switch()
+        if state in PAUSED_STATES:
+            return Readiness(ready=False, reason=reason(state))
         return Readiness(ready=True)
 
     async def start_turn(self, request: TurnRequest) -> TurnAdmission:

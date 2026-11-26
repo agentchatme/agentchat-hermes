@@ -22,7 +22,9 @@
 4. **The tools** — ``mcp_servers.agentchat`` in the profile's
    ``config.yaml`` (:mod:`.mcp_registration`), with
    ``Authorization: "Bearer ${AGENTCHAT_API_KEY}"`` as a template: the key
-   never lands in ``config.yaml``.
+   never lands in ``config.yaml``. Written only once a person decided whether
+   the agent may use them on its own (``trust: full`` or ``untrusted``;
+   :mod:`.allow`).
 
 Every placer is idempotent and reports what it did; the wizard prints the
 report, the activation path logs it, ``doctor --fix`` runs it again.
@@ -52,6 +54,8 @@ from .turn import identity_line as render_identity_line
 if TYPE_CHECKING:
     from agentchatme.types import Texts
 
+    from .mcp_registration import Decision
+
 logger = logging.getLogger(__name__)
 
 # The package's copy of the manual: the fallback bytes only (see :mod:`.manual`).
@@ -72,6 +76,9 @@ class PlacementStep:
     name: str
     status: str
     detail: str
+    # What the placer did, where callers branch on it (``place_mcp``: the
+    # :data:`.mcp_registration.EnsureOutcome`); ``None`` otherwise.
+    outcome: str | None = None
 
     @property
     def failed(self) -> bool:
@@ -235,19 +242,42 @@ def place_secrets() -> PlacementStep:
     )
 
 
-def place_mcp(api_base: str) -> PlacementStep:
+def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementStep:
+    """``mcp_servers.agentchat`` as ``decision`` asks (:func:`.mcp_registration.install_entry`):
+    with no decision nothing is added (``missing``). A written or allowed
+    entry is recorded in the profile's own data (:func:`.allow.write_record`).
+    Never raises."""
     try:
-        outcome = install_entry(api_base=api_base)
+        placed = install_entry(api_base=api_base, decision=decision)
     except McpRegistrationError as exc:
         return PlacementStep("mcp", "failed", str(exc))
     except Exception as exc:  # Hermes' config layer raised something of its own
         return PlacementStep("mcp", "failed", f"Hermes refused the config.yaml write: {exc}")
+    outcome = placed.outcome
+    if outcome in ("added", "allowed"):
+        from .allow import write_record
+
+        write_record(
+            resolve_hermes_home(),
+            how="carried_over" if decision == "carried_over" else "asked",
+            trust=placed.trust,
+        )
     if outcome == "added":
         return PlacementStep(
             "mcp",
             "changed",
-            "registered the hosted tools as mcp_servers.agentchat in config.yaml "
-            "(a running gateway connects it within about a minute; a session on /reload-mcp)",
+            f"registered the hosted tools as mcp_servers.agentchat in config.yaml with trust: {placed.trust} "
+            "(a running gateway connects them within about a minute; a session on /reload-mcp)",
+            outcome,
+        )
+    if outcome == "allowed":
+        named = " and named this client (X-AgentChat-Client: hermes)" if placed.header_added else ""
+        return PlacementStep(
+            "mcp",
+            "changed",
+            f"set trust: full on mcp_servers.agentchat{named} (a running gateway uses it after /reload-mcp "
+            "in a chat it serves, or hermes gateway restart)",
+            outcome,
         )
     if outcome == "upgraded":
         return PlacementStep(
@@ -256,13 +286,24 @@ def place_mcp(api_base: str) -> PlacementStep:
             "added the client header to mcp_servers.agentchat (X-AgentChat-Client: hermes), so "
             "the hosted tools know this agent runs on Hermes (used after a gateway restart, or "
             "/reload-mcp in a session)",
+            outcome,
         )
     if outcome == "present":
-        return PlacementStep("mcp", "ok", "hosted tools already registered as mcp_servers.agentchat")
+        return PlacementStep("mcp", "ok", "hosted tools already registered as mcp_servers.agentchat", outcome)
+    if outcome == "missing":
+        return PlacementStep(
+            "mcp",
+            "skipped",
+            "hosted tools not registered: AgentChat tools are not allowed yet (the entry is added when the "
+            "person allows them: /agentchat allow)",
+            outcome,
+        )
     if outcome == "disabled":
-        return PlacementStep("mcp", "skipped", "mcp_servers.agentchat exists but is disabled in config.yaml — left alone")
+        return PlacementStep(
+            "mcp", "skipped", "mcp_servers.agentchat exists but is disabled in config.yaml — left alone", outcome
+        )
     return PlacementStep(
-        "mcp", "skipped", "mcp_servers.agentchat is managed by hand in config.yaml — left alone"
+        "mcp", "skipped", "mcp_servers.agentchat is managed by hand in config.yaml — left alone", outcome
     )
 
 
@@ -276,12 +317,15 @@ def place_identity_and_tools(
     hermes_home: Path | None = None,
     identity_template: str | None = None,
     replace_other_agent: bool = True,
+    tools_decision: Decision | None = None,
 ) -> list[PlacementStep]:
     """Anchor, manual, the key source, tools — in that order (the tools' entry
     needs the key source). ``served_manual`` is the texts' announcement
     (``texts.manual``), ``None`` when no texts are in hand; ``identity_template``
     the served template (recognises a block an earlier release wrote);
-    ``replace_other_agent`` False keeps another agent's block (``doctor --fix``).
+    ``replace_other_agent`` False keeps another agent's block (``doctor --fix``);
+    ``tools_decision`` what the person decided about the tools
+    (:func:`.allow.decide`; ``None``: nobody asked, no entry is added).
     Never raises."""
     return [
         place_anchor(
@@ -293,7 +337,7 @@ def place_identity_and_tools(
         ),
         place_manual(served_manual, api_base=api_base, hermes_home=hermes_home),
         place_secrets(),
-        place_mcp(api_base),
+        place_mcp(api_base, decision=tools_decision),
     ]
 
 

@@ -155,6 +155,23 @@ def manual_sync_on(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(manual, name, real)
 
 
+@pytest.fixture(autouse=True)
+def _tools_switch_not_known(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The one switch (``agentchatme_hermes.allow``) reads the profile's
+    ``config.yaml`` through Hermes. In the unit suite it reads as *not known*
+    (as without Hermes: nothing paused, Hermes' own gate decides) whether or
+    not Hermes is installed (the nightly installs it, and an empty temporary
+    home would read as "not allowed yet"); a test that is about the switch
+    sets it."""
+    from agentchatme_hermes import allow
+    from agentchatme_hermes.mcp_registration import McpRegistrationError
+
+    def not_known(*, api_base: str) -> Any:
+        raise McpRegistrationError("the switch is not read in this test")
+
+    monkeypatch.setattr(allow, "inspect_allowance", not_known)
+
+
 _THREAD_GRACE_S = 2.0
 
 
