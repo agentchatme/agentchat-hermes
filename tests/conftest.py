@@ -19,10 +19,15 @@ whatever test runs then.
 """
 from __future__ import annotations
 
+import builtins
+import io
 import ipaddress
 import os
+import pathlib
 import socket
 import stat
+import sys
+import sysconfig
 import threading
 import time
 from typing import TYPE_CHECKING, Any
@@ -107,16 +112,157 @@ def _home_guard(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.Mo
 
 
 @pytest.fixture(autouse=True)
-def _process_env_snapshot() -> Iterator[None]:
-    """The plugin remembers ``AGENTCHAT_API_KEY`` as the process environment
-    had it when the plugin loaded (so an exported key that disagrees with the
-    saved one stays refused after Hermes rewrites the variable). Each test
-    starts from its own environment, never the runner's shell."""
-    from agentchatme_hermes import config
+def _copies_found() -> Iterator[None]:
+    """What a process found about a profile holding a copy of another's key
+    (``config.copy_of``) is kept for the process: each test starts without."""
+    from agentchatme_hermes import config, profile_scope
 
-    config._PROCESS_ENV_AT_IMPORT.clear()
+    config.reset_copies_for_tests()
+    profile_scope._keeps_launch_env.clear()
     yield
-    config._PROCESS_ENV_AT_IMPORT.clear()
+    config.reset_copies_for_tests()
+    profile_scope._keeps_launch_env.clear()
+
+
+class DotenvReadBlocked(OSError):
+    """Raised by the ``.env`` guard: the plugin opened a ``.env`` file itself."""
+
+
+_PACKAGE_DIR = os.path.dirname(os.path.abspath(__import__("agentchatme_hermes").__file__))
+_STDLIB_DIRS = tuple(
+    {os.path.abspath(p) for p in (sysconfig.get_paths()["stdlib"], sysconfig.get_paths()["platstdlib"])}
+)
+
+
+_THIS_FILE = os.path.abspath(__file__)
+_TESTS_DIR = os.path.dirname(_THIS_FILE) + os.sep
+# Hermes' own top-level modules (its reads of .env are its own business),
+# known names plus whatever sits beside ``hermes_constants`` when Hermes is
+# installed. A module of these names is Hermes only outside site-packages'
+# third-party tree, which is told apart by the module name, not the path.
+_HERMES_MODULES = {
+    "agent", "cron", "gateway", "hermes_cli", "hermes_constants", "hermes_logging", "hermes_scope",
+    "hermes_state", "run_agent", "tools", "tui_gateway", "utils",
+}
+
+
+def _discover_hermes_modules() -> None:
+    import importlib.util
+
+    try:
+        spec = importlib.util.find_spec("hermes_constants")
+    except (ImportError, ValueError):
+        return
+    if spec is None or not spec.origin:
+        return
+    root = os.path.dirname(spec.origin)
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return
+    for entry in entries:
+        if entry.endswith(".py"):
+            _HERMES_MODULES.add(entry[:-3])
+        elif os.path.isfile(os.path.join(root, entry, "__init__.py")):
+            _HERMES_MODULES.add(entry)
+
+
+_discover_hermes_modules()
+
+
+def _frame_kind(frame: Any) -> str:
+    """``skip`` (this guard, the standard library, frozen code), ``plugin``,
+    ``tests``, ``hermes`` or ``other`` (third-party code)."""
+    filename = frame.f_code.co_filename
+    path = os.path.abspath(filename)
+    if filename.startswith("<") or path == _THIS_FILE or path.startswith(_STDLIB_DIRS):
+        return "skip"
+    if path.startswith(_PACKAGE_DIR + os.sep):
+        return "plugin"
+    if path.startswith(_TESTS_DIR):
+        return "tests"
+    module = str(frame.f_globals.get("__name__") or "")
+    if module.split(".", 1)[0] in _HERMES_MODULES:
+        return "hermes"
+    return "other"
+
+
+def _opened_by_the_plugin() -> bool:
+    """Did the plugin's own code open this file, directly or through a library it called?
+
+    Walks up from the caller, skipping the guard's own frames, the standard
+    library and frozen code (no call depth is assumed). Blocked when the
+    nearest remaining frame is the plugin's, or third-party code with the
+    plugin anywhere above it (a ``.env`` parser the plugin called). Allowed
+    when the nearest is Hermes (its own reads, ``get_secret``'s overlay) or
+    a test or test double.
+    """
+    nearest: str | None = None
+    frame = sys._getframe(1)
+    while frame is not None:
+        kind = _frame_kind(frame)
+        if kind != "skip":
+            if nearest is None:
+                nearest = kind
+                if nearest in ("plugin", "tests", "hermes"):
+                    return nearest == "plugin"
+            elif kind == "plugin":
+                return True
+        frame = frame.f_back
+    return False
+
+
+def _names_a_dotenv(path: Any) -> bool:
+    try:
+        name = os.path.basename(os.fsdecode(path))
+    except TypeError:
+        return False
+    return name == ".env"
+
+
+@pytest.fixture(autouse=True)
+def _dotenv_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+    """The plugin never opens a ``.env`` file (Nous review, ask 1): settings
+    come from Hermes' ``get_secret``, lines are removed and written by Hermes'
+    ``remove_env_value`` / ``save_env_value``. Any open of a file named
+    ``.env`` whose nearest non-stdlib caller is the plugin's own code fails
+    the test — even when the code under test swallowed the error. Test
+    doubles for Hermes (``tests/``) may."""
+    attempts: list[str] = []
+    real_open = builtins.open
+    real_io_open = io.open
+    real_os_open = os.open
+    real_path_open = pathlib.Path.open
+
+    def check(path: Any) -> None:
+        if _names_a_dotenv(path) and _opened_by_the_plugin():
+            attempts.append(os.fsdecode(path))
+            raise DotenvReadBlocked(f"the plugin opened a .env file: {os.fsdecode(path)}")
+
+    def guarded_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        check(file)
+        return real_open(file, *args, **kwargs)
+
+    def guarded_io_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        check(file)
+        return real_io_open(file, *args, **kwargs)
+
+    def guarded_os_open(path: Any, *args: Any, **kwargs: Any) -> Any:
+        check(path)
+        return real_os_open(path, *args, **kwargs)
+
+    def guarded_path_open(self: pathlib.Path, *args: Any, **kwargs: Any) -> Any:
+        # Python 3.10's pathlib opens through an accessor bound to io.open at import.
+        check(self)
+        return real_path_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", guarded_open)
+    monkeypatch.setattr(io, "open", guarded_io_open)
+    monkeypatch.setattr(os, "open", guarded_os_open)
+    monkeypatch.setattr(pathlib.Path, "open", guarded_path_open)
+    yield attempts  # the guard's own test reads (and clears) what it recorded
+    if attempts:
+        pytest.fail("the plugin opened a .env file: " + "; ".join(attempts[:5]), pytrace=False)
 
 
 @pytest.fixture(autouse=True)

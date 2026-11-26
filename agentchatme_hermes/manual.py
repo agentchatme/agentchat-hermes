@@ -68,10 +68,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
-from .profile_scope import hermes_home_key
+from .profile_scope import context_thread, hermes_home_key
 
 if TYPE_CHECKING:
     from agentchatme.integration import ManualSync, ManualSyncResult
+
+    from .profile_scope import ProfileScope
 
 logger = logging.getLogger(__name__)
 
@@ -430,9 +432,12 @@ _inflight_lock = threading.Lock()
 _exit_hook_installed = False
 
 
-def sync_in_background(*, home: Path, served: Any, api_base: str | None, label: str) -> threading.Thread | None:
+def sync_in_background(
+    *, home: Path, served: Any, api_base: str | None, label: str, scope: ProfileScope | None = None
+) -> threading.Thread | None:
     """One sync on a daemon thread (a gateway that holds no receive loop for
-    this account: another gateway is the leader, or the integration is off).
+    this account: another gateway is the leader, or the integration is off),
+    in the profile's scope (``scope``; the caller's context without one).
     ``None`` when nothing is announced: there is nothing to sync to."""
     if served is None:
         return None
@@ -451,7 +456,11 @@ def sync_in_background(*, home: Path, served: Any, api_base: str | None, label: 
             with _inflight_lock:
                 _inflight.discard(threading.current_thread())
 
-    thread = threading.Thread(target=run, name="agentchat-manual-sync", daemon=True)
+    thread = (
+        scope.thread(run, name="agentchat-manual-sync")
+        if scope is not None
+        else context_thread(run, name="agentchat-manual-sync")
+    )
     with _inflight_lock:
         _inflight.add(thread)
         if not _exit_hook_installed:

@@ -411,8 +411,15 @@ class TestSupervisionEdges:
         constants.set_hermes_home_override = lambda path: override.set(str(path))  # type: ignore[attr-defined]
         constants.reset_hermes_home_override = lambda token: override.reset(token)  # type: ignore[attr-defined]
         monkeypatch.setitem(sys.modules, "hermes_constants", constants)
+        from agentchatme_hermes.profile_scope import ProfileScope
+
         home = tmp_path / ".hermes" / "profiles" / "b"
-        receiver = _receiver(tmp_path, hermes_home=home)
+        token = override.set(str(home))  # as Hermes' loader binds it around register()
+        try:
+            scope = ProfileScope.capture(home)
+        finally:
+            override.reset(token)
+        receiver = _receiver(tmp_path, hermes_home=home, scope=scope)
         seen: list[str | None] = []
         monkeypatch.setattr(receiver, "_supervise", lambda: seen.append(override.get()))
         receiver.start()

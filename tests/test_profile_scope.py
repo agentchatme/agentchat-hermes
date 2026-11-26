@@ -1,22 +1,26 @@
 """Tests for ``agentchatme_hermes.profile_scope``.
 
 Hermes itself is not importable in the test environment, so the module's
-fallback chain is what runs by default. The Hermes-present paths are
-exercised with a stand-in ``agent.secret_scope`` module injected into
-``sys.modules``.
+no-Hermes path is what runs by default. The Hermes-present paths are
+exercised with a stand-in ``agent.secret_scope`` (``tests/hermes_doubles.py``);
+the real one is ``test_hermes_contract.py``'s.
 """
 from __future__ import annotations
 
+import contextvars
 import sys
-import types
+import threading
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from fake_keys import api_key
+from hermes_doubles import FakeSecretScope
 
-from agentchatme_hermes import profile_scope
 from agentchatme_hermes.profile_scope import (
+    ProfileScope,
+    ProfileScopeError,
     account_fingerprint,
+    context_thread,
     hermes_root_of,
     profile_label,
     resolve_hermes_home,
@@ -92,80 +96,247 @@ class TestAccountFingerprint:
         assert api_key("secret") not in account_fingerprint("https://x", api_key("secret"))
 
 
-def _install_fake_secret_scope(
-    monkeypatch: pytest.MonkeyPatch, get_secret: Any
-) -> type[Exception]:
-    """Inject a stand-in for Hermes' ``agent.secret_scope`` module."""
-
-    class UnscopedSecretError(RuntimeError):
-        pass
-
-    pkg = types.ModuleType("agent")
-    mod = types.ModuleType("agent.secret_scope")
-    mod.get_secret = get_secret  # type: ignore[attr-defined]
-    mod.UnscopedSecretError = UnscopedSecretError  # type: ignore[attr-defined]
-    pkg.secret_scope = mod  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "agent", pkg)
-    monkeypatch.setitem(sys.modules, "agent.secret_scope", mod)
-    return UnscopedSecretError
-
-
 class TestResolveSetting:
     def test_falls_back_to_environ_without_hermes(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.delitem(sys.modules, "agent.secret_scope", raising=False)
         monkeypatch.delitem(sys.modules, "agent", raising=False)
-        monkeypatch.setenv("AGENTCHATME_API_KEY", "from-env")
-        assert resolve_setting("AGENTCHATME_API_KEY") == "from-env"
-        monkeypatch.delenv("AGENTCHATME_API_KEY")
-        assert resolve_setting("AGENTCHATME_API_KEY") is None
+        monkeypatch.setenv("AGENTCHATME_HANDLE", "from-env")
+        assert resolve_setting("AGENTCHATME_HANDLE") == "from-env"
+        monkeypatch.delenv("AGENTCHATME_HANDLE")
+        assert resolve_setting("AGENTCHATME_HANDLE") is None
 
     def test_hermes_scope_wins_over_process_environment(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """The multiplexing fix: the bound profile's value, never os.environ."""
-        monkeypatch.setenv("AGENTCHATME_API_KEY", "launch-profile-key")
-        _install_fake_secret_scope(
-            monkeypatch, lambda name, default=None: {"AGENTCHATME_API_KEY": "growth-key"}.get(name, default)
-        )
-        assert resolve_setting("AGENTCHATME_API_KEY") == "growth-key"
-
-    def test_unscoped_under_multiplexing_reads_profile_dotenv(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        err = _install_fake_secret_scope(monkeypatch, None)
+        """The multiplexing fix: the bound profile's value, never os.environ."""
+        monkeypatch.setenv("AGENTCHATME_HANDLE", "launch-profile")
+        fake = FakeSecretScope(multiplex=True, by_home={tmp_path: {"AGENTCHATME_HANDLE": "growth"}})
+        fake.install(monkeypatch)
+        assert ProfileScope.capture(tmp_path).run(resolve_setting, "AGENTCHATME_HANDLE") == "growth"
 
-        def raising(name: str, default: Any = None) -> Any:
-            raise err(name)
-
-        sys.modules["agent.secret_scope"].get_secret = raising  # type: ignore[attr-defined]
-        home = tmp_path / "profiles" / "ops"
-        home.mkdir(parents=True)
-        (home / ".env").write_text(
-            "# comment\nexport AGENTCHATME_API_KEY='ops-key'  \nAGENTCHATME_HANDLE=ops # trailing\n",
-            encoding="utf-8",
-        )
-        monkeypatch.setenv("HERMES_HOME", str(home))
-        monkeypatch.setenv("AGENTCHATME_API_KEY", "must-not-leak")
-        assert resolve_setting("AGENTCHATME_API_KEY") == "ops-key"
-        assert resolve_setting("AGENTCHATME_HANDLE") == "ops"
-        assert resolve_setting("AGENTCHATME_API_BASE") is None
+    def test_unscoped_under_multiplexing_is_a_typed_failure_never_a_file_read(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No fallback reader: a read outside the scope while the gateway
+        multiplexes is a plugin path that did not enter it, and fails."""
+        FakeSecretScope(multiplex=True).install(monkeypatch)
+        monkeypatch.setenv("AGENTCHATME_HANDLE", "must-not-leak")
+        with pytest.raises(ProfileScopeError, match="outside this profile's scope"):
+            resolve_setting("AGENTCHATME_HANDLE")
 
     def test_override_resolver_for_tests(self) -> None:
-        set_setting_resolver_for_tests(lambda name: {"AGENTCHATME_API_KEY": "o"}.get(name))
-        assert resolve_setting("AGENTCHATME_API_KEY") == "o"
+        set_setting_resolver_for_tests(lambda name: {"AGENTCHATME_HANDLE": "o"}.get(name))
+        assert resolve_setting("AGENTCHATME_HANDLE") == "o"
         assert resolve_setting("OTHER") is None
 
 
-class TestDotenvReader:
-    def test_missing_file(self, tmp_path: Path) -> None:
-        assert profile_scope._dotenv_value(tmp_path / "nope", "K") is None
+_PROBE: contextvars.ContextVar[str] = contextvars.ContextVar("probe", default="unset")
 
-    def test_quotes_and_comments(self, tmp_path: Path) -> None:
-        env = tmp_path / ".env"
-        env.write_text('A="x y"\nB=plain # note\nC = spaced\n#D=hidden\n', encoding="utf-8")
-        assert profile_scope._dotenv_value(env, "A") == "x y"
-        assert profile_scope._dotenv_value(env, "B") == "plain"
-        assert profile_scope._dotenv_value(env, "C") == "spaced"
-        assert profile_scope._dotenv_value(env, "D") is None
+
+class TestProfileScope:
+    def test_runs_in_the_captured_context(self, tmp_path: Path) -> None:
+        token = _PROBE.set("register's")
+        try:
+            scope = ProfileScope.capture(tmp_path)
+        finally:
+            _PROBE.reset(token)
+        assert _PROBE.get() == "unset"
+        assert scope.run(_PROBE.get) == "register's"
+        assert scope.home == tmp_path
+
+    def test_a_fresh_copy_per_call(self, tmp_path: Path) -> None:
+        """Nothing one call sets leaks into the next (each runs in its own copy)."""
+        scope = ProfileScope.capture(tmp_path)
+        scope.run(_PROBE.set, "first call")
+        assert scope.run(_PROBE.get) == "unset"
+
+    def test_two_threads_run_at_once(self, tmp_path: Path) -> None:
+        """A Context cannot be entered twice at once: each call copies it."""
+        scope = ProfileScope.capture(tmp_path)
+        inside = threading.Barrier(2, timeout=5.0)
+        seen: list[str] = []
+
+        def body(name: str) -> None:
+            _PROBE.set(name)
+            inside.wait()
+            seen.append(_PROBE.get())
+
+        threads = [scope.thread(lambda n=n: body(n), name=f"agentchat-test-{n}") for n in ("a", "b")]
+        for thread in threads:
+            assert thread.daemon
+            thread.start()
+        for thread in threads:
+            thread.join(5.0)
+        assert sorted(seen) == ["a", "b"]
+
+    def test_outside_hermes_nothing_is_bound(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        monkeypatch.delitem(sys.modules, "agent.secret_scope", raising=False)
+        monkeypatch.delitem(sys.modules, "agent", raising=False)
+        assert ProfileScope.capture(tmp_path).run(lambda: 42) == 42
+
+    def test_a_single_profile_process_binds_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """As Hermes' own standalone gateway turns: the process env is the profile's."""
+        fake = FakeSecretScope(multiplex=False)
+        fake.install(monkeypatch)
+        monkeypatch.setenv("AGENTCHATME_HANDLE", "own")
+        assert ProfileScope.capture(tmp_path).run(resolve_setting, "AGENTCHATME_HANDLE") == "own"
+        assert fake.binds == [] and fake.refreshed == []
+
+    def test_multiplexed_binds_the_profiles_secrets_for_the_call_and_resets(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        fake = FakeSecretScope(multiplex=True, by_home={tmp_path: {"OPENAI_API_KEY": "own-key"}})
+        fake.install(monkeypatch)
+        scope = ProfileScope.capture(tmp_path)
+        seen = scope.run(lambda: fake.get_secret("OPENAI_API_KEY"))
+        assert seen == "own-key"
+        # One empty mapping stamped with the home, filled by Hermes, reset after.
+        assert fake.binds == [str(tmp_path)]
+        assert fake.refreshed == [str(tmp_path)]
+        assert fake.resets == 1
+        assert fake.bound.get() is None
+        # A miss is a miss: never the process environment.
+        monkeypatch.setenv("OTHER_KEY", "launch-only")
+        assert scope.run(lambda: fake.get_secret("OTHER_KEY")) is None
+
+    def test_rebound_on_every_call(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """A rotated key is seen at the next call, as the gateway rebinds per turn."""
+        fake = FakeSecretScope(multiplex=True, by_home={tmp_path: {"K": "old"}})
+        fake.install(monkeypatch)
+        scope = ProfileScope.capture(tmp_path)
+        assert scope.run(lambda: fake.get_secret("K")) == "old"
+        fake.by_home[fake._key(tmp_path)]["K"] = "new"
+        assert scope.run(lambda: fake.get_secret("K")) == "new"
+
+    def test_reset_even_when_the_call_raises(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        fake = FakeSecretScope(multiplex=True)
+        fake.install(monkeypatch)
+
+        def boom() -> None:
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            ProfileScope.capture(tmp_path).run(boom)
+        assert fake.resets == 1
+
+    @pytest.mark.parametrize("failure", ["set_raises", "refresh_empty", "missing_api"])
+    def test_a_scope_that_cannot_be_bound_runs_nothing(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
+    ) -> None:
+        fake = FakeSecretScope(multiplex=True)
+        module = fake.install(monkeypatch)
+        if failure == "set_raises":
+            fake.fail_set = RuntimeError("hosted scope")
+        elif failure == "refresh_empty":
+            fake.refresh_fills = False
+        else:
+            monkeypatch.delattr(module, "refresh_installed_secret_scope")
+        ran: list[bool] = []
+        with pytest.raises(ProfileScopeError):
+            ProfileScope.capture(tmp_path).run(lambda: ran.append(True))
+        assert ran == []
+        assert fake.bound.get() is None
+        if failure == "refresh_empty":
+            assert fake.resets == 1
+
+    def test_a_thread_runs_in_the_captured_context_and_binds_nothing_itself(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A failing bind fails the entry point the thread calls, never the thread."""
+        fake = FakeSecretScope(multiplex=True)
+        fake.install(monkeypatch)
+        fake.fail_set = RuntimeError("hosted scope")
+        token = _PROBE.set("register's")
+        try:
+            scope = ProfileScope.capture(tmp_path)
+        finally:
+            _PROBE.reset(token)
+        seen: list[Any] = []
+
+        def body() -> None:
+            seen.append(_PROBE.get())
+            try:
+                scope.run(lambda: None)
+            except ProfileScopeError:
+                seen.append("entry point refused")
+
+        thread = scope.thread(body, name="agentchat-test-thread")
+        thread.start()
+        thread.join(5.0)
+        assert seen == ["register's", "entry point refused"]
+        assert fake.binds == []
+
+    def test_context_thread_inherits_the_callers_context(self) -> None:
+        token = _PROBE.set("the turn's scope")
+        try:
+            seen: list[str] = []
+            thread = context_thread(lambda: seen.append(_PROBE.get()), name="agentchat-test-worker")
+        finally:
+            _PROBE.reset(token)
+        thread.start()
+        thread.join(5.0)
+        assert seen == ["the turn's scope"] and thread.daemon
+
+
+class TestLaunchProfileLoadedBeforeMultiplexing:
+    def test_a_scope_captured_before_activation_binds_once_the_gateway_multiplexes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The launch profile's plugins load while the gateway does not multiplex
+        yet; the scope follows the process's state at each call, not at capture."""
+        fake = FakeSecretScope(multiplex=False, by_home={tmp_path: {"K": "launch"}})
+        fake.install(monkeypatch)
+        scope = ProfileScope.capture(tmp_path)  # register(), before activation
+        monkeypatch.setenv("K", "process-env")
+        assert scope.run(lambda: fake.get_secret("K")) == "process-env" and fake.binds == []
+        fake.multiplex = True  # the gateway started hosting a second profile
+        assert scope.run(lambda: fake.get_secret("K")) == "launch"
+        assert fake.binds == [str(tmp_path)]
+
+
+class TestAnOlderHermes:
+    """Hermes before 0.23.2 rebuilds a plugin's scope from the profile's files
+    only: warned (once per process), never refused."""
+
+    def test_the_probe_reads_the_refresh_contract(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import profile_scope
+
+        FakeSecretScope().install(monkeypatch)
+        assert profile_scope.refresh_keeps_launch_env() is True
+        profile_scope._keeps_launch_env.clear()
+        FakeSecretScope(files_only=True).install(monkeypatch)
+        assert profile_scope.refresh_keeps_launch_env() is False
+        profile_scope._keeps_launch_env.clear()
+        monkeypatch.setitem(sys.modules, "agent", None)  # not importable: not Hermes
+        assert profile_scope.refresh_keeps_launch_env() is None
+
+    def test_it_is_warned_once_and_the_call_still_runs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from agentchatme_hermes import profile_scope
+
+        monkeypatch.setattr(profile_scope, "_warned", set())
+        fake = FakeSecretScope(multiplex=True, files_only=True, by_home={tmp_path: {"K": "own"}})
+        fake.install(monkeypatch)
+        scope = ProfileScope.capture(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.profile_scope"):
+            assert scope.run(lambda: fake.get_secret("K")) == "own"
+            assert scope.run(lambda: fake.get_secret("K")) == "own"
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and "older than 0.23.2" in warnings[0] and "update Hermes" in warnings[0]
+        assert profile_scope.scope_status() == {"multiplexed": True, "keeps_launch_env": False}
+
+    def test_doctor_warns_from_the_running_gateways_record(self) -> None:
+        from agentchatme_hermes.cli import _describe_scope
+
+        line = _describe_scope({"scope": {"multiplexed": True, "keeps_launch_env": False}})
+        assert line is not None and "older than 0.23.2" in line and "update Hermes" in line
+        assert _describe_scope({"scope": {"multiplexed": True, "keeps_launch_env": True}}) is None
+        assert _describe_scope({"scope": {"multiplexed": False, "keeps_launch_env": None}}) is None
+        assert _describe_scope({}) is None

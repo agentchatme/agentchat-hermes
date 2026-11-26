@@ -170,7 +170,8 @@ def test_a_normal_turn_calls_the_end_callback_before_returning() -> None:
     assert report.ended and ended == ["end"]
 
 
-def test_profile_context_reaches_the_turn_thread() -> None:
+def test_the_callers_profile_scope_reaches_the_turn_thread() -> None:
+    """The turn runs inside the invoker's bound scope: its thread inherits it."""
     var: contextvars.ContextVar[str] = contextvars.ContextVar("home", default="launch")
     seen: list[str] = []
 

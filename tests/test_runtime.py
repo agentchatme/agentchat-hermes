@@ -115,9 +115,11 @@ class TestRuntimeStartLeaderMode:
             assert invoker_cls.called
             ws_cls.return_value.start.assert_called_once()
             invoker_cls.return_value.start.assert_not_called()  # the receiver runs it; it has no thread
-            # MS-F19: the runtime activated, so a hosted tools server Hermes parked
-            # while api.agentchat.me was unreachable is asked to reconnect.
-            invoker_cls.return_value.nudge_hosted_tools.assert_called_once_with("the AgentChat runtime activated")
+            # Hermes has no public reconnect: nothing is asked of its MCP client.
+            assert not invoker_cls.return_value.nudge_hosted_tools.called
+            # Every thread runs in the profile's scope: the runtime hands its own on.
+            assert invoker_cls.call_args.kwargs["scope"] is rt._scope
+            assert ws_cls.call_args.kwargs["scope"] is rt._scope
 
             assert rt.identity.handle == "alice"
             assert rt.client is fake_client
@@ -391,9 +393,10 @@ class TestManualSync:
     ) -> None:
         served, calls, _ws = self._run(monkeypatch, tmp_path, gateway_mode=gateway_mode, lock_winner=lock_winner, integration=integration)
         assert served is not None
-        assert calls == [
+        assert [{k: v for k, v in call.items() if k != "scope"} for call in calls] == [
             {"home": tmp_path / ".hermes", "served": served.manual, "api_base": "https://api.example.test", "label": "default"}
         ]
+        assert all(call["scope"] is not None for call in calls), "the sync thread runs in the profile's scope"
 
     @pytest.mark.parametrize("integration", [True, False])
     def test_a_process_that_is_not_the_gateway_never_syncs(

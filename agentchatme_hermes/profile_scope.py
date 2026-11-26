@@ -1,43 +1,62 @@
-"""Profile-scoped resolution of the Hermes home, settings, and secrets.
+"""Which Hermes profile this code runs for: its home, its settings, its scope.
 
 Why this module exists
 ──────────────────────
 Hermes runs several *profiles* on one machine, each with its own home
 (``~/.hermes`` for the default profile, ``~/.hermes/profiles/<name>`` for
-every other one), its own ``.env`` and its own ``SOUL.md``. Since Hermes
+every other one), its own settings and its own ``SOUL.md``. Since Hermes
 0.22 a single gateway process can serve every profile at once
 ("multiplexing"): Hermes keeps one plugin manager per profile home and
-calls our ``register(ctx)`` once per profile, inside a context that
-points ``hermes_constants.get_hermes_home()`` at that profile's directory
-and resolves that profile's secrets through
-``agent.secret_scope.get_secret``.
+calls our ``register(ctx)`` once per profile, in a context that points
+``hermes_constants.get_hermes_home()`` at that profile's directory.
 
-Versions of this plugin before 0.2.3111111 ignored both signals. They read
-``AGENTCHATME_API_KEY`` straight from ``os.environ`` (the *process*
-environment, which under multiplexing belongs to whichever profile
-launched the gateway), kept one module-global runtime for the whole
-process, and derived the WebSocket leader lock from ``Path.home()``.
-The observable failures on real fleets (September 2026 investigation):
-only the first profile to start ever received live messages, and a
-second profile could send as the first profile's handle.
+Versions of this plugin before 0.2.3111111 ignored that. They read the key
+straight from ``os.environ`` (under multiplexing the environment of
+whichever profile launched the gateway), kept one runtime for the whole
+process, and derived the WebSocket leader lock from ``Path.home()``. On
+real fleets (September 2026) only the first profile to start received, and
+a second profile could send as the first profile's handle.
+
+The profile's scope: :class:`ProfileScope`
+──────────────────────────────────────────
+``register(ctx)`` captures the context Hermes loaded the plugin in
+(``contextvars.copy_context()``: the profile's home override and, for a
+profile a multiplexed gateway serves beside its launch profile, the runtime
+scope Hermes bound for it). Every thread this plugin starts and every cycle
+it runs (an activation attempt, a gate call, the runtime check, the wait
+for the hosted tools, a turn) runs in a fresh copy of that context through
+:meth:`ProfileScope.run`. On a multiplexed gateway ``run`` also binds the
+profile's secrets for the call, with Hermes' public secret-scope API only
+(``agent.secret_scope``): an empty mapping stamped with the profile home
+(``set_secret_scope``), filled in place by
+``refresh_installed_secret_scope``, which builds it the way Hermes builds
+a turn's (the launch profile: the environment frozen when the gateway began
+multiplexing, so keys set only by systemd ``Environment=`` or ``op run``
+are kept, under its ``.env``; any other profile: its own ``.env`` and secret
+sources only). The mapping is rebuilt on every call, as the gateway rebinds
+per turn. A single-profile process binds nothing: ``get_secret`` reads the
+process environment, which is that profile's own.
+
+Settings are read only through Hermes: :func:`resolve_setting` is
+``agent.secret_scope.get_secret`` in the scope the caller runs in. This
+plugin never opens a ``.env`` file.
 
 Everything that needs to answer *which profile am I* goes through this
-module, so the answer is computed one way, with one fallback chain, and
-is unit-testable without Hermes installed.
+module, so the answer is computed one way and is unit-testable without
+Hermes installed.
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import logging
 import os
-import sys
-from contextlib import contextmanager
+import tempfile
+import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import Any, Callable, Optional, TypeVar
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-    from contextlib import AbstractContextManager
+T = TypeVar("T")
 
 logger = logging.getLogger(__name__)
 
@@ -49,10 +68,6 @@ SettingResolver = Callable[[str], Optional[str]]
 # Test seam: when set, every setting read goes through this callable
 # instead of Hermes / the process environment.
 _resolver_override: SettingResolver | None = None
-
-# Names for which we already logged an "unscoped under multiplexing"
-# warning — the condition repeats on every read, the log line should not.
-_unscoped_warned: set[str] = set()
 
 
 # ─── Hermes home ───────────────────────────────────────────────────────────
@@ -78,42 +93,8 @@ def resolve_hermes_home() -> Path:
     return Path(home).expanduser()
 
 
-@contextmanager
-def profile_context(home: Path) -> Iterator[None]:
-    """Run the block as Hermes runs ``home``'s own work.
-
-    Hermes keys everything per profile through a context-local ``HERMES_HOME``
-    override (``hermes_constants.set_hermes_home_override``): the tool
-    registry's profile overlay (where a multiplexed gateway registers the
-    ``agentchat`` MCP server's tools), ``get_hermes_home()`` for SOUL.md,
-    ``config.yaml`` and ``.env``, the MCP registry scope. The gateway sets it
-    around each served profile's turns and carries it to its workers with
-    ``copy_context()``; a thread this plugin starts has no such context, so
-    under multiplex it would read the launch profile's registry (no
-    ``mcp__agentchat__*`` tools → a held turn that never starts) and build
-    the agent for the wrong home. Our worker and activation threads enter
-    this for their lifetime. A no-op outside Hermes.
-    """
-    try:
-        from hermes_constants import (
-            reset_hermes_home_override,
-            set_hermes_home_override,
-        )
-    except Exception:
-        yield
-        return
-    token = set_hermes_home_override(str(home))
-    try:
-        yield
-    finally:
-        try:
-            reset_hermes_home_override(token)
-        except Exception:
-            logger.debug("profile_context: reset raised", exc_info=True)
-
-
 class ProfileScopeError(RuntimeError):
-    """The profile's runtime scope could not be entered; the work must not run unscoped."""
+    """The profile's scope could not be entered; the work must not run unscoped."""
 
 
 _warned: set[str] = set()
@@ -126,175 +107,180 @@ def _warn_once(key: str, message: str, *args: object) -> None:
     logger.warning(message, *args)
 
 
-@contextmanager
-def profile_turn_scope(home: Path) -> Iterator[None]:
-    """Run one cycle (tray, gate, turn) in the scope Hermes runs ``home``'s own turns in.
+class ProfileScope:
+    """The scope of the Hermes profile that loaded this plugin, for every
+    thread and cycle the plugin runs (module docstring).
 
-    The HERMES_HOME override (:func:`profile_context`) picks the profile's
-    home, registry overlay and config; it does NOT pick its credentials.
-    Under a multiplexed gateway those come from a per-profile *secret
-    scope*: ``get_secret`` reads the bound mapping and, with none bound,
-    fails closed (``UnscopedSecretError``) instead of reading another
-    profile's ``os.environ`` (``agent/secret_scope.py``). The gateway binds
-    it around every served profile's turn (``gateway/run.py``
-    ``_profile_runtime_scope``). A turn this plugin starts must do the same.
-
-    * Multiplexing: Hermes's own ``_profile_runtime_scope(home)``. If that
-      helper is not importable, the same three pieces it enters, from
-      Hermes's own modules: the HERMES_HOME override; the profile's secret
-      scope — external sources hydrated (``hydrate_profile_secret_sources``)
-      and the mapping from ``owner_secret_scope`` (which keeps a launch
-      profile's process-env-only keys); and the profile's terminal policy
-      (``install_and_reset_profile_terminal_scope``). If any piece is
-      missing, :class:`ProfileScopeError` — never a partial scope.
-    * Single profile: ``GatewayTurnMixin._standalone_launch_scope()``, what
-      the gateway enters for its own turns (a no-op unless the process also
-      hosts another profile). If it cannot be entered, the cycle runs
-      without it — on a single-profile gateway the process env is the
-      profile's own, as in 0.4.1 — and that is logged once.
-    * Outside Hermes: nothing.
-
-    Entered per cycle, not per thread, so it follows the process's
-    multiplex state and re-reads secrets per turn as the gateway does.
-    Raises :class:`ProfileScopeError` when a multiplexed scope cannot be
-    entered: the cycle must not run with another profile's credentials; the
-    caller skips it and re-wakes later.
+    :meth:`capture` is called in ``register(ctx)``. :meth:`run` is an
+    entry point (an activation attempt, a gate call, the runtime check, the
+    hold for the hosted tools, a turn): one call in a fresh copy of the
+    captured context (a ``Context`` cannot be entered by two threads at
+    once, and nothing one call sets leaks into the next) with, on a
+    multiplexed gateway, the profile's secrets bound for that call.
+    :meth:`thread` is a daemon thread that runs in a fresh copy of the
+    captured context — the profile's home, Hermes' runtime scope for it, its
+    log routing — and binds no secrets itself: the entry points it calls
+    do, each when it runs, so a binding that fails fails that entry point,
+    never the thread. A worker inside a call that already runs in the scope
+    (the turn's own thread) inherits it with :func:`context_thread`.
     """
-    # Branch condition. The gateway picks a turn's scope from its own config:
-    # ``config.multiplex_profiles`` → ``_profile_runtime_scope``, else
-    # ``_standalone_launch_scope`` (``gateway/run_turn.py``
-    # ``_profile_scope_key_for_source``). This plugin has no gateway config
-    # object, so it branches on ``is_multiplex_active()`` — the flag
-    # ``get_secret`` itself consults, i.e. exactly the condition under which
-    # an unscoped read fails closed. The two differ in one case: a hosted
-    # room enabled multi-profile hosting in a gateway whose
-    # ``multiplex_profiles`` is off (#112878). There the gateway enters the
-    # standalone launch scope for its own turns (the launch profile's
-    # ``.env`` over the env frozen at activation, its ambient ``TERMINAL_*``
-    # left as they are), while this plugin enters
-    # ``_profile_runtime_scope(launch home)``: the launch profile's
-    # ``owner_secret_scope`` (which also keeps its process-env-only keys)
-    # and its full terminal policy overlay. Same credentials; the terminal
-    # policy is the profile's declared one rather than the ambient one.
-    if _multiplexing():
+
+    __slots__ = ("_context", "_home")
+
+    def __init__(self, home: Path, context: contextvars.Context) -> None:
+        self._home = Path(home)
+        self._context = context
+
+    @classmethod
+    def capture(cls, home: Path) -> ProfileScope:
+        """The scope of the current context, for profile ``home``."""
+        return cls(Path(home), contextvars.copy_context())
+
+    @property
+    def home(self) -> Path:
+        return self._home
+
+    def run(self, fn: Callable[..., T], /, *args: Any, **kwargs: Any) -> T:
+        """``fn(*args, **kwargs)`` in this profile's scope.
+
+        Raises :class:`ProfileScopeError` (and does not call ``fn``) when a
+        multiplexed gateway's secret scope cannot be bound for the profile.
+        """
+        return self._context.copy().run(self._call, fn, args, kwargs)
+
+    def thread(self, target: Callable[[], object], *, name: str) -> threading.Thread:
+        """An unstarted daemon thread that runs ``target`` in a fresh copy of the
+        captured context (no secrets bound: see the class docstring)."""
+        return threading.Thread(target=self._context.copy().run, args=(target,), name=name, daemon=True)
+
+    def _call(self, fn: Callable[..., T], args: tuple[Any, ...], kwargs: dict[str, Any]) -> T:
+        token, reset = self._bind_secrets()
         try:
-            helper = _hermes_profile_runtime_scope()
-            if helper is not None:
-                scope = helper(Path(home))
-            else:
-                _warn_once(
-                    "fallback",
-                    "agentchat: Hermes' gateway.run._profile_runtime_scope is not importable — "
-                    "entering the same profile scope from its pieces (override, hydrated "
-                    "owner secret scope, terminal policy)",
-                )
-                scope = _replicated_profile_scope(Path(home))
-            scope.__enter__()
-        except ProfileScopeError:
-            raise
-        except Exception as exc:
-            raise ProfileScopeError(f"could not enter profile scope for {home}: {exc!r}") from exc
-        try:
-            yield
-        except BaseException:
-            if not scope.__exit__(*sys.exc_info()):
-                raise
-        else:
-            scope.__exit__(None, None, None)
-        return
-
-    standalone_scope = None
-    try:
-        standalone = _hermes_standalone_launch_scope()
-        if standalone is not None:
-            standalone_scope = standalone()
-            standalone_scope.__enter__()
-    except Exception as exc:
-        standalone_scope = None
-        _warn_once(
-            "standalone",
-            "agentchat: could not enter Hermes' standalone launch scope (%r) — running cycles "
-            "without it (single-profile gateway: the process env is this profile's own)",
-            exc,
-        )
-    if standalone_scope is None:
-        yield
-        return
-    try:
-        yield
-    except BaseException:
-        if not standalone_scope.__exit__(*sys.exc_info()):
-            raise
-    else:
-        standalone_scope.__exit__(None, None, None)
-
-
-def _multiplexing() -> bool:
-    try:
-        from agent.secret_scope import is_multiplex_active
-    except Exception:
-        return False
-    try:
-        return bool(is_multiplex_active())
-    except Exception:
-        return False
-
-
-def _hermes_profile_runtime_scope() -> Callable[[Path], AbstractContextManager[None]] | None:
-    try:
-        from gateway.run import _profile_runtime_scope  # type: ignore[import-not-found]
-    except Exception:
-        return None
-    return _profile_runtime_scope if callable(_profile_runtime_scope) else None
-
-
-def _hermes_standalone_launch_scope() -> Callable[[], AbstractContextManager[None]] | None:
-    try:
-        from gateway.run_turn import GatewayTurnMixin  # type: ignore[import-not-found]
-    except Exception:
-        return None
-    scope = getattr(GatewayTurnMixin, "_standalone_launch_scope", None)
-    return scope if callable(scope) else None
-
-
-def _replicated_profile_scope(home: Path) -> AbstractContextManager[None]:
-    """What ``gateway.run._profile_runtime_scope(home)`` enters, built from the same pieces.
-
-    Raises :class:`ProfileScopeError` when any piece is not importable: a
-    partial scope (say, secrets without the terminal policy) is worse than
-    skipping the cycle.
-    """
-    try:
-        from agent.secret_scope import reset_secret_scope, set_secret_scope
-        from hermes_cli.env_loader import hydrate_profile_secret_sources
-        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
-        from tools.terminal_scope import install_and_reset_profile_terminal_scope
-        from tui_gateway.launch_profile_policy import (  # type: ignore[import-not-found]
-            owner_secret_scope,
-        )
-    except Exception as exc:
-        raise ProfileScopeError(
-            f"Hermes' profile scope pieces are not importable ({exc!r}) — not running this "
-            "profile's cycle unscoped"
-        ) from exc
-
-    @contextmanager
-    def scope() -> Iterator[None]:
-        home_token = set_hermes_home_override(str(home))
-        try:
-            # As ``_load_profile_secret_scope``: hydrate external sources, then
-            # the owner scope, both under the profile's home override.
-            hydrate_profile_secret_sources(home)
-            secret_token = set_secret_scope(owner_secret_scope(home), profile_home=str(home))
-            try:
-                with install_and_reset_profile_terminal_scope(home):
-                    yield
-            finally:
-                reset_secret_scope(secret_token)
+            return fn(*args, **kwargs)
         finally:
-            reset_hermes_home_override(home_token)
+            if token is not None and reset is not None:
+                try:
+                    reset(token)
+                except Exception:
+                    logger.debug("ProfileScope: resetting the secret scope raised", exc_info=True)
 
-    return scope()
+    def _bind_secrets(self) -> tuple[Any, Callable[[Any], None] | None]:
+        """Bind this profile's secrets when the process multiplexes; ``(token, reset)``.
+
+        ``set_secret_scope`` installs an empty mapping stamped with the home
+        (with Hermes' runtime scope bound for this profile it passes the
+        mapping through, ``agent.runtime_scope.legacy_switch``); Hermes holds
+        it by reference, and ``refresh_installed_secret_scope`` fills it with
+        the mapping Hermes builds for the profile's own turns
+        (``owner_secret_scope``). Outside Hermes, or in a process that does
+        not multiplex, nothing is bound: ``get_secret`` reads the process
+        environment, which is the profile's own.
+        """
+        try:
+            from agent import secret_scope
+        except ImportError:
+            return None, None
+        try:
+            multiplexed = bool(secret_scope.is_multiplex_active())
+        except Exception as exc:
+            raise ProfileScopeError(f"Hermes' multiplex state is not readable ({exc!r})") from exc
+        if not multiplexed:
+            return None, None
+        home = str(self._home)
+        set_scope = getattr(secret_scope, "set_secret_scope", None)
+        refresh = getattr(secret_scope, "refresh_installed_secret_scope", None)
+        reset = getattr(secret_scope, "reset_secret_scope", None)
+        if not (callable(set_scope) and callable(refresh) and callable(reset)):
+            raise ProfileScopeError(
+                "this Hermes has no public way to bind a profile's secrets for a plugin's work "
+                "(agent.secret_scope.set_secret_scope / refresh_installed_secret_scope) — upgrade "
+                "Hermes to 0.23.2 or later"
+            )
+        try:
+            token = set_scope({}, profile_home=home)
+        except Exception as exc:
+            raise ProfileScopeError(f"Hermes refused this profile's secret scope ({exc!r})") from exc
+        try:
+            filled = refresh(self._home)
+        except Exception as exc:
+            reset(token)
+            raise ProfileScopeError(f"Hermes could not build this profile's secrets ({exc!r})") from exc
+        if not filled:
+            reset(token)
+            raise ProfileScopeError("Hermes did not fill this profile's secret scope")
+        if refresh_keeps_launch_env() is False:
+            _warn_once(
+                "files_only_refresh",
+                "agentchat: this Hermes (older than 0.23.2) rebuilds a plugin's secret scope from "
+                "the profile's files only, so on this gateway serving several profiles, keys set "
+                "only in the gateway's environment (systemd Environment=, op run, docker -e) are "
+                "not visible to AgentChat's gate calls and turns — update Hermes",
+            )
+        return token, reset
+
+
+# The probe's answer, once per process (``None``: not known yet / not Hermes).
+_keeps_launch_env: list[bool | None] = []
+
+
+def refresh_keeps_launch_env() -> bool | None:
+    """Does this Hermes fill a plugin-installed secret scope the way it builds a
+    profile's own turns — keeping the launch profile's environment-only keys
+    (Hermes 0.23.2 and later)? ``None`` outside Hermes or when it cannot tell.
+
+    Hermes exposes no release number to a plugin (its distribution reports
+    ``0.0.0``; ``hermes --version`` reads a private module), so this asks the
+    public function itself, in an empty context: since 0.23.2
+    ``refresh_installed_secret_scope`` builds through ``owner_secret_scope`` and
+    refuses to refill a scope stamped for another home (its documented
+    contract); before, it rebuilt any installed scope from the named home's
+    files alone. Two homes that do not exist are named, so nothing is read for
+    a real profile.
+    """
+    if _keeps_launch_env:
+        return _keeps_launch_env[0]
+    try:
+        from agent import secret_scope
+    except ImportError:
+        return None
+
+    def probe() -> bool:
+        base = Path(tempfile.gettempdir()) / "agentchat-scope-probe"
+        token = secret_scope.set_secret_scope({}, profile_home=str(base / "a"))
+        try:
+            return not secret_scope.refresh_installed_secret_scope(base / "b")
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    try:
+        answer: bool | None = bool(contextvars.Context().run(probe))
+    except Exception:
+        logger.debug("profile_scope: the secret-scope refresh probe raised", exc_info=True)
+        answer = None
+    _keeps_launch_env.append(answer)
+    return answer
+
+
+def scope_status() -> dict[str, bool | None]:
+    """For the health record: does this process multiplex, and does its Hermes keep
+    the launch profile's environment-only keys in a plugin's scope?"""
+    try:
+        from agent import secret_scope
+    except ImportError:
+        return {"multiplexed": None, "keeps_launch_env": None}
+    try:
+        multiplexed: bool | None = bool(secret_scope.is_multiplex_active())
+    except Exception:
+        multiplexed = None
+    return {"multiplexed": multiplexed, "keeps_launch_env": refresh_keeps_launch_env() if multiplexed else None}
+
+
+def context_thread(target: Callable[[], object], *, name: str) -> threading.Thread:
+    """An unstarted daemon thread that runs ``target`` in a copy of the caller's
+    context: a worker inside a call already in the profile's scope (the shape
+    of Hermes' ``agent.memory_provider.spawn_context_thread``)."""
+    context = contextvars.copy_context()
+    return threading.Thread(target=context.run, args=(target,), name=name, daemon=True)
 
 
 def hermes_root_of(home: Path) -> Path:
@@ -335,42 +321,35 @@ def hermes_home_key(home: Path) -> str:
 
 
 def resolve_setting(name: str) -> str | None:
-    """Resolve one ``AGENTCHATME_*`` setting for the current profile.
+    """One ``AGENTCHAT*`` setting for the profile this code runs for.
 
-    Chain:
+    Hermes' ``agent.secret_scope.get_secret``, the profile-scoped resolver:
+    in a single-profile process the process environment (Hermes loaded the
+    profile's ``.env`` into it, over the shell's exports); on a multiplexed
+    gateway the secrets :class:`ProfileScope` bound for the call, never
+    another profile's. Without Hermes importable (tests, inspection outside
+    Hermes): ``os.environ``. ``None`` when unset.
 
-    1. Hermes' ``agent.secret_scope.get_secret`` — the profile-scoped
-       resolver. Outside multiplexing it reads the profile ``.env``
-       overlay and falls back to ``os.environ``; under multiplexing it
-       serves the bound profile's secrets and never another profile's.
-    2. If Hermes reports *no scope bound while multiplexing* (plugin
-       discovery can run before a turn scope exists), read the current
-       profile's own ``.env`` file. That is exactly the value the scope
-       would have served, and strictly safer than the process env.
-    3. Without Hermes importable (tests, inspection outside Hermes):
-       ``os.environ``.
-
-    Returns ``None`` when unset. Never raises for a missing value.
+    Raises :class:`ProfileScopeError` when Hermes reports a read outside any
+    profile's scope while the gateway multiplexes: a plugin path that did not
+    enter the scope, which must not be answered from anywhere else.
     """
     if _resolver_override is not None:
         return _resolver_override(name)
     try:
         from agent.secret_scope import UnscopedSecretError, get_secret
     except ImportError:
-        return _environ_value(name)
-
+        return os.environ.get(name)
     try:
         value = get_secret(name)
-    except UnscopedSecretError:
-        if name not in _unscoped_warned:
-            _unscoped_warned.add(name)
-            logger.warning(
-                "agentchat: %s read outside a profile secret scope while the "
-                "gateway multiplexes profiles — falling back to this profile's "
-                ".env file (never the process environment).",
-                name,
-            )
-        return _dotenv_value(resolve_hermes_home() / ".env", name)
+    except UnscopedSecretError as exc:
+        _warn_once(
+            f"unscoped:{name}",
+            "agentchat: %s was read outside this profile's scope while the gateway multiplexes "
+            "profiles — the work that read it does not run (please report this)",
+            name,
+        )
+        raise ProfileScopeError(f"{name} was read outside this profile's scope") from exc
     if value is None:
         return None
     return str(value)
@@ -380,43 +359,6 @@ def set_setting_resolver_for_tests(resolver: SettingResolver | None) -> None:
     """Install (or clear with ``None``) a resolver override. Test-only."""
     global _resolver_override
     _resolver_override = resolver
-
-
-def _environ_value(name: str) -> str | None:
-    value = os.environ.get(name)
-    return value if value is not None else None
-
-
-def dotenv_value(path: Path, name: str) -> str | None:
-    """``name``'s value in the dotenv file at ``path`` (``None`` when unset or unreadable)."""
-    return _dotenv_value(path, name)
-
-
-def _dotenv_value(path: Path, name: str) -> str | None:
-    """Minimal ``KEY=VALUE`` reader for one key of a dotenv file.
-
-    Supports ``export KEY=value``, single/double quotes, blank lines and
-    ``#`` comments. Deliberately tiny: we only ever look up our own
-    ``AGENTCHATME_*`` names in the profile's own file.
-    """
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("export "):
-            line = line[len("export ") :].lstrip()
-        key, sep, value = line.partition("=")
-        if not sep or key.strip() != name:
-            continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
-            return value[1:-1]
-        return value.split(" #", 1)[0].strip()
-    return None
 
 
 # ─── account identity ──────────────────────────────────────────────────────

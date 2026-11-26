@@ -8,9 +8,12 @@ and status / doctor said all was well. The key file is not copied by
 ``create`` / ``--clone``; a ``--clone-all`` copy names the profile it belongs
 to; a ``.env`` copy of another profile's key is refused, with the fix.
 
-Target 6 of the key fix: an ``AGENTCHAT_API_KEY`` exported in the shell (or
-left in ``.env``) never silently decides which agent a profile is; when it
-disagrees with the saved key, the plugin refuses and says what to do.
+With a key file the key file decides: an ``AGENTCHAT_API_KEY`` set anywhere
+else is not used (the key source supplies the key file's over it). The plugin
+never reads a ``.env`` file (Nous review, ask 1): a profile's settings are what
+Hermes' ``get_secret`` returns for the profile in scope — here the process
+environment, as in a single-profile Hermes process — and another profile is
+seen only through its key file.
 """
 from __future__ import annotations
 
@@ -23,7 +26,8 @@ from unittest.mock import MagicMock
 
 import pytest
 from fake_keys import api_key
-from key_files import profile_home, save_key
+from hermes_doubles import FakeHermesEnv
+from key_files import profile_home, save_key, set_up_as_agent
 
 from agentchatme_hermes import cli, config, key_source, key_store
 from agentchatme_hermes.config import (
@@ -49,8 +53,21 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _env(home: Path, text: str) -> None:
+    """A ``.env`` file as a user or an earlier release left it (never read by the plugin)."""
     home.mkdir(parents=True, exist_ok=True)
     (home / ".env").write_text(text, encoding="utf-8")
+
+
+def _scope(monkeypatch: pytest.MonkeyPatch, home: Path, **lines: str) -> FakeHermesEnv:
+    """Run as profile ``home`` (``HERMES_HOME``), its ``.env`` holding ``lines``,
+    loaded into the environment as Hermes does at start; Hermes' ``.env``
+    helpers stand in for that profile."""
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    hermes = FakeHermesEnv(monkeypatch)
+    hermes.install()
+    hermes.write(home, **lines)
+    hermes.load()
+    return hermes
 
 
 def _profile(name: str) -> Path:
@@ -91,79 +108,47 @@ class TestTheKeyFile:
         cfg = load_config()
         assert cfg is not None and cfg.api_base == "https://other.example"
 
-    def test_a_leftover_dotenv_copy_is_a_note(self) -> None:
+    def test_a_leftover_pre_v3_setting_is_a_note(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The key source never supplies the pre-v3 name: Hermes' value for it is
+        the profile's own, a copy an earlier release left in .env."""
         save_key(ONE)
-        _env(profile_home(), f"{ENV_API_KEY}={ONE}\n")
+        monkeypatch.setenv(ENV_API_KEY_LEGACY, ONE)
         resolved = resolve_key()
         assert resolved.api_key == ONE and resolved.refusal is None
-        assert any("doctor --fix" in note for note in resolved.notes)
+        assert any(ENV_API_KEY_LEGACY in note and "doctor --fix` removes it" in note for note in resolved.notes)
+
+    def test_a_different_pre_v3_setting_is_said_and_not_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        save_key(ONE)
+        monkeypatch.setenv(ENV_API_KEY_LEGACY, TWO)
+        resolved = resolve_key()
+        assert resolved.api_key == ONE and resolved.refusal is None
+        assert any("holds a different key; it is not used (the key file decides)" in n for n in resolved.notes)
+        assert TWO not in " ".join(resolved.notes)
 
 
-class TestAnotherKeyIsNeverQuietlyUsed:
-    def test_a_different_dotenv_key_is_refused(self) -> None:
+class TestTheKeyFileDecides:
+    def test_another_agentchat_api_key_is_not_used(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An export, a service's Environment=, a line left in .env: with a key
+        file, the key source supplies the key file's over it, so it decides."""
         save_key(ONE, handle="alice")
-        _env(profile_home(), f"{ENV_API_KEY}={TWO}\n")
-        resolved = resolve_key()
-        assert resolved.api_key is None and resolved.refusal is not None
-        assert "is not the key this profile saved" in resolved.refusal and "(@alice)" in resolved.refusal
-        assert ONE not in resolved.refusal and TWO not in resolved.refusal
-        with pytest.raises(KeyRefused):
-            load_config()
-
-    def test_an_exported_key_that_disagrees_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        save_key(ONE)
         monkeypatch.setenv(ENV_API_KEY, TWO)
         resolved = resolve_key()
-        assert resolved.refusal is not None
-        assert "this process's environment" in resolved.refusal
-        assert "login --api-key-file" in resolved.refusal
-
-    def test_it_stays_refused_after_hermes_rewrites_the_variable(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Hermes' re-pull of the key source overwrites the variable with the
-        saved key; the export the plugin saw at load is still the user's."""
-        save_key(ONE)
-        monkeypatch.setenv(ENV_API_KEY, TWO)
-        config._snapshot_process_env()  # the plugin is imported
-        assert resolve_key().refusal is not None
-        monkeypatch.setenv(ENV_API_KEY, ONE)  # the source's override_existing write-back
-        assert resolve_key().refusal is not None, "the 30 s re-check does not quietly accept it"
-
-    def test_an_exported_key_that_agrees_is_fine(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        save_key(ONE)
-        monkeypatch.setenv(ENV_API_KEY, ONE)
-        assert resolve_key().refusal is None
-
-    def test_our_own_sources_earlier_value_is_not_a_conflict(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """A rotation saved while this process runs: the environment still has the
-        old key, written there by the plugin's own source (Hermes' provenance)."""
-        save_key(ONE)
-        monkeypatch.setenv(ENV_API_KEY, TWO)
-        monkeypatch.setattr(key_source, "supplied_by_us", lambda name=ENV_API_KEY: True)
-        assert resolve_key().refusal is None
+        assert (resolved.api_key, resolved.refusal, resolved.notes) == (ONE, None, ())
+        cfg = load_config()
+        assert cfg is not None and cfg.api_key == ONE
 
     def test_another_profiles_environment_is_not_this_ones(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Under a multiplexed gateway the process environment is the launch profile's."""
         he2 = _profile("he2")
         save_key(TWO, home=he2)
         monkeypatch.setenv(ENV_API_KEY, ONE)  # the launch profile's
-        assert resolve_key(he2).refusal is None
+        assert resolve_key(he2).refusal is None and resolve_key(he2).api_key == TWO
 
-
-class TestTheEnvironmentSnapshot:
-    def test_a_value_hermes_loaded_from_dotenv_is_not_an_export(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The gateway started with a key in the profile .env (Hermes loads it into
-        the environment). The user then moves to a new key: the old value still
-        in the environment is not "exported in the shell", and fixing it takes
-        effect without a restart."""
-        root = profile_home()
-        _env(root, f"{ENV_API_KEY}={ONE}\n")
-        monkeypatch.setenv(ENV_API_KEY, ONE)  # Hermes' dotenv load at process start
-        config._snapshot_process_env()  # the plugin is imported
-        assert resolve_key(root).api_key == ONE
-        (root / ".env").write_text("", encoding="utf-8")  # login with another key removed it
-        save_key(TWO)
-        resolved = resolve_key(root)
-        assert (resolved.api_key, resolved.refusal) == (TWO, None)
+    def test_another_profiles_settings_are_never_read(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """For a home that is not the profile in scope only its key file counts."""
+        monkeypatch.setenv(ENV_API_KEY, ONE)  # this profile's (the default's)
+        resolved = resolve_key(_profile("he2"))
+        assert (resolved.api_key, resolved.refusal) == (None, None)
 
 
 class TestCopiesAreNotAdopted:
@@ -188,33 +173,153 @@ class TestCopiesAreNotAdopted:
         assert "hermes -p he2 agentchat logout" in resolved.refusal
         assert resolve_key(root).api_key == ONE, "the original is still the agent"
 
-    def test_a_dotenv_copy_of_the_default_profiles_key_is_refused(self) -> None:
-        """A profile created before this release: the key was in .env and
-        Hermes copied it. The default profile stays the agent."""
+    def test_a_settings_copy_of_the_default_profiles_key_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A profile created before 0.6: Hermes copied the key in .env. The default
+        profile saved it in its key file, so it is that agent."""
         root = profile_home()
-        _env(root, f"{ENV_API_KEY}={ONE}\n")
-        clone = _hermes_profile_create(root, "he2")
+        save_key(ONE)
+        clone = _profile("he2")
+        _scope(monkeypatch, clone, **{ENV_API_KEY: ONE})
         resolved = resolve_key(clone)
-        assert resolved.refusal is not None and "same AgentChat key as profile default" in resolved.refusal
+        assert resolved.refusal is not None and "same AgentChat key that profile default" in resolved.refusal
         assert "hermes -p he2 agentchat logout" in resolved.refusal
         assert "hermes agentchat logout" in resolved.refusal, "or the other way round"
-        root_resolved = resolve_key(root)
-        assert root_resolved.api_key == ONE and root_resolved.refusal is None
-        assert [h.home for h in root_resolved.shared_with] == [clone], "said in the original too"
+        assert ONE not in resolved.refusal
+        assert config.copy_of(clone) == root, "found for the key source"
+        with pytest.raises(KeyRefused):
+            load_config(hermes_home=clone)
 
-    def test_a_dotenv_key_another_profile_saved_in_its_key_file_is_refused(self) -> None:
+    def test_a_copy_stays_refused_once_its_setting_is_masked(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """After Hermes applies the key source the copy's setting reads empty;
+        it stays refused while the other profile holds the key, and not after."""
+        root = profile_home()
+        save_key(ONE)
+        clone = _profile("he2")
+        _scope(monkeypatch, clone, **{ENV_API_KEY: ONE})
+        assert resolve_key(clone).refusal is not None
+        monkeypatch.setenv(ENV_API_KEY, "")  # the source's empty value
+        assert resolve_key(clone).refusal is not None
+        assert key_source._supplies_for(clone), "the source keeps masking it"
+        key_store.delete_store(root)  # the default profile logged out
+        resolved = resolve_key(clone)
+        assert (resolved.api_key, resolved.refusal) == (None, None)
+        assert config.copy_of(clone) is None
+
+    def test_a_settings_key_another_named_profile_saved_is_refused(self, monkeypatch: pytest.MonkeyPatch) -> None:
         he1, he2 = _profile("he1"), _profile("he2")
         save_key(ONE, home=he1)
-        _env(he2, f"{ENV_API_KEY}={ONE}\n")
+        _scope(monkeypatch, he2, **{ENV_API_KEY: ONE})
         resolved = resolve_key(he2)
         assert resolved.refusal is not None and "profile he1" in resolved.refusal
 
-    def test_two_named_profiles_sharing_a_dotenv_key_are_told(self) -> None:
-        """Before 0.6 nothing tells which of two set-up profiles is the one in
-        use: both keep working as before, and it is said (doctor fails on it)."""
+    def test_two_profiles_holding_a_key_only_in_their_settings_are_not_told(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Changed in 0.7: another profile's .env is never read, so two pre-0.6
+        set-up profiles sharing one key only there are not detected across
+        processes until one of them saves it (``doctor --fix``, ``login``)."""
         he1, he2 = _profile("he1"), _profile("he2")
-        _env(he1, f"{ENV_API_KEY}={ONE}\n")
-        _env(he2, f"{ENV_API_KEY}={ONE}\n")
+        set_up_as_agent(he2)
+        _env(he1, f"{ENV_API_KEY}={ONE}\n")  # left as it was: never read
+        _scope(monkeypatch, he2, **{ENV_API_KEY: ONE})
+        resolved = resolve_key(he2)
+        assert (resolved.api_key, resolved.refusal, resolved.shared_with) == (ONE, None, ())
+
+    def test_two_profiles_one_process_resolves_with_one_key_are_told_root_first(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """One multiplexed gateway resolves every profile in its own scope: two that
+        hold one key in their settings are said to be one agent, the default first."""
+        root, ops = profile_home(), _profile("ops")
+        set_up_as_agent(ops, "ops")
+        _scope(monkeypatch, root, **{ENV_API_KEY: ONE})
+        assert resolve_key(root).shared_with == ()
+        _scope(monkeypatch, ops, **{ENV_API_KEY: ONE})
+        ops_resolved = resolve_key(ops)
+        assert ops_resolved.refusal is None and [(h.home, h.where) for h in ops_resolved.shared_with] == [(root, "settings")]
+        assert "also holds this key in its settings" in config.shared_note(ops_resolved.shared_with[0])
+        monkeypatch.setenv("HERMES_HOME", str(root))
+        assert [h.home for h in resolve_key(root).shared_with] == [ops]
+
+    def test_a_never_set_up_named_profile_with_the_default_profiles_key_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """What `hermes profile create` makes of the default profile's .env, on one
+        gateway: the default profile resolved the key from its settings, and a
+        named profile never set up as an agent holds the same one. Refused, with
+        the way out if it is meant to be its own agent; nothing starts."""
+        root, clone = profile_home(), _profile("he2")
+        _scope(monkeypatch, root, **{ENV_API_KEY: ONE})
+        assert resolve_key(root).api_key == ONE
+        _scope(monkeypatch, clone, **{ENV_API_KEY: ONE})
+        resolved = resolve_key(clone)
+        assert resolved.api_key is None and resolved.refusal is not None and resolved.copy_of == root
+        assert "the same AgentChat key as the default profile" in resolved.refusal
+        assert "never set up as an AgentChat agent" in resolved.refusal
+        assert "hermes -p he2 agentchat logout" in resolved.refusal
+        assert "run `hermes -p he2 agentchat login` with it" in resolved.refusal
+        assert ONE not in resolved.refusal
+        with pytest.raises(KeyRefused):
+            load_config(hermes_home=clone)
+        set_up_as_agent(clone)
+        shared = resolve_key(clone)
+        assert shared.api_key == ONE and [h.home for h in shared.shared_with] == [root], "set up: one agent, said"
+
+    def test_a_never_set_up_named_profile_alone_keeps_working(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A named profile whose key a container or service exports, never run
+        through the wizard (README's settings table): no evidence of a copy, so it
+        activates as before and is set up by that activation."""
+        named = _profile("bot")
+        _scope(monkeypatch, named, **{ENV_API_KEY: ONE})
+        resolved = resolve_key(named)
+        assert (resolved.api_key, resolved.refusal) == (ONE, None)
+
+    def test_a_settings_key_that_is_gone_is_forgotten(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        root, clone = profile_home(), _profile("he2")
+        _scope(monkeypatch, root, **{ENV_API_KEY: ONE})
+        resolve_key(root)
+        monkeypatch.delenv(ENV_API_KEY)  # the default profile's key is gone (logout)
+        assert resolve_key(root).api_key is None
+        _scope(monkeypatch, clone, **{ENV_API_KEY: ONE})
+        assert resolve_key(clone).refusal is None, "no longer the default profile's key"
+
+    def test_the_hosted_tools_entry_counts_as_set_up(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        clone = _profile("he2")
+        (clone / "config.yaml").write_text(
+            'mcp_servers:\n  agentchat:\n    headers:\n      Authorization: "Bearer ${AGENTCHAT_API_KEY}"\n',
+            encoding="utf-8",
+        )
+        _scope(monkeypatch, clone, **{ENV_API_KEY: ONE})
+        assert resolve_key(clone).api_key == ONE
+
+    def test_the_default_profile_is_never_a_likely_copy(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        _scope(monkeypatch, profile_home(), **{ENV_API_KEY: ONE})
+        resolved = resolve_key()
+        assert (resolved.api_key, resolved.refusal) == (ONE, None)
+
+    def test_a_never_set_up_copy_places_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import _register
+
+        root, clone = profile_home(), _profile("he2")
+        _scope(monkeypatch, root, **{ENV_API_KEY: ONE})
+        resolve_key(root)  # the default profile, resolved first on this gateway
+        _scope(monkeypatch, clone, **{ENV_API_KEY: ONE})
+        touched: list[str] = []
+        monkeypatch.setattr(_register, "_try_start_runtime", lambda *a, **k: touched.append("runtime"))
+        for name in ("_reconcile_soul_anchor", "_reconcile_key_store", "_reconcile_secrets_block", "_reconcile_mcp_registration"):
+            monkeypatch.setattr(_register, name, lambda *_a, n=name: touched.append(n))
+        watcher = _register.ActivationWatcher(hermes_home=clone, profile="he2", gateway_mode=True)
+        assert watcher.try_activate() == "refused"
+        assert touched == []
+        assert not (clone / "SOUL.md").exists() and not (clone / "config.yaml").exists()
+
+    def test_two_key_files_holding_one_key_are_told(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both profiles saved the same key (two logins): both keep working and it
+        is said (doctor fails on it)."""
+        he1, he2 = _profile("he1"), _profile("he2")
+        save_key(ONE, home=he1)
+        save_key(ONE, home=he2)
+        monkeypatch.setenv("HERMES_HOME", str(he2))
         resolved = resolve_key(he2)
         assert resolved.api_key == ONE and resolved.refusal is None
         assert [h.home for h in resolved.shared_with] == [he1]
@@ -223,29 +328,12 @@ class TestCopiesAreNotAdopted:
         cfg = load_config(hermes_home=he2)
         assert cfg is not None and any("profile he1" in n for n in cfg.key_notes), "logged at activation"
 
-    def test_a_dormant_default_does_not_take_a_set_up_named_profile_offline(self) -> None:
-        """The default profile still holds the key in .env from long ago; the
-        named profile is the one that was set up (identity line placed): it
-        keeps working, with the sharing said."""
-        root = profile_home()
-        _env(root, f"{ENV_API_KEY}={ONE}\n")
-        ops = _profile("ops")
-        _env(ops, f"{ENV_API_KEY}={ONE}\n")
-        (ops / "SOUL.md").write_text("<!-- agentchat:start -->\nI am @ops\n<!-- agentchat:end -->\n", encoding="utf-8")
-        resolved = resolve_key(ops)
-        assert resolved.api_key == ONE and resolved.refusal is None
-        assert [h.home for h in resolved.shared_with] == [root]
-
-    def test_a_clone_with_the_tools_entry_is_shared_not_refused(self) -> None:
-        root = profile_home()
-        _env(root, f"{ENV_API_KEY}={ONE}\n")
-        (root / "config.yaml").write_text(
-            'mcp_servers:\n  agentchat:\n    headers:\n      Authorization: "Bearer ${AGENTCHAT_API_KEY}"\n',
-            encoding="utf-8",
-        )
-        clone = _hermes_profile_create(root, "he2")  # --clone: .env and config.yaml
-        resolved = resolve_key(clone)
-        assert resolved.refusal is None and [h.home for h in resolved.shared_with] == [root]
+    def test_two_different_names_are_said(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv(ENV_API_KEY, ONE)
+        monkeypatch.setenv(ENV_API_KEY_LEGACY, TWO)
+        resolved = resolve_key()
+        assert resolved.api_key == ONE and resolved.source == ENV_API_KEY
+        assert any("hold different keys" in n for n in resolved.notes)
 
 
 class TestSharedActivation:
@@ -258,8 +346,9 @@ class TestSharedActivation:
         from agentchatme_hermes import _register
 
         he1, he2 = _profile("he1"), _profile("he2")
-        _env(he1, f"{ENV_API_KEY}={ONE}\n")
-        _env(he2, f"{ENV_API_KEY}={ONE}\n")
+        save_key(ONE, home=he1)
+        save_key(ONE, home=he2)
+        monkeypatch.setenv("HERMES_HOME", str(he2))
         runtime = SimpleNamespace(identity=SimpleNamespace(handle="x"), hermes_home=he2)
         monkeypatch.setattr(_register, "_try_start_runtime", lambda *a, **k: runtime)
         for name in ("_reconcile_soul_anchor", "_reconcile_key_store", "_reconcile_secrets_block", "_reconcile_mcp_registration"):
@@ -294,6 +383,278 @@ class TestRefusedActivation:
         assert not (clone / "SOUL.md").exists()
 
 
+class TestPreV3KeyAtActivation:
+    """A profile set up by a release before v3 (the catalog's August build) has
+    only ``AGENTCHATME_API_KEY``. The hosted tools read ``AGENTCHAT_API_KEY``,
+    which only the key file supplies: once the server has accepted the key, and
+    before the runtime opens a socket, the profile copies it into its key file —
+    the root, and a named profile set up as an agent — unless another profile's
+    key file holds it, under the per-account lock."""
+
+    @staticmethod
+    def _watcher(
+        monkeypatch: pytest.MonkeyPatch, home: Path, *, accepted: bool | None = True
+    ) -> tuple[Any, list[Any], list[str]]:
+        from types import SimpleNamespace
+
+        from agentchatme.integration.account import CheckKeyResult
+
+        from agentchatme_hermes import _register, signup
+
+        started: list[Any] = []
+        checked: list[str] = []
+
+        def check_key(api_key: str, *, api_base: str) -> Any:
+            checked.append(api_key)
+            if accepted is None:
+                raise ConnectionError("unreachable")
+            if accepted:
+                return CheckKeyResult(ok=True, handle="growth-bot")
+            return CheckKeyResult(ok=False, code="UNAUTHORIZED", message="the key was revoked")
+
+        monkeypatch.setattr(signup, "check_key", check_key)
+
+        def start(config: Any, **_kw: Any) -> Any:
+            started.append(config)
+            return SimpleNamespace(identity=SimpleNamespace(handle="x"), hermes_home=home)
+
+        monkeypatch.setattr(_register, "_try_start_runtime", start)
+        for name in ("_reconcile_soul_anchor", "_reconcile_key_store", "_reconcile_secrets_block", "_reconcile_mcp_registration"):
+            monkeypatch.setattr(_register, name, lambda *_a: None)
+        monkeypatch.setattr(key_source, "source_supported", lambda: True)
+        return _register.ActivationWatcher(hermes_home=home, profile=home.name, gateway_mode=True), started, checked
+
+    @pytest.mark.parametrize("named", [False, True], ids=["root", "named"])
+    def test_the_key_is_copied_into_the_key_file_after_the_server_accepted_it(
+        self, monkeypatch: pytest.MonkeyPatch, named: bool
+    ) -> None:
+        home = _profile("growth") if named else profile_home()
+        if named:
+            set_up_as_agent(home, "growth")
+        _scope(monkeypatch, home, **{ENV_API_KEY_LEGACY: ONE})
+        watcher, started, checked = self._watcher(monkeypatch, home)
+        assert watcher.try_activate() == "active"
+        assert checked == [ONE] and [c.api_key for c in started] == [ONE]
+        stored = key_store.read_store(home)
+        assert stored.usable and stored.key is not None
+        assert (stored.key.api_key, stored.key.handle) == (ONE, "growth-bot"), "the handle the server returned"
+
+    @pytest.mark.parametrize("accepted", [False, None], ids=["refused", "unreachable"])
+    def test_a_key_the_server_did_not_accept_is_never_saved(
+        self, monkeypatch: pytest.MonkeyPatch, accepted: bool | None
+    ) -> None:
+        home = profile_home()
+        _scope(monkeypatch, home, **{ENV_API_KEY_LEGACY: ONE})
+        watcher, started, _checked = self._watcher(monkeypatch, home, accepted=accepted)
+        assert watcher.try_activate() == "failed"
+        assert started == [] and key_store.read_store(home).status == "missing"
+
+    def test_a_named_profile_never_set_up_runs_and_adopts_nothing_yet(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """No evidence it is a copy: it activates as before (and is set up by that
+        activation), but does not take the key before the default profile could."""
+        import logging
+
+        named = _profile("bot")
+        _scope(monkeypatch, named, **{ENV_API_KEY_LEGACY: ONE})
+        watcher, started, checked = self._watcher(monkeypatch, named)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes._register"):
+            assert watcher.try_activate() == "active"
+        assert len(started) == 1 and checked == []
+        assert key_store.read_store(named).status == "missing"
+        assert any("not set up as an AgentChat agent before" in r.getMessage() for r in caplog.records)
+
+    def test_a_clone_of_an_adopted_key_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        save_key(ONE)  # the default profile adopted it first
+        clone = _profile("clone")
+        set_up_as_agent(clone)  # a --clone copies SOUL.md too
+        _scope(monkeypatch, clone, **{ENV_API_KEY_LEGACY: ONE})
+        watcher, started, _checked = self._watcher(monkeypatch, clone)
+        with caplog.at_level(logging.ERROR, logger="agentchatme_hermes._register"):
+            assert watcher.try_activate() == "refused"
+        assert started == [] and key_store.read_store(clone).status == "missing"
+        assert any("same AgentChat key that profile default" in r.getMessage() for r in caplog.records)
+
+    def test_taken_between_the_check_and_the_adoption_is_refused_before_any_socket(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Two profiles holding one key: the other one's key file appears after this
+        profile resolved its key. The adoption under the lock sees it, before the
+        runtime starts: this profile never opens the account's socket."""
+        from agentchatme_hermes import credentials
+
+        root = profile_home()
+        clone = _profile("clone")
+        set_up_as_agent(clone)
+        _scope(monkeypatch, clone, **{ENV_API_KEY_LEGACY: ONE})
+        watcher, started, _checked = self._watcher(monkeypatch, clone)
+        real = credentials.adopt_legacy_key
+
+        def root_first(**kw: Any) -> Any:
+            save_key(ONE, home=root)  # the launch profile adopted it meanwhile
+            return real(**kw)
+
+        monkeypatch.setattr(credentials, "adopt_legacy_key", root_first)
+        assert watcher.try_activate() == "refused"
+        assert started == [] and key_store.read_store(clone).status == "missing"
+        assert config.copy_of(clone) == root
+
+    def test_another_profile_adopting_the_same_key_right_now_starts_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import contextlib
+
+        from agentchatme_hermes import leader_lock
+
+        clone = _profile("clone")
+        set_up_as_agent(clone)
+        _scope(monkeypatch, clone, **{ENV_API_KEY_LEGACY: ONE})
+        watcher, started, _checked = self._watcher(monkeypatch, clone)
+
+        @contextlib.contextmanager
+        def busy(_path: Path, **_kw: Any) -> Any:
+            yield "busy"
+
+        monkeypatch.setattr(leader_lock, "held_lock", busy)
+        assert watcher.try_activate() == "failed"
+        assert started == [] and key_store.read_store(clone).status == "missing"
+
+
+class TestAConfigHermesCannotRead:
+    """An unreadable or invalid config.yaml (Hermes' reader raises): activation is
+    refused with the error, said once; register() never raises because of it;
+    doctor fails on it."""
+
+    def test_activation_is_refused_with_the_error(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register, secrets_registration
+
+        save_key(ONE)
+
+        def unreadable() -> bool:
+            raise ValueError("while parsing a block mapping: line 3")
+
+        monkeypatch.setattr(secrets_registration, "inspect_source_enabled", unreadable)
+        monkeypatch.setattr(key_source, "source_supported", lambda: True)
+        started: list[Any] = []
+        monkeypatch.setattr(
+            _register, "_try_start_runtime", lambda c, **_k: started.append(c) or SimpleNamespace(identity=SimpleNamespace(handle="x"))
+        )
+        watcher = _register.ActivationWatcher(hermes_home=profile_home(), profile="default", gateway_mode=True)
+        with caplog.at_level(logging.ERROR, logger="agentchatme_hermes._register"):
+            assert watcher.attempt() == "refused"
+            assert watcher.attempt() == "refused"
+        assert started == []
+        errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert len(errors) == 1 and "could not read this profile's config.yaml" in errors[0]
+        assert "line 3" in errors[0]
+
+    def test_an_unexpected_error_never_escapes_an_attempt(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from agentchatme_hermes import _register
+
+        def boom(**_kw: Any) -> Any:
+            raise RuntimeError("a Hermes helper changed")
+
+        monkeypatch.setattr(_register, "load_config", boom)
+        watcher = _register.ActivationWatcher(hermes_home=profile_home(), profile="default", gateway_mode=True)
+        with caplog.at_level(logging.ERROR, logger="agentchatme_hermes._register"):
+            assert watcher.attempt() == "failed"
+            assert watcher.attempt() == "failed"
+        assert len([r for r in caplog.records if r.levelno >= logging.ERROR]) == 1
+
+    def test_doctor_fails_on_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import secrets_registration
+
+        save_key(ONE)
+
+        def unreadable() -> Any:
+            raise ValueError("while parsing a block mapping: line 3")
+
+        monkeypatch.setattr(secrets_registration, "inspect_block", unreadable)
+        monkeypatch.setattr(key_source, "source_supported", lambda: True)
+        lines: list[tuple[str, str]] = []
+        cli._doctor_secrets_checks(
+            resolve_key(),
+            cmd="hermes agentchat",
+            ok=lambda t: lines.append(("ok", t)),
+            warn=lambda t: lines.append(("warn", t)),
+            fail=lambda t: lines.append(("fail", t)),
+        )
+        assert any(lvl == "fail" and "could not read this profile's config.yaml" in t and "line 3" in t for lvl, t in lines)
+
+
+class TestSplitIdentity:
+    """The socket and the gate act as the key file's agent; the hosted tools as
+    whatever ``AGENTCHAT_API_KEY`` Hermes' MCP client gets. With the key source
+    off, a different key there would be another agent: nothing starts."""
+
+    def _watcher(self, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[Any]]:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register
+
+        started: list[Any] = []
+        monkeypatch.setattr(
+            _register,
+            "_try_start_runtime",
+            lambda config, **_kw: started.append(config) or SimpleNamespace(identity=SimpleNamespace(handle="x"), hermes_home=profile_home()),
+        )
+        for name in ("_reconcile_soul_anchor", "_reconcile_key_store", "_reconcile_secrets_block", "_reconcile_mcp_registration"):
+            monkeypatch.setattr(_register, name, lambda *_a: None)
+        return _register.ActivationWatcher(hermes_home=profile_home(), profile="default", gateway_mode=True), started
+
+    def test_the_source_off_and_another_key_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from agentchatme_hermes import credentials
+
+        save_key(ONE)
+        monkeypatch.setenv(ENV_API_KEY, TWO)
+        monkeypatch.setattr(credentials, "key_bridge", lambda: (False, "secrets.agentchat is disabled"))
+        monkeypatch.setattr(credentials, "source_carries_key", lambda: False)
+        watcher, started = self._watcher(monkeypatch)
+        with caplog.at_level(logging.ERROR, logger="agentchatme_hermes._register"):
+            assert watcher.try_activate() == "refused"
+        assert started == []
+        (line,) = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+        assert "they would act as another agent" in line and "doctor --fix` places secrets.agentchat" in line
+        assert ONE not in line and TWO not in line
+
+    def test_the_source_on_the_key_file_decides(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import credentials
+
+        save_key(ONE)
+        monkeypatch.setenv(ENV_API_KEY, TWO)  # supplied over by the source
+        monkeypatch.setattr(credentials, "key_bridge", lambda: (True, ""))
+        watcher, started = self._watcher(monkeypatch)
+        assert watcher.try_activate() == "active" and [c.api_key for c in started] == [ONE]
+
+    def test_the_source_off_and_the_same_key_starts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import credentials
+
+        save_key(ONE)
+        monkeypatch.setenv(ENV_API_KEY, ONE)
+        monkeypatch.setattr(credentials, "key_bridge", lambda: (False, "no secret sources"))
+        monkeypatch.setattr(credentials, "source_carries_key", lambda: False)
+        watcher, started = self._watcher(monkeypatch)
+        assert watcher.try_activate() == "active" and [c.api_key for c in started] == [ONE]
+
+
 class TestStatusAndDoctorSayItIsAnotherProfilesAgent:
     def _in(self, monkeypatch: pytest.MonkeyPatch, home: Path) -> None:
         from agentchatme_hermes import profile_scope
@@ -315,7 +676,7 @@ class TestStatusAndDoctorSayItIsAnotherProfilesAgent:
         root = profile_home()
         ops = _profile("ops")
         save_key(ONE, home=ops)
-        _env(root, f"{ENV_API_KEY}={ONE}\n")
+        save_key(ONE, home=root)
         scratch = ops / "cache" / "scratch"
         scratch.mkdir(parents=True)
         (scratch / "hermes-snap-abc.sh").write_text(f"declare -x {ENV_API_KEY}={ONE}\n", encoding="utf-8")
@@ -332,14 +693,15 @@ class TestStatusAndDoctorSayItIsAnotherProfilesAgent:
 
     def test_doctor(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
         root = profile_home()
-        _env(root, f"{ENV_API_KEY}={ONE}\n")
+        save_key(ONE, home=root)
         clone = _hermes_profile_create(root, "he2")
         self._in(monkeypatch, clone)
+        monkeypatch.setenv(ENV_API_KEY, ONE)  # the clone's settings: its copied .env
         monkeypatch.setattr(cli, "_hermes_mcp_client_importable", lambda: True)
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         out = capsys.readouterr().out
         assert rc >= 1
-        assert "[fail] This profile's .env holds the same AgentChat key as profile default" in out
+        assert "[fail] This profile's settings hold the same AgentChat key that profile default" in out
         assert "All checks passed" not in out
         assert ONE not in out
 
@@ -366,6 +728,34 @@ class TestLogout:
     def test_logout_with_nothing(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
         assert cli._dispatch_logout(argparse.Namespace()) == 0
         assert "Nothing to clear" in capsys.readouterr().out
+
+    def test_logout_of_a_settings_copy_removes_its_line_through_hermes(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        root = profile_home()
+        save_key(ONE)
+        clone = _profile("he2")
+        hermes = _scope(monkeypatch, clone, **{ENV_API_KEY: ONE})
+        monkeypatch.setattr(cli, "_uninstall_soul_anchor", lambda _identity: None)
+        monkeypatch.setattr(cli, "_uninstall_secrets_registration", lambda: None)
+        monkeypatch.setattr(cli, "_uninstall_mcp_registration", lambda: None)
+        assert resolve_key(clone).refusal is not None
+        assert cli._dispatch_logout(argparse.Namespace()) == 0
+        out = capsys.readouterr().out
+        assert "the profile .env (AGENTCHAT_API_KEY)" in out and "still set" not in out
+        assert hermes.file(clone) == {} and config.copy_of(clone) is None
+        assert key_store.read_store(root).usable, "the original keeps its key"
+
+    def test_logout_says_what_the_environment_still_sets(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _scope(monkeypatch, profile_home())
+        monkeypatch.setenv(ENV_API_KEY, ONE)  # exported, in no .env line
+        monkeypatch.setattr(cli, "_uninstall_soul_anchor", lambda _identity: None)
+        monkeypatch.setattr(cli, "_uninstall_secrets_registration", lambda: None)
+        monkeypatch.setattr(cli, "_uninstall_mcp_registration", lambda: None)
+        assert cli._dispatch_logout(argparse.Namespace()) == 0
+        assert "AGENTCHAT_API_KEY is still set in this process's environment" in capsys.readouterr().out
 
 
 class TestProfileAwareHints:
@@ -585,22 +975,22 @@ class TestDoctorFixKeepsAKeyTheToolsWouldLose:
         from agentchatme_hermes import credentials
 
         root = profile_home()
-        _env(root, f"{ENV_API_KEY}={ONE}\n")
+        hermes = _scope(monkeypatch, root, **{ENV_API_KEY: ONE})
         monkeypatch.setattr(credentials, "key_bridge", lambda: (False, "this Hermes has no secret sources"))
         lines = cli._fix_key(resolve_key(root), handle="alice", api_base="https://api.agentchat.me", home=root)
-        assert lines == [("fail", "fix: the key stays in the profile .env — this Hermes has no secret sources")]
-        assert (root / ".env").read_text(encoding="utf-8") == f"{ENV_API_KEY}={ONE}\n"
+        assert lines == [("fail", "fix: the key stays in this profile's settings — this Hermes has no secret sources")]
+        assert hermes.file(root) == {ENV_API_KEY: ONE} and hermes.removed == []
         assert key_store.read_store(root).status == "missing"
 
 
 class TestDoctorFixMovesTheKey:
-    def test_fix_moves_a_dotenv_key_into_the_key_file(
+    def test_fix_moves_a_settings_key_into_the_key_file(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         from agentchatme_hermes import kit, mcp_registration, secrets_registration
 
         root = profile_home()
-        _env(root, f"KEEP=1\n{ENV_API_KEY}={ONE}\n")
+        hermes = _scope(monkeypatch, root, KEEP="1", **{ENV_API_KEY: ONE})
         fake_client = MagicMock()
         fake_client.get_me.return_value = {"handle": "alice", "status": "active"}
         sdk = types.ModuleType("agentchatme")
@@ -623,10 +1013,97 @@ class TestDoctorFixMovesTheKey:
 
         cli._dispatch_doctor(argparse.Namespace(fix=True))
         out = capsys.readouterr().out
-        assert "[warn] key in the profile .env as AGENTCHAT_API_KEY" in out
-        assert "[ok]   fix: moved the key from the profile .env to" in out
-        assert (root / ".env").read_text(encoding="utf-8") == "KEEP=1\n"
+        assert "[warn] key read from this profile's settings as AGENTCHAT_API_KEY" in out
+        assert "[ok]   fix: moved the key from this profile's settings to" in out
+        assert hermes.file(root) == {"KEEP": "1"}
         record = key_store.read_store(root)
         assert record.usable and record.key is not None and (record.key.api_key, record.key.handle) == (ONE, "alice")
         assert ONE not in out
         assert config.resolve_key(root).source == KEY_SOURCE_STORE
+
+
+class TestTheKeyFileDecidesDoctorLines:
+    """What ``doctor`` says in each case where the key file decides (it cannot
+    see an ``AGENTCHAT_API_KEY`` in .env: the key source supplies the key
+    file's over it)."""
+
+    @staticmethod
+    def _key_lines(resolution: Any) -> list[tuple[str, str]]:
+        lines: list[tuple[str, str]] = []
+        cli._doctor_key_checks(
+            resolution,
+            cmd="hermes agentchat",
+            ok=lambda t: lines.append(("ok", t)),
+            warn=lambda t: lines.append(("warn", t)),
+            fail=lambda t: lines.append(("fail", t)),
+        )
+        return lines
+
+    def test_the_key_file_alone(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        save_key(ONE)
+        monkeypatch.setenv(ENV_API_KEY, TWO)  # invisible to the decision
+        (line,) = self._key_lines(resolve_key())
+        assert line[0] == "ok" and "the key file decides which agent this profile is" in line[1]
+        assert "AGENTCHAT_API_KEY in the profile .env or the environment is not used" in line[1]
+
+    def test_a_leftover_pre_v3_line_is_removed_by_fix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = profile_home()
+        save_key(ONE)
+        hermes = _scope(monkeypatch, root, **{ENV_API_KEY_LEGACY: ONE})
+        lines = self._key_lines(resolve_key())
+        assert ("warn" in {lvl for lvl, _ in lines}) and any("pre-v3 name" in t and "doctor --fix` removes it" in t for _, t in lines)
+        fixed = cli._fix_key(resolve_key(), handle="alice", api_base="https://api.agentchat.me", home=root)
+        assert fixed == [("ok", "fix: removed AGENTCHATME_API_KEY from the profile .env")]
+        assert hermes.file(root) == {}
+
+    def test_an_exported_pre_v3_key_is_said_not_removed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = profile_home()
+        save_key(ONE)
+        _scope(monkeypatch, root)
+        monkeypatch.setenv(ENV_API_KEY_LEGACY, ONE)  # set by the service, in no .env line
+        fixed = cli._fix_key(resolve_key(), handle="alice", api_base="https://api.agentchat.me", home=root)
+        assert fixed == [(
+            "warn",
+            "fix: AGENTCHATME_API_KEY is not in the profile .env — it is set in the environment (the shell or "
+            "the service): unset it there",
+        )]
+
+    def test_a_different_pre_v3_key_is_said_and_left(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = profile_home()
+        save_key(ONE)
+        hermes = _scope(monkeypatch, root, **{ENV_API_KEY_LEGACY: TWO})
+        lines = self._key_lines(resolve_key())
+        assert any(lvl == "warn" and "holds a different key; it is not used" in t for lvl, t in lines)
+        assert cli._fix_key(resolve_key(), handle="alice", api_base="https://api.agentchat.me", home=root) == []
+        assert hermes.file(root) == {ENV_API_KEY_LEGACY: TWO}
+
+    def test_the_tools_would_act_as_another_agent_without_the_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """secrets.agentchat missing: Hermes' MCP client takes AGENTCHAT_API_KEY
+        from the settings, and a different key there is another agent."""
+        from agentchatme_hermes import secrets_registration
+
+        save_key(ONE)
+        monkeypatch.setenv(ENV_API_KEY, TWO)
+        monkeypatch.setattr(key_source, "source_supported", lambda: True)
+        monkeypatch.setattr(secrets_registration, "inspect_block", lambda: "missing")
+        monkeypatch.setattr(cli, "_hermes_strips_key_from_commands", lambda: None)
+        lines: list[tuple[str, str]] = []
+        cli._doctor_secrets_checks(
+            resolve_key(),
+            cmd="hermes agentchat",
+            ok=lambda t: lines.append(("ok", t)),
+            warn=lambda t: lines.append(("warn", t)),
+            fail=lambda t: lines.append(("fail", t)),
+        )
+        assert any(lvl == "fail" and "they would act as another agent" in t for lvl, t in lines)
+        assert TWO not in " ".join(t for _, t in lines)
+        monkeypatch.setenv(ENV_API_KEY, ONE)
+        lines.clear()
+        cli._doctor_secrets_checks(
+            resolve_key(),
+            cmd="hermes agentchat",
+            ok=lambda t: lines.append(("ok", t)),
+            warn=lambda t: lines.append(("warn", t)),
+            fail=lambda t: lines.append(("fail", t)),
+        )
+        assert not any("another agent" in t for _, t in lines)

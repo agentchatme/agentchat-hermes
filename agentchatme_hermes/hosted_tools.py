@@ -24,30 +24,27 @@ A parked server
 Hermes' MCP client tries a server's first connection three times; when they
 all fail (the gateway started while api.agentchat.me could not be reached: a
 reboot before the network, a DNS or provider outage) it *parks* the server:
-its tools are dropped from the registry and the server waits for a reconnect
-request, or for its own timed self-probe (300 s, and on Hermes ``main``
-doubling per failed probe up to an hour). Nothing in Hermes connects it when
-the network comes back, while this plugin's socket reconnects on its own and
-keeps receiving wakes, so every wake ended ``tools_unavailable`` until the
-gateway was restarted. :func:`request_reconnect` asks Hermes for the
-reconnect (``reconnect_mcp_server``, what Hermes' own connectors call after a
-re-authorization) when the server is parked: when the runtime activates, and
-when a turn finds the tools missing, never more often than
-:data:`RECONNECT_FIRST_INTERVAL_S` and less often while it does not help. A
-connected or connecting server is never asked (a reconnect tears its session
-down). :func:`hosted_server_state` is Hermes' own reading of the server
-(``hermes mcp list``'s), and the log line and ``doctor`` name the cause it
-gives.
+its tools are dropped from the registry and Hermes probes it again on its
+own, after 5 minutes and then at doubling intervals up to an hour
+(``tools/mcp_tool.py`` ``_PARKED_RETRY_INTERVAL`` / ``_PARKED_PROBE_BACKOFF_MAX``).
+Hermes has no public way for a plugin to ask for a reconnect, so this plugin
+does not: while the server is parked every wake ends ``tools_unavailable``,
+and the log line and ``doctor`` name the cause and the remedy — ``/reload-mcp``
+in a chat this gateway serves, or ``hermes gateway restart``.
+:func:`hosted_server_state` is Hermes' own reading of the server (``hermes
+mcp list``'s), read only.
 """
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Literal, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 from .turn import MCP_SERVER_NAME, MCP_TOOL_PREFIX
+
+if TYPE_CHECKING:
+    import threading
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +60,13 @@ HOSTED_TOOLS_POLL_S = 0.5
 
 Probe = Callable[[], Optional[list[str]]]
 
-# A reconnect request for a parked server: at most one per this interval per
-# profile, doubling while the server stays parked after one, up to the cap.
-RECONNECT_FIRST_INTERVAL_S = 60.0
-RECONNECT_MAX_INTERVAL_S = 1800.0
+# What a parked server waits for on its own (Hermes' self-probe), and what
+# brings it back now: said in the log line and by ``doctor``.
+PARKED_REMEDY = (
+    "Hermes probes it again on its own after 5 minutes, then at longer intervals up to an "
+    "hour; to reconnect it now, send /reload-mcp in a chat this gateway serves, or run "
+    "`hermes gateway restart`"
+)
 
 
 @dataclass(frozen=True)
@@ -89,7 +89,6 @@ class ServerState:
 
 
 StateProbe = Callable[[], Optional[ServerState]]
-Reconnect = Callable[[str], bool]
 
 
 def hosted_server_state() -> ServerState | None:
@@ -119,118 +118,6 @@ def hosted_server_state() -> ServerState | None:
     return ServerState(status="missing")
 
 
-def _hermes_reconnect(name: str) -> bool:
-    from tools.mcp_tool_loop import reconnect_mcp_server
-
-    return bool(reconnect_mcp_server(name))
-
-
-ReconnectOutcome = Literal["requested", "not_parked", "too_soon", "no_connection", "unavailable"]
-
-
-@dataclass(frozen=True)
-class ReconnectResult:
-    """``requested``: Hermes was asked to reconnect the parked server.
-    ``not_parked``: connected, connecting, disabled, missing: nothing asked.
-    ``too_soon``: asked less than the interval ago. ``no_connection``: Hermes
-    holds no parked connection to wake (only a restart connects it).
-    ``unavailable``: this Hermes has no reconnect request, or the state is not
-    known."""
-
-    outcome: ReconnectOutcome
-    state: ServerState | None
-    asked_ago_s: float | None = None
-
-
-@dataclass
-class _Gate:
-    last_at: float | None = None
-    interval: float = RECONNECT_FIRST_INTERVAL_S
-    requests: int = 0
-
-
-_gates: dict[str, _Gate] = {}
-_gates_lock = threading.Lock()
-
-
-def reconnect_record(key: str, *, now: Callable[[], float] | None = None) -> dict[str, object]:
-    """The reconnect requests made for ``key`` (the health record's view)."""
-    clock = now or time.monotonic
-    with _gates_lock:
-        gate = _gates.get(key)
-        if gate is None or gate.last_at is None:
-            return {"requests": 0 if gate is None else gate.requests, "asked_ago_s": None}
-        return {"requests": gate.requests, "asked_ago_s": round(clock() - gate.last_at, 1)}
-
-
-def request_reconnect(
-    *,
-    key: str,
-    reason: str,
-    state: ServerState | None = None,
-    state_probe: StateProbe | None = None,
-    reconnect: Reconnect | None = None,
-    now: Callable[[], float] | None = None,
-    label: str = "",
-) -> ReconnectResult:
-    """Ask Hermes to reconnect the hosted tools server when it is parked.
-
-    ``key`` names the profile (its home); the interval is per key. A server
-    that is connected resets it. Never raises."""
-    clock = now or time.monotonic
-    if state is None:
-        state = (state_probe or hosted_server_state)()
-    if state is None:
-        return ReconnectResult("unavailable", None)
-    with _gates_lock:
-        gate = _gates.setdefault(key, _Gate())
-        if state.status == "connected":
-            gate.last_at, gate.interval = None, RECONNECT_FIRST_INTERVAL_S
-            return ReconnectResult("not_parked", state)
-        if not state.parked:
-            return ReconnectResult("not_parked", state)
-        at = clock()
-        if gate.last_at is not None and at - gate.last_at < gate.interval:
-            return ReconnectResult("too_soon", state, at - gate.last_at)
-        if gate.last_at is not None:
-            # Asked before and still parked: wait longer before the next one.
-            gate.interval = min(gate.interval * 2, RECONNECT_MAX_INTERVAL_S)
-        gate.last_at = at
-        gate.requests += 1
-    if not label:
-        label = _profile_label()
-    try:
-        asked = (reconnect or _hermes_reconnect)(MCP_SERVER_NAME)
-    except Exception as exc:
-        _warn_once(f"hosted_tools: Hermes' MCP reconnect request is not available ({exc!r})")
-        return ReconnectResult("unavailable", state)
-    if not asked:
-        logger.warning(
-            "agentchat%s: Hermes holds no parked mcp_servers.agentchat connection to reconnect (%s) — "
-            "the hosted tools come back after `hermes gateway restart`",
-            label,
-            state.error or "no error recorded",
-        )
-        return ReconnectResult("no_connection", state)
-    logger.info(
-        "agentchat%s: asked Hermes to reconnect mcp_servers.agentchat (%s; parked after: %s)",
-        label,
-        reason,
-        state.error or "no error recorded",
-    )
-    return ReconnectResult("requested", state, 0.0)
-
-
-def _profile_label() -> str:
-    """`` profile=NAME`` for the profile in scope, for a log line; ``""`` when unknown."""
-    try:
-        from .profile_scope import profile_label, resolve_hermes_home
-
-        return f" profile={profile_label(resolve_hermes_home())}"
-    except Exception:
-        return ""
-
-
 def _cmd() -> str:
     """``hermes agentchat`` for the profile in scope (``hermes -p NAME agentchat``)."""
     try:
@@ -242,7 +129,7 @@ def _cmd() -> str:
         return "hermes agentchat"
 
 
-def describe_cause(state: ServerState | None, reconnect: ReconnectResult | None = None) -> str:
+def describe_cause(state: ServerState | None) -> str:
     """Why the hosted tools are not registered, in words, with what to do."""
     cmd = _cmd()
     if state is None:
@@ -252,20 +139,7 @@ def describe_cause(state: ServerState | None, reconnect: ReconnectResult | None 
         )
     if state.parked:
         why = f" ({state.error})" if state.error else ""
-        if reconnect is not None and reconnect.outcome in ("requested", "too_soon"):
-            asked = (
-                "a reconnect was just requested"
-                if reconnect.outcome == "requested"
-                else f"a reconnect was requested {reconnect.asked_ago_s or 0:.0f}s ago"
-            )
-            return (
-                f"Hermes parked mcp_servers.agentchat after its connection failed{why}; {asked} — if the "
-                "tools do not come back, run `hermes gateway restart`"
-            )
-        return (
-            f"Hermes parked mcp_servers.agentchat after its connection failed{why} — run "
-            "`hermes gateway restart`"
-        )
+        return f"Hermes parked mcp_servers.agentchat after its connection failed{why}: {PARKED_REMEDY}"
     if state.status == "connecting":
         return "Hermes is still connecting mcp_servers.agentchat"
     if state.status == "disabled":
@@ -342,9 +216,7 @@ def wait_for_hosted_tools(
     now: Callable[[], float] | None = None,
     stopped: threading.Event | None = None,
     label: str = "turn",
-    key: str | None = None,
     state_probe: StateProbe | None = None,
-    reconnect: Reconnect | None = None,
 ) -> bool | None:
     """Hold until the hosted tools are registered, at most ``timeout_s``.
 
@@ -352,12 +224,10 @@ def wait_for_hosted_tools(
     outside Hermes), ``False`` after the bound, ``None`` when ``stopped``
     was set meanwhile (the invoker is stopping — its leader lease is gone,
     nothing may start). Logs once when it starts waiting and once when the
-    wait ends, so a slow start is visible. When Hermes has parked the server
-    (``key`` given: the profile), a reconnect is requested first
-    (:func:`request_reconnect`), so the tools can come back within this hold;
-    the closing line names the cause Hermes gives. The probes and the clock
-    are resolved at call time (tests swap them); with ``stopped`` the poll
-    waits on the event, so a stop ends the hold at once.
+    wait ends, so a slow start is visible; the closing line names the cause
+    Hermes gives (a parked server: :data:`PARKED_REMEDY`). The probes and
+    the clock are resolved at call time (tests swap them); with ``stopped``
+    the poll waits on the event, so a stop ends the hold at once.
     """
     probe = probe or hosted_tool_names
     state_probe = state_probe or hosted_server_state
@@ -378,15 +248,11 @@ def wait_for_hosted_tools(
         return True
     started = now()
     state = state_probe()
-    asked: ReconnectResult | None = None
-    if key is not None and state is not None and state.parked:
-        asked = request_reconnect(key=key, reason=f"a {label} is waiting for the tools", state=state, reconnect=reconnect)
     if state is not None and state.parked:
         logger.info(
             "AgentInvoker: hosted AgentChat tools not registered — Hermes parked mcp_servers.agentchat "
-            "(%s)%s; holding the %s up to %.0fs",
+            "(%s); holding the %s up to %.0fs",
             state.error or "its connection failed",
-            "; a reconnect was requested" if asked is not None and asked.outcome == "requested" else "",
             label,
             timeout_s,
         )
@@ -400,18 +266,13 @@ def wait_for_hosted_tools(
     while True:
         elapsed = now() - started
         if elapsed >= timeout_s:
-            final = state_probe()
-            if key is not None and asked is None and final is not None and final.parked:
-                asked = request_reconnect(
-                    key=key, reason=f"a {label} is waiting for the tools", state=final, reconnect=reconnect
-                )
             logger.warning(
                 "AgentInvoker: hosted AgentChat tools still not registered after %.0fs — the %s "
                 "is not started: nothing is recorded, the cards stay on the tray and the next "
                 "wake tries again. Cause: %s.",
                 elapsed,
                 label,
-                describe_cause(final, asked),
+                describe_cause(state_probe()),
             )
             return False
         sleep(min(poll_s, max(0.0, timeout_s - elapsed)))

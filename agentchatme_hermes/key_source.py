@@ -18,9 +18,13 @@ Hermes' public plugin API).
   values in that profile's own scope, out of the shared process environment.
   ``override_existing`` is on, so a stale ``.env`` line or an exported
   variable never decides which agent the tools act as. A profile whose key
-  is a copy of another profile's (``config.copy_owner``: a cloned profile)
-  gets the variable *empty*, over the copy in its ``.env``, so its hosted
-  tools fail closed instead of acting as the other agent.
+  is a copy of another profile's — its key file names that profile
+  (``--clone-all``), or its settings hold a key that profile's key file holds
+  (a ``.env`` copied by ``hermes profile create``, found by
+  :func:`.config.resolve_key` in this process, :func:`.config.copy_of`) —
+  gets the variable *empty*, over the copy, so its hosted tools fail closed
+  instead of acting as the other agent. ``fetch`` reads only this plugin's
+  own key files and that finding, never a ``.env`` or a setting.
 * The same ``secrets.agentchat`` block carries ``api_key_env:
   AGENTCHAT_API_KEY``. Hermes reads a ``*_key_env`` field anywhere in a
   profile's ``config.yaml`` (outside ``mcp_servers``) as naming a credential,
@@ -47,7 +51,7 @@ from pathlib import Path
 from typing import Any
 
 from . import key_store
-from .config import ENV_API_KEY, cli_prefix, copy_owner
+from .config import ENV_API_KEY, cli_prefix, copy_of
 from .profile_scope import profile_label, resolve_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -56,6 +60,17 @@ SOURCE_NAME = "agentchat"
 SOURCE_LABEL = "AgentChat key file"
 # The field Hermes reads as "this variable is a credential" (any ``*_key_env``).
 KEY_ENV_FIELD = "api_key_env"
+
+
+def _supplies_for(home: Path) -> bool:
+    """Does the source have something to say for ``home``: a key file it may
+    use, or a copy of another profile's key it masks (see ``fetch``)?"""
+    read = key_store.read_store(home)
+    if read.usable:
+        return True
+    if read.status == "copied" and read.origin_home is not None:
+        return True
+    return copy_of(home) is not None
 
 
 def secrets_section() -> dict[str, Any]:
@@ -103,7 +118,7 @@ def build_key_source() -> Any | None:
                 return False
             try:
                 home = resolve_hermes_home()
-                return key_store.read_store(home).usable or copy_owner(home) is not None
+                return _supplies_for(home)
             except Exception:
                 return False
 
@@ -115,7 +130,7 @@ def build_key_source() -> Any | None:
                 if read.usable and read.key is not None:
                     result.secrets = {ENV_API_KEY: read.key.api_key}
                     return result
-                owner = copy_owner(home)
+                owner = read.origin_home if read.status == "copied" else copy_of(home)
                 if owner is not None:
                     # This profile holds a copy of another profile's key (a
                     # cloned profile). Its hosted tools must not act as that
@@ -134,12 +149,6 @@ def build_key_source() -> Any | None:
                         f"({read.path}); run `{cli_prefix(home)} login`"
                     )
                     result.error_kind = ErrorKind.NOT_CONFIGURED
-                elif read.status == "copied":
-                    result.error = (
-                        f"the AgentChat key file of profile {profile_label(home)} is a copy of "
-                        f"profile {profile_label(read.origin_home or home)}'s; not used"
-                    )
-                    result.error_kind = ErrorKind.REF_INVALID
                 else:
                     result.error = read.detail or f"{read.path} cannot be used"
                     result.error_kind = ErrorKind.REF_INVALID
@@ -196,22 +205,3 @@ def register_key_source(ctx: Any) -> str:
         logger.warning("agentchat plugin: Hermes refused the key source (see the line above)")
         return "failed"
     return "registered"
-
-
-def supplied_by_us(name: str = ENV_API_KEY) -> bool:
-    """Was the process environment's value of ``name`` supplied by this source?
-
-    Hermes records which source supplied a variable (``agent.secret_scope.
-    secret_source_label``, public). ``False`` when it cannot tell.
-    """
-    try:
-        from agent.secret_scope import secret_source_label
-    except Exception:
-        return False
-    try:
-        suffix = str(secret_source_label(name) or "")
-    except Exception:
-        return False
-    # The label when Hermes finds the registration, the bare name when it does
-    # not (a profile-scoped registration looked up without its scope).
-    return f"(from {SOURCE_LABEL})" in suffix or f"(from {SOURCE_NAME})" in suffix
