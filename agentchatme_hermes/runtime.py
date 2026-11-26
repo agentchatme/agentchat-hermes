@@ -12,11 +12,13 @@ bound to that profile's own key, home, SOUL.md and leader lock. Owns:
   and the texts all go through it.
 * The served texts in use (from the SDK kit's ``TextsCache``: a one-shot
   load at start, then the receive loop's daily-refreshed cache), with
-  listeners for the SOUL.md identity line.
-* The manual (:mod:`.manual`): the leader's receive loop keeps it current
-  (the kit's ``ManualSync``); a gateway runtime that is not the leader syncs it
-  once, on a daemon thread, after the start-time texts load; any other process
-  never writes it.
+  listeners for the SOUL.md identity line when ``live_texts`` is on (by
+  default the line is this release's: :func:`.texts.identity_text`).
+* The manual (:mod:`.manual`), with ``live_texts`` on: the leader's receive
+  loop keeps it current (the kit's ``ManualSync``); a gateway runtime that is
+  not the leader syncs it once, on a daemon thread, after the start-time
+  texts load; any other process never writes it. By default it is this
+  release's copy and nothing syncs it.
 * The :class:`~.receiver.Receiver` (the kit's receive loop on a supervised
   thread: socket, texts, wakes, gate, turns), leader only.
 * The :class:`AgentInvoker` (the loop's Hermes callbacks: model call, turn), leader only.
@@ -44,9 +46,7 @@ from .profile_scope import (
 )
 from .receiver import Receiver
 from .state import LEGACY_INVITES_FILENAME, state_dir_for
-from .texts import load_texts, remove_legacy_cache, texts_cache
-from .turn import identity_line as render_identity_line
-from .turn import identity_line_template as render_identity_line_template
+from .texts import IdentityText, identity_text, load_texts, remove_legacy_cache, texts_cache
 from .types import AgentIdentity
 from .ws_health import HealthBoard, health_path_for
 
@@ -196,15 +196,11 @@ class Runtime:
         with self._texts_lock:
             return self._texts_now
 
-    def identity_line(self) -> str | None:
-        """The served identity line for this agent (served spelled for Hermes); ``None`` without texts."""
-        texts = self.texts
-        return render_identity_line(texts) if texts is not None else None
-
-    def identity_line_template(self) -> str | None:
-        """The served template (``<handle>`` unfilled); ``None`` without texts."""
-        texts = self.texts
-        return render_identity_line_template(texts) if texts is not None else None
+    def identity_text(self) -> IdentityText:
+        """The identity line this agent places in SOUL.md (:func:`.texts.identity_text`:
+        this release's, or with ``live_texts`` on the served texts in use)."""
+        handle = self._identity.handle if self._identity is not None else None
+        return identity_text(self.texts, handle=handle, home=self._hermes_home)
 
     def on_texts(self, callback: Callable[[Texts], None]) -> None:
         """Run ``callback(texts)`` now if texts are loaded, and whenever they change."""

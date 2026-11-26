@@ -12,10 +12,40 @@ from fake_keys import PREFIX, api_key
 
 from agentchatme_hermes import placement
 
+# The served manual and identity line, kept current: the plugin setting
+# live_texts on (tests/conftest.py ``live_texts``). This release's texts, the
+# default, are tests/test_pinned_texts.py.
+pytestmark = pytest.mark.usefixtures("live_texts")
+
 if TYPE_CHECKING:
     from pathlib import Path
 
 LINE = "I am @alice on AgentChat (api.agentchat.me). Peers reach me there."
+
+
+def _served_texts() -> Texts:
+    """Served texts whose identity line is :data:`LINE`, announcing the bundled
+    manual (placed from the bundled bytes: no download)."""
+    import hashlib
+
+    from agentchatme_hermes import manual
+
+    bundle = manual.BUNDLED_MANUAL_PATH.read_bytes()
+    announced = {
+        "url": "https://agentchat.me/skill.md",
+        "version": manual.bundled_version(),
+        "sha256": hashlib.sha256(bundle).hexdigest(),
+    }
+    return Texts.model_validate(
+        {
+            "version": "1",
+            "manual": announced,
+            "wake_instruction": "w",
+            "invite_prompt": "i",
+            "identity_line": LINE,
+            "identity_line_template": "I am @<handle> on AgentChat (api.agentchat.me). Peers reach me there.",
+        }
+    )
 
 
 def read_anchor_handle(*, soul_path: Path) -> str | None:
@@ -68,7 +98,7 @@ class TestAnchorAndSkill:
         assert "## Be reachable" in text
 
 
-class TestResolveIdentityLine:
+class TestResolveTexts:
     def _texts(self) -> Texts:
         return Texts.model_validate(
             {
@@ -84,6 +114,8 @@ class TestResolveIdentityLine:
     def test_served_line_is_placed_as_served(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        from agentchatme_hermes.texts import identity_text
+
         seen: dict[str, Any] = {}
 
         def fake_load(client: Any, *, state_dir: Path, **_kw: Any) -> Texts:
@@ -91,16 +123,17 @@ class TestResolveIdentityLine:
             return self._texts()
 
         monkeypatch.setattr(placement, "load_texts", fake_load)
-        line = placement.resolve_identity_line(
+        texts = placement.resolve_texts(
             api_key=api_key("k"), api_base="https://api.example.test", hermes_home=tmp_path
         )
+        line = identity_text(texts, handle="alice", home=tmp_path).line
         assert line == "I am @alice on AgentChat. I call mcp__agentchat__agentchat_inbox first."
         assert seen["state_dir"].parent == tmp_path / "agentchat-state"
 
     def test_nothing_available_is_none(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         monkeypatch.setattr(placement, "load_texts", lambda client, *, state_dir, **_kw: None)
         assert (
-            placement.resolve_identity_line(
+            placement.resolve_texts(
                 api_key="k", api_base="https://api.example.test", hermes_home=tmp_path
             )
             is None
@@ -278,7 +311,7 @@ class TestMcpStep:
         monkeypatch.setattr(secrets_registration, "install_block", lambda: "added")
         steps = placement.place_identity_and_tools(
             handle="alice",
-            identity_line=LINE,
+            texts=_served_texts(),
             api_base="https://api.example.test",
             soul_path=tmp_path / "SOUL.md",
             tools_decision="yes",
@@ -340,7 +373,7 @@ class TestNothingSecretLeaks:
         monkeypatch.setattr(secrets_registration, "install_block", lambda: "added")
         steps: list[Any] = placement.place_identity_and_tools(
             handle="alice",
-            identity_line=LINE,
+            texts=_served_texts(),
             api_base="https://api.example.test",
             soul_path=tmp_path / "SOUL.md",
         )

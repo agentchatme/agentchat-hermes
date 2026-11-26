@@ -1,0 +1,211 @@
+name: refresh-texts
+
+# Keeps the texts this release bundles at what AgentChat serves: the manual
+# (agentchatme_hermes/skills/agentchat/SKILL.md) and the identity-line template
+# (agentchatme_hermes/texts_snapshot.json), which a Hermes profile reads by
+# default (the plugin setting live_texts off). Once a day, and on dispatch,
+# scripts/refresh_bundled_texts.py takes them from the server (the manual
+# checked against the announced version and sha256); when they differ it opens
+# one pull request, or updates the open one, and leaves it. CI runs on it like
+# on any pull request. It is merged only as part of a release, right before the
+# tag: an install from git without --ref tracks main, and Hermes' update (and
+# plugins.auto_apply) pulls it, so a merge would change those users' texts
+# without a release. A run that fails opens an issue (or comments on the open
+# one); the next good run closes it.
+#
+# Set up by the repository owner; until then the job skips with a notice:
+# - secret AGENTCHAT_TEXTS_API_KEY: an AgentChat agent's API key (any agent:
+#   the texts are the same for every agent). Keep that agent in the analytics
+#   exclusion list: this job calls GET /v1/texts with it once a day.
+# - variable TEXTS_REFRESH_APP_CLIENT_ID and secret TEXTS_REFRESH_APP_KEY: a
+#   GitHub App installed on this repository with Contents and Pull requests
+#   read and write. Its token pushes the branch and opens the pull request: a
+#   pull request opened with the workflow's own GITHUB_TOKEN starts no CI.
+# RUNBOOK.md § Refreshing the bundled texts.
+#
+# Secrets: the checkout keeps no credentials; the AgentChat key is in the
+# refresh step's environment only; the App token is made after the refresh,
+# only when there is something to propose, and is given to the push step alone.
+#
+# Actions are pinned to commits (the version is in the trailing comment).
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refresh-texts
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      ready: ${{ steps.gate.outputs.ready }}
+    steps:
+      - name: Set up?
+        id: gate
+        env:
+          TEXTS_KEY: ${{ secrets.AGENTCHAT_TEXTS_API_KEY }}
+          APP_CLIENT_ID: ${{ vars.TEXTS_REFRESH_APP_CLIENT_ID }}
+          APP_KEY: ${{ secrets.TEXTS_REFRESH_APP_KEY }}
+        run: |
+          missing=()
+          [ -n "$TEXTS_KEY" ] || missing+=("secret AGENTCHAT_TEXTS_API_KEY")
+          [ -n "$APP_CLIENT_ID" ] || missing+=("variable TEXTS_REFRESH_APP_CLIENT_ID")
+          [ -n "$APP_KEY" ] || missing+=("secret TEXTS_REFRESH_APP_KEY")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::notice::refresh-texts is not set up, so it was skipped (missing: ${missing[*]}). RUNBOOK.md § Refreshing the bundled texts says how to set it up."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          python-version: "3.12"
+
+      # The package's own declared range (pyproject.toml), as ci.yml installs
+      # it: the repository keeps no lock or constraints file to install from.
+      - name: Install the package
+        if: steps.gate.outputs.ready == 'true'
+        run: python -m pip install -e .
+
+      - name: Refresh the bundled texts
+        if: steps.gate.outputs.ready == 'true'
+        id: refresh
+        env:
+          AGENTCHAT_API_KEY: ${{ secrets.AGENTCHAT_TEXTS_API_KEY }}
+        run: python scripts/refresh_bundled_texts.py
+
+      - name: Only the bundled texts changed
+        if: steps.gate.outputs.ready == 'true' && steps.refresh.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          allowed=$'agentchatme_hermes/skills/agentchat/SKILL.md\nagentchatme_hermes/texts_snapshot.json\ntests/test_skill_bundle.py'
+          unexpected=$(git status --porcelain --untracked-files=all | cut -c4- | grep -vxF "$allowed" || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::the refresh changed files other than the bundled texts: $unexpected"
+            exit 1
+          fi
+
+      - name: App token
+        if: steps.gate.outputs.ready == 'true' && steps.refresh.outputs.changed == 'true'
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.TEXTS_REFRESH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.TEXTS_REFRESH_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open or update the pull request (never merged here)
+        if: steps.gate.outputs.ready == 'true' && steps.refresh.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          MANUAL: ${{ steps.refresh.outputs.manual }}
+          SUMMARY: ${{ steps.refresh.outputs.summary }}
+        run: |
+          set -euo pipefail
+          branch=automation/refresh-texts
+          bot="${APP_SLUG}[bot]"
+          bot_id=$(gh api "/users/${bot}" --jq .id)
+          git config user.name "$bot"
+          git config user.email "${bot_id}+${bot}@users.noreply.github.com"
+          git switch -C "$branch"
+          git add agentchatme_hermes/skills/agentchat/SKILL.md agentchatme_hermes/texts_snapshot.json tests/test_skill_bundle.py
+          git commit -q -m "Bundle the served texts: manual ${MANUAL}"
+          # The branch is the bot's own, rebuilt from main on every run: pushed
+          # again only when this tree differs from what it holds.
+          if git fetch -q origin "refs/heads/${branch}:refs/remotes/origin/${branch}" 2>/dev/null \
+            && [ "$(git rev-parse "HEAD^{tree}")" = "$(git rev-parse "origin/${branch}^{tree}")" ]; then
+            echo "origin/${branch} already holds these texts on this main: not pushed again"
+          else
+            git push -q --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${branch}"
+          fi
+          title="Bundle the served texts: manual ${MANUAL}"
+          body="$RUNNER_TEMP/pr-body.md"
+          cat > "$body" <<EOF
+          ## What changes
+
+          The texts this release bundles, brought to what AgentChat serves now by \`scripts/refresh_bundled_texts.py\` (the refresh-texts workflow): ${SUMMARY}. Profiles with \`live_texts\` off (the default) read them from the next release on.
+
+          **Do not merge outside a release.** An install from git without \`--ref\` tracks \`main\`, and Hermes' update (and \`plugins.auto_apply\`) pulls it, so merging changes those users' texts at once. Merge this right before the release tag (RUNBOOK § Refreshing the bundled texts).
+
+          ## Verification
+
+          - Tests: CI on this pull request (ruff, mypy, pytest on Python 3.9 to 3.13); \`tests/test_skill_bundle.py\` pins the new files
+          - Review: the lead reviews and merges it as part of the next release
+          - Live check: lab round before the release tag
+
+          ## Risk and rollback
+
+          Text only: no code, no dependency, no capability, so Hermes' own update can apply the release unattended. Revert this pull request to go back.
+          EOF
+          number=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$number" ]; then
+            gh pr create --base main --head "$branch" --title "$title" --body-file "$body"
+          else
+            gh pr edit "$number" --title "$title" --body-file "$body"
+          fi
+
+  # The same open / comment / close pattern as hermes-main.yml's report (its
+  # script is written for that workflow's legs and wording, so it is not reused).
+  report:
+    name: Open, update or close the refresh issue
+    needs: refresh
+    if: ${{ !cancelled() && needs.refresh.outputs.ready == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RESULT: ${{ needs.refresh.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="refresh-texts: the bundled texts could not be refreshed"
+          lookup_ok=1
+          issue=$(gh api -X GET "repos/$GH_REPO/issues" -f state=open -f creator='github-actions[bot]' -f per_page=100 --paginate \
+            | jq -rs --arg title "$title" '[.[][] | select(.pull_request == null and .title == $title) | .number] | first // empty') \
+            || { echo "::warning::could not look up the open refresh issue"; issue=""; lookup_ok=0; }
+          if [ "$RESULT" = success ]; then
+            if [ "$lookup_ok" = 0 ]; then
+              echo "::error::the refresh ran, but the open refresh issue could not be looked up to close it"
+              exit 1
+            fi
+            if [ -n "$issue" ]; then
+              gh issue comment "$issue" --body "The refresh ran again in $RUN_URL. Closing."
+              gh issue close "$issue" --reason completed
+            fi
+            exit 0
+          fi
+          body="$RUNNER_TEMP/refresh-issue.md"
+          {
+            echo "The refresh-texts run ended \`$RESULT\`: the bundled manual and identity line were not brought to what AgentChat serves, or the pull request was not opened. Read the run: $RUN_URL"
+            echo
+            echo "\`refresh refused\` in the refresh step is the script's reason (nothing was written); the App token and push steps are the GitHub App's setup (RUNBOOK § Refreshing the bundled texts). The next good run closes this issue."
+          } > "$body"
+          if [ -n "$issue" ]; then
+            gh issue comment "$issue" --body-file "$body"
+          else
+            gh issue create --title "$title" --body-file "$body"
+          fi

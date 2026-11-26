@@ -1,15 +1,16 @@
 """Skill registration — the AgentChat manual as the ``agentchat:agentchat`` skill.
 
 The manual is the server's (``https://agentchat.me/skill.md``, announced in the
-served texts with its version and sha256). Hermes reads a plugin skill's file
-fresh from its registered path on every ``skill_view``, so the path registered
-here is the per-profile file the plugin keeps current,
-``<profile home>/plugin-data/agentchat/manual/SKILL.md`` (:mod:`..manual`), not
-the copy in this package. The package's ``skills/agentchat/SKILL.md`` is the
-offline floor: the gateway writes it there when no file exists yet; it is
-registered itself only when that file cannot be used (``hermes agentchat
-doctor`` then says the manual is frozen at the bundled version), and by a
-process that places nothing while the file is not there yet.
+served texts with its version and sha256). By default the path registered here
+is this release's copy, the package's ``skills/agentchat/SKILL.md``: it changes
+only when the plugin is updated. With the plugin setting ``live_texts`` on,
+Hermes reading a plugin skill's file fresh from its registered path on every
+``skill_view`` lets the plugin register the per-profile file it keeps current,
+``<profile home>/plugin-data/agentchat/manual/SKILL.md`` (:mod:`..manual`), and
+the package's copy is the offline floor: the gateway writes it there when no
+file exists yet; it is registered itself only when that file cannot be used
+(``hermes agentchat doctor`` then says the manual is frozen at the bundled
+version), and by a process that places nothing while the file is not there yet.
 
 Per Hermes' skill contract (``hermes_cli/plugins_content.py``), a plugin skill
 is namespaced ``<plugin_name>:<skill_name>`` and listed in the system prompt's
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 SKILL_NAME = "agentchat"
-# The package's copy: the fallback bytes only.
+# The package's copy: this release's manual (``live_texts`` off), else the fallback bytes.
 SKILL_PATH = BUNDLED_MANUAL_PATH
 SKILL_SOURCE_URL = MANUAL_URL
 SKILL_DESCRIPTION = (
@@ -48,8 +49,9 @@ def register_skill(ctx: Any, *, hermes_home: Path, place: bool = True) -> Path |
     """Register the manual for the profile at ``hermes_home``; return the path
     Hermes was given (``None`` when there is no manual at all).
 
-    Local only — no network. ``place`` (the gateway): the file is created from
-    the bundled bytes when missing, then registered. Without ``place`` (every
+    Local only — no network. ``live_texts`` off (the default): the package's
+    copy, nothing written. With it on, ``place`` (the gateway): the file is
+    created from the bundled bytes when missing, then registered. Without ``place`` (every
     other Hermes process) nothing is written. When the file cannot be used
     (written, read, or is not the manual), the bundled copy is registered
     instead and that is said once.
@@ -71,12 +73,16 @@ def register_skill(ctx: Any, *, hermes_home: Path, place: bool = True) -> Path |
         )
         ctx.register_skill(name=SKILL_NAME, path=registration.path, description=SKILL_DESCRIPTION)
     record_registration(hermes_home, registration)
-    if registration.kept_current or registration.routine:
+    if registration.kept_current or registration.routine or registration.pinned:
         logger.debug(
             "agentchat: registered skill %s -> %s%s",
             SKILL_NAME,
             registration.path,
-            f" ({registration.reason})" if registration.routine else "",
+            " (this release's copy: live_texts is off)"
+            if registration.pinned
+            else f" ({registration.reason})"
+            if registration.routine
+            else "",
         )
     else:
         logger.warning(

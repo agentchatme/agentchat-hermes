@@ -8,12 +8,14 @@ Hermes loads ``SOUL.md`` from the profile home as slot #1 of the system
 prompt on every agent turn (``prompt_builder.py``), so that is where the
 identity line goes — TUI sessions, cron jobs, every channel see it.
 
-The text is not ours. It is served by ``GET /v1/texts`` as
-``identity_line`` with this agent's handle filled in (:mod:`.texts`), and
-spelled for Hermes' tool names by :mod:`.turn`. This module only places
-whatever line it is given; it carries no copy and no template. When the
-texts are not available (server unreachable, nothing cached) nothing is
-placed, and the runtime places the line as soon as a fetch succeeds.
+The text is not ours. It is the server's, spelled for Hermes' tool names:
+by default this release's copy of the served ``identity_line_template``
+filled for this agent's handle, with the plugin setting ``live_texts`` on the
+``identity_line`` served by ``GET /v1/texts`` (:func:`.texts.identity_text`
+decides, for every caller). This module only places whatever line it is
+given; it carries no copy and no template. With ``live_texts`` on and the
+texts not available (server unreachable, nothing cached) nothing is placed,
+and the runtime places the line as soon as a fetch succeeds.
 
 We can't take SOUL.md over (it's the user's file), but we can manage a
 fenced block within it, mirroring the OpenClaw plugin's AGENTS.md approach.
@@ -37,7 +39,8 @@ words anywhere in the block) is for display only.
 
 Lifecycle
 ─────────
-refresh — the activation path, on every texts change: ``anchor.follow``
+refresh — the activation path (once with this release's line; with
+          ``live_texts`` on, on every texts change): ``anchor.follow``
           brings this agent's own block to the served line and leaves every
           other block alone (another agent's is an IDENTITY MISMATCH; one
           edited by hand is the user's; several blocks are left as they are).

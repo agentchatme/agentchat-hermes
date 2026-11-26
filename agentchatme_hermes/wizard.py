@@ -52,8 +52,6 @@ from .placement import (
 )
 from .profile_scope import resolve_hermes_home
 from .soul_anchor import remove_soul_anchor
-from .turn import identity_line as render_identity_line
-from .turn import identity_line_template as render_identity_line_template
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -728,23 +726,17 @@ def _place_or_warn(
 ) -> None:
     """Place the identity line and the manual, register the hosted tools.
 
-    The texts (the identity line, the manual's announcement) are fetched from
-    the server for this key (cached copy when the server is unreachable;
-    without either the line is skipped and the manual is the bundled copy —
-    the gateway places both later). Non-fatal — the credentials are persisted
+    The texts are fetched from the server for this key (cached copy when the
+    server is unreachable). By default the identity line and the manual are
+    this release's; with ``live_texts`` on they are the served ones (without
+    texts the line is skipped and the manual is the bundled copy — the
+    gateway places both later). Non-fatal — the credentials are persisted
     and the runtime will boot; each failed step is surfaced so the operator
     can repair it (``hermes agentchat doctor --fix`` re-runs the placement).
     """
     api_base = _api_base()
     texts = resolve_texts(api_key=api_key, api_base=api_base)
-    for step in place_identity_and_tools(
-        handle=handle,
-        identity_line=render_identity_line(texts) if texts is not None else None,
-        api_base=api_base,
-        served_manual=texts.manual if texts is not None else None,
-        identity_template=render_identity_line_template(texts) if texts is not None else None,
-        tools_decision=tools_decision,
-    ):
+    for step in place_identity_and_tools(handle=handle, texts=texts, api_base=api_base, tools_decision=tools_decision):
         if step.name == "mcp" and step.outcome == "missing":
             continue  # the AgentChat tools line says it
         if step.needs_attention:

@@ -8,14 +8,18 @@
    ``secrets.agentchat`` in ``config.yaml`` turns on; the same block tells
    Hermes to keep that variable out of every command the agent runs
    (:mod:`.secrets_registration`, :mod:`.key_source`).
-2. **The identity line** — the served ``identity_line`` (``GET /v1/texts``,
-   served spelled for Hermes) into ``SOUL.md`` (:mod:`.soul_anchor`),
-   the file Hermes loads into every turn. Nothing is placed when the texts
-   cannot be fetched and nothing is cached; the gateway places the line as
-   soon as a fetch succeeds.
-3. **The manual** — the one the served texts announce
-   (``https://agentchat.me/skill.md``, with its version and sha256), as the
-   ``agentchat:agentchat`` skill: ``<profile home>/plugin-data/agentchat/
+2. **The identity line** — into ``SOUL.md`` (:mod:`.soul_anchor`), the file
+   Hermes loads into every turn: the line :func:`.texts.identity_text` gives,
+   the same for every placement and the gateway. By default it is this
+   release's copy of the served template, filled for this agent's handle;
+   with the plugin setting ``live_texts`` on, the served ``identity_line``
+   (``GET /v1/texts``, served spelled for Hermes) — then nothing is placed
+   when the texts cannot be fetched and nothing is cached, and the gateway
+   places the line as soon as a fetch succeeds.
+3. **The manual** — the ``agentchat:agentchat`` skill. By default this
+   release's copy in the package (nothing to place). With ``live_texts`` on,
+   the one the served texts announce (``https://agentchat.me/skill.md``, with
+   its version and sha256): ``<profile home>/plugin-data/agentchat/
    manual/SKILL.md``, downloaded and checked by the SDK kit when it is not the
    announced one, the bundled copy only when nothing verified can be had
    (:mod:`.manual`). The gateway keeps it current from then on.
@@ -48,8 +52,7 @@ from .mcp_registration import McpRegistrationError, install_entry
 from .profile_scope import resolve_hermes_home
 from .soul_anchor import AnchorError, place_soul_anchor
 from .state import state_dir_for_account
-from .texts import load_texts
-from .turn import identity_line as render_identity_line
+from .texts import TEXTS_UNAVAILABLE_DETAIL, identity_text, load_texts, mode_for
 
 if TYPE_CHECKING:
     from agentchatme.types import Texts
@@ -58,13 +61,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# The package's copy of the manual: the fallback bytes only (see :mod:`.manual`).
+# The package's copy of the manual: this release's (see :mod:`.manual`).
 BUNDLED_SKILL_PATH = BUNDLED_MANUAL_PATH
-
-TEXTS_UNAVAILABLE_DETAIL = (
-    "identity line not placed: /v1/texts is unreachable and nothing is cached — the gateway "
-    "places it once the server answers (or run `hermes agentchat doctor --fix` later)"
-)
 
 
 @dataclass(frozen=True)
@@ -91,22 +89,7 @@ class PlacementStep:
         return self.status in ("failed", "warned", "skipped")
 
 
-# ─── the served identity line ──────────────────────────────────────────────
-
-
-def resolve_identity_line(
-    *,
-    api_key: str,
-    api_base: str,
-    hermes_home: Path | None = None,
-    state_dir: Path | None = None,
-) -> str | None:
-    """The served identity line for the account behind ``api_key``, as served for Hermes.
-
-    :func:`resolve_texts`, then its identity line. Never raises.
-    """
-    texts = resolve_texts(api_key=api_key, api_base=api_base, hermes_home=hermes_home, state_dir=state_dir)
-    return render_identity_line(texts) if texts is not None else None
+# ─── the served texts ──────────────────────────────────────────────────────
 
 
 def resolve_texts(
@@ -155,15 +138,16 @@ def place_anchor(
     soul_path: Path | None = None,
     template: str | None = None,
     replace_other: bool = True,
+    missing: str | None = None,
 ) -> PlacementStep:
-    """The served identity line in SOUL.md, on request (:func:`.soul_anchor.place_soul_anchor`):
-    this agent's block brought to the served line, one placed where there is
+    """The identity line in SOUL.md, on request (:func:`.soul_anchor.place_soul_anchor`):
+    this agent's block brought to the line, one placed where there is
     none; a block edited by hand, or several blocks, left (``warned``, with the
     remedy); another agent's block replaced only with ``replace_other`` (login,
     the wizard), refused otherwise (``doctor --fix``). The detail says what it
-    was. Never raises."""
+    was. ``missing``: why there is no line (``skipped``). Never raises."""
     if identity_line is None:
-        return PlacementStep("anchor", "skipped", TEXTS_UNAVAILABLE_DETAIL)
+        return PlacementStep("anchor", "skipped", missing or TEXTS_UNAVAILABLE_DETAIL)
     try:
         placement = place_soul_anchor(
             identity_line, handle=handle, soul_path=soul_path, template=template, replace_other=replace_other
@@ -182,6 +166,8 @@ def place_manual(
 ) -> PlacementStep:
     """The manual the served texts announce (``served``: ``texts.manual``, ``None``
     when no texts are in hand) as this profile's ``agentchat:agentchat`` file.
+    ``live_texts`` off (the default): nothing to place — the skill is this
+    release's copy in the package (``ok``; ``failed`` when it is missing).
 
     One sync through the SDK kit (a download when the file is not the announced
     manual); the detail says what the file was when the sync changed it
@@ -193,6 +179,17 @@ def place_manual(
     download may go. Never raises.
     """
     home = hermes_home if hermes_home is not None else resolve_hermes_home()
+    if not mode_for(home).live:
+        if not BUNDLED_MANUAL_PATH.is_file():
+            return PlacementStep(
+                "manual", "failed", f"this release's manual is missing at {BUNDLED_MANUAL_PATH} (reinstall agentchatme-hermes)"
+            )
+        return PlacementStep(
+            "manual",
+            "ok",
+            f"this release's manual {manual_module.bundled_version() or '?'} ({BUNDLED_MANUAL_PATH}); live_texts is "
+            "off, so it changes only with a plugin update",
+        )
     before = manual_module.check(manual_module.manual_path(home), served)
     result = manual_module.sync_once(home=home, served=served, api_base=api_base)
     if result is None:
@@ -352,32 +349,33 @@ def _begin_two_step_yes(api_base: str, home: Path) -> PlacementStep | None:
 def place_identity_and_tools(
     *,
     handle: str,
-    identity_line: str | None,
+    texts: Texts | None,
     api_base: str,
     soul_path: Path | None = None,
-    served_manual: Any = None,
     hermes_home: Path | None = None,
-    identity_template: str | None = None,
     replace_other_agent: bool = True,
     tools_decision: Decision | None = None,
 ) -> list[PlacementStep]:
     """Anchor, manual, the key source, tools — in that order (the tools' entry
-    needs the key source). ``served_manual`` is the texts' announcement
-    (``texts.manual``), ``None`` when no texts are in hand; ``identity_template``
-    the served template (recognises a block an earlier release wrote);
-    ``replace_other_agent`` False keeps another agent's block (``doctor --fix``);
-    ``tools_decision`` what the person decided about the tools
-    (:func:`.allow.decide`; ``None``: nobody asked, no entry is added).
+    needs the key source). ``texts``: the served texts in hand (``None``
+    without): the identity line is :func:`.texts.identity_text`'s, the manual
+    the one ``texts.manual`` announces; with ``live_texts`` off both are this
+    release's. ``replace_other_agent`` False keeps another agent's block
+    (``doctor --fix``); ``tools_decision`` what the person decided about the
+    tools (:func:`.allow.decide`; ``None``: nobody asked, no entry is added).
     Never raises."""
+    home = hermes_home if hermes_home is not None else resolve_hermes_home()
+    identity = identity_text(texts, handle=handle, home=home)
     return [
         place_anchor(
             handle=handle,
-            identity_line=identity_line,
+            identity_line=identity.line,
             soul_path=soul_path,
-            template=identity_template,
+            template=identity.template,
             replace_other=replace_other_agent,
+            missing=identity.missing,
         ),
-        place_manual(served_manual, api_base=api_base, hermes_home=hermes_home),
+        place_manual(texts.manual if texts is not None else None, api_base=api_base, hermes_home=home),
         place_secrets(),
         place_mcp(api_base, decision=tools_decision),
     ]
@@ -403,12 +401,12 @@ def profile_identity(home: Path, *, api_base: str) -> ProfileIdentity:
     """Who ``home``'s profile is configured as — read BEFORE logout removes the
     key: the handle its key file names (a copied key file too: it names the
     agent this profile held the key of), else ``AGENTCHATME_HANDLE`` (a profile
-    set up before 0.6); the served identity line and template cached for the
-    key it holds. No network. Never raises."""
+    set up before 0.6); the identity line and template in use
+    (:func:`.texts.identity_text`: this release's, or with ``live_texts`` on the
+    served texts cached for the key it holds). No network. Never raises."""
     from .config import ENV_HANDLE, resolve_key
     from .profile_scope import resolve_setting
     from .texts import cached_texts
-    from .turn import identity_line_template as render_identity_line_template
 
     try:
         resolution = resolve_key(home)
@@ -424,16 +422,14 @@ def profile_identity(home: Path, *, api_base: str) -> ProfileIdentity:
             raw = ""
     handle = raw.strip().lstrip("@").lower() or None
     api_key = resolution.held_key or (stored.api_key if stored is not None else None)
-    if not api_key:
-        return ProfileIdentity(handle)
-    try:
-        texts, _ = cached_texts(state_dir_for_account(hermes_home=home, api_base=api_base, api_key=api_key))
-    except Exception:
-        logger.debug("placement: cached texts unreadable", exc_info=True)
-        texts = None
-    if texts is None:
-        return ProfileIdentity(handle)
-    return ProfileIdentity(handle, render_identity_line(texts), render_identity_line_template(texts))
+    texts = None
+    if api_key:
+        try:
+            texts, _ = cached_texts(state_dir_for_account(hermes_home=home, api_base=api_base, api_key=api_key))
+        except Exception:
+            logger.debug("placement: cached texts unreadable", exc_info=True)
+    identity = identity_text(texts, handle=handle, home=home)
+    return ProfileIdentity(handle, identity.line, identity.template)
 
 
 def gateway_still_serving(home: Path, *, api_base: str) -> str | None:

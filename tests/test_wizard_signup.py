@@ -96,9 +96,7 @@ class _Wizard:
         self.asked_with_key_saved.append(saved() is not None)
         return self.tools
 
-    def _place(
-        self, *, handle: str, identity_line: Any, api_base: str, served_manual: Any = None, **kw: Any
-    ) -> list[Any]:
+    def _place(self, *, handle: str, texts: Any, api_base: str, **kw: Any) -> list[Any]:
         self.placed.append(handle)
         self.tools_decisions.append(kw.get("tools_decision"))
         return []

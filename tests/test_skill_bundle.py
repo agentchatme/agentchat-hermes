@@ -1,26 +1,31 @@
-"""The bundled copy IS the published manual — the offline floor.
+"""This release's texts ARE what the server serves.
 
-The texts an agent reads are served (``GET /v1/texts``) and never bundled,
-and so is the manual: the ``agentchat:agentchat`` skill is the per-profile
-file the plugin keeps at the version the server announces
-(``test_manual.py``). The one copy left in this package is the fallback for
-a first install with no server in reach. These tests keep it the published
-document byte for byte, so that fallback is a manual the server served.
+Two texts load into every session of a profile: the manual (the
+``agentchat:agentchat`` skill) and the identity line in ``SOUL.md``. By
+default both are this release's copies (``live_texts`` off): the package's
+``skills/agentchat/SKILL.md`` and the served identity-line template in
+``texts_snapshot.json``. With ``live_texts`` on the package's manual is the
+fallback for a first install with no server in reach (``test_manual.py``).
+These tests keep both files what the server served, byte for byte.
+
+``scripts/refresh_bundled_texts.py`` takes them from the server and rewrites
+the three pins below (one line each; ``tests/test_refresh_texts.py``).
 """
 from __future__ import annotations
 
 import hashlib
 import re
 
+from agentchatme_hermes import texts
 from agentchatme_hermes.placement import BUNDLED_SKILL_PATH
 from agentchatme_hermes.skills import SKILL_NAME, SKILL_PATH, SKILL_SOURCE_URL
 
 # The published manual this release bundles, byte for byte: the server pins the
-# same pair (MANUAL_VERSION / MANUAL_SHA256 in the core repository's
-# packages/shared/src/types/texts.ts) and announces it in the served texts. A
-# new manual changes both here.
-MANUAL_VERSION = "2.4.4"
-MANUAL_SHA256 = "7826ac17ce9ec6b1cf6dd0469170c19183439e4d88d006aa9f3050954b618ce4"
+# same pair and announces it in the served texts. A new manual changes both here.
+MANUAL_VERSION = "2.4.23"
+MANUAL_SHA256 = "adf13e4fa20af2997a5bfb122a1e2a29f9afe3f7c52740631940471b47c41bd2"
+# texts_snapshot.json, byte for byte.
+TEXTS_SNAPSHOT_SHA256 = "862ec76b5bbe6720f7f19025976658f03a5e44ccf86ba70c3c6f23ef97b8f7a7"
 
 
 class TestBundle:
@@ -82,10 +87,40 @@ class TestBundle:
             assert needle in text
 
 
+class TestSnapshot:
+    def test_the_snapshot_is_pinned_byte_for_byte(self) -> None:
+        assert hashlib.sha256(texts.SNAPSHOT_PATH.read_bytes()).hexdigest() == TEXTS_SNAPSHOT_SHA256
+
+    def test_it_reads_and_announces_the_bundled_manual(self) -> None:
+        snapshot = texts.parse_snapshot(texts.SNAPSHOT_PATH.read_bytes())
+        assert snapshot == texts.bundled_texts()
+        assert snapshot.runtime == "hermes"
+        assert snapshot.manual == {
+            "url": SKILL_SOURCE_URL,
+            "version": MANUAL_VERSION,
+            "sha256": MANUAL_SHA256,
+        }
+
+    def test_it_is_written_the_one_way(self) -> None:
+        """The bytes the refresh script writes: the same texts, the same file."""
+        raw = texts.SNAPSHOT_PATH.read_bytes()
+        assert texts.snapshot_bytes(texts.parse_snapshot(raw)) == raw
+
+    def test_the_template_fills_for_any_handle_through_the_kit(self) -> None:
+        snapshot = texts.parse_snapshot(texts.SNAPSHOT_PATH.read_bytes())
+        line = texts.fill_template(snapshot.identity_line_template, "@Relay-Bot")
+        assert "@relay-bot " in line and "<handle>" not in line
+
+    def test_its_folder_is_not_the_skills(self) -> None:
+        """``skill_view`` serves every file in a skill's folder: the snapshot is not there."""
+        assert texts.SNAPSHOT_PATH.parent == SKILL_PATH.parents[2]
+
+
 class TestNoCopiedTexts:
     def test_package_carries_no_wake_instruction_or_identity_template(self) -> None:
-        """Rule 3: every text an agent sees is served. The package may name
-        the hosted tools and the manual; it may not carry the sentences."""
+        """Rule 3: every text an agent sees is the server's. The package may name
+        the hosted tools and the manual; its code may not carry the sentences.
+        The two this release bundles are the files above, as served."""
         package_dir = BUNDLED_SKILL_PATH.parents[2]
         for path in package_dir.glob("*.py"):
             source = path.read_text(encoding="utf-8")
