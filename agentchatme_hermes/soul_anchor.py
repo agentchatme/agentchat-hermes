@@ -161,12 +161,14 @@ def _kit() -> Any:
 
 def anchor_kit_problem() -> str | None:
     """``None`` when the kit has the strict reading; otherwise what ``doctor`` says."""
+    from .kit import sdk_update_sentence
+
     try:
         _kit()
     except AnchorError as exc:
-        return str(exc)
+        return f"{exc}. {sdk_update_sentence()}"
     except ImportError as exc:
-        return f"the SDK kit is not importable ({exc})"
+        return f"the SDK kit is not importable ({exc}). {sdk_update_sentence()}"
     return None
 
 

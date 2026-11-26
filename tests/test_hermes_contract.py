@@ -380,6 +380,102 @@ def test_our_config_schema_is_one_boolean_setting_hermes_shows() -> None:
     assert field["description"].startswith("Off: your agent reads the AgentChat manual")
 
 
+def _pyproject_sdk_requirement() -> str:
+    import re
+
+    pyproject = (_REPO / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'^\s*"(agentchatme[^"]*)",?\s*$', pyproject, re.MULTILINE)
+    assert match, "pyproject.toml declares agentchatme"
+    return match.group(1)
+
+
+def test_hermes_installs_the_sdk_pyproject_declares_and_asks_first() -> None:
+    """The plugin installs nothing: Hermes reads this tree's one Python
+    dependency from pyproject.toml (``pm.plugin_declarations``), shows it and
+    asks before installing it; a headless install without ``--yes-deps`` is
+    refused (Hermes leaves the plugin installed but disabled) and
+    ``--yes-deps`` is the yes."""
+    import io
+
+    from rich.console import Console
+
+    declarations = _import("pm.plugin_declarations")
+    install = _import("hermes_cli.plugins_cmd_install")
+    plugins_cmd = _import("hermes_cli.plugins_cmd")
+
+    declaration = declarations.read_python_declaration(_REPO)
+    assert declaration.pyproject == _REPO / "pyproject.toml"
+    assert declaration.install_requirements == (_pyproject_sdk_requirement(),)
+    manifest = plugins_cmd._read_manifest_for_install(_REPO)
+    shown = io.StringIO()
+    consented, reason = install._install_plugin_python_deps(manifest, _REPO, Console(file=shown, width=200))
+    assert consented is False and getattr(reason, "failure_class", None) == "non_interactive"
+    assert f"- {_pyproject_sdk_requirement()}" in shown.getvalue()
+    assert install._install_plugin_python_deps(manifest, _REPO, Console(file=io.StringIO()), assume_yes=True) == (
+        True,
+        None,
+    )
+
+
+def test_hermes_reads_our_floor_and_skips_the_plugin_below_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``requires_hermes`` as Hermes parses it from our manifest, validates it
+    (``hermes plugins validate``) and gates the load on it."""
+    manifest_mod = _import("hermes_cli.plugins_manifest")
+    validate = _import("hermes_cli.plugin_validate")
+
+    parsed = manifest_mod.parse_manifest_file(_REPO / "plugin.yaml", _REPO, "user", "")
+    assert parsed is not None and parsed.requires_hermes == ">=0.23.4"
+    assert validate._requires_hermes_spec_valid(parsed.requires_hermes)
+    monkeypatch.setattr(manifest_mod, "running_hermes_version", lambda: "0.23.3")
+    assert manifest_mod.requires_hermes_error(parsed) == "requires hermes >=0.23.4, running 0.23.3"
+    for running in ("0.23.4", "0.24.0", "unknown"):
+        monkeypatch.setattr(manifest_mod, "running_hermes_version", lambda running=running: running)
+        assert manifest_mod.requires_hermes_error(parsed) is None, running
+
+
+def test_a_directory_plugin_is_imported_under_the_namespace_the_kit_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``kit._install_source`` tells a directory install (``hermes plugins
+    install``) from a pip install by the module name Hermes' directory loader
+    gives the plugin, ``hermes_plugins.<slug>``."""
+    loader = _import("hermes_cli.plugins_loader")
+    plugins = _import("hermes_cli.plugins")
+    manifest_mod = _import("hermes_cli.plugins_manifest")
+
+    assert loader._NS_PARENT == "hermes_plugins"
+    monkeypatch.setattr(loader, "_BARE_MODULE_SCOPE", {})  # which scope claimed the bare name: not this test's
+    parsed = manifest_mod.parse_manifest_file(_REPO / "plugin.yaml", _REPO, "user", "")
+    manager = plugins.PluginManager()
+    assert manager._directory_module_name(parsed).startswith("hermes_plugins.agentchat")
+
+
+def test_dropping_the_manifest_copy_of_the_sdk_widens_nothing(tmp_path: Path) -> None:
+    """0.6.5's manifests listed the SDK under ``pip_dependencies``; this
+    release's do not and name a Hermes floor instead. Hermes' unattended update
+    (``plugins.auto_apply``) sees no wider surface and no new dependency."""
+    catalog = _import("hermes_cli.plugins_cmd_catalog")
+    declarations = _import("pm.plugin_declarations")
+    plugins_cmd = _import("hermes_cli.plugins_cmd")
+
+    manifest = (_REPO / "plugin.yaml").read_text(encoding="utf-8")
+    floor = 'requires_hermes: ">=0.23.4"\n'
+    assert floor in manifest
+    previous = manifest.replace(floor, f"pip_dependencies:\n  - {_pyproject_sdk_requirement()}\n")
+    trees = {}
+    for name, text in (("old", previous), ("new", manifest)):
+        tree = tmp_path / name
+        tree.mkdir()
+        (tree / "plugin.yaml").write_text(text, encoding="utf-8")
+        (tree / "pyproject.toml").write_bytes((_REPO / "pyproject.toml").read_bytes())
+        trees[name] = tree
+    old = catalog.plugin_surface(plugins_cmd._read_manifest(trees["old"]), trees["old"])
+    new = catalog.plugin_surface(plugins_cmd._read_manifest(trees["new"]), trees["new"])
+    assert catalog.surface_delta(old, new) == {}
+    assert (
+        declarations.read_python_declaration(trees["new"]).install_requirements
+        == declarations.read_python_declaration(trees["old"]).install_requirements
+    )
+
+
 def test_a_release_that_changes_only_the_texts_widens_nothing(tmp_path: Path) -> None:
     """What Hermes' unattended update refuses (``plugins.auto_apply``): a wider
     surface (``plugin_surface``: capabilities, tools, hooks, Python
