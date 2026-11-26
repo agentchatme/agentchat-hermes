@@ -1,7 +1,7 @@
 name: hermes-main
 
-# The test suite against Hermes Agent, every night: its main branch and its
-# latest release.
+# The test suite against Hermes Agent, every night: its main branch, its
+# latest release and the oldest release this plugin accepts (the floor).
 #
 # The CI gate (ci.yml) runs without Hermes installed: Hermes is stubbed, so it
 # proves this package, not that Hermes still has what the package imports.
@@ -20,11 +20,14 @@ name: hermes-main
 # refuses even with --force, fails the leg; every critical and high finding is
 # printed. Both run even when the tests failed.
 #
-# Two legs. `main`: a red leg means Hermes main changed something the next
+# Three legs. `main`: a red leg means Hermes main changed something the next
 # Hermes release would break here. `latest release`: the newest hermes-agent
 # release that is neither a draft nor a pre-release, looked up at run time
 # from its GitHub releases — what users run today; a red leg means this
-# package's main fails on it. Nothing is published or changed.
+# package's main fails on it. `floor`: the release `requires_hermes` in
+# plugin.yaml names (">=0.23.2" → v0.23.2), the oldest one Hermes loads the
+# plugin on; a red leg means the floor is no longer true. It is left out when
+# it is the latest release. Nothing is published or changed.
 #
 # Alerting: a red scheduled run opens one issue, or comments on the open one,
 # and the next green scheduled run closes it (.github/scripts/nightly-issue.sh,
@@ -33,8 +36,9 @@ name: hermes-main
 # one. Slack is an extra channel that does nothing until a
 # SLACK_WEBHOOK_WARNING secret exists.
 #
-# If the latest release cannot be looked up, `main` is still tested and the
-# release leg fails, so the night is red rather than empty.
+# If the latest release cannot be looked up, or plugin.yaml names no floor,
+# `main` is still tested and that leg fails, so the night is red rather than
+# empty.
 #
 # Actions are pinned to commits (the version is in the trailing comment), as
 # in publish.yml. setup-uv and the uv version are the ones Hermes' tests.yml
@@ -72,7 +76,13 @@ jobs:
     outputs:
       matrix: ${{ steps.refs.outputs.matrix }}
     steps:
-      - name: main and the latest release, or the ref asked for
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: plugin.yaml
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: main, the latest release and the floor, or the ref asked for
         id: refs
         env:
           GH_TOKEN: ${{ github.token }}
@@ -96,8 +106,17 @@ jobs:
             else
               echo "hermes-agent latest release: $latest"
             fi
-            matrix=$(jq -cn --arg tag "$latest" \
-              '{include: [{ref: "main", leg: "main"}, {ref: $tag, leg: "latest release"}]}')
+            # The floor: requires_hermes in plugin.yaml, ">=X.Y.Z" → tag vX.Y.Z.
+            # An empty ref fails that leg at its first step, like the release leg.
+            floor=$(sed -n 's/^requires_hermes: ">=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)"$/v\1/p' plugin.yaml)
+            if [ -z "$floor" ]; then
+              echo "::warning::plugin.yaml names no requires_hermes floor of the form \">=X.Y.Z\""
+            else
+              echo "hermes-agent floor release: $floor"
+            fi
+            matrix=$(jq -cn --arg tag "$latest" --arg floor "$floor" \
+              '{include: ([{ref: "main", leg: "main"}, {ref: $tag, leg: "latest release"}]
+                          + (if $floor != "" and $floor == $tag then [] else [{ref: $floor, leg: "floor"}] end))}')
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
 
@@ -113,9 +132,11 @@ jobs:
       HERMES_REF: ${{ matrix.ref }}
     steps:
       - name: A ref to test
+        env:
+          LEG: ${{ matrix.leg }}
         run: |
           if [ -z "$HERMES_REF" ]; then
-            echo "::error::the latest hermes-agent release could not be looked up (see the refs job)"
+            echo "::error::the $LEG hermes-agent ref could not be resolved (see the refs job)"
             exit 1
           fi
 
@@ -233,7 +254,7 @@ jobs:
       - name: Post to Slack
         env:
           WEBHOOK: ${{ secrets.SLACK_WEBHOOK_WARNING }}
-          TEXT: ":warning: *agentchatme-hermes nightly vs hermes-agent failed* (main or the latest release) — see the nightly issue: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          TEXT: ":warning: *agentchatme-hermes nightly vs hermes-agent failed* (main, the latest release or the floor) — see the nightly issue: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
           if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped (the nightly issue carries the alert)"; exit 0; fi
           printf '%s' "$TEXT" | jq -Rs '{text: .}' | curl -sS -o /dev/null --max-time 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK" || true

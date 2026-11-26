@@ -57,15 +57,14 @@ NEW_CODE_QUESTION = "Send a new code?"
 def sdk_problem() -> str | None:
     """``None`` when the SDK's sign-up helper imports; otherwise what to tell
     the person (it shipped in the release this package names as its floor)."""
-    from .kit import KIT_REQUIREMENT, installed_sdk_version
+    from .kit import KIT_REQUIREMENT, installed_sdk_version, sdk_update_sentence
 
     try:
         importlib.import_module("agentchatme.integration.account")
     except ImportError:
         return (
             f"Sign-up needs {KIT_REQUIREMENT} (installed agentchatme: "
-            f"{installed_sdk_version()}). Upgrade it in the Hermes environment "
-            f"(pip install -U '{KIT_REQUIREMENT}') and run this again."
+            f"{installed_sdk_version()}). {sdk_update_sentence('run this again')}"
         )
     return None
 

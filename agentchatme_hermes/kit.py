@@ -8,9 +8,15 @@ loud: ``register()`` logs one ERROR naming the requirement and keeps the CLI
 from __future__ import annotations
 
 import importlib
+import json
+import os
+import shlex
+import sys
+from pathlib import Path
+from typing import Any
 
-# The agentchatme release this package needs: the floor in pyproject.toml,
-# plugin.yaml and the git-clone shim. ``agentchatme.integration`` (contract
+# The agentchatme release this package needs: the floor of the one declaration
+# in pyproject.toml, which Hermes installs. ``agentchatme.integration`` (contract
 # v1) shipped in 1.3.0; 1.3.3 is the kit that acks a system notice without
 # starting a cycle and anchors a card without a preview at its last message;
 # 1.4.0 adds ``agentchatme.integration.account``, the sign-up helper the
@@ -27,7 +33,12 @@ import importlib
 # (:func:`.soul_anchor.anchor_kit_problem`, a doctor warning).
 KIT_MIN_VERSION = "1.8.0"
 KIT_REQUIREMENT = f"agentchatme>={KIT_MIN_VERSION}"
+# pyproject.toml's ``[project].dependencies`` entry, exactly (a test keeps the two
+# identical): what the pip command below installs.
+SDK_REQUIREMENT = f"{KIT_REQUIREMENT},<2"
 _MANUAL_RETRY_FLOOR = (1, 6, 1)
+# The repo a git install clones, when Hermes' install record names no source.
+_REPO_URL = "https://github.com/agentchatme/agentchat-hermes.git"
 
 
 def kit_problem() -> str | None:
@@ -37,17 +48,106 @@ def kit_problem() -> str | None:
     except ImportError as exc:
         return (
             f"the installed agentchatme ({installed_sdk_version()}) has no agentchatme.integration "
-            f"— agentchatme-hermes needs {KIT_REQUIREMENT} to receive. Upgrade it in the Hermes "
-            f"environment (pip install -U '{KIT_REQUIREMENT}') and restart the gateway. ({exc})"
+            f"— agentchatme-hermes needs {KIT_REQUIREMENT} to receive. {sdk_update_sentence()} ({exc})"
         )
     if not _has_could_not_process(integration):
         return (
             f"the installed agentchatme ({installed_sdk_version()}) has a kit without could not "
             f"process (no check_runtime on its ReceiveLoop) — agentchatme-hermes needs "
-            f"{KIT_REQUIREMENT} to receive. Upgrade it in the Hermes environment "
-            f"(pip install -U '{KIT_REQUIREMENT}') and restart the gateway."
+            f"{KIT_REQUIREMENT} to receive. {sdk_update_sentence()}"
         )
     return None
+
+
+def sdk_update_sentence(then: str = "restart the gateway") -> str:
+    """``Run `<command>` and <then>.``: :func:`sdk_update_command` in a sentence."""
+    return f"Run `{sdk_update_command()}` and {then}."
+
+
+def sdk_update_command() -> str:
+    """The one command that installs :data:`SDK_REQUIREMENT` the way this copy
+    of the plugin was installed. Never raises.
+
+    - A directory install (``hermes plugins install``, from Hermes' plugin
+      catalog or from git): Hermes installs the dependency pyproject.toml
+      declares, at install, reinstall and update, after a yes (``--yes-deps``),
+      and leaves the plugin disabled on a no; the plugin installs nothing
+      itself. ``hermes plugins update <directory>``, in the profile whose
+      ``plugins/`` holds the directory; a copy pinned with ``--ref``, which
+      ``update`` refuses, is installed again at a release's commit.
+    - A pip install: ``python -m pip install -U`` in the environment that runs
+      Hermes (:data:`sys.executable`).
+    """
+    try:
+        from_hermes, directory = _install_source()
+    except Exception:
+        from_hermes, directory = False, None
+    if not from_hermes:
+        return f"{_quoted(sys.executable)} -m pip install -U {_quoted(SDK_REQUIREMENT, always=True)}"
+    if directory is None:
+        return "hermes plugins update agentchat"
+    from .profile_scope import profile_label
+
+    label = profile_label(directory.parent.parent)
+    flag = "" if label == "default" else f" -p {label}"
+    record = _install_record(directory)
+    if record.get("pinned") is True:
+        source = record.get("source")
+        source = source if isinstance(source, str) and source else _REPO_URL
+        return (
+            f"hermes{flag} plugins install {_quoted(source)} --force "
+            "--ref <release SHA> --yes-deps"
+        )
+    return f"hermes{flag} plugins update {directory.name}"
+
+
+def _quoted(arg: str, *, always: bool = False) -> str:
+    """``arg`` as one word for the person's shell: POSIX quoting, or on
+    Windows double quotes (``cmd`` and PowerShell both take them; a
+    requirement's ``<`` / ``>`` must never reach ``cmd`` bare)."""
+    if os.name != "nt":
+        return shlex.quote(arg)
+    return f'"{arg}"' if always or any(char in arg for char in " \t&()^|<>") else arg
+
+
+def _install_source() -> tuple[bool, Path | None]:
+    """Whether Hermes installed this code (``hermes plugins install``), and
+    from which plugin directory (``None`` when it cannot be found).
+
+    Hermes imports a directory plugin as ``hermes_plugins.<slug>``
+    (``hermes_cli/plugins_loader.py``), so this module's name says it was
+    loaded from ``<home>/plugins/<directory>/``. A profile that enables the
+    installed plugin without its own directory runs the package Hermes'
+    package manager installed, editable, from a snapshot of the directory
+    (``…/plugin-sources/<member key>/``): the directory is the one whose
+    member key matches, in the default profile or one under ``profiles/``.
+    Anything else is a pip install."""
+    package_root = Path(__file__).resolve().parent.parent
+    if __name__.startswith("hermes_plugins."):
+        return True, package_root
+    if package_root.parent.name != "plugin-sources":
+        return False, None
+    from .cli import _agentchat_directories, _hermes_member_key, _profiles_with_a_git_copy
+    from .profile_scope import resolve_hermes_home
+
+    for home in _profiles_with_a_git_copy(resolve_hermes_home()):
+        for directory in _agentchat_directories(home / "plugins"):
+            if _hermes_member_key(directory) == package_root.name:
+                return True, directory
+    return True, None
+
+
+def _install_record(directory: Path) -> dict[str, Any]:
+    """Hermes' installer-owned record of ``directory``
+    (``plugins/.install-metadata.json``, keyed by the directory's name);
+    ``{}`` when it cannot be read."""
+    try:
+        record = json.loads((directory.parent / ".install-metadata.json").read_text(encoding="utf-8-sig"))[
+            directory.name
+        ]
+    except Exception:
+        return {}
+    return record if isinstance(record, dict) else {}
 
 
 def _has_could_not_process(integration: object) -> bool:
@@ -75,8 +175,7 @@ def manual_retry_problem() -> str | None:
         return None
     return (
         f"the installed agentchatme ({installed}) does not retry a failed manual download: the "
-        "gateway tries again only when the served texts change or it restarts. Upgrade it in the "
-        f"Hermes environment (pip install -U '{KIT_REQUIREMENT}') and restart the gateway"
+        f"gateway tries again only when the served texts change or it restarts. {sdk_update_sentence()}"
     )
 
 
