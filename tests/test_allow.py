@@ -10,6 +10,7 @@ switch (:func:`allow.read_switch`) for the pause, doctor, status and the wizard.
 from __future__ import annotations
 
 import builtins
+import contextvars
 import io
 import sys
 import threading
@@ -74,36 +75,6 @@ class TestAgentTerminal:
         assert allow.stdin_is_tty() is False
         monkeypatch.setattr(sys, "stdin", None)
         assert allow.stdin_is_tty() is False
-
-
-class TestProcessOrigin:
-    """``/agentchat allow`` in a classic chat process: the reading taken at
-    ``register(ctx)``, before the chat's own session sets an id."""
-
-    @pytest.fixture(autouse=True)
-    def _fresh(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(allow, "_origin_session", None)
-
-    def test_started_by_an_agents_terminal(self) -> None:
-        allow.note_process_origin({"HERMES_SESSION_ID": "agent-session"})
-        assert allow.started_in_agent_terminal("cli-session") is True
-        assert allow.started_in_agent_terminal("") is True
-
-    def test_a_persons_terminal(self) -> None:
-        allow.note_process_origin({})
-        assert allow.started_in_agent_terminal("cli-session") is False
-
-    def test_registered_after_the_chat_began_is_the_chats_own_id(self) -> None:
-        allow.note_process_origin({"HERMES_SESSION_ID": "cli-session"})
-        assert allow.started_in_agent_terminal("cli-session") is False
-
-    def test_taken_once(self) -> None:
-        allow.note_process_origin({})
-        allow.note_process_origin({"HERMES_SESSION_ID": "later"})
-        assert allow.started_in_agent_terminal("x") is False
-
-    def test_not_taken_reads_as_a_persons(self) -> None:
-        assert allow.started_in_agent_terminal("x") is False
 
 
 class TestTheQuestion:
@@ -428,6 +399,13 @@ class TestFirstPlacement:
 
 
 class TestCompletePending:
+    @pytest.fixture(autouse=True)
+    def _fresh_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(allow, "_timed_out", {})
+        monkeypatch.setattr(allow, "POLL_S", 0.0)
+        # The entry as step one left it: removed.
+        monkeypatch.setattr(mcp_registration, "inspect_entry", lambda *, api_base: "missing")
+
     def _placement(self, monkeypatch: pytest.MonkeyPatch, outcome: str = "added") -> list[Any]:
         from agentchatme_hermes import placement
         from agentchatme_hermes.placement import PlacementStep
@@ -438,6 +416,21 @@ class TestCompletePending:
             placement, "place_mcp", lambda api_base, decision=None: placed.append(decision) or PlacementStep("mcp", status, "d", outcome)
         )
         return placed
+
+    def _runtime(self, monkeypatch: pytest.MonkeyPatch, *readings: str, then: Any = None) -> list[str]:
+        """What :func:`allow.server_runtime` reads, in turn (the last one repeats)."""
+        seen: list[str] = []
+        queue = list(readings)
+
+        def runtime(api_base: str) -> str:
+            current = queue.pop(0) if len(queue) > 1 else queue[0]
+            seen.append(current)
+            if then is not None:
+                then(len(seen))
+            return current
+
+        monkeypatch.setattr(allow, "server_runtime", runtime)
+        return seen
 
     def test_nothing_pending_writes_nothing(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         placed = self._placement(monkeypatch)
@@ -458,48 +451,138 @@ class TestCompletePending:
             allow.on_applied(tmp_path, None)
         assert placed == [decision] and called == ["applied"]
 
-    def test_it_waits_for_hermes_to_drop_the_old_server(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    def test_it_waits_until_hermes_runs_no_agentchat_server(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Not "no tools registered" (a connecting or parked server has none):
+        Hermes' own status for the name, until it holds nothing under it."""
         from agentchatme_hermes import placement
         from agentchatme_hermes.placement import PlacementStep
 
         allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True)
-        readings = iter([["old"], ["old"], [], ["new"]])
         log: list[str] = []
+        monkeypatch.setattr(allow, "server_runtime", lambda api_base: log.append(next(readings)) or log[-1])
+        readings = iter(["held", "held", "held", "gone"])
+        names = iter([[], ["mcp__agentchat__agentchat_inbox"]])
 
-        def names() -> list[str]:
-            current = next(readings, ["new"])
-            log.append("held" if current == ["old"] else "none" if not current else "connected")
+        def tools() -> list[str]:
+            current = next(names, ["mcp__agentchat__agentchat_inbox"])
+            log.append("connected" if current else "none")
             return current
 
         def place(api_base: str, decision: Any = None) -> PlacementStep:
             log.append(f"write {decision}")
             return PlacementStep("mcp", "changed", "d", "added")
 
-        monkeypatch.setattr(hosted_tools, "hosted_tool_names", names)
+        monkeypatch.setattr(hosted_tools, "hosted_tool_names", tools)
         monkeypatch.setattr(placement, "place_mcp", place)
-        monkeypatch.setattr(allow, "POLL_S", 0.0)
         assert allow.complete_pending(tmp_path, api_base="x", wait=True) is True
-        # Written only once Hermes held no AgentChat tools; done once they are connected again.
-        assert log == ["held", "held", "none", "write yes", "connected"]
+        assert log == ["held", "held", "held", "gone", "write yes", "none", "connected"]
 
-    def test_a_server_that_is_never_dropped_is_written_anyway_and_said(
+    def test_a_status_that_cannot_tell_waits_one_watcher_tick(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        placed = self._placement(monkeypatch)
+        allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True)
+        self._runtime(monkeypatch, "unknown")
+        monkeypatch.setattr(allow, "TICK_WAIT_S", 0.2)
+        monkeypatch.setattr(allow, "POLL_S", 0.01)
+        monkeypatch.setattr(hosted_tools, "hosted_tool_names", lambda: ["mcp__agentchat__agentchat_inbox"])
+        import time as _time
+
+        started = _time.monotonic()
+        assert allow.complete_pending(tmp_path, api_base="x", wait=True) is True
+        assert _time.monotonic() - started >= 0.2 and placed == ["yes"]
+
+    def test_a_server_never_dropped_is_not_written_and_says_restart(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         placed = self._placement(monkeypatch)
         allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True)
-        monkeypatch.setattr(hosted_tools, "hosted_tool_names", lambda: ["mcp__agentchat__agentchat_inbox"])
+        self._runtime(monkeypatch, "held")
         monkeypatch.setattr(allow, "DROP_TIMEOUT_S", 0.0)
-        monkeypatch.setattr(allow, "CONNECT_TIMEOUT_S", 0.0)
-        assert allow.complete_pending(tmp_path, api_base="x", wait=True) is True
-        assert placed == ["yes"]
-        assert any("hermes gateway restart" in r.getMessage() for r in caplog.records)
+        assert allow.complete_pending(tmp_path, api_base="x", wait=True) is False
+        assert placed == [], "never written blindly: the old connection would keep its tier"
+        record = allow.read_record(tmp_path)
+        assert record is not None and record["pending"] is True and record["stalled"] is True
+        assert any("restart the gateway to apply" in r.getMessage() for r in caplog.records)
+        switch = allow.Switch("applying", _allowance("missing", None), record)
+        assert switch.stalled and "restart the gateway to apply" in allow.describe(switch, "alice")
+        assert "restart the gateway to apply" in allow.reason("applying", stalled=True)
 
-    def test_a_failed_write_stays_pending(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        self._placement(monkeypatch, outcome="failed")
+    def test_this_process_stops_trying_after_a_few_timed_out_waits(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        placed = self._placement(monkeypatch)
         allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True)
+        self._runtime(monkeypatch, "held")
+        monkeypatch.setattr(allow, "DROP_TIMEOUT_S", 0.0)
+        scope = ProfileScope.capture(tmp_path)
+        for _ in range(allow.MAX_APPLY_ATTEMPTS):
+            thread = allow.start_completion(scope, api_base="x")
+            assert thread is not None
+            thread.join(5.0)
+        assert allow.start_completion(scope, api_base="x") is None, "a restart applies it"
+        assert placed == []
+
+    def test_a_logout_during_the_wait_is_never_written_over(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        placed = self._placement(monkeypatch)
+        allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True)
+        self._runtime(monkeypatch, "held", then=lambda n: n == 2 and allow.clear_pending(tmp_path))
+        assert allow.complete_pending(tmp_path, api_base="x", wait=True) is False
+        assert placed == []
+
+    def test_the_decision_is_read_again_right_before_the_write(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        placed = self._placement(monkeypatch)
+        allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True)
+        # The logout lands as Hermes drops the server.
+        self._runtime(monkeypatch, "gone", then=lambda n: allow.clear_pending(tmp_path))
+        assert allow.complete_pending(tmp_path, api_base="x", wait=True) is False
+        assert placed == []
+
+    def test_an_entry_back_in_config_is_not_written_over(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        placed = self._placement(monkeypatch)
+        allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True)
+        monkeypatch.setattr(mcp_registration, "inspect_entry", lambda *, api_base: "user_managed")
         assert allow.complete_pending(tmp_path, api_base="x", wait=False) is False
         record = allow.read_record(tmp_path)
-        assert record is not None and record["pending"] is True
+        assert placed == [] and record is not None and record["pending"] is False
+
+    def test_a_failed_write_stays_pending_then_is_given_up(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A read-only or package-managed config.yaml: a few attempts, then
+        "not allowed yet" with the operator's route — never "being applied"
+        for ever."""
+        self._placement(monkeypatch, outcome="failed")
+        allow.write_record(tmp_path, how="carried_over", trust="full", pending=True)
+        for attempt in range(1, allow.MAX_WRITE_FAILURES):
+            assert allow.complete_pending(tmp_path, api_base="x", wait=False) is False
+            record = allow.read_record(tmp_path)
+            assert record is not None and record["pending"] is True and record["write_failures"] == attempt
+        assert allow.complete_pending(tmp_path, api_base="x", wait=False) is False
+        record = allow.read_record(tmp_path)
+        assert record is not None and record["pending"] is False and record["gave_up"] == "d"
+        assert record["how"] == "carried_over", "still recorded: never carried over again"
+        switch = allow.Switch(allow.state_of(_allowance("missing", None), record), _allowance("missing", None), record)
+        assert switch.state == "not_allowed_yet" and switch.gave_up == "d"
+        assert "could not be written to config.yaml (d)" in allow.describe(switch, "alice")
+        assert any("given up" in r.getMessage() and "trust: full" in r.getMessage() for r in caplog.records)
+        assert allow.first_placement(tmp_path, entry="missing", legacy_key_set=True) is None
+
+    @pytest.mark.parametrize(
+        ("row", "runtime"),
+        [
+            (None, "unknown"),
+            (hosted_tools.ServerState("configured"), "gone"),
+            (hosted_tools.ServerState("connected", tools=3), "held"),
+            (hosted_tools.ServerState("connecting"), "held"),
+            (hosted_tools.ServerState("lazy", tools=3), "held"),
+            (hosted_tools.ServerState("failed"), "held"),  # parked: registered, probing itself
+            (hosted_tools.ServerState("failed", error="refused"), "unknown"),
+        ],
+    )
+    def test_server_runtime(self, monkeypatch: pytest.MonkeyPatch, row: Any, runtime: str) -> None:
+        asked: list[Any] = []
+        monkeypatch.setattr(hosted_tools, "hosted_server_state", lambda entry=None: asked.append(entry) or row)
+        assert allow.server_runtime("https://api.agentchat.me") == runtime
+        assert asked and asked[0]["url"].startswith("https://api.agentchat.me"), "read for our entry, not config.yaml's"
 
     def test_start_completion_runs_once(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         release = threading.Event()
@@ -533,9 +616,17 @@ class TestCompletePending:
 # ─── /agentchat allow ──────────────────────────────────────────────────────
 
 
+# Hermes' asker for ``ctx.ask_choice`` (``hermes_cli.plugin_choices._ASKER``):
+# a context variable the surface that dispatches a command binds around the
+# handler call (``bind_asker``). A context copied before that — the profile's
+# scope, captured at ``register(ctx)`` — has none.
+_ASKER: contextvars.ContextVar[Any] = contextvars.ContextVar("test_plugin_choice_asker", default=None)
+
+
 class _Chat:
     """A ``ctx`` with Hermes' two command methods; ``picked`` is what the
-    person taps (``None``: unanswered, or nothing can ask here)."""
+    person taps (``None``: unanswered). Like Hermes', ``ask_choice`` asks only
+    through the asker bound in the calling context, else returns ``None``."""
 
     def __init__(self, picked: Any = "allow") -> None:
         self.picked = picked
@@ -546,15 +637,14 @@ class _Chat:
         self.commands[name] = (handler, description, args_hint)
 
     def ask_choice(self, question: str, choices: list[Any]) -> Any:
+        asker = _ASKER.get()
+        if asker is None:
+            return None
         self.asked.append((question, choices))
-        return self.picked
+        return asker(question, choices)
 
 
 class TestSlashCommand:
-    @pytest.fixture(autouse=True)
-    def _a_persons_process(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(allow, "_origin_session", "")
-
     def _wire(
         self,
         monkeypatch: pytest.MonkeyPatch,
@@ -584,11 +674,17 @@ class TestSlashCommand:
         monkeypatch.setattr(leader_lock, "is_hermes_gateway_process", lambda: gateway)
         return placed
 
-    def _run(self, tmp_path: Path, chat: _Chat, args: str = "allow", session_id: str = "") -> str:
+    def _run(self, tmp_path: Path, chat: _Chat, args: str = "allow") -> str:
+        """Registered (the scope captured, no asker bound), then dispatched as
+        a surface does: its asker bound around the call."""
         allow.register_allow_command(chat, ProfileScope.capture(tmp_path))
         handler, _description, hint = chat.commands["agentchat"]
         assert hint == "allow"
-        return str(handler(args, session_id=session_id))
+        token = _ASKER.set(lambda question, choices: chat.picked)
+        try:
+            return str(handler(args))
+        finally:
+            _ASKER.reset(token)
 
     def test_allow_with_no_entry_writes_it_full(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         placed = self._wire(monkeypatch, tmp_path, state="not_allowed_yet", allowance=_allowance("missing", None))
@@ -628,23 +724,49 @@ class TestSlashCommand:
         assert self._run(tmp_path, _Chat(None)) == "Nothing changed: the question was not answered."
         assert placed == []
 
-    def test_a_classic_chat_an_agents_terminal_started_is_refused(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-    ) -> None:
+    def test_a_classic_chat_is_asked_like_any_other(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """No refusal by where the process came from: the question goes to the
+        surface the command came from (best effort, not a boundary)."""
         placed = self._wire(monkeypatch, tmp_path, state="not_allowed_yet", allowance=_allowance("missing", None), gateway=False)
-        monkeypatch.setattr(allow, "_origin_session", "the-agents-session")
+        monkeypatch.setenv("HERMES_SESSION_ID", "some-session")
         chat = _Chat("allow")
-        reply = self._run(tmp_path, chat, session_id="this-chats-session")
-        assert chat.asked == [] and placed == []
-        assert reply.startswith("This chat runs in a process an agent's terminal started")
-        assert "Send /agentchat allow in your own chat with @alice" in reply
+        assert self._run(tmp_path, chat).startswith("AgentChat tools allowed for @alice")
+        assert len(chat.asked) == 1 and placed == ["yes"]
 
-    def test_the_gateways_chats_are_the_persons(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        """A gateway an agent's terminal restarted still serves the person's chats."""
-        placed = self._wire(monkeypatch, tmp_path, state="not_allowed_yet", allowance=_allowance("missing", None), gateway=True)
-        monkeypatch.setattr(allow, "_origin_session", "the-agents-session")
-        assert self._run(tmp_path, _Chat("allow"), session_id="tg-session").startswith("AgentChat tools allowed")
-        assert placed == ["yes"]
+    def test_the_question_is_asked_in_the_callers_context(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """The profile's scope reads and writes; the question is asked outside
+        it, where the surface bound its asker."""
+        placed = self._wire(monkeypatch, tmp_path, state="not_allowed_yet", allowance=_allowance("missing", None))
+        in_scope: contextvars.ContextVar[bool] = contextvars.ContextVar("in_scope", default=False)
+        run = ProfileScope.run
+        seen: list[bool] = []
+
+        def scoped(self: ProfileScope, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+            def marked() -> Any:
+                in_scope.set(True)
+                return fn(*args, **kwargs)
+
+            return run(self, marked)
+
+        monkeypatch.setattr(ProfileScope, "run", scoped)
+        chat = _Chat("allow")
+        allow.register_allow_command(chat, ProfileScope.capture(tmp_path))
+        handler = chat.commands["agentchat"][0]
+        token = _ASKER.set(lambda question, choices: seen.append(in_scope.get()) or "allow")
+        try:
+            reply = str(handler("allow"))
+        finally:
+            _ASKER.reset(token)
+        assert seen == [False] and placed == ["yes"] and reply.startswith("AgentChat tools allowed")
+
+    def test_allowed_meanwhile_is_not_written_again(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        placed = self._wire(monkeypatch, tmp_path, state="not_allowed_yet", allowance=_allowance("missing", None))
+        readings = iter([allow.Switch("not_allowed_yet", _allowance("missing", None))])
+        monkeypatch.setattr(
+            allow, "read_switch", lambda home, *, api_base: next(readings, allow.Switch("allowed", _allowance("ours", "full", "trust")))
+        )
+        assert self._run(tmp_path, _Chat("allow")) == "AgentChat tools are already allowed for @alice."
+        assert placed == []
 
     @pytest.mark.parametrize("via", ["trust", "no_trust_key"])
     def test_already_allowed_asks_nothing(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, via: str) -> None:
@@ -740,13 +862,13 @@ class TestSlashCommand:
         allow.register_allow_command(Refusing(), ProfileScope.capture(tmp_path))
         assert any("/agentchat could not be registered" in r.getMessage() for r in caplog.records)
 
-    def test_the_handler_takes_hermes_context_keywords(self, tmp_path: Path) -> None:
-        """Hermes passes only the keywords a handler declares (``invoke_plugin_command``)."""
+    def test_the_handler_is_a_plain_sync_handler(self, tmp_path: Path) -> None:
+        """Hermes passes only the keywords a handler declares
+        (``invoke_plugin_command``); ``ask_choice`` needs a sync handler."""
         import inspect
 
         chat = _Chat()
         allow.register_allow_command(chat, ProfileScope.capture(tmp_path))
         handler = chat.commands["agentchat"][0]
-        params = inspect.signature(handler).parameters
-        assert list(params) == ["raw_args", "session_id"]
-        assert params["session_id"].kind is inspect.Parameter.KEYWORD_ONLY
+        assert list(inspect.signature(handler).parameters) == ["raw_args"]
+        assert not inspect.iscoroutinefunction(handler)

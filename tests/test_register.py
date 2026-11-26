@@ -505,10 +505,27 @@ class TestReconcileKeyStore:
 
         home = tmp_path / ".hermes"
         home.mkdir()
+        monkeypatch.setattr(_register, "_legacy_verified", set())
         assert _register._adopt_legacy_key(self._config(home, api_key("old"), ENV_API_KEY_LEGACY)) == "go"
         read = key_store.read_store(home)
         assert read.usable and read.key is not None and read.key.api_key == api_key("old")
         assert not (home / ".env").exists(), "never mirrored into .env (0.5.3 wrote AGENTCHAT_API_KEY there)"
+        from agentchatme_hermes.profile_scope import hermes_home_key
+
+        assert _register._legacy_verified == {hermes_home_key(home)}, "accepted by the server at this activation"
+
+    def test_a_key_the_server_refuses_is_not_verified(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme.integration.account import CheckKeyResult
+
+        from agentchatme_hermes import _register, signup
+        from agentchatme_hermes.config import ENV_API_KEY_LEGACY
+
+        monkeypatch.setattr(signup, "check_key", lambda key, *, api_base: CheckKeyResult(ok=False, code="INVALID_KEY"))
+        monkeypatch.setattr(_register, "_legacy_verified", set())
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        assert _register._adopt_legacy_key(self._config(home, api_key("old"), ENV_API_KEY_LEGACY)) == "retry"
+        assert _register._legacy_verified == set()
 
     def test_a_legacy_key_another_profile_saved_is_not_adopted(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -568,24 +585,24 @@ class TestReconcileMcpRegistration:
     def _wire(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        home: Path,
         *,
         entry: str,
         legacy: bool,
         outcome: str = "missing",
-        adopted: bool = True,
     ) -> list[Any]:
-        from types import SimpleNamespace
-
-        from agentchatme_hermes import _register, allow, key_store, mcp_registration, placement
+        """``legacy``: the server accepted this profile's pre-0.3 key at this
+        activation (:func:`_register._adopt_legacy_key`)."""
+        from agentchatme_hermes import _register, allow, mcp_registration, placement
         from agentchatme_hermes.placement import PlacementStep
-
-        monkeypatch.setattr(key_store, "read_store", lambda home: SimpleNamespace(usable=adopted))
+        from agentchatme_hermes.profile_scope import hermes_home_key
 
         calls: list[Any] = []
         monkeypatch.setattr(_register, "_said_not_allowed", set())
+        monkeypatch.setattr(_register, "_legacy_verified", {hermes_home_key(home)} if legacy else set())
         monkeypatch.setattr(mcp_registration, "inspect_entry", lambda *, api_base: entry)
-        monkeypatch.setattr(allow, "legacy_key_set", lambda: legacy)
-        status = {"missing": "skipped", "added": "changed", "present": "ok"}.get(outcome, "ok")
+        monkeypatch.setattr(allow, "legacy_key_set", lambda: True)  # the .env line alone carries nothing
+        status = {"missing": "skipped", "added": "changed", "present": "ok", "failed": "failed"}.get(outcome, "ok")
         monkeypatch.setattr(
             placement,
             "place_mcp",
@@ -599,7 +616,7 @@ class TestReconcileMcpRegistration:
     ) -> None:
         from agentchatme_hermes import _register, allow
 
-        calls = self._wire(monkeypatch, entry="missing", legacy=False)
+        calls = self._wire(monkeypatch, tmp_path, entry="missing", legacy=False)
         with caplog.at_level(logging.INFO, logger="agentchatme_hermes._register"):
             _register._reconcile_mcp_registration(self._runtime(tmp_path))
             _register._reconcile_mcp_registration(self._runtime(tmp_path))
@@ -610,23 +627,24 @@ class TestReconcileMcpRegistration:
         assert "An operator who builds config.yaml" in said[0].getMessage() and "trust: full" in said[0].getMessage()
         assert allow.read_record(tmp_path) is None, "nothing decided, nothing recorded"
 
-    def test_outside_the_gateway_it_is_said_at_info(
+    def test_a_cli_process_says_it_at_warning_too(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
+        """A profile used only in CLI chats: its person may never run a gateway."""
         from agentchatme_hermes import _register
 
-        self._wire(monkeypatch, entry="missing", legacy=False)
+        self._wire(monkeypatch, tmp_path, entry="missing", legacy=False)
         with caplog.at_level(logging.INFO, logger="agentchatme_hermes._register"):
             _register._reconcile_mcp_registration(self._runtime(tmp_path, gateway=False))
         said = [r for r in caplog.records if "not allowed yet" in r.getMessage()]
-        assert len(said) == 1 and said[0].levelno == logging.INFO
+        assert len(said) == 1 and said[0].levelno == logging.WARNING
 
     def test_a_setup_from_before_0_3_is_carried_over_once(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         from agentchatme_hermes import _register, allow
 
-        calls = self._wire(monkeypatch, entry="missing", legacy=True, outcome="added")
+        calls = self._wire(monkeypatch, tmp_path, entry="missing", legacy=True, outcome="added")
         with caplog.at_level(logging.INFO, logger="agentchatme_hermes._register"):
             _register._reconcile_mcp_registration(self._runtime(tmp_path))
         assert calls == [("https://api.example.test", "carried_over")]
@@ -637,24 +655,52 @@ class TestReconcileMcpRegistration:
         _register._reconcile_mcp_registration(self._runtime(tmp_path))
         assert calls == [("https://api.example.test", None)]
 
-    def test_a_copied_pre_0_3_line_that_was_not_adopted_is_not_carried_over(
+    @pytest.mark.parametrize("gateway", [True, False])
+    def test_a_verified_pre_0_3_key_is_carried_over_in_any_process(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, gateway: bool
+    ) -> None:
+        """A named August profile used only in CLI chats keeps its tools: the
+        server accepted its key at this activation — whether or not the key
+        file took it."""
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register, key_store
+
+        monkeypatch.setattr(key_store, "read_store", lambda home: SimpleNamespace(usable=False))
+        calls = self._wire(monkeypatch, tmp_path, entry="missing", legacy=True, outcome="added")
+        _register._reconcile_mcp_registration(self._runtime(tmp_path, gateway=gateway))
+        assert calls == [("https://api.example.test", "carried_over")]
+
+    def test_a_pre_0_3_line_nobody_verified_is_not_carried_over(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """A named profile never set up as an agent keeps its copied .env line
-        unadopted (no key file): it gets no tools entry, only the person's yes."""
+        """A named profile never set up as an agent is not checked with the
+        server (its .env may be a copy): no tools entry, only the person's yes."""
         from agentchatme_hermes import _register, allow
 
-        calls = self._wire(monkeypatch, entry="missing", legacy=True, adopted=False)
+        calls = self._wire(monkeypatch, tmp_path, entry="missing", legacy=False)
         _register._reconcile_mcp_registration(self._runtime(tmp_path))
         assert calls == [("https://api.example.test", None)]
         assert allow.read_record(tmp_path) is None
+
+    def test_a_carry_over_that_cannot_be_written_is_counted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agentchatme_hermes import _register, allow
+
+        self._wire(monkeypatch, tmp_path, entry="missing", legacy=True, outcome="failed")
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.allow"):
+            _register._reconcile_mcp_registration(self._runtime(tmp_path))
+        record = allow.read_record(tmp_path)
+        assert record is not None and record["pending"] is True and record["write_failures"] == 1
+        assert any("could not be written" in r.getMessage() for r in caplog.records)
 
     def test_an_entry_already_there_is_recorded_and_left(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         from agentchatme_hermes import _register, allow
 
-        calls = self._wire(monkeypatch, entry="ours", legacy=True, outcome="present")
+        calls = self._wire(monkeypatch, tmp_path, entry="ours", legacy=True, outcome="present")
         _register._reconcile_mcp_registration(self._runtime(tmp_path))
         assert calls == [("https://api.example.test", None)]
         record = allow.read_record(tmp_path)
@@ -668,7 +714,7 @@ class TestReconcileMcpRegistration:
     def test_an_unreadable_config_decides_nothing(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         from agentchatme_hermes import _register, mcp_registration
 
-        calls = self._wire(monkeypatch, entry="missing", legacy=True)
+        calls = self._wire(monkeypatch, tmp_path, entry="missing", legacy=True)
 
         def unreadable(*, api_base: str) -> str:
             raise mcp_registration.McpRegistrationError("no hermes")
@@ -696,7 +742,7 @@ class TestReconcileMcpRegistration:
     ) -> None:
         from agentchatme_hermes import _register
 
-        calls = self._wire(monkeypatch, entry="missing", legacy=True)
+        calls = self._wire(monkeypatch, tmp_path, entry="missing", legacy=True)
         done = self._applying(monkeypatch, tmp_path)
         _register._reconcile_mcp_registration(self._runtime(tmp_path, gateway=True))
         assert done == [("thread", tmp_path)] and calls == [], "nothing else is placed meanwhile"
@@ -706,7 +752,7 @@ class TestReconcileMcpRegistration:
     ) -> None:
         from agentchatme_hermes import _register, allow
 
-        calls = self._wire(monkeypatch, entry="missing", legacy=False)
+        calls = self._wire(monkeypatch, tmp_path, entry="missing", legacy=False)
         done = self._applying(monkeypatch, tmp_path)
         monkeypatch.setattr(allow, "gateway_lives", lambda home, *, api_base: True)
         _register._reconcile_mcp_registration(self._runtime(tmp_path, gateway=False))
@@ -721,7 +767,7 @@ class TestReconcileMcpRegistration:
         from agentchatme_hermes import _register, placement
         from agentchatme_hermes.placement import PlacementStep
 
-        self._wire(monkeypatch, entry="ours", legacy=False)
+        self._wire(monkeypatch, tmp_path, entry="ours", legacy=False)
         monkeypatch.setattr(
             placement, "place_mcp", lambda api_base, decision=None: PlacementStep("mcp", "failed", "no hermes")
         )
@@ -731,18 +777,6 @@ class TestReconcileMcpRegistration:
 
 
 class TestAllowCommandRegistration:
-    def test_register_takes_the_agent_terminal_reading_once(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        from agentchatme_hermes import _register, allow
-
-        monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
-        monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: None)
-        monkeypatch.setattr(sys, "argv", ["hermes", "chat"])
-        monkeypatch.setattr(allow, "_origin_session", None)
-        monkeypatch.setenv("HERMES_SESSION_ID", "the-agents-session")
-        _register.register(MagicMock())
-        monkeypatch.setenv("HERMES_SESSION_ID", "this-chats-own-session")
-        assert allow.started_in_agent_terminal("this-chats-own-session") is True
-
     def test_register_adds_the_slash_command(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         from agentchatme_hermes import _register
 

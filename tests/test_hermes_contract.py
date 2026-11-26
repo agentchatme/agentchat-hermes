@@ -811,6 +811,92 @@ def test_ask_choice_answers_only_where_someone_can(monkeypatch: pytest.MonkeyPat
         assert choices.ask_choice("q", options) is None
 
 
+_ALLOW_PROBE = """    from agentchatme_hermes.allow import register_allow_command
+    from agentchatme_hermes.profile_scope import ProfileScope, resolve_hermes_home
+    register_allow_command(ctx, ProfileScope.capture(resolve_hermes_home()))"""
+
+
+@pytest.mark.parametrize("surface", ["classic_cli", "gateway"])
+def test_allow_is_asked_through_the_asker_the_surface_binds(
+    _hermes_home: Path, monkeypatch: pytest.MonkeyPatch, surface: str
+) -> None:
+    """``/agentchat allow`` registered through a real ``PluginContext`` (its
+    scope captured in ``register()``, before any asker exists), dispatched as
+    Hermes dispatches it: the classic CLI's own ``_run_plugin_slash_command``
+    (``bind_asker(clarify_asker(...))`` around ``invoke_plugin_command``), and
+    the gateway's (``invoke_plugin_command`` on its executor, the caller's
+    context carried by ``_run_in_executor_with_context``). The question
+    reaches the surface's asker; the switch is written in the profile's scope.
+    Inside that scope Hermes' ``ask_choice`` finds no asker — where the
+    question was asked before this fix."""
+    import asyncio
+    import functools
+    import types as _types
+
+    from fake_keys import api_key
+    from key_files import save_key
+
+    from agentchatme_hermes import allow
+    from agentchatme_hermes import mcp_registration as reg
+    from agentchatme_hermes.profile_scope import ProfileScope
+
+    monkeypatch.setattr(allow, "inspect_allowance", reg.inspect_allowance)  # the real file
+    monkeypatch.setattr(allow, "gateway_lives", lambda home, *, api_base: False)
+    save_key(api_key("contract_" + "0" * 32), handle="alice", home=_hermes_home)
+    (_hermes_home / "config.yaml").write_text("model:\n  default: x\n", encoding="utf-8")
+    _probe_plugin(_hermes_home, "agentchat_allow_probe", _ALLOW_PROBE)
+    manager = _load_plugins(_hermes_home, routed=False)
+    entry = manager._plugin_commands.get("agentchat")
+    assert entry is not None, f"registered through Hermes: {sorted(manager._plugin_commands)}"
+    handler = entry["handler"]
+    choices = _import("hermes_cli.plugin_choices")
+    dispatch = _import("hermes_cli.plugin_command_dispatch")
+    asked: list[tuple[str, list[str]]] = []
+
+    def clarify(questions: list[dict[str, Any]]) -> dict[str, Any]:
+        asked.append((questions[0]["question"], list(questions[0]["choices"])))
+        return {"answers": {"q0": "Allow"}, "outcome": "answered"}
+
+    if surface == "classic_cli":
+        cli = _import("cli")
+        printed: list[str] = []
+        monkeypatch.setattr(_import("hermes_cli.gateway_plugin_commands"), "run", lambda *a, **k: None)
+        monkeypatch.setattr(_import("hermes_cli.plugins"), "get_plugin_command_handler", lambda name: handler)
+        monkeypatch.setattr(cli, "_cprint", lambda text, *a, **k: printed.append(str(text)))
+        shell = _types.SimpleNamespace(_clarify_callback=clarify, session_id="cli-session")
+        cli.HermesCLI._run_plugin_slash_command(shell, "/agentchat", "allow")
+        reply = "\n".join(printed)
+    else:
+        runner_cls = _import("gateway.run").GatewayRunner
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=1)
+        runner = _types.SimpleNamespace(_get_executor=lambda: pool)
+        call = functools.partial(
+            dispatch.invoke_plugin_command, handler, "allow", source=None, session_id="tg", session_key="tg",
+            platform="telegram",
+        )
+
+        async def dispatched() -> Any:
+            with choices.bind_asker(choices.clarify_asker(clarify)):
+                return await runner_cls._run_in_executor_with_context(runner, call)
+
+        try:
+            reply = str(asyncio.run(dispatched()))
+        finally:
+            pool.shutdown(wait=True)
+    assert asked == [("Allow @alice to use AgentChat tools on its own?", ["Allow", "Don't allow"])], reply
+    assert "AgentChat tools allowed for @alice" in reply
+    assert reg.inspect_allowance(api_base=allow._api_base(_hermes_home)).trust == "full"
+
+    # Why it is asked outside the scope: a scope captured before the surface
+    # binds its asker (as register() captures it) does not see the asker.
+    scope = ProfileScope.capture(_hermes_home)
+    with choices.bind_asker(lambda question, labels: labels[0]):
+        assert choices.ask_choice("q", ["a"]) == "a"
+        assert scope.run(choices.ask_choice, "q", ["a"]) is None
+
+
 def test_hermes_shows_after_install_md() -> None:
     install = _import("hermes_cli.plugins_cmd_install")
     assert "after-install.md" in inspect.getsource(install._display_after_install)
@@ -1574,15 +1660,26 @@ def test_a_new_entry_connects_with_the_trust_it_was_written_with(
         lifecycle.shutdown_mcp_servers()
 
 
+def _eventually(check: Any, timeout: float = 30.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if check():
+            return True
+        time.sleep(0.05)
+    return bool(check())
+
+
 def test_a_yes_over_a_connected_untrusted_server_is_applied_in_two_steps(
     _hermes_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A no, connected untrusted; then a yes while the gateway runs. Hermes
     keeps a connected server's tier and its config reconcile never re-reads
     it, so the plugin removes the entry (the reconcile, one housekeeping tick,
-    drops the server), then writes it back full once no AgentChat tool is
-    registered (the next tick connects it fresh, with the new tier): two
-    ticks, about two minutes. The real discovery path, a localhost server."""
+    drops the server), and the gateway's second step — waiting on its own
+    thread — writes it back full only once Hermes runs no agentchat server for
+    the profile (its own status for the name, not "no tools registered"); the
+    next tick connects it fresh, with the new tier: two ticks, about two
+    minutes. The real discovery path, a localhost server."""
     pytest.importorskip("mcp.client.streamable_http")
     from fake_keys import api_key
 
@@ -1594,11 +1691,13 @@ def test_a_yes_over_a_connected_untrusted_server_is_applied_in_two_steps(
     monkeypatch.setattr(_import("tools.approval_prompt"), "request_elicitation_consent", lambda *a, **k: "decline")
     monkeypatch.setattr(allow, "inspect_allowance", reg.inspect_allowance)  # the real file, not the unit suite's stand-in
     monkeypatch.setattr(allow, "gateway_lives", lambda home, *, api_base: True)  # this process is the gateway
+    monkeypatch.setattr(allow, "POLL_S", 0.05)
     monkeypatch.setattr(placement, "resolve_hermes_home", lambda: _hermes_home)
     monkeypatch.setenv("AGENTCHAT_API_KEY", api_key("contract_" + "0" * 32))
     port = _free_port()
     api_base = f"http://127.0.0.1:{port}"
     (_hermes_home / "config.yaml").write_text("model:\n  default: x\n", encoding="utf-8")
+    worker: threading.Thread | None = None
     try:
         with _McpStub(port, tools=("agentchat_inbox", "agentchat_send_message")):
             assert placement.place_mcp(api_base, decision="no").outcome == "added"
@@ -1613,21 +1712,125 @@ def test_a_yes_over_a_connected_untrusted_server_is_applied_in_two_steps(
             assert reg.inspect_entry(api_base=api_base) == "missing"
             assert allow.read_switch(_hermes_home, api_base=api_base).state == "applying"
             assert _gate() is False, "until the gateway connects it again, Hermes keeps the old tier"
+            assert allow.server_runtime(api_base) == "held"
 
-            # Hermes' watcher, one tick: the removed server is dropped.
+            # Step two, the gateway's, on its own thread: nothing written while Hermes runs the server.
+            done: list[bool] = []
+            worker = threading.Thread(
+                target=lambda: done.append(allow.complete_pending(_hermes_home, api_base=api_base, wait=True))
+            )
+            worker.start()
+            time.sleep(0.5)
+            assert reg.inspect_entry(api_base=api_base) == "missing", "never written while the old connection lives"
+
+            # Hermes' watcher, one tick: the removed server is dropped; step two writes trust: full.
             assert discovery.reconcile_mcp_servers_with_config()["removed"] == ["agentchat"]
-            assert hosted_tools.hosted_tool_names() == []
-
-            # Step two (the gateway's): no AgentChat tool held, so it writes trust: full.
-            assert allow.complete_pending(_hermes_home, api_base=api_base, wait=False) is True
+            assert allow.server_runtime(api_base) == "gone"
+            assert _eventually(lambda: reg.inspect_entry(api_base=api_base) == "ours")
             assert reg.inspect_allowance(api_base=api_base).trust == "full"
+
+            # The next tick: connected fresh, with the new tier; step two ends once the tools are back.
+            assert discovery.reconcile_mcp_servers_with_config()["added"] == ["agentchat"]
+            worker.join(30.0)
+            assert done == [True]
             record = allow.read_record(_hermes_home)
             assert record is not None and record["pending"] is False and record["decision"] == "yes"
-
-            # The next tick: connected fresh, with the new tier.
-            assert discovery.reconcile_mcp_servers_with_config()["added"] == ["agentchat"]
             assert hosted_tools.wait_for_hosted_tools(timeout_s=30.0) is True
             assert _gate() is True
             assert allow.read_switch(_hermes_home, api_base=api_base).state == "allowed"
+    finally:
+        if worker is not None:
+            allow.clear_pending(_hermes_home)
+            worker.join(10.0)
+        lifecycle.shutdown_mcp_servers()
+
+
+def test_a_parked_server_is_waited_for_like_a_connected_one(
+    _hermes_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parked server has no tools registered, but Hermes still runs it (it
+    probes itself and would come back with its old tier). The second step
+    never reads it as dropped: this one parked on its first connect and keeps
+    that error, which Hermes' status shows like a first connect that left
+    nothing, so the reading is "cannot tell" and the wait is one watcher tick
+    plus margin — by when the tick tore it down, as here."""
+    pytest.importorskip("mcp.client.streamable_http")
+    from fake_keys import api_key
+
+    from agentchatme_hermes import allow, hosted_tools
+    from agentchatme_hermes import mcp_registration as reg
+
+    discovery = _import("tools.mcp_tool_discovery")
+    lifecycle = _import("tools.mcp_tool_lifecycle")
+    monkeypatch.setenv("AGENTCHAT_API_KEY", api_key("contract_" + "0" * 32))
+    api_base = f"http://127.0.0.1:{_free_port()}"  # nothing listens
+    (_hermes_home / "config.yaml").write_text("model:\n  default: x\n", encoding="utf-8")
+    try:
+        assert reg.install_entry(api_base=api_base, decision="no").outcome == "added"
+        discovery.discover_mcp_tools()  # three refused attempts, then parked
+        state = hosted_tools.hosted_server_state()
+        assert state is not None and state.parked, state
+        assert hosted_tools.hosted_tool_names() == [], "no tools: what the earlier wait took for dropped"
+        assert reg.uninstall_entry(api_base=api_base)
+        assert allow.server_runtime(api_base) in ("held", "unknown"), "never read as dropped"
+        assert discovery.reconcile_mcp_servers_with_config()["removed"] == ["agentchat"]
+        assert allow.server_runtime(api_base) == "gone"
+        assert allow.TICK_WAIT_S > 60, "one housekeeping tick (contract-tested: 60 s) plus margin"
+    finally:
+        lifecycle.shutdown_mcp_servers()
+
+
+def test_each_profile_waits_only_on_its_own_server(
+    _hermes_home: Path, monkeypatch: pytest.MonkeyPatch, _multiplexed: Any, _probe_captures: dict[str, Any]
+) -> None:
+    """A gateway serving two profiles runs an ``agentchat`` server for each,
+    keyed by the profile's home. Read in a profile's scope (the one its
+    plugin captured in ``register()``), Hermes' status shows that profile's
+    server only: once the launch profile's watcher tick drops its server, its
+    second step reads it gone while the served profile's same-named server is
+    still connected — and the other way round."""
+    pytest.importorskip("mcp.client.streamable_http")
+    discovery = _import("tools.mcp_tool_discovery")
+    lifecycle = _import("tools.mcp_tool_lifecycle")
+    monkeypatch.setattr(_import("tools.approval_prompt"), "request_elicitation_consent", lambda *a, **k: "decline")
+    from agentchatme_hermes import allow
+
+    root = _hermes_home
+    served = _two_profiles(root, monkeypatch)
+    ports = {root: _free_port(), served: _free_port()}
+    base = {home: (home / "config.yaml").read_text(encoding="utf-8") for home in ports}
+    for home, port in ports.items():
+        (home / "config.yaml").write_text(
+            base[home] + f"mcp_servers:\n  agentchat:\n    url: http://127.0.0.1:{port}/mcp\n    trust: untrusted\n",
+            encoding="utf-8",
+        )
+    _multiplexed()
+    _load_plugins(root, routed=False)
+    _load_plugins(served, routed=True)
+    key = _import("hermes_constants").hermes_home_key
+    scopes = {key(Path(home)): scope for home, scope in _probe_captures.items()}
+    assert set(scopes) == {key(root), key(served)}
+
+    def runtime(home: Path) -> str:
+        return str(_in_a_worker(lambda: scopes[key(home)].run(allow.server_runtime, "https://api.agentchat.me")))
+
+    def in_scope(home: Path, fn: Any) -> Any:
+        return _in_a_worker(lambda: scopes[key(home)].run(fn))
+
+    try:
+        with _McpStub(ports[root]), _McpStub(ports[served]):
+            for home in ports:
+                in_scope(home, discovery.discover_mcp_tools)
+            assert runtime(root) == "held" and runtime(served) == "held"
+
+            (root / "config.yaml").write_text(base[root], encoding="utf-8")  # the launch profile's step one
+            assert runtime(root) == "held"
+            assert in_scope(root, discovery.reconcile_mcp_servers_with_config)["removed"] == ["agentchat"]
+            assert runtime(root) == "gone", "the served profile's agentchat server is not the launch profile's"
+            assert runtime(served) == "held"
+
+            (served / "config.yaml").write_text(base[served], encoding="utf-8")
+            assert in_scope(served, discovery.reconcile_mcp_servers_with_config)["removed"] == ["agentchat"]
+            assert runtime(served) == "gone"
     finally:
         lifecycle.shutdown_mcp_servers()

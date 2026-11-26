@@ -247,8 +247,8 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
     A yes over our ``untrusted`` entry while a gateway runs for this profile
     is the first of two steps (``applying``): the decision is recorded, the
     entry removed (Hermes' watcher drops the connected server), and the
-    gateway writes it with ``trust: full`` once it holds no AgentChat tools
-    any more (:func:`.allow.start_completion`). With no gateway running the
+    gateway writes it with ``trust: full`` once Hermes runs no AgentChat
+    server for the profile any more (:func:`.allow.start_completion`). With no gateway running the
     entry is changed in place (``allowed``). Never raises."""
     home = resolve_hermes_home()
     if decision == "yes":

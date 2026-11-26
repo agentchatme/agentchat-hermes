@@ -95,7 +95,7 @@ from .config import (
     DEFAULT_TURN_IDLE_S,
     DEFAULT_TURN_MAX_S,
 )
-from .hosted_tools import hosted_server_state, wait_for_hosted_tools
+from .hosted_tools import hosted_server_state, hosted_tool_names, wait_for_hosted_tools
 from .model_call import (
     DEFAULT_MAX_TOKENS,
     GATE_CALL_PURPOSE,
@@ -226,10 +226,14 @@ class AgentInvoker:
         self._resolved_hermes = False
 
         # The one switch (:mod:`.allow`) as last read, for the health record,
-        # and the state last logged (one line per change).
+        # and the state last logged (one line per change). ``_tools_wanted``:
+        # a cycle found no tools to work with (paused, or not registered in
+        # Hermes) and nothing has woken the loop since — :meth:`check_tools`
+        # wakes it once they are there.
         self._switch_lock = threading.Lock()
         self._switch: dict[str, Any] | None = None
         self._switch_said: str | None = None
+        self._tools_wanted = False
 
     # -- wiring ---------------------------------------------------------------
 
@@ -243,9 +247,9 @@ class AgentInvoker:
         from .allow import on_applied
 
         self._wake = wake
-        # A yes applied in two steps finishes on its own thread: re-read the
-        # switch then (it wakes the loop when the pause ends).
-        on_applied(self._home(), self._read_switch if wake is not None else None)
+        # A yes applied in two steps finishes on its own thread, once the tools
+        # are registered again: check then (it wakes the loop).
+        on_applied(self._home(), self.check_tools if wake is not None else None)
 
     def stop(self) -> None:
         """No new turns; a running one is interrupted by its watch; a gate
@@ -314,27 +318,58 @@ class AgentInvoker:
 
     def tools_allowed_status(self) -> dict[str, Any] | None:
         """The switch for the health record (``doctor`` reads it from the
-        running gateway): ``state`` (:data:`.allow.State`), the entry's
-        ``trust``, what lets the writes through (``via``), when read. Read now
-        (the health record is written every minute), so a change shows, and a
-        yes being applied is finished, even while no wake arrives."""
-        self._read_switch()
+        running gateway) as last read: ``state`` (:data:`.allow.State`), the
+        entry's ``trust``, what lets the writes through (``via``), ``stalled``
+        (a yes the running gateway did not take up: restart to apply), when
+        read. Reads nothing itself — the health record is also written from
+        the receiver's event loop; :meth:`check_tools` (every minute, on a
+        thread) and :meth:`readiness` read the switch."""
         with self._switch_lock:
             return dict(self._switch) if self._switch is not None else None
 
-    def _read_switch(self) -> State:
-        """:meth:`_switch_now` as an entry point of its own, in the profile's
-        scope (the health record's writer, the second step's callback)."""
+    def check_tools(self) -> State:
+        """The minute check (the receiver's heartbeat, on a worker thread; the
+        second step of a yes when it is done), in the profile's scope: read the
+        switch now — a change shows and a yes being applied is finished even
+        while no wake arrives — and wake the receive loop when a cycle found no
+        tools to work with and they are there now (a yes after "not allowed
+        yet", a pause that ended, a parked server Hermes connected again)."""
         try:
-            return self._scope.run(self._switch_now)
+            return self._scope.run(self._check_tools_now)
         except Exception:
             logger.debug("AgentInvoker: the tools switch could not be read", exc_info=True)
             return "unknown"
 
+    def _check_tools_now(self) -> State:
+        from .allow import PAUSED_STATES
+
+        state = self._switch_now()
+        if state not in PAUSED_STATES:
+            self._wake_if_tools_back()
+        return state
+
+    def _want_tools(self) -> None:
+        with self._switch_lock:
+            self._tools_wanted = True
+
+    def _wake_if_tools_back(self) -> None:
+        """Wake the loop once for the cards a cycle could not work on, when
+        Hermes has the hosted tools registered now (or this is not Hermes)."""
+        with self._switch_lock:
+            wanted = self._tools_wanted and self._wake is not None
+        if not wanted or hosted_tool_names() == []:
+            return  # nothing waits, or not registered yet: the next check looks again
+        with self._switch_lock:
+            wanted, self._tools_wanted = self._tools_wanted, False
+        if wanted:
+            logger.info("AgentInvoker: the hosted AgentChat tools are there — waking the receive loop for the waiting cards")
+            self._wake_loop()
+
     def _switch_now(self) -> State:
         """Read the switch (:func:`.allow.read_switch`) in the calling scope,
-        record it, log a change once, finish a yes being applied, and wake the
-        receive loop when the pause ends."""
+        record it, log a change once, and finish a yes being applied. When a
+        pause ends the cards that waited are wanted: :meth:`check_tools` wakes
+        the loop for them once the tools are registered."""
         from .allow import PAUSED_STATES, Switch, describe, read_switch, start_completion
 
         home = self._home()
@@ -351,12 +386,15 @@ class AgentInvoker:
                 "state": state,
                 "trust": allowance.trust if allowance is not None else None,
                 "via": allowance.via if allowance is not None else None,
+                "stalled": switch.stalled,
                 "at": time.time(),
             }
             changed = state != self._switch_said and state != "unknown"
             previous = self._switch_said
             if changed:
                 self._switch_said = state
+            if changed and previous in PAUSED_STATES and state not in PAUSED_STATES:
+                self._tools_wanted = True  # the cards that waited on the tray
         if state == "applying" and not self._stopped.is_set():
             start_completion(self._scope, api_base=api_base)
         if changed:
@@ -373,14 +411,6 @@ class AgentInvoker:
                 )
             elif previous is not None:
                 logger.info("agentchat plugin: AgentChat tools %s (profile=%s)", text, profile_label(home))
-            if previous in PAUSED_STATES and state not in PAUSED_STATES:
-                # The pause ended: the cards that waited on the tray are gated now.
-                wake = self._wake
-                if wake is not None:
-                    try:
-                        wake()
-                    except Exception:
-                        logger.debug("AgentInvoker: wake after the pause raised", exc_info=True)
         return state
 
     def live_turns(self) -> int:
@@ -557,13 +587,20 @@ class AgentInvoker:
         except ProfileScopeError as exc:
             return Readiness(ready=False, reason=f"profile scope unavailable: {exc}")
         if state in PAUSED_STATES:
-            return Readiness(ready=False, reason=reason(state))
+            self._want_tools()
+            with self._switch_lock:
+                stalled = bool(self._switch and self._switch.get("stalled"))
+            return Readiness(ready=False, reason=reason(state, stalled=stalled))
         if held is None:
             return Readiness(ready=False, reason="stopping")
         if not held:
+            # tools_unavailable: woken again once Hermes has them (check_tools).
+            self._want_tools()
             return Readiness(
                 ready=False, reason="the hosted AgentChat tools are not registered in Hermes yet"
             )
+        with self._switch_lock:
+            self._tools_wanted = False
         return Readiness(ready=True)
 
     def _switch_then_hold(self) -> tuple[State, bool | None]:

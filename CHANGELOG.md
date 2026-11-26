@@ -26,8 +26,9 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   `HERMES_SESSION_ID`) or without a terminal. The plugin never offers or answers the question for the agent; this is
   best effort, not a security boundary (an agent with a shell can edit `config.yaml`). There is no `--yes` flag.
 - **`/agentchat allow`** in a chat with the agent (Telegram, Desktop, the CLI): the same question, asked through
-  Hermes' own prompt (`ctx.ask_choice`). Refused in a classic chat process an agent's terminal started; the gateway's
-  chats are the person's. `/agentchat` alone says where the tools stand.
+  Hermes' own prompt (`ctx.ask_choice`) on the surface the command came from, so it is answered wherever that surface
+  is (an agent driving a Hermes CLI in a terminal of its own could answer it there: best effort, not a boundary).
+  `/agentchat` alone says where the tools stand.
 - **`hermes agentchat allow`**: the same question in your own terminal; the wizard's edit menu offers it while the
   entry's tier does not allow the tools.
 - **`after-install.md`**: `hermes plugins install` now says the two steps (sign up, allow once).
@@ -105,20 +106,29 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   answer. Entries an earlier release wrote (no `trust` key, which Hermes reads as `full`) are left as they are.
 - **A yes over a connected `untrusted` entry takes two steps** while a gateway runs: Hermes keeps a connected server's
   trust and its config watcher only adds and removes servers, so the plugin records the decision, removes the entry
-  (the watcher drops the server), and the gateway writes it back with `trust: full` once it holds no AgentChat tool
-  (the watcher connects it fresh). Within about two minutes; a gateway restart in between finishes it. With no gateway
+  (the watcher drops the server), and the gateway writes it back with `trust: full` once Hermes' own status shows no
+  `agentchat` server for that profile (each profile's own on a gateway serving several; a status that cannot tell waits
+  one watcher tick plus margin), and the watcher connects it fresh. Within about two minutes; a gateway restart in
+  between finishes it. A gateway that keeps the old connection past three minutes gets nothing written (the old
+  connection would keep its trust): the decision stays pending, `doctor` fails with "restart the gateway to apply",
+  `status` and the health record say so, and the gateway stops trying after three such waits. The decision and the
+  entry are read again right before the write, so a logout or a no meanwhile is never written over. With no gateway
   running the entry is changed in place.
 - **Profiles set up before 0.3** (only `AGENTCHATME_API_KEY`, no `mcp_servers.agentchat`, the population the earlier
-  catalog pin left behind) get the entry with `trust: full`, once, at the first activation of this release that
-  adopted that key (the server accepted it and it was copied into the key file) or at `doctor --fix`, recorded first
-  in `<profile home>/agentchat/mcp-entry.json` so it never happens again (a copied `.env` line that was not adopted
-  gets nothing); `doctor --fix`
-  removes the key's old `.env` line only after that entry landed. The log and `doctor` say "carried over from your
-  setup under an earlier release".
+  catalog pin left behind) get the entry with `trust: full`, once, at the first activation of this release at which the
+  server accepts that key — in any Hermes process, the gateway or a CLI chat, whether or not the key file took it — or
+  at `doctor --fix`, recorded first in `<profile home>/agentchat/mcp-entry.json` so it never happens again (a copied
+  `.env` line nobody verified gets nothing); `doctor --fix` removes the key's old `.env` line only after that entry
+  landed. The log and `doctor` say "carried over from your setup under an earlier release". A carry-over (or a yes)
+  that cannot be written — a read-only or package-managed `config.yaml` — is given up after three attempts: the switch
+  then reads "not allowed yet" with the operator's route, never "being applied" for ever.
 - **No AgentChat work while the tools are not allowed.** Before any gate call or turn the receive loop's readiness
   check reads the switch: the entry's tier, else `approvals.mode: off` or the gateway's own `--yolo`. Not allowed means
-  no gate call, no turn and nothing recorded (the socket still acknowledges delivery). When the pause ends the receive
-  loop is woken, so the conversations that waited are gated at once.
+  no gate call, no turn and nothing recorded (the socket still acknowledges delivery). When the pause ends, or a cycle
+  found the hosted tools not registered (a yes Hermes' watcher has not connected yet, a parked server Hermes connected
+  again), the gateway's minute check wakes the receive loop as soon as Hermes has the tools, so the conversations that
+  waited are gated without waiting for the server's re-wake. "Not allowed yet" is logged at WARNING in every process,
+  a CLI chat included.
 - **The manual and the SOUL.md identity line are this release's by default.** Both load into every session of the
   profile, so they no longer change from the server between plugin releases. The `agentchat:agentchat` skill is the
   package's `skills/agentchat/SKILL.md` (now manual 2.4.23); nothing downloads or writes a manual. The identity line is

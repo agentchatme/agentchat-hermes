@@ -562,8 +562,17 @@ class TestToolsSwitch:
         assert answer.ready is False and "being applied" in (answer.reason or "")
         assert held == [] and started == [home]
 
-    def test_the_pause_ending_wakes_the_loop(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        """The cards that waited on the tray are gated as soon as the tools are allowed."""
+    def _registered(self, monkeypatch: pytest.MonkeyPatch, names: list[str] | None = None) -> list[list[str] | None]:
+        """What Hermes has registered of the hosted tools (``hosted_tool_names``)."""
+        box: list[list[str] | None] = [[] if names is None else names]
+        monkeypatch.setattr(invoker_module, "hosted_tool_names", lambda: box[0])
+        return box
+
+    def test_the_pause_ending_wakes_the_loop_once_the_tools_are_there(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The cards that waited on the tray are gated as soon as the tools are
+        allowed and registered: the minute check wakes the loop, once."""
         from agentchatme_hermes.mcp_registration import Allowance
 
         inv = _invoker(monkeypatch, home=tmp_path / "p6")
@@ -571,13 +580,78 @@ class TestToolsSwitch:
         inv.set_wake(lambda: woken.append("wake"))
         box = self._switch(monkeypatch, "untrusted")
         self._held(monkeypatch)
+        self._registered(monkeypatch, ["mcp_agentchat_agentchat_inbox"])
         assert inv.readiness().ready is False
         assert woken == []
         box[0] = Allowance("ours", "full", "trust")
-        inv.tools_allowed_status()  # the health record's minute read sees it first
+        inv.check_tools()  # the receiver's minute check sees it first
         assert woken == ["wake"]
         assert inv.readiness().ready is True
-        assert woken == ["wake"], "once per change"
+        inv.check_tools()
+        assert woken == ["wake"], "once"
+        inv.set_wake(None)
+
+    def test_a_yes_after_not_allowed_yet_is_woken_when_hermes_connects_the_tools(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The sequence that lost the wake: no entry (paused); the person says
+        yes; the entry is written, but Hermes' watcher connects it up to a
+        minute later — a wake at the switch change ran a cycle whose hold
+        ended tools_unavailable, and nothing woke the loop again. Now the
+        minute check wakes it once the tools are registered."""
+        from agentchatme_hermes.mcp_registration import Allowance
+
+        inv = _invoker(monkeypatch, home=tmp_path / "p8")
+        woken: list[str] = []
+        inv.set_wake(lambda: woken.append("wake"))
+        box = self._switch(monkeypatch, None, entry="missing")
+        registered = self._registered(monkeypatch)
+        assert inv.readiness().ready is False  # paused: not allowed yet
+        box[0] = Allowance("ours", "full", "trust")  # the yes: written trust: full
+        inv.check_tools()
+        assert woken == [], "not registered yet: a cycle now would only hold and fail"
+        monkeypatch.setattr(invoker_module, "wait_for_hosted_tools", lambda **kw: False)
+        answer = inv.readiness()  # a peer's wake meanwhile: the hold ends tools_unavailable
+        assert answer.ready is False and "not registered" in (answer.reason or "")
+        inv.check_tools()
+        assert woken == []
+        registered[0] = ["mcp_agentchat_agentchat_inbox"]  # the watcher connected it
+        inv.check_tools()
+        assert woken == ["wake"]
+        inv.check_tools()
+        assert woken == ["wake"], "once"
+        inv.set_wake(None)
+
+    def test_a_parked_server_hermes_connects_again_wakes_the_loop(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Allowed, but Hermes parked the server: every cycle ends
+        tools_unavailable with no switch change. When Hermes' own probe
+        connects it again the cards are gated without waiting for a re-wake."""
+        inv = _invoker(monkeypatch, home=tmp_path / "p9")
+        woken: list[str] = []
+        inv.set_wake(lambda: woken.append("wake"))
+        self._switch(monkeypatch, "full", via="trust")
+        registered = self._registered(monkeypatch)
+        monkeypatch.setattr(invoker_module, "wait_for_hosted_tools", lambda **kw: False)
+        assert inv.readiness().ready is False
+        inv.check_tools()
+        assert woken == []
+        registered[0] = ["mcp_agentchat_agentchat_inbox"]
+        inv.check_tools()
+        assert woken == ["wake"]
+        inv.set_wake(None)
+
+    def test_no_wake_when_no_cycle_waited(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        inv = _invoker(monkeypatch, home=tmp_path / "p10")
+        woken: list[str] = []
+        inv.set_wake(lambda: woken.append("wake"))
+        self._switch(monkeypatch, "full", via="trust")
+        self._registered(monkeypatch, ["mcp_agentchat_agentchat_inbox"])
+        self._held(monkeypatch)
+        assert inv.readiness().ready is True
+        inv.check_tools()
+        assert woken == []
         inv.set_wake(None)
 
     def test_a_yes_applied_elsewhere_reaches_the_loop(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -589,6 +663,7 @@ class TestToolsSwitch:
         woken: list[str] = []
         inv.set_wake(lambda: woken.append("wake"))
         box = self._switch(monkeypatch, None, entry="missing")
+        self._registered(monkeypatch, ["mcp_agentchat_agentchat_inbox"])
         inv.readiness()
         box[0] = Allowance("ours", "full", "trust")
         callback = allow._on_applied.get(str(home))
@@ -597,6 +672,34 @@ class TestToolsSwitch:
         assert woken == ["wake"]
         inv.set_wake(None)
         assert str(home) not in allow._on_applied
+
+    def test_the_status_reads_nothing_itself(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """The health record is written from the receiver's event loop too: the
+        status is the last reading; the minute check (on a thread) reads."""
+        from agentchatme_hermes import allow
+
+        inv = _invoker(monkeypatch, home=tmp_path / "p11")
+        reads: list[str] = []
+        box = self._switch(monkeypatch, None, entry="missing")
+        monkeypatch.setattr(allow, "inspect_allowance", lambda *, api_base: reads.append("read") or box[0])
+        assert inv.tools_allowed_status() is None and reads == []
+        inv.check_tools()
+        assert reads == ["read"]
+        status = inv.tools_allowed_status()
+        assert status is not None and status["state"] == "not_allowed_yet" and reads == ["read"]
+
+    def test_a_stalled_yes_says_restart_to_apply(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from agentchatme_hermes import allow
+
+        home = tmp_path / "p12"
+        inv = _invoker(monkeypatch, home=home)
+        self._switch(monkeypatch, None, entry="missing")
+        allow.write_record(home, how="asked", trust="full", decision="yes", pending=True, stalled=True)
+        monkeypatch.setattr(allow, "start_completion", lambda scope, *, api_base: None)
+        answer = inv.readiness()
+        assert answer.ready is False and "restart the gateway to apply" in (answer.reason or "")
+        status = inv.tools_allowed_status()
+        assert status is not None and status["stalled"] is True
 
     def test_an_unreadable_config_does_not_pause(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         inv = _invoker(monkeypatch, home=tmp_path / "p4")

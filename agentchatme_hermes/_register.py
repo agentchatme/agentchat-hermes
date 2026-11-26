@@ -67,7 +67,13 @@ from ._version import __version__
 from .config import ENV_API_KEY_LEGACY, KEY_SOURCE_STORE, ConfigError, KeyRefused, load_config
 from .kit import kit_problem
 from .leader_lock import is_hermes_gateway_process
-from .profile_scope import ProfileScope, ProfileScopeError, profile_label, resolve_hermes_home
+from .profile_scope import (
+    ProfileScope,
+    ProfileScopeError,
+    hermes_home_key,
+    profile_label,
+    resolve_hermes_home,
+)
 from .texts import mode_for, read_mode, record_mode
 
 if TYPE_CHECKING:
@@ -131,14 +137,12 @@ def register(ctx: Any) -> None:
         )
 
     # ``/agentchat allow``: the person allows the AgentChat tools from a chat
-    # with the agent (Hermes' own prompt), worked out in this profile's scope.
-    # Registered unconditionally, like the CLI: it needs no key and no runtime.
+    # with the agent (Hermes' own prompt, asked in the command's own context;
+    # the switch read and written in this profile's scope). Registered
+    # unconditionally, like the CLI: it needs no key and no runtime.
     try:
-        from .allow import note_process_origin, register_allow_command
+        from .allow import register_allow_command
 
-        # Before a chat session of this process sets its own session id: was
-        # this process started inside an agent's terminal? (best effort)
-        note_process_origin()
         register_allow_command(ctx, scope)
     except Exception:
         logger.error("agentchat plugin: /agentchat could not be registered", exc_info=True)
@@ -348,6 +352,7 @@ class ActivationWatcher:
         if split is not None:
             # The socket and the gate would be one agent, the hosted tools another.
             return self._refused(split)
+        _legacy_verified.discard(hermes_home_key(self._hermes_home))
         if getattr(config, "api_key_source", KEY_SOURCE_STORE) == ENV_API_KEY_LEGACY:
             # Verified with the server, then copied into the key file under the
             # per-account lock — before the runtime opens any socket, so a copy
@@ -813,6 +818,12 @@ def _split_identity(config: Any) -> str | None:
     return tools_key_conflict(home, api_key)
 
 
+# Profiles (their home keys) whose pre-0.3 key the server accepted at the
+# activation attempt running now (:func:`_adopt_legacy_key`): the one-time
+# carry-over of the tools (:func:`_reconcile_mcp_registration`) needs it.
+_legacy_verified: set[str] = set()
+
+
 def _adopt_legacy_key(config: Any) -> Literal["go", "copy", "retry"]:
     """A key found only under the pre-v3 name: verify it with the server, then
     copy it into the key file (:func:`.credentials.adopt_legacy_key`), before
@@ -875,6 +886,7 @@ def _adopt_legacy_key(config: Any) -> Literal["go", "copy", "retry"]:
             cmd,
         )
         return "retry"
+    _legacy_verified.add(hermes_home_key(home))
     outcome = adopt_legacy_key(
         home=home,
         api_key=api_key,
@@ -992,12 +1004,16 @@ def _reconcile_mcp_registration(runtime: Any) -> None:
 
     * a profile set up before 0.3 (only the old ``AGENTCHATME_API_KEY``, no
       entry) gets the entry with ``trust: full``, once
-      (:func:`.allow.first_placement`) — it was set up when the tools acted
-      without asking;
+      (:func:`.allow.first_placement`), when the server accepted that key at
+      this activation (:func:`_adopt_legacy_key`), in any process — the
+      gateway or a CLI chat — whether or not the key file took it: it was set
+      up when the tools acted without asking;
     * a recorded ``trust: full`` not written yet (a yes applied in two steps,
-      or a carry-over, interrupted) is written: by the gateway once it holds
-      no AgentChat tools (:func:`.allow.start_completion`), by another process
-      only while no gateway runs for the account.
+      or a carry-over, interrupted) is written: by the gateway once Hermes
+      runs no AgentChat server for the profile (:func:`.allow.start_completion`),
+      by another process only while no gateway runs for the account. One that
+      cannot be written is given up after a few attempts
+      (:func:`.allow.note_write_failure`).
 
     An entry that is there gets the client header once when it has none (the
     entry is static, so this writes at most once per install); a user-managed
@@ -1009,7 +1025,7 @@ def _reconcile_mcp_registration(runtime: Any) -> None:
             complete_pending,
             first_placement,
             gateway_lives,
-            legacy_key_set,
+            note_write_failure,
             read_switch,
             start_completion,
         )
@@ -1038,16 +1054,14 @@ def _reconcile_mcp_registration(runtime: Any) -> None:
     except McpRegistrationError:
         entry = None
     if entry is not None:
-        # Only a profile the pre-0.3 key was adopted for at this activation
-        # (verified with the server, then copied into the key file before the
-        # runtime started: _adopt_legacy_key) — never a profile that only holds
-        # a copied .env line.
-        from .key_store import read_store
-
-        adopted = read_store(home).usable
-        decision = first_placement(home, entry=entry, legacy_key_set=adopted and legacy_key_set())
+        # Only a pre-0.3 key the server accepted at this activation
+        # (_adopt_legacy_key) — never a copied .env line nobody verified.
+        verified = hermes_home_key(home) in _legacy_verified
+        decision = first_placement(home, entry=entry, legacy_key_set=verified)
     step = place_mcp(api_base, decision=decision)
-    if step.failed:
+    if step.failed and decision == "carried_over":
+        note_write_failure(home, step.detail, api_base=api_base)
+    elif step.failed:
         logger.warning("agentchat plugin: hosted tools not registered for profile=%s — %s", label, step.detail)
     elif decision == "carried_over" and step.outcome == "added":
         logger.info(
@@ -1071,21 +1085,19 @@ def _record_path(home: Any) -> Any:
 
 
 def _say_not_allowed_yet(runtime: Any, label: str) -> None:
-    """Once per process and profile: the gateway at WARNING (it would answer
-    peers), every other process at INFO (a session the person runs)."""
+    """Once per process and profile, at WARNING in every process: the agent
+    answers nothing on AgentChat until the person allows the tools (a CLI chat
+    included, whose person may never run the gateway)."""
     key = str(runtime.hermes_home)
     if key in _said_not_allowed:
         return
     _said_not_allowed.add(key)
     from .allow import operator_route, who
     from .config import cli_prefix
-    from .runtime import keeps_placements_current
 
     handle = getattr(getattr(runtime, "identity", None), "handle", None)
-    level = logging.WARNING if keeps_placements_current(runtime) else logging.INFO
     api_base = getattr(getattr(runtime, "config", None), "api_base", None)
-    logger.log(
-        level,
+    logger.warning(
         "agentchat plugin: AgentChat tools are not allowed yet for profile=%s (%s): no AgentChat work "
         "starts until the person allows them — /agentchat allow in a chat with it, or `%s allow` in a "
         "terminal. %s",

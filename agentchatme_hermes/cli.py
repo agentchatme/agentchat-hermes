@@ -1159,9 +1159,10 @@ def _doctor_tools_switch(
     warn: Callable[[str], None],
     fail: Callable[[str], None],
 ) -> None:
-    """The one switch (:func:`.allow.read_switch`): not decided yet is a
-    failure (setup is not finished: the agent has no AgentChat tools); a no,
-    a yes being applied, or a trust changed by hand is a warning."""
+    """The one switch (:func:`.allow.read_switch`): not decided yet, or a yes
+    the running gateway did not take up (restart to apply), is a failure — the
+    agent answers nothing on AgentChat; a no, a yes being applied, or a trust
+    changed by hand is a warning."""
     switch = allow.read_switch(hermes_home, api_base=api_base)
     if switch.state == "disabled":
         return  # said above
@@ -1169,7 +1170,7 @@ def _doctor_tools_switch(
         warn("AgentChat tools: not checked — this Hermes' config.yaml could not be read here")
         return
     text = f"AgentChat tools: {allow.describe(switch, handle, cmd=cmd)}"
-    if switch.state == "not_allowed_yet":
+    if switch.state == "not_allowed_yet" or switch.stalled:
         fail(text)
     elif switch.state == "allowed" and not switch.hand_edited:
         ok(text)
@@ -1295,8 +1296,10 @@ def _describe_worker(worker: Any, *, now: float) -> tuple[str, str] | None:
     if bad and newest is not None and newest.get("outcome") == "tools_unavailable" and paused in allow.PAUSED_STATES:
         # Paused by the switch (the person's choice, or a yes being applied):
         # said with its remedy, not alarmed on.
+        stalled = isinstance(switch, dict) and switch.get("stalled") is True
         return "warn", (
-            f"The receive loop is paused: {allow.reason(paused)} — AgentChat messages wait on the tray"
+            f"The receive loop is paused: {allow.reason(paused, stalled=stalled)} — AgentChat messages wait on "
+            "the tray"
         )
     if bad and newest is not None:
         what = str(newest.get("outcome") or "?")
