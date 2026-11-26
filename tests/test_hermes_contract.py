@@ -2,9 +2,10 @@
 
 Skipped unless Hermes is importable (the unit suite runs without it). The
 scheduled ``hermes-main`` workflow installs hermes-agent from its main branch,
-and from its latest release, and runs the whole suite with each, so a Hermes
-change that breaks one of these couplings shows within a day instead of at the
-next release, and a break on the release users run shows too. What each one is
+its latest release and the floor release (``requires_hermes``), and runs the
+whole suite with each, so a Hermes change that breaks one of these couplings
+shows within a day instead of at the next release, and a break on the release
+users run, or on the oldest one the plugin accepts, shows too. What each one is
 for, and which public hook would replace it, is ``docs/hermes-coupling.md``.
 
 Nothing here reaches a network service: the model is a localhost stub and
@@ -368,9 +369,11 @@ def test_live_texts_reaches_each_profile_through_ctx_get_config(
 def test_our_config_schema_is_one_boolean_setting_hermes_shows() -> None:
     """The manifest's ``config_schema`` as Hermes parses, validates and renders
     it (the Desktop form, ``hermes plugins config``, the settings offer at
-    ``hermes plugins install``)."""
+    ``hermes plugins install``). ``hermes_cli.plugins_settings`` names the
+    form's fields on every release (a module up to v0.23.3, a package
+    re-exporting ``fields`` since v0.23.4)."""
     manifest_mod = _import("hermes_cli.plugins_manifest")
-    fields_mod = _import("hermes_cli.plugins_settings.fields")
+    fields_mod = _import("hermes_cli.plugins_settings")
 
     parsed = manifest_mod.parse_manifest_file(_REPO / "plugin.yaml", _REPO, "user", "")
     assert parsed is not None and set(parsed.config_schema) == {"live_texts"}
@@ -381,6 +384,102 @@ def test_our_config_schema_is_one_boolean_setting_hermes_shows() -> None:
     assert field["default"] is False and field["value"] is False
     assert field["label"] == "Keep the AgentChat manual and identity line current"
     assert field["description"].startswith("Off: your agent reads the AgentChat manual")
+
+
+def _pyproject_sdk_requirement() -> str:
+    import re
+
+    pyproject = (_REPO / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'^\s*"(agentchatme[^"]*)",?\s*$', pyproject, re.MULTILINE)
+    assert match, "pyproject.toml declares agentchatme"
+    return match.group(1)
+
+
+def test_hermes_installs_the_sdk_pyproject_declares_and_asks_first() -> None:
+    """The plugin installs nothing: Hermes reads this tree's one Python
+    dependency from pyproject.toml (``pm.plugin_declarations``), shows it and
+    asks before installing it; a headless install without ``--yes-deps`` is
+    refused (Hermes leaves the plugin installed but disabled) and
+    ``--yes-deps`` is the yes."""
+    import io
+
+    from rich.console import Console
+
+    declarations = _import("pm.plugin_declarations")
+    install = _import("hermes_cli.plugins_cmd_install")
+    plugins_cmd = _import("hermes_cli.plugins_cmd")
+
+    declaration = declarations.read_python_declaration(_REPO)
+    assert declaration.pyproject == _REPO / "pyproject.toml"
+    assert declaration.install_requirements == (_pyproject_sdk_requirement(),)
+    manifest = plugins_cmd._read_manifest_for_install(_REPO)
+    shown = io.StringIO()
+    consented, reason = install._install_plugin_python_deps(manifest, _REPO, Console(file=shown, width=200))
+    assert consented is False and getattr(reason, "failure_class", None) == "non_interactive"
+    assert f"- {_pyproject_sdk_requirement()}" in shown.getvalue()
+    assert install._install_plugin_python_deps(manifest, _REPO, Console(file=io.StringIO()), assume_yes=True) == (
+        True,
+        None,
+    )
+
+
+def test_hermes_reads_our_floor_and_skips_the_plugin_below_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``requires_hermes`` as Hermes parses it from our manifest, validates it
+    (``hermes plugins validate``) and gates the load on it."""
+    manifest_mod = _import("hermes_cli.plugins_manifest")
+    validate = _import("hermes_cli.plugin_validate")
+
+    parsed = manifest_mod.parse_manifest_file(_REPO / "plugin.yaml", _REPO, "user", "")
+    assert parsed is not None and parsed.requires_hermes == ">=0.23.2"
+    assert validate._requires_hermes_spec_valid(parsed.requires_hermes)
+    monkeypatch.setattr(manifest_mod, "running_hermes_version", lambda: "0.23.1")
+    assert manifest_mod.requires_hermes_error(parsed) == "requires hermes >=0.23.2, running 0.23.1"
+    for running in ("0.23.2", "0.23.4", "0.24.0", "unknown"):
+        monkeypatch.setattr(manifest_mod, "running_hermes_version", lambda running=running: running)
+        assert manifest_mod.requires_hermes_error(parsed) is None, running
+
+
+def test_a_directory_plugin_is_imported_under_the_namespace_the_kit_reads(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``kit._install_source`` tells a directory install (``hermes plugins
+    install``) from a pip install by the module name Hermes' directory loader
+    gives the plugin, ``hermes_plugins.<slug>``."""
+    loader = _import("hermes_cli.plugins_loader")
+    plugins = _import("hermes_cli.plugins")
+    manifest_mod = _import("hermes_cli.plugins_manifest")
+
+    assert loader._NS_PARENT == "hermes_plugins"
+    monkeypatch.setattr(loader, "_BARE_MODULE_SCOPE", {})  # which scope claimed the bare name: not this test's
+    parsed = manifest_mod.parse_manifest_file(_REPO / "plugin.yaml", _REPO, "user", "")
+    manager = plugins.PluginManager()
+    assert manager._directory_module_name(parsed).startswith("hermes_plugins.agentchat")
+
+
+def test_dropping_the_manifest_copy_of_the_sdk_widens_nothing(tmp_path: Path) -> None:
+    """0.6.5's manifests listed the SDK under ``pip_dependencies``; this
+    release's do not and name a Hermes floor instead. Hermes' unattended update
+    (``plugins.auto_apply``) sees no wider surface and no new dependency."""
+    catalog = _import("hermes_cli.plugins_cmd_catalog")
+    declarations = _import("pm.plugin_declarations")
+    plugins_cmd = _import("hermes_cli.plugins_cmd")
+
+    manifest = (_REPO / "plugin.yaml").read_text(encoding="utf-8")
+    floor = 'requires_hermes: ">=0.23.2"\n'
+    assert floor in manifest
+    previous = manifest.replace(floor, f"pip_dependencies:\n  - {_pyproject_sdk_requirement()}\n")
+    trees = {}
+    for name, text in (("old", previous), ("new", manifest)):
+        tree = tmp_path / name
+        tree.mkdir()
+        (tree / "plugin.yaml").write_text(text, encoding="utf-8")
+        (tree / "pyproject.toml").write_bytes((_REPO / "pyproject.toml").read_bytes())
+        trees[name] = tree
+    old = catalog.plugin_surface(plugins_cmd._read_manifest(trees["old"]), trees["old"])
+    new = catalog.plugin_surface(plugins_cmd._read_manifest(trees["new"]), trees["new"])
+    assert catalog.surface_delta(old, new) == {}
+    assert (
+        declarations.read_python_declaration(trees["new"]).install_requirements
+        == declarations.read_python_declaration(trees["old"]).install_requirements
+    )
 
 
 def test_a_release_that_changes_only_the_texts_widens_nothing(tmp_path: Path) -> None:
@@ -1220,7 +1319,11 @@ def _load_plugins(home: Path, *, routed: bool) -> Any:
     scope the gateway binds for it (``gateway.run._profile_runtime_scope``)."""
     plugins = _import("hermes_cli.plugins")
     constants = _import("hermes_constants")
-    manager = plugins.PluginManager(scope_key=constants.hermes_home_key(home), owner_home=home)
+    # As the release's own ``get_plugin_manager`` builds a profile's manager:
+    # with the home it was named by since v0.23.4 (``owner_home``), from the
+    # scope key alone before.
+    owner = {"owner_home": home} if "owner_home" in _params(plugins.PluginManager) else {}
+    manager = plugins.PluginManager(scope_key=constants.hermes_home_key(home), **owner)
 
     def load() -> None:
         if routed:
@@ -1493,19 +1596,26 @@ def test_gateway_marks_its_process() -> None:
 def test_hermes_mcp_status_surface_and_the_parked_remedy() -> None:
     """``hosted_tools`` reads ``get_mcp_status()`` rows (read only, diagnostics).
     Its remedy for a parked server is true of this Hermes: a parked server
-    probes itself after 300 s, backing off to an hour, and ``/reload-mcp`` is a
-    command a chat on the gateway can send."""
+    probes itself after 300 s — again every 300 s on v0.23.2, backing off to
+    an hour since v0.23.3 — and ``/reload-mcp`` is a command a chat on the
+    gateway can send."""
     from agentchatme_hermes import hosted_tools
 
     discovery = _import("tools.mcp_tool_discovery")
     assert {"configured"} <= _params(discovery.get_mcp_status)
     mcp_tool = _import("tools.mcp_tool")
     assert mcp_tool._PARKED_RETRY_INTERVAL == 300
-    assert mcp_tool._PARKED_PROBE_BACKOFF_MAX == 3600
+    remedy = hosted_tools.PARKED_REMEDY
+    assert "after 5 minutes" in remedy and "/reload-mcp" in remedy
+    if hasattr(mcp_tool, "_PARKED_PROBE_BACKOFF_MAX"):
+        assert mcp_tool._PARKED_PROBE_BACKOFF_MAX == 3600
+        assert "up to an hour" in remedy
+    else:
+        run = _import("tools.mcp_tool_server_run")
+        assert "timeout=_core._PARKED_RETRY_INTERVAL" in inspect.getsource(run), "a fixed 5-minute probe"
+        assert "every 5 minutes on Hermes v0.23.2" in remedy
     command = _import("hermes_cli.commands").resolve_command("reload-mcp")
     assert command is not None and not getattr(command, "cli_only", False)
-    assert "after 5 minutes" in hosted_tools.PARKED_REMEDY and "up to an hour" in hosted_tools.PARKED_REMEDY
-    assert "/reload-mcp" in hosted_tools.PARKED_REMEDY
 
 
 class _McpStub:

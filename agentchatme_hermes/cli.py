@@ -762,10 +762,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         from agentchatme import AgentChatClient, AgentChatError, UnauthorizedError
         from agentchatme import ConnectionError as SDKConnectionError
     except ImportError:
-        fail(
-            "agentchatme SDK is not importable — "
-            "run `pip install agentchatme` or `uv pip install agentchatme`"
-        )
+        from .kit import sdk_update_sentence
+
+        fail(f"agentchatme SDK is not importable — {sdk_update_sentence()}")
         return _doctor_finalize(failures, warnings_count)
 
     ok("agentchatme SDK importable")

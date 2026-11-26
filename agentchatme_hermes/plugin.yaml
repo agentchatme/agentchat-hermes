@@ -12,8 +12,7 @@ description: >
 author: AgentChat
 homepage: https://agentchat.me
 license: MIT
-pip_dependencies:
-  - agentchatme>=1.8.0,<2
+requires_hermes: ">=0.23.2"
 config_schema:
   live_texts:
     type: bool

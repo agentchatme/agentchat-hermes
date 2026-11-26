@@ -1239,6 +1239,94 @@ class TestWithoutTheKit:
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         out = capsys.readouterr().out
         assert rc >= 1 and "SDK kit missing" in out and KIT_REQUIREMENT in out
+        assert f"Run `{_pip_command()}` and restart the gateway." in out
+
+
+def _pip_command() -> str:
+    """The pip line for this interpreter as the person's shell takes it."""
+    import os
+
+    if os.name == "nt":
+        return f'{sys.executable} -m pip install -U "agentchatme>=1.8.0,<2"'
+    return f"{sys.executable} -m pip install -U 'agentchatme>=1.8.0,<2'"
+
+
+class TestTheCommandThatInstallsTheSdk:
+    """The plugin installs nothing: a missing or old SDK is reported with the
+    one command that installs the SDK pyproject.toml declares, for the way this
+    copy was installed (``kit.sdk_update_command``)."""
+
+    @staticmethod
+    def _loaded_from(monkeypatch: pytest.MonkeyPatch, module_name: str, package_root: Path) -> Any:
+        from agentchatme_hermes import kit
+
+        monkeypatch.setattr(kit, "__name__", module_name)
+        monkeypatch.setattr(kit, "__file__", str(package_root / "agentchatme_hermes" / "kit.py"))
+        return kit
+
+    @staticmethod
+    def _directory(home: Path) -> Path:
+        directory = home / "plugins" / "agentchat"
+        directory.mkdir(parents=True)
+        (directory / "plugin.yaml").write_text("name: agentchat\nversion: 0.7.0\n", encoding="utf-8")
+        return directory
+
+    def test_a_pip_install_gets_pip_in_hermes_environment(self) -> None:
+        from agentchatme_hermes import kit
+
+        assert kit.sdk_update_command() == _pip_command()
+        assert kit.sdk_update_sentence("run this again") == f"Run `{kit.sdk_update_command()}` and run this again."
+
+    def test_a_directory_install_gets_hermes_plugins_update(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "hermes"
+        default = self._directory(root)
+        kit = self._loaded_from(monkeypatch, "hermes_plugins.agentchat.agentchatme_hermes.kit", default)
+        assert kit.sdk_update_command() == "hermes plugins update agentchat"
+        growth = self._directory(root / "profiles" / "growth")
+        kit = self._loaded_from(monkeypatch, "hermes_plugins.agentchat__home_0a1b.agentchatme_hermes.kit", growth)
+        assert kit.sdk_update_command() == "hermes -p growth plugins update agentchat"
+        monkeypatch.setitem(sys.modules, "agentchatme.integration", None)
+        problem = kit.kit_problem()
+        assert problem is not None
+        assert "Run `hermes -p growth plugins update agentchat` and restart the gateway." in problem
+
+    def test_a_copy_pinned_with_ref_is_installed_again(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """``hermes plugins update`` refuses a copy installed with ``--ref``
+        (Hermes' install record says ``pinned``)."""
+        import json
+
+        directory = self._directory(tmp_path / "hermes")
+        source = "https://github.com/agentchatme/agentchat-hermes.git"
+        (directory.parent / ".install-metadata.json").write_text(
+            json.dumps({"agentchat": {"pinned": True, "source": source, "revision": "0" * 40}}), encoding="utf-8"
+        )
+        kit = self._loaded_from(monkeypatch, "hermes_plugins.agentchat.agentchatme_hermes.kit", directory)
+        assert kit.sdk_update_command() == (
+            f"hermes plugins install {source} --force --ref <release SHA> --yes-deps"
+        )
+        (directory.parent / ".install-metadata.json").write_text("{not json", encoding="utf-8")
+        assert kit.sdk_update_command() == "hermes plugins update agentchat"
+
+    def test_a_profile_running_the_package_managers_snapshot_names_the_directorys_profile(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A profile that enabled the installed plugin without its own copy
+        runs the editable snapshot Hermes' package manager took of the
+        directory (``plugin-sources/<member key>``): the command is for the
+        profile that holds the directory."""
+        from agentchatme_hermes.cli import _hermes_member_key
+
+        root = tmp_path / "hermes"
+        (root / "profiles" / "growth").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(root / "profiles" / "growth"))
+        ops = self._directory(root / "profiles" / "ops")
+        sources = tmp_path / "pm" / "workspace" / "plugin-sources"
+        kit = self._loaded_from(monkeypatch, "agentchatme_hermes.kit", sources / _hermes_member_key(ops))
+        assert kit.sdk_update_command() == "hermes -p ops plugins update agentchat"
+        kit = self._loaded_from(monkeypatch, "agentchatme_hermes.kit", sources / "agentchat-0123456789abcdef")
+        assert kit.sdk_update_command() == "hermes plugins update agentchat", "no directory matches: still Hermes'"
 
 
 class TestKeyReachesTheHostedToolsOnly:

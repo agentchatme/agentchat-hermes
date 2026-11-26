@@ -25,8 +25,9 @@ Hermes' MCP client tries a server's first connection three times; when they
 all fail (the gateway started while api.agentchat.me could not be reached: a
 reboot before the network, a DNS or provider outage) it *parks* the server:
 its tools are dropped from the registry and Hermes probes it again on its
-own, after 5 minutes and then at doubling intervals up to an hour
-(``tools/mcp_tool.py`` ``_PARKED_RETRY_INTERVAL`` / ``_PARKED_PROBE_BACKOFF_MAX``).
+own, after 5 minutes and then at doubling intervals up to an hour (every 5
+minutes on v0.23.2; ``tools/mcp_tool.py`` ``_PARKED_RETRY_INTERVAL`` /
+``_PARKED_PROBE_BACKOFF_MAX``).
 Hermes has no public way for a plugin to ask for a reconnect, so this plugin
 does not: while the server is parked every wake ends ``tools_unavailable``,
 and the log line and ``doctor`` name the cause and the remedy — ``/reload-mcp``
@@ -68,8 +69,8 @@ Probe = Callable[[], Optional[list[str]]]
 # brings it back now: said in the log line and by ``doctor``.
 PARKED_REMEDY = (
     "Hermes probes it again on its own after 5 minutes, then at longer intervals up to an "
-    "hour; to reconnect it now, send /reload-mcp in a chat this gateway serves, or run "
-    "`hermes gateway restart`"
+    "hour (every 5 minutes on Hermes v0.23.2); to reconnect it now, send /reload-mcp in a "
+    "chat this gateway serves, or run `hermes gateway restart`"
 )
 
 
