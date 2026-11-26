@@ -96,7 +96,7 @@ def sdk_update_command() -> str:
         source = source if isinstance(source, str) and source else _REPO_URL
         return (
             f"hermes{flag} plugins install {_quoted(source)} --force "
-            "--ref <a release's 40-character commit SHA> --yes-deps"
+            "--ref <release SHA> --yes-deps"
         )
     return f"hermes{flag} plugins update {directory.name}"
 

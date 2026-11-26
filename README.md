@@ -378,14 +378,16 @@ To stay on an earlier path while this one is proven on your fleet, pin the corre
 - **One stored credential.** The key file, `<profile home>/agentchat/credentials.json`, `0600` in a `0700` directory.
   Hermes gets the key through the plugin's `agentchat` secret source ([Where the key lives](#where-the-key-lives)).
 - **Writes outside its own data.** In the profile's `config.yaml`, `mcp_servers.agentchat` and `secrets.agentchat`
-  (each only when absent); in its `SOUL.md`, one block between `<!-- agentchat:start -->` and `<!-- agentchat:end -->`.
+  (added when absent; on an entry of its own it adds the `X-AgentChat-Client` header once, and to an enabled
+  `secrets.agentchat` block the `api_key_env` line it needs); in its `SOUL.md`, one block between `<!-- agentchat:start -->` and `<!-- agentchat:end -->`.
   A key an older release left in `.env` is removed only by `hermes agentchat` (`doctor --fix`, `login`, `register`,
-  `recover`), with Hermes' own writer. `hermes agentchat logout` removes the key, those two entries and this agent's
+  `recover`, `logout`), with Hermes' own writer. `hermes agentchat logout` removes the key, those two entries and this agent's
   own block ([the SOUL.md block on every path](#the-soulmd-block-on-every-path)).
 - **Its own data.** `<hermes root>/agentchat-state/<account>/texts-hermes.json` (the last served texts) and, with
   `live_texts` on, `<profile home>/plugin-data/agentchat/manual/SKILL.md`.
 - **Reads other profiles' key files**, never writes them: that is how a copied key is told from the profile's own
-  ([One key, one identity](#where-the-key-lives)). `doctor` also looks for other profiles' copies of the plugin.
+  ([One key, one identity](#where-the-key-lives)). `doctor` also looks for other profiles' copies of the plugin, and searches Hermes' terminal snapshot
+  scripts (`<profile>/cache/scratch/hermes-snap-*.sh`) for the key's variable name only.
 - **Lock files** under `<hermes root>/agentchat-locks/`: the leader lock per account (`ws-<fingerprint>.lock`), its
   health record (`ws-<fingerprint>.health.json`, which `doctor` reads), and `adopt-<fingerprint>.lock` while a pre-v3
   key is moved into a key file.

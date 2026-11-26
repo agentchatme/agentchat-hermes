@@ -1096,7 +1096,7 @@ class TestTheCommandThatInstallsTheSdk:
         )
         kit = self._loaded_from(monkeypatch, "hermes_plugins.agentchat.agentchatme_hermes.kit", directory)
         assert kit.sdk_update_command() == (
-            f"hermes plugins install {source} --force --ref <a release's 40-character commit SHA> --yes-deps"
+            f"hermes plugins install {source} --force --ref <release SHA> --yes-deps"
         )
         (directory.parent / ".install-metadata.json").write_text("{not json", encoding="utf-8")
         assert kit.sdk_update_command() == "hermes plugins update agentchat"
