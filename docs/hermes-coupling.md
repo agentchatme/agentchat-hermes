@@ -78,7 +78,7 @@ of another source.
 |---|---|---|---|
 | `hermes_constants.get_hermes_home` (**public**) | `profile_scope.resolve_hermes_home`, `soul_anchor.py` | The profile's home: SOUL.md, `config.yaml`, the key file, lock root. | Upstream ask: `ctx.profile_home` (`ctx.profile_name` exists, the path does not). |
 | `contextvars.copy_context()` in `register()` (stdlib) | `profile_scope.ProfileScope` | The profile's home override and, for a served profile, Hermes' runtime scope and terminal policy as bound when it loaded the plugin, for every plugin thread. | **Upstream ask:** `ctx.profile_scope()` / `ctx.run_in_profile(fn)`: the profile's full scope (secrets and terminal policy included) for plugin work, so a plugin binds nothing itself. |
-| `agent.secret_scope.is_multiplex_active` / `set_secret_scope` / `refresh_installed_secret_scope` / `reset_secret_scope` (**public**) | `ProfileScope._bind_secrets` | The profile's secrets for each entry point's call on a multiplexed gateway. `refresh_installed_secret_scope` builds through `owner_secret_scope` from v0.23.2; before (v0.23.1 and older) it rebuilt from the profile's files only, which drops the launch profile's environment-only keys — hence `requires_hermes >= 0.23.2`. Contract-tested on a real two-profile multiplexed gateway, and mutation-checked: no bind fails it, a files-only bind loses the launch profile's environment-only key. | Same ask. |
+| `agent.secret_scope.is_multiplex_active` / `set_secret_scope` / `refresh_installed_secret_scope` / `reset_secret_scope` (**public**) | `ProfileScope._bind_secrets` | The profile's secrets for each entry point's call on a multiplexed gateway. `refresh_installed_secret_scope` builds through `owner_secret_scope` from v0.23.2; before (v0.23.1 and older) it rebuilt from the profile's files only, which drops the launch profile's environment-only keys. That is warned, not refused: one WARNING per process and a `doctor` line from the running gateway's health record (`worker.scope`). Hermes exposes no release number to a plugin (its distribution reports `0.0.0`; `hermes --version` reads the private `hermes_cli.version_info`), so `profile_scope.refresh_keeps_launch_env` asks the public function itself, in an empty context, whether it refills a scope stamped for another (nonexistent) home — its documented contract since 0.23.2 is that it does not. Contract-tested on a real two-profile multiplexed gateway (including a launch profile loaded before the gateway multiplexes), and mutation-checked: no bind fails it, a files-only bind loses the launch profile's environment-only key. | Same ask. |
 | `hermes_constants.hermes_home_key` (**public**) | `profile_scope.hermes_home_key`, `config.copy_of` | Our registries key profiles the way Hermes' plugin managers do. | Part of the same ask. |
 | `agent.secret_scope.get_secret` / `UnscopedSecretError` (**public**) | `profile_scope.resolve_setting` | Every setting, in the scope the caller runs in. An unscoped read under multiplex is a `ProfileScopeError` (no fallback reader). | — |
 
@@ -91,8 +91,14 @@ Known limits (said to Nous):
   way to bind a profile's terminal policy.
 - **The loader's in-load flag.** The context captured in `register()` carries `hermes_cli.plugins_loader`'s
   `_IN_PLUGIN_LOAD`, so `in_plugin_load_worker()` is true in our threads and a `discover_plugins()` from them does
-  not wait for a sweep still running (`hermes_cli/plugins.py` `discover_and_load`, `_join_background_discovery`).
-  Turns run after the socket connects and the gate answers, well after the boot sweep;
+  not wait for a sweep still running (`hermes_cli/plugins.py` `discover_and_load`, `_join_background_discovery`):
+  the boot sweep, or a forced reload — `discover_plugins(force=True)` from `/reload-plugins`, a plugin enable
+  (`hermes_cli/plugins_activation.py`), the gateway's plugin rewire (`gateway/run_plugin_rewire.py:112`), the
+  dashboard — which first unloads every plugin (their tools and hooks unregistered) and then loads them again. A
+  turn of ours that builds its agent during either can find the registry without the tools of plugins not loaded
+  (back) yet. A forced reload unloads this plugin too (`ctx.on_unload` stops its runtime), so no new turn of ours
+  starts during one; a turn already running keeps the tool list its agent was built with. Our turns run after
+  the socket connects and the gate answers, well after the boot sweep;
   `test_a_plugin_loaded_after_ours_is_visible_from_our_scope` checks that a plugin loaded after ours is visible
   from our scope once the sweep is done. With `plugins.load_timeout_seconds: 0` (inline loads) there is no flag.
 - **Source hydration.** The bind uses the external-source snapshot Hermes made for the profile
@@ -176,18 +182,37 @@ against hermes-agent v0.23.2 and `main` of 2026-11-18.
 
 **Which key, and one key is one agent.** With a key file the key file decides: the key source supplies its key over
 any `AGENTCHAT_API_KEY` set elsewhere, so a different value in `.env` or the environment is not used (0.6.5 refused
-such a profile; it now runs as the key file's agent, and `doctor` says the key file decides). Without one, the key is
-the profile's setting as Hermes resolves it (`get_secret`). A setting another profile's **key file** holds is that
-profile's agent: refused, and found in each process (in `register()`, in the profile's scope) for the key source,
-which then gives the copy's hosted tools an empty key — `fetch` reads only our key files and that finding. Other
-profiles' `.env` files are never read, so two pre-0.6 profiles holding one key only in `.env` are not told apart until
-one of them saves it (`doctor --fix`, `login`). A key found only under the pre-v3 name `AGENTCHATME_API_KEY` is
-copied into the key file at activation in every profile (the hosted tools read `AGENTCHAT_API_KEY`), under a
-per-account lock (`<hermes root>/agentchat-locks/adopt-<fingerprint>.lock`, beside the socket's leader lock): of two
-profiles holding one key, the first to activate adopts it and the second is refused as its copy. At a multiplexed
-boot the launch profile loads first, so the default profile normally wins; the rare inverse — a named launch
-profile that is a copy adopting before the default profile ever starts — leaves the default profile refused, and
-its `doctor` names the fix (`hermes -p <name> agentchat logout` in the copy, then the default profile activates).
+such a profile; it now runs as the key file's agent, and `doctor` says the key file decides). Except when the source
+cannot carry it (`secrets.agentchat` disabled or not placeable, or no secret sources): then Hermes' MCP client takes
+`AGENTCHAT_API_KEY` from the settings, and a different key there would make the hosted tools another agent than the
+socket — nothing starts for the profile (`credentials.tools_key_conflict`, the same line `doctor` fails on;
+`doctor --fix` places the block). Without a key file, the key is the profile's setting as Hermes resolves it
+(`get_secret`), and is refused when it is certainly or likely another profile's:
+
+- another profile's **key file** holds it — found in each process (in `register()`, in the profile's scope) for the
+  key source, which then gives the copy's hosted tools an empty key (`fetch` reads only our key files and that finding);
+- a **named** profile that was never set up as an agent holds it (no identity line in its `SOUL.md`, no hosted-tools
+  entry in its `config.yaml`: `config.was_set_up_as_agent`, which reads those two files, never `.env`) — what
+  `hermes profile create` makes of the launch profile's `.env`. Its remedy also says `hermes -p <name> agentchat login`
+  if it is meant to be its own agent. Nothing is placed for it (no identity line, no `secrets.agentchat`, no tools
+  entry, so no hosted tools to mask).
+
+Profiles one process resolves with the same settings key (a multiplexed gateway, each in its own scope) are said to be
+one agent, the default profile first (`shared_with`, `where: settings`). Other profiles' `.env` files are never read,
+so two set-up pre-0.6 profiles holding one key only in `.env`, on gateways of their own, are not told apart until one
+of them saves it (`doctor --fix`, `login`).
+
+A key found only under the pre-v3 name `AGENTCHATME_API_KEY` (the August build) is copied into the key file — the
+hosted tools read `AGENTCHAT_API_KEY` — once the runtime has verified it with the server (its identity resolved, as
+before 0.7: a revoked key is never saved), in the default profile and in a named profile set up as an agent, under a
+per-account lock (`<hermes root>/agentchat-locks/adopt-<fingerprint>.lock`, beside the socket's leader lock, waited
+for 2 s at most) and only when no other profile's key file holds it. Of two profiles holding one key, the first to
+adopt it is the agent; the other's runtime is stopped and it is refused as the copy (a busy lock stops it too, and
+the next attempt decides). At a multiplexed boot the launch profile loads first, so the default profile normally wins.
+Remaining edge: a `--clone` or `--clone-all` copy of an August setup (its identity line copied too) on per-profile
+gateways that start in any order — whichever adopts first is the agent, and the other one's `doctor` names the fix
+(`hermes -p <the copy> agentchat logout`, then `register` it as its own agent; if the wrong one won, log that one out
+and the other adopts at its next attempt).
 
 ## Settings and the wizard
 

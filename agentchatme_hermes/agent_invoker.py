@@ -104,7 +104,7 @@ from .model_call import (
     build_call_model,
     is_timeout,
 )
-from .profile_scope import ProfileScope, ProfileScopeError, resolve_hermes_home
+from .profile_scope import ProfileScope, ProfileScopeError, resolve_hermes_home, scope_status
 from .turn import invite_session_id, wake_session_id, with_manual
 from .turn_runner import TurnLimits, TurnReport, run_turn
 
@@ -264,6 +264,7 @@ class AgentInvoker:
                 "turns": self.turns,
                 "runs": self.runs,
                 "hung_total": self.hung_total,
+                "scope": scope_status(),
             }
 
     def beat(self) -> None:

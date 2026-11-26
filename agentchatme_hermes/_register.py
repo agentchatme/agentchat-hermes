@@ -284,28 +284,11 @@ class ActivationWatcher:
                 return "active"
         try:
             config = load_config(hermes_home=self._hermes_home)
-            if config is not None and getattr(config, "api_key_source", KEY_SOURCE_STORE) == ENV_API_KEY_LEGACY:
-                adopted = _adopt_legacy_key(config)
-                if adopted == "copy":
-                    # Another profile's key file took this key first: this
-                    # profile is its copy, refused with the copy sentence.
-                    config = load_config(hermes_home=self._hermes_home)
-                elif adopted == "retry":
-                    # Another profile is adopting the same key right now: start
-                    # nothing until it is decided which profile is the agent.
-                    self._failures += 1
-                    return "failed"
         except KeyRefused as exc:
             # Not acting as an agent this profile must not be: no socket, no
             # placement. Said once; the watcher keeps checking, so fixing it
             # (logout, login) takes effect without a restart.
-            message = str(exc)
-            if message != self._refusal:
-                self._refusal = message
-                logger.error(
-                    "agentchat plugin: not starting for profile=%s — %s", self._profile, message
-                )
-            return "refused"
+            return self._refused(str(exc))
         except ConfigError as exc:
             logger.warning(
                 "agentchat plugin: configuration error (profile=%s) — %s",
@@ -316,6 +299,10 @@ class ActivationWatcher:
             return "failed"
         if config is None:
             return "unconfigured"
+        split = _split_identity(config)
+        if split is not None:
+            # The socket and the gate would be one agent, the hosted tools another.
+            return self._refused(split)
 
         runtime = _try_start_runtime(
             config, gateway_mode=self._gateway_mode, host_llm=self._host_llm, scope=self._scope
@@ -329,6 +316,23 @@ class ActivationWatcher:
             # not keep the socket or the lock for code that is gone.
             _shutdown_runtime(runtime, profile=self._profile)
             return "closed"
+
+        if getattr(config, "api_key_source", KEY_SOURCE_STORE) == ENV_API_KEY_LEGACY:
+            # The server accepted the key (the runtime resolved its identity):
+            # only now is it copied into the key file — never a revoked key.
+            adopted = _adopt_legacy_key(config)
+            if adopted != "go":
+                # Another profile's key file holds it (this profile is its
+                # copy), or another profile is adopting it right now: this
+                # runtime must not keep the account's socket.
+                self._drop(runtime)
+                if adopted == "copy":
+                    try:
+                        load_config(hermes_home=self._hermes_home)
+                    except KeyRefused as exc:
+                        return self._refused(str(exc))
+                self._failures += 1
+                return "failed"
         self._failures = 0
 
         # Placement reconciliation. Wizard users (`hermes agentchat
@@ -367,6 +371,32 @@ class ActivationWatcher:
             "gateway" if self._gateway_mode else "cli",
         )
         return "active"
+
+    def _refused(self, message: str) -> str:
+        """Said once (the watcher re-checks every 30 s); nothing starts or is placed."""
+        if message != self._refusal:
+            self._refusal = message
+            logger.error("agentchat plugin: not starting for profile=%s — %s", self._profile, message)
+        return "refused"
+
+    def _drop(self, runtime: Runtime) -> None:
+        """Stop a runtime this attempt started and keep watching (not an unload)."""
+        from .runtime import forget_runtime
+
+        with self._state_lock:
+            if self._runtime is runtime:
+                self._runtime = None
+        try:
+            runtime.stop()
+        except Exception:
+            logger.exception("agentchat plugin: stopping the runtime raised")
+        finally:
+            forget_runtime(runtime)
+        logger.info(
+            "agentchat plugin: profile=%s — the runtime this attempt started is stopped (socket closed, "
+            "leader lock released)",
+            self._profile,
+        )
 
     def retry_schedule(self) -> str:
         """What :meth:`next_delay` does from here, in words, for the log."""
@@ -709,10 +739,35 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
         logger.warning("agentchat plugin: SOUL.md identity line not followed for profile=%s — %s", label, result.detail)
 
 
+def _split_identity(config: Any) -> str | None:
+    """Why the socket and the hosted tools would act as two agents, or ``None``.
+
+    With a key file the key source hands Hermes' MCP client the key file's key.
+    When the source is not on (``secrets.agentchat`` missing and not placeable,
+    disabled, or this Hermes has no secret sources), the client takes
+    ``AGENTCHAT_API_KEY`` from the profile's settings instead: a different key
+    there is another agent (:func:`.credentials.tools_key_conflict`, the line
+    ``doctor`` shows too). The block is placed first when it is missing, as
+    every activation does.
+    """
+    if getattr(config, "api_key_source", KEY_SOURCE_STORE) != KEY_SOURCE_STORE:
+        return None
+    home = getattr(config, "hermes_home", None)
+    api_key = getattr(config, "api_key", None)
+    if home is None or not isinstance(api_key, str):
+        return None
+    from .credentials import key_bridge, tools_key_conflict
+
+    ready, _why = key_bridge()
+    if ready:
+        return None
+    return tools_key_conflict(home, api_key)
+
+
 def _adopt_legacy_key(config: Any) -> Literal["go", "copy", "retry"]:
-    """A key found only under the pre-v3 name: copy it into the key file, before
-    the runtime starts (:func:`.credentials.adopt_legacy_key`). Never writes
-    ``.env`` (``doctor --fix`` removes the old line).
+    """A key found only under the pre-v3 name: copy it into the key file, once the
+    runtime has verified it with the server (:func:`.credentials.adopt_legacy_key`).
+    Never writes ``.env`` (``doctor --fix`` removes the old line).
 
     ``"copy"``: another profile's key file holds the key — this profile is that
     agent's copy and must not start. ``"retry"``: another profile is adopting the
@@ -778,8 +833,8 @@ def _reconcile_key_store(config: Any) -> None:
       this profile recorded in it.
     * A key file the group or others can read is made ``0600``.
 
-    (A key found only under the pre-v3 name is copied into the key file
-    before the runtime starts: :func:`_adopt_legacy_key`.) Non-fatal:
+    (A key found only under the pre-v3 name is copied into the key file once
+    the runtime has verified it: :func:`_adopt_legacy_key`.) Non-fatal:
     failures are logged with the fix.
     """
     from . import key_store

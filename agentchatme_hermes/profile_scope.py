@@ -51,6 +51,7 @@ import contextvars
 import hashlib
 import logging
 import os
+import tempfile
 import threading
 from pathlib import Path
 from typing import Any, Callable, Optional, TypeVar
@@ -207,7 +208,71 @@ class ProfileScope:
         if not filled:
             reset(token)
             raise ProfileScopeError("Hermes did not fill this profile's secret scope")
+        if refresh_keeps_launch_env() is False:
+            _warn_once(
+                "files_only_refresh",
+                "agentchat: this Hermes (older than 0.23.2) rebuilds a plugin's secret scope from "
+                "the profile's files only, so on this gateway serving several profiles, keys set "
+                "only in the gateway's environment (systemd Environment=, op run, docker -e) are "
+                "not visible to AgentChat's gate calls and turns — update Hermes",
+            )
         return token, reset
+
+
+# The probe's answer, once per process (``None``: not known yet / not Hermes).
+_keeps_launch_env: list[bool | None] = []
+
+
+def refresh_keeps_launch_env() -> bool | None:
+    """Does this Hermes fill a plugin-installed secret scope the way it builds a
+    profile's own turns — keeping the launch profile's environment-only keys
+    (Hermes 0.23.2 and later)? ``None`` outside Hermes or when it cannot tell.
+
+    Hermes exposes no release number to a plugin (its distribution reports
+    ``0.0.0``; ``hermes --version`` reads a private module), so this asks the
+    public function itself, in an empty context: since 0.23.2
+    ``refresh_installed_secret_scope`` builds through ``owner_secret_scope`` and
+    refuses to refill a scope stamped for another home (its documented
+    contract); before, it rebuilt any installed scope from the named home's
+    files alone. Two homes that do not exist are named, so nothing is read for
+    a real profile.
+    """
+    if _keeps_launch_env:
+        return _keeps_launch_env[0]
+    try:
+        from agent import secret_scope
+    except ImportError:
+        return None
+
+    def probe() -> bool:
+        base = Path(tempfile.gettempdir()) / "agentchat-scope-probe"
+        token = secret_scope.set_secret_scope({}, profile_home=str(base / "a"))
+        try:
+            return not secret_scope.refresh_installed_secret_scope(base / "b")
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+    try:
+        answer: bool | None = bool(contextvars.Context().run(probe))
+    except Exception:
+        logger.debug("profile_scope: the secret-scope refresh probe raised", exc_info=True)
+        answer = None
+    _keeps_launch_env.append(answer)
+    return answer
+
+
+def scope_status() -> dict[str, bool | None]:
+    """For the health record: does this process multiplex, and does its Hermes keep
+    the launch profile's environment-only keys in a plugin's scope?"""
+    try:
+        from agent import secret_scope
+    except ImportError:
+        return {"multiplexed": None, "keeps_launch_env": None}
+    try:
+        multiplexed: bool | None = bool(secret_scope.is_multiplex_active())
+    except Exception:
+        multiplexed = None
+    return {"multiplexed": multiplexed, "keeps_launch_env": refresh_keeps_launch_env() if multiplexed else None}
 
 
 def context_thread(target: Callable[[], object], *, name: str) -> threading.Thread:

@@ -280,3 +280,63 @@ class TestProfileScope:
         thread.start()
         thread.join(5.0)
         assert seen == ["the turn's scope"] and thread.daemon
+
+
+class TestLaunchProfileLoadedBeforeMultiplexing:
+    def test_a_scope_captured_before_activation_binds_once_the_gateway_multiplexes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The launch profile's plugins load while the gateway does not multiplex
+        yet; the scope follows the process's state at each call, not at capture."""
+        fake = FakeSecretScope(multiplex=False, by_home={tmp_path: {"K": "launch"}})
+        fake.install(monkeypatch)
+        scope = ProfileScope.capture(tmp_path)  # register(), before activation
+        monkeypatch.setenv("K", "process-env")
+        assert scope.run(lambda: fake.get_secret("K")) == "process-env" and fake.binds == []
+        fake.multiplex = True  # the gateway started hosting a second profile
+        assert scope.run(lambda: fake.get_secret("K")) == "launch"
+        assert fake.binds == [str(tmp_path)]
+
+
+class TestAnOlderHermes:
+    """Hermes before 0.23.2 rebuilds a plugin's scope from the profile's files
+    only: warned (once per process), never refused."""
+
+    def test_the_probe_reads_the_refresh_contract(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import profile_scope
+
+        FakeSecretScope().install(monkeypatch)
+        assert profile_scope.refresh_keeps_launch_env() is True
+        profile_scope._keeps_launch_env.clear()
+        FakeSecretScope(files_only=True).install(monkeypatch)
+        assert profile_scope.refresh_keeps_launch_env() is False
+        profile_scope._keeps_launch_env.clear()
+        monkeypatch.setitem(sys.modules, "agent", None)  # not importable: not Hermes
+        assert profile_scope.refresh_keeps_launch_env() is None
+
+    def test_it_is_warned_once_and_the_call_still_runs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from agentchatme_hermes import profile_scope
+
+        monkeypatch.setattr(profile_scope, "_warned", set())
+        fake = FakeSecretScope(multiplex=True, files_only=True, by_home={tmp_path: {"K": "own"}})
+        fake.install(monkeypatch)
+        scope = ProfileScope.capture(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.profile_scope"):
+            assert scope.run(lambda: fake.get_secret("K")) == "own"
+            assert scope.run(lambda: fake.get_secret("K")) == "own"
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and "older than 0.23.2" in warnings[0] and "update Hermes" in warnings[0]
+        assert profile_scope.scope_status() == {"multiplexed": True, "keeps_launch_env": False}
+
+    def test_doctor_warns_from_the_running_gateways_record(self) -> None:
+        from agentchatme_hermes.cli import _describe_scope
+
+        line = _describe_scope({"scope": {"multiplexed": True, "keeps_launch_env": False}})
+        assert line is not None and "older than 0.23.2" in line and "update Hermes" in line
+        assert _describe_scope({"scope": {"multiplexed": True, "keeps_launch_env": True}}) is None
+        assert _describe_scope({"scope": {"multiplexed": False, "keeps_launch_env": None}}) is None
+        assert _describe_scope({}) is None

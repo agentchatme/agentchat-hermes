@@ -78,10 +78,21 @@ class FakeSecretScope:
     :class:`UnscopedSecretError` while multiplexing.
     """
 
-    def __init__(self, *, multiplex: bool = False, by_home: dict[str, dict[str, str]] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        multiplex: bool = False,
+        by_home: dict[str, dict[str, str]] | None = None,
+        files_only: bool = False,
+    ) -> None:
         import contextvars
 
         self.multiplex = multiplex
+        # Hermes before 0.23.2: refresh rebuilds any installed scope from the
+        # named home's files (no owner check, no launch environment).
+        self.files_only = files_only
+        self.probes = 0
+        self._probe_tokens: list[Any] = []
         self.by_home = {self._key(h): dict(v) for h, v in (by_home or {}).items()}
         self.bound: contextvars.ContextVar[tuple[dict[str, str], str | None] | None] = contextvars.ContextVar(
             "fake_secret_scope", default=None
@@ -126,19 +137,30 @@ class FakeSecretScope:
         return os.environ.get(name, default)
 
     def set_secret_scope(self, mapping: dict[str, str], *, profile_home: str | None = None) -> Any:
+        if profile_home is not None and "agentchat-scope-probe" in profile_home:
+            self.probes += 1  # the plugin asking how this Hermes refreshes, not a profile bind
+            token = self.bound.set((mapping, profile_home))
+            self._probe_tokens.append(token)
+            return token
         if self.fail_set is not None:
             raise self.fail_set
         self.binds.append(profile_home)
         return self.bound.set((mapping, profile_home))
 
     def reset_secret_scope(self, token: Any) -> None:
-        self.resets += 1
+        if not any(token is probe for probe in self._probe_tokens):
+            self.resets += 1
         self.bound.reset(token)
 
     def refresh(self, home: Any) -> bool:
-        self.refreshed.append(str(home))
         bound = self.bound.get()
-        if bound is None or not self.refresh_fills:
+        if bound is None:
+            return False
+        if bound[1] is not None and "agentchat-scope-probe" in bound[1]:
+            # The owner check Hermes has since 0.23.2: another home's scope is never refilled.
+            return self.files_only or self._key(bound[1]) == self._key(home)
+        self.refreshed.append(str(home))
+        if not self.refresh_fills:
             return False
         bound[0].update(self.by_home.get(self._key(home), {}))
         return True

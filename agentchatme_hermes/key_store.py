@@ -334,10 +334,11 @@ def delete_store(home: Path) -> bool:
 
 @dataclass(frozen=True)
 class Holder:
-    """Another profile home on this Hermes root whose key file holds the same key."""
+    """Another profile home on this Hermes root holding the same key: in its key
+    file, or in its settings as this process resolved them for it."""
 
     home: Path
-    where: Literal["key file"] = "key file"
+    where: Literal["key file", "settings"] = "key file"
 
 
 def profile_homes(root: Path) -> list[Path]:

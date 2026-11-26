@@ -949,6 +949,38 @@ def test_profile_scope_on_a_real_two_profile_multiplexed_gateway(
     assert left is None, "the call's binding is reset"
 
 
+def test_the_launch_profile_loaded_before_multiplexing_gets_its_scope_once_it_starts(
+    _hermes_home: Path, monkeypatch: pytest.MonkeyPatch, _multiplexed: Any, _probe_captures: dict[str, Any]
+) -> None:
+    """A gateway loads the launch profile's plugins before it starts hosting a
+    second profile (the eager activation is its last boot step). The scope
+    captured then binds the launch profile's secrets — its environment-only key
+    included — once the gateway multiplexes."""
+    root = _hermes_home
+    _two_profiles(root, monkeypatch)
+    _load_plugins(root, routed=False)  # before activation: single-profile semantics
+    key = _import("hermes_constants").hermes_home_key
+    (scope,) = [s for home, s in _probe_captures.items() if key(Path(home)) == key(root)]
+    secret_scope = _import("agent.secret_scope")
+    assert not secret_scope.is_multiplex_active()
+    _multiplexed()
+    seen = _in_a_worker(
+        lambda: scope.run(lambda: (secret_scope.get_secret("AGENTCHATME_HANDLE"), secret_scope.get_secret("CONTRACT_ENV_ONLY_KEY")))
+    )
+    assert seen == ("root-h", "launch-only")
+
+
+def test_the_refresh_contract_the_version_probe_reads() -> None:
+    """``profile_scope.refresh_keeps_launch_env`` asks Hermes' public refresh
+    whether it refills a scope stamped for another home: since 0.23.2 it does
+    not (it builds through ``owner_secret_scope``), so this Hermes keeps the
+    launch profile's environment-only keys and no warning is said."""
+    from agentchatme_hermes import profile_scope
+
+    profile_scope._keeps_launch_env.clear()
+    assert profile_scope.refresh_keeps_launch_env() is True
+
+
 def test_ctx_llm_in_each_profiles_scope_uses_its_own_key(
     _hermes_home: Path,
     monkeypatch: pytest.MonkeyPatch,

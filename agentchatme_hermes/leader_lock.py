@@ -295,7 +295,7 @@ HeldLock = Literal["held", "busy", "unavailable"]
 
 
 @contextlib.contextmanager
-def held_lock(path: Path, *, timeout_s: float = 10.0, poll_s: float = 0.05) -> Iterator[HeldLock]:
+def held_lock(path: Path, *, timeout_s: float = 2.0, poll_s: float = 0.05) -> Iterator[HeldLock]:
     """Hold an exclusive ``flock`` on ``path`` for the block.
 
     Yields ``"held"`` while held; ``"busy"`` when another holder kept it

@@ -13,13 +13,21 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   - With a key file, **the key file decides**: a different `AGENTCHAT_API_KEY` in `.env` or the environment is not
     used — 0.6.5 started nothing for such a profile; it now runs as the key file's agent, and `doctor` says the key file
     decides.
-  - **One key is one agent through key files only.** A key another profile's key file holds is refused as a copy, and
-    the copy's hosted tools get no key (found in each process in the profile's scope; the key source reads only our
-    files). Two profiles that both hold one key only in `.env` (set up before 0.6, neither moved) are not detected until
-    one of them saves it.
+  - With a key file but the key source off (`secrets.agentchat` disabled or not placeable, or no secret sources), a
+    different `AGENTCHAT_API_KEY` in the settings would make the hosted tools another agent than the socket: nothing
+    starts, and the gateway log and `doctor` say so (`doctor --fix` places the block).
+  - **One key is one agent without reading another profile's `.env`.** A key another profile's key file holds is
+    refused as a copy, and the copy's hosted tools get no key (found in each process in the profile's scope; the key
+    source reads only our files). A named profile that holds a key in its settings and was never set up as an agent
+    (no identity line in SOUL.md, no hosted-tools entry) is refused as a likely copy — `hermes -p <name> agentchat
+    login` if it is meant to be its own agent — and nothing is placed for it. Profiles one gateway resolves with the
+    same key are said to be one agent, the default profile first. Two set-up profiles that both hold one key only in
+    `.env`, on gateways of their own, are not detected until one of them saves it.
   - A key found only under the pre-v3 `AGENTCHATME_API_KEY` (the August build) is copied into the key file at
-    activation in **every** profile, as before, now under a per-account lock (`<hermes root>/agentchat-locks/adopt-…`):
-    of two profiles holding one key, the first to activate adopts it and the second is refused as its copy.
+    activation **after the server accepted it** (as before; never a revoked key), in the default profile and in a
+    named profile set up as an agent, now under a per-account lock (`<hermes root>/agentchat-locks/adopt-…`, 2 s
+    wait): of two profiles holding one key, the first to adopt it is the agent; the other's runtime is stopped and it
+    is refused as its copy.
   - `doctor --fix` moves a pre-0.6 key into the key file and removes its `.env` line through Hermes; a key no `.env`
     line holds (set by the shell or a service) is not moved, and an `AGENTCHAT_API_KEY` move is undone.
 - **Profile scope with public Hermes names only** (Nous catalog review, ask 2). `register()` captures the context
@@ -28,9 +36,11 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   `set_secret_scope` + `refresh_installed_secret_scope`, which keeps the launch profile's environment-only keys
   (systemd `Environment=`, `op run`, `docker -e`). `gateway.run._profile_runtime_scope`,
   `GatewayTurnMixin._standalone_launch_scope` and the hand-built scope (with its `hermes_cli.env_loader`,
-  `tools.terminal_scope` and `tui_gateway` imports) are gone. Needs Hermes 0.23.2 or later. Known limits, documented
-  in `docs/hermes-coupling.md`: no public way to bind the launch profile's terminal policy; the captured context
-  carries the loader's in-load flag.
+  `tools.terminal_scope` and `tui_gateway` imports) are gone. On a Hermes older than 0.23.2 a multiplexed gateway's
+  launch profile does not see keys set only in its environment: warned once in the log and by `doctor`, never
+  refused. Known limits, documented in `docs/hermes-coupling.md`: no public way to bind the launch profile's
+  terminal policy; the captured context carries the loader's in-load flag (a turn built during a boot sweep or a
+  forced plugin reload may miss the tools of plugins not loaded yet).
 - **No private MCP reconnect.** The plugin no longer calls `tools.mcp_tool_loop.reconnect_mcp_server`. A hosted tools
   server Hermes parked (a gateway started offline) comes back at Hermes' own probe — after 5 minutes, then at longer
   intervals up to an hour — or at once with `/reload-mcp` in a chat the gateway serves, or `hermes gateway restart`;

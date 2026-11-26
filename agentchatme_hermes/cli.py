@@ -993,6 +993,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                 if tools_report is not None:
                     level, text = tools_report
                     {"ok": ok, "warn": warn, "fail": fail}[level](text)
+                scope_line = _describe_scope(health.get("worker"))
+                if scope_line is not None:
+                    warn(scope_line)
                 for level, text in _describe_could_not_process(health.get("worker"), now=time.time()):
                     {"ok": ok, "warn": warn, "fail": fail}[level](text)
         elif state in ("free", "not present") and gateway is not None:
@@ -1038,6 +1041,21 @@ _CYCLE_REMEDIES = {
         "`hermes gateway restart`, reconnects them"
     ),
 }
+
+
+def _describe_scope(worker: Any) -> str | None:
+    """The warn line when the running gateway multiplexes on a Hermes that rebuilds a
+    plugin's secret scope from the profile's files only (older than 0.23.2)."""
+    section = worker.get("scope") if isinstance(worker, dict) else None
+    if not isinstance(section, dict):
+        return None
+    if section.get("multiplexed") is True and section.get("keeps_launch_env") is False:
+        return (
+            "The running gateway serves several profiles on a Hermes older than 0.23.2: keys set only "
+            "in the gateway's environment (systemd Environment=, op run, docker -e) are not visible to "
+            "AgentChat's gate calls and turns — update Hermes"
+        )
+    return None
 
 
 def _describe_hosted_tools(worker: Any, *, now: float) -> tuple[str, str] | None:
@@ -1278,8 +1296,10 @@ def _doctor_secrets_checks(
         )
     if not has_key:
         return
-    if in_store and (state != "ours" or not source_supported()):
-        _doctor_tools_key_check(resolution, cmd=cmd, fail=fail)
+    if in_store and resolution.api_key:
+        conflict = credentials.tools_key_conflict(resolution.store.path.parent.parent, resolution.api_key)
+        if conflict is not None:
+            fail(conflict)
     stripped = _hermes_strips_key_from_commands()
     if stripped is True:
         ok("Hermes strips AGENTCHAT_API_KEY from the commands the agent runs (checked)")
@@ -1288,29 +1308,6 @@ def _doctor_secrets_checks(
             "this Hermes does not strip AGENTCHAT_API_KEY from the commands the agent runs: the key "
             "is in their environment. Needs Hermes v0.23.2 or later with secrets.agentchat in "
             "config.yaml"
-        )
-
-
-def _doctor_tools_key_check(
-    resolution: KeyResolution, *, cmd: str, fail: Callable[[str], None]
-) -> None:
-    """With the key source not carrying the key file, which key do the hosted tools get?
-
-    Hermes' MCP client resolves ``${AGENTCHAT_API_KEY}`` from the profile's
-    settings (``get_secret``: the profile .env or the environment). A
-    different key there means the tools act as another agent.
-    """
-    from .profile_scope import ProfileScopeError, resolve_setting
-
-    try:
-        theirs = (resolve_setting(_ENV_API_KEY) or "").strip()
-    except ProfileScopeError:
-        return
-    if theirs and theirs != resolution.api_key:
-        fail(
-            f"Hermes gives the hosted tools {_ENV_API_KEY} from the profile .env or the environment "
-            f"— a different key than {resolution.store.path}: they would act as another agent. "
-            f"`{cmd} doctor --fix` places secrets.agentchat; then restart the gateway"
         )
 
 

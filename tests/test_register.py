@@ -715,11 +715,13 @@ class TestActivationInTheProfilesScope:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         from hermes_doubles import FakeSecretScope
+        from key_files import set_up_as_agent
 
         from agentchatme_hermes._register import ActivationWatcher
         from agentchatme_hermes.profile_scope import ProfileScope
 
         home = tmp_path / ".hermes" / "profiles" / "ops"
+        set_up_as_agent(home, "ops")
         monkeypatch.setenv("HERMES_HOME", str(home))
         monkeypatch.setenv("AGENTCHAT_API_KEY", api_key("the_launch_profiles"))
         fake = FakeSecretScope(multiplex=True, by_home={home: {"AGENTCHAT_API_KEY": api_key("ops")}})

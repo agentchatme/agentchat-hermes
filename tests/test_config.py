@@ -270,7 +270,10 @@ class TestProfileScopedConfig:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         _isolated(monkeypatch, AGENTCHATME_API_KEY=api_key("x"))
+        from key_files import set_up_as_agent
+
         home = tmp_path / ".hermes" / "profiles" / "growth"
+        set_up_as_agent(home)  # a named profile set up as an agent (else: a likely copy)
         monkeypatch.setenv("HERMES_HOME", str(home))  # the profile in scope, as Hermes runs it
         cfg = load_config(hermes_home=home)
         assert cfg is not None

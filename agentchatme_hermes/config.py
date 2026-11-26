@@ -22,11 +22,12 @@ as Hermes resolves them (``agent.secret_scope.get_secret``: the profile's
 ``.env`` or the environment), ``AGENTCHAT_API_KEY`` or the pre-v3
 ``AGENTCHATME_API_KEY``. This plugin never reads a ``.env`` file itself.
 ``hermes agentchat doctor --fix`` (or a login) moves the key into the key
-file; a key found only under the pre-v3 name is moved at activation
-(:func:`.credentials.adopt_legacy_key`), because the hosted tools read
-``AGENTCHAT_API_KEY``. :func:`resolve_key` refuses a key this profile must
-not act as — one another profile's key file holds (``hermes profile
-create`` copies ``.env``) — with a sentence that says what to do.
+file; a key found only under the pre-v3 name is moved at activation, once
+the server has accepted it (:func:`.credentials.adopt_legacy_key`), because
+the hosted tools read ``AGENTCHAT_API_KEY``. :func:`resolve_key` refuses a
+key this profile must not act as — one another profile's key file holds, or
+one a named profile that was never set up as an agent holds (``hermes
+profile create`` copies ``.env``) — with a sentence that says what to do.
 Behaviour knobs keep their ``AGENTCHATME_`` prefix and are read as before.
 
 Two knobs were renamed with the words (integration, wake); the old
@@ -266,7 +267,10 @@ def resolve_key(home: Path | None = None) -> KeyResolution:
        profile in scope (another home's settings are not this process's to
        read). A key another profile's key file holds is that profile's agent:
        refused, and remembered for the key source (:func:`copy_of`), which
-       then gives this profile's hosted tools no key.
+       then gives this profile's hosted tools no key. A named profile that
+       was never set up as an agent (:func:`was_set_up_as_agent`) is refused
+       as a likely copy. Profiles of this process resolving the same key are
+       said to share it (``shared_with``), the root profile first.
 
     Raises :class:`~.profile_scope.ProfileScopeError` when called outside
     the profile's scope on a multiplexed gateway.
@@ -300,6 +304,7 @@ def resolve_key(home: Path | None = None) -> KeyResolution:
         )
     if store.usable and store.key is not None:
         _forget_copy(home)
+        _forget_settings_key(home)
         return _resolve_from_store(home, store, cmd)
 
     found = settings_key() if _in_scope(home) else None
@@ -312,12 +317,20 @@ def resolve_key(home: Path | None = None) -> KeyResolution:
             return _copy_refusal(home, store, found_owner, None)
         return KeyResolution(None, "", store)
     value, name = found
-    holders = key_store.other_holders(home, value, root=hermes_root_of(home))
+    root = hermes_root_of(home)
+    holders = key_store.other_holders(home, value, root=root)
     if holders:
         owner = holders[0].home
         _remember_copy(home, owner, value)
+        _forget_settings_key(home)
         return _copy_refusal(home, store, owner, value, source=name)
     _forget_copy(home)
+    if not key_store.same_home(home, root) and not was_set_up_as_agent(home):
+        # A named profile that holds a key only in its settings and was never
+        # set up as an agent: what `hermes profile create` makes of the launch
+        # profile's .env. Refused as a likely copy, nothing placed for it.
+        _forget_settings_key(home)
+        return _never_set_up_refusal(home, store, value, source=name)
     notes: list[str] = []
     if name == ENV_API_KEY:
         legacy = _setting(ENV_API_KEY_LEGACY)
@@ -326,7 +339,50 @@ def resolve_key(home: Path | None = None) -> KeyResolution:
                 f"{ENV_API_KEY} and {ENV_API_KEY_LEGACY} in this profile's settings hold different "
                 f"keys — the plugin uses {ENV_API_KEY}; remove the wrong one"
             )
-    return KeyResolution(value, name, store, notes=tuple(notes), held_key=value)
+    # Profiles of this process holding the same key in their settings (a
+    # multiplexed gateway resolves each in its own scope): one agent, said.
+    shared = tuple(key_store.Holder(other, "settings") for other in _remember_settings_key(home, value))
+    return KeyResolution(value, name, store, notes=tuple(notes), held_key=value, shared_with=shared)
+
+
+def _never_set_up_refusal(
+    home: Path, store: key_store.StoreRead, value: str, *, source: str
+) -> KeyResolution:
+    cmd = cli_prefix(home)
+    root_label = profile_label(hermes_root_of(home))
+    return KeyResolution(
+        None,
+        source,
+        store,
+        refusal=(
+            f"This profile's settings hold an AgentChat key ({source}), but this profile was never set "
+            "up as an AgentChat agent (no identity line in its SOUL.md, no hosted-tools entry in its "
+            "config.yaml) — `hermes profile create` copies .env into new profiles, so the key is "
+            f"likely another profile's (profile {root_label}'s). One key is one agent. Run `{cmd} "
+            f"logout` to remove the copy from this profile, then `{cmd} register` to give this profile "
+            f"its own agent. If this profile is meant to be its own agent with this key, run `{cmd} "
+            "login` with it."
+        ),
+        held_key=value,
+    )
+
+
+def was_set_up_as_agent(home: Path) -> bool:
+    """Has this profile ever had the integration placed: an identity line in its
+    SOUL.md, or a hosted-tools entry in its ``config.yaml``? (Never its ``.env``.)"""
+    from .soul_anchor import ANCHOR_START
+
+    for path, markers in (
+        (home / "SOUL.md", (ANCHOR_START,)),
+        (home / "config.yaml", ("${AGENTCHAT_API_KEY}", "${env:AGENTCHAT_API_KEY}")),
+    ):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if any(marker in text for marker in markers):
+            return True
+    return False
 
 
 def _copy_refusal(
@@ -391,8 +447,9 @@ def _forget_copy(home: Path) -> None:
 
 
 def forget_copy(home: Path) -> None:
-    """Drop what this process found about ``home`` holding a copy (logout)."""
+    """Drop what this process found about ``home``'s key (logout)."""
     _forget_copy(home)
+    _forget_settings_key(home)
 
 
 def copy_of(home: Path) -> Path | None:
@@ -412,9 +469,31 @@ def copy_of(home: Path) -> Path | None:
     return found.origin
 
 
+# The key each profile of this process resolved from its settings (its
+# fingerprint), so two profiles one multiplexed gateway serves with the same
+# key are told they are one agent, the root profile first.
+_settings_keys: dict[str, tuple[Path, str]] = {}
+
+
+def _remember_settings_key(home: Path, api_key: str) -> list[Path]:
+    """Record ``home``'s settings key; return the other homes of this process holding it,
+    the root profile first."""
+    fp = key_store.fingerprint(api_key)
+    with _copies_lock:
+        _settings_keys[_copy_key(home)] = (Path(home), fp)
+        others = [h for key, (h, other_fp) in _settings_keys.items() if other_fp == fp and key != _copy_key(home)]
+    return sorted(others, key=lambda h: (not key_store.same_home(h, hermes_root_of(h)), str(h)))
+
+
+def _forget_settings_key(home: Path) -> None:
+    with _copies_lock:
+        _settings_keys.pop(_copy_key(home), None)
+
+
 def reset_copies_for_tests() -> None:
     with _copies_lock:
         _copies.clear()
+        _settings_keys.clear()
 
 
 def _resolve_from_store(home: Path, store: key_store.StoreRead, cmd: str) -> KeyResolution:

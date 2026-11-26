@@ -23,6 +23,7 @@ import builtins
 import io
 import ipaddress
 import os
+import pathlib
 import socket
 import stat
 import sys
@@ -114,11 +115,13 @@ def _home_guard(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.Mo
 def _copies_found() -> Iterator[None]:
     """What a process found about a profile holding a copy of another's key
     (``config.copy_of``) is kept for the process: each test starts without."""
-    from agentchatme_hermes import config
+    from agentchatme_hermes import config, profile_scope
 
     config.reset_copies_for_tests()
+    profile_scope._keeps_launch_env.clear()
     yield
     config.reset_copies_for_tests()
+    profile_scope._keeps_launch_env.clear()
 
 
 class DotenvReadBlocked(OSError):
@@ -131,15 +134,24 @@ _STDLIB_DIRS = tuple(
 )
 
 
+_THIS_FILE = os.path.abspath(__file__)
+
+
 def _opened_by_the_plugin() -> bool:
-    """Is the nearest caller outside the standard library this plugin's own code?"""
-    frame = sys._getframe(2)
+    """Is the nearest caller outside this guard and the standard library the plugin's own code?
+
+    Walks up from the caller, skipping the guard's own frames (this file),
+    the standard library (``pathlib``'s ``read_text`` → ``io.open``) and
+    frozen or generated code, so no call depth is assumed.
+    """
+    frame = sys._getframe(1)
     while frame is not None:
         filename = frame.f_code.co_filename
-        if filename.startswith("<") or os.path.abspath(filename).startswith(_STDLIB_DIRS):
+        path = os.path.abspath(filename)
+        if filename.startswith("<") or path == _THIS_FILE or path.startswith(_STDLIB_DIRS):
             frame = frame.f_back
             continue
-        return os.path.abspath(filename).startswith(_PACKAGE_DIR)
+        return path.startswith(_PACKAGE_DIR + os.sep)
     return False
 
 
@@ -152,7 +164,7 @@ def _names_a_dotenv(path: Any) -> bool:
 
 
 @pytest.fixture(autouse=True)
-def _dotenv_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def _dotenv_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
     """The plugin never opens a ``.env`` file (Nous review, ask 1): settings
     come from Hermes' ``get_secret``, lines are removed and written by Hermes'
     ``remove_env_value`` / ``save_env_value``. Any open of a file named
@@ -163,6 +175,7 @@ def _dotenv_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     real_open = builtins.open
     real_io_open = io.open
     real_os_open = os.open
+    real_path_open = pathlib.Path.open
 
     def check(path: Any) -> None:
         if _names_a_dotenv(path) and _opened_by_the_plugin():
@@ -181,10 +194,16 @@ def _dotenv_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         check(path)
         return real_os_open(path, *args, **kwargs)
 
+    def guarded_path_open(self: pathlib.Path, *args: Any, **kwargs: Any) -> Any:
+        # Python 3.10's pathlib opens through an accessor bound to io.open at import.
+        check(self)
+        return real_path_open(self, *args, **kwargs)
+
     monkeypatch.setattr(builtins, "open", guarded_open)
     monkeypatch.setattr(io, "open", guarded_io_open)
     monkeypatch.setattr(os, "open", guarded_os_open)
-    yield
+    monkeypatch.setattr(pathlib.Path, "open", guarded_path_open)
+    yield attempts  # the guard's own test reads (and clears) what it recorded
     if attempts:
         pytest.fail("the plugin opened a .env file: " + "; ".join(attempts[:5]), pytrace=False)
 

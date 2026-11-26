@@ -9,8 +9,9 @@
 * :func:`move_env_key` — ``doctor --fix``: a key found in this profile's
   settings moves into the key file, and its ``.env`` line is removed.
 * :func:`adopt_legacy_key` — activation: a key found only under the pre-v3
-  name ``AGENTCHATME_API_KEY`` is copied into the key file (the hosted tools
-  read ``AGENTCHAT_API_KEY``); the ``.env`` line stays for ``doctor --fix``.
+  name ``AGENTCHATME_API_KEY`` is copied into the key file once the server
+  has accepted it (the hosted tools read ``AGENTCHAT_API_KEY``); the ``.env``
+  line stays for ``doctor --fix``.
 * :func:`clear_credentials` — logout: the key file and the key settings.
 
 This module never opens a ``.env`` file. The key is read from the profile's
@@ -271,11 +272,14 @@ def adopt_legacy_key(
     The hosted tools authenticate with ``AGENTCHAT_API_KEY``, which Hermes
     gets from the key file through the plugin's secret source; a profile set
     up by a release before v3 has only ``AGENTCHATME_API_KEY``. Done at
-    activation in every profile, under the per-account lock: only when no
-    other profile's key file holds the key, so of two profiles holding the
-    same key the first to activate takes it (at a multiplexed boot, the
-    launch profile) and the second is refused as its copy. The ``.env`` line
-    is left for ``doctor --fix`` (never edited from a gateway).
+    activation, once the server has accepted the key (the runtime resolved
+    its identity), in the default profile and in a named profile set up as an
+    agent (:func:`.config.resolve_key` refuses one that never was), under the
+    per-account lock: only when no other profile's key file holds the key, so
+    of two profiles holding the same key the first to adopt it is the agent
+    (at a multiplexed boot, the launch profile) and the second is refused as
+    its copy. The ``.env`` line is left for ``doctor --fix`` (never edited
+    from a gateway).
     """
     from .key_source import source_supported
 
@@ -297,6 +301,11 @@ def adopt_legacy_key(
     return AdoptOutcome("adopted", path=path)
 
 
+# How long a move waits for the per-account lock. It runs inside ``register()``,
+# which Hermes abandons at 10 s by default; a busy lock is retried anyway.
+KEY_LOCK_WAIT_S = 2.0
+
+
 def _key_lock(
     home: Path, *, api_base: str, api_key: str, lock_dir: Path | None
 ) -> AbstractContextManager[HeldLock]:
@@ -309,7 +318,49 @@ def _key_lock(
             account_fingerprint=profile_scope.account_fingerprint(api_base, api_key),
             lock_dir=lock_dir,
             purpose="adopt",
-        )
+        ),
+        timeout_s=KEY_LOCK_WAIT_S,
+    )
+
+
+def source_carries_key() -> bool:
+    """Does Hermes' MCP client get ``AGENTCHAT_API_KEY`` from the key source in this profile?
+
+    The source is on when Hermes has secret sources and ``secrets.agentchat``
+    turns it on (whoever wrote the block). Reads ``config.yaml`` only.
+    """
+    from .key_source import source_supported
+    from .mcp_registration import McpRegistrationError
+    from .secrets_registration import inspect_source_enabled
+
+    if not source_supported():
+        return False
+    try:
+        return inspect_source_enabled()
+    except McpRegistrationError:
+        return False
+
+
+def tools_key_conflict(home: Path, api_key: str) -> str | None:
+    """The sentence when Hermes would give the hosted tools another key than the key file's.
+
+    ``None`` while the key source carries the key file (it then supplies its key
+    over any other), or when the profile's settings hold no other key.
+    """
+    from .config import cli_prefix
+
+    if source_carries_key():
+        return None
+    try:
+        theirs = (profile_scope.resolve_setting(ENV_API_KEY) or "").strip()
+    except profile_scope.ProfileScopeError:
+        return None
+    if not theirs or theirs == api_key:
+        return None
+    return (
+        f"Hermes gives the hosted tools {ENV_API_KEY} from the profile .env or the environment — a "
+        f"different key than {key_store.store_path(home)}: they would act as another agent. "
+        f"`{cli_prefix(home)} doctor --fix` places secrets.agentchat; then restart the gateway"
     )
 
 
