@@ -31,8 +31,10 @@ class TestEntry:
         assert entry == {
             "url": "https://api.agentchat.me/mcp",
             "headers": {"Authorization": "Bearer ${AGENTCHAT_API_KEY}", **CLIENT_HEADERS},
+            "trust": "untrusted",
         }
         assert PREFIX not in json.dumps(entry)
+        assert reg.server_entry(trust="full")["trust"] == "full"
 
     def test_the_client_header_is_the_sdk_name_and_static(self) -> None:
         """The name the SDK sends on REST and the socket; no version, so the
@@ -53,21 +55,67 @@ class TestEntry:
         assert "  agentchat:" in snippet
         assert 'url: "https://api.agentchat.me/mcp"' in snippet
         assert 'Authorization: "Bearer ${AGENTCHAT_API_KEY}"' in snippet
-        assert snippet.endswith('      X-AgentChat-Client: "hermes"\n')
+        assert '      X-AgentChat-Client: "hermes"\n' in snippet
+        assert snippet.endswith("    trust: full  # untrusted: each AgentChat write tool asks first\n")
+        assert "    trust: untrusted  #" in reg.manual_snippet(trust="untrusted")
 
 
 class TestDescribeEnsureRemove:
     def test_missing_then_added_then_present(self) -> None:
         config: dict[str, Any] = {}
         assert reg.describe_entry(config) == "missing"
-        assert reg.ensure_entry(config) == "added"
-        assert config["mcp_servers"]["agentchat"] == reg.server_entry()
+        assert reg.ensure_entry(config, decision="no") == "added"
+        assert config["mcp_servers"]["agentchat"] == reg.server_entry(trust="untrusted")
         assert reg.describe_entry(config) == "ours"
         assert reg.ensure_entry(config) == "present"
 
+    def test_nobody_decided_nothing_is_added(self) -> None:
+        config: dict[str, Any] = {"model": {"default": "x"}}
+        assert reg.ensure_entry(config) == "missing"
+        assert config == {"model": {"default": "x"}}
+
+    @pytest.mark.parametrize(("decision", "trust"), [("yes", "full"), ("no", "untrusted"), ("carried_over", "full")])
+    def test_a_new_entry_carries_the_decided_trust(self, decision: Any, trust: str) -> None:
+        config: dict[str, Any] = {}
+        assert reg.ensure_entry(config, decision=decision) == "added"
+        assert config["mcp_servers"]["agentchat"]["trust"] == trust
+
+    def test_a_yes_turns_our_untrusted_entry_full(self) -> None:
+        config: dict[str, Any] = {"mcp_servers": {"agentchat": reg.server_entry(trust="untrusted")}}
+        assert reg.ensure_entry(config, decision="yes") == "allowed"
+        assert config["mcp_servers"]["agentchat"]["trust"] == "full"
+        assert reg.ensure_entry(config, decision="yes") == "present"
+
+    @pytest.mark.parametrize("decision", [None, "no", "carried_over"])
+    def test_only_a_yes_changes_an_existing_entrys_trust(self, decision: Any) -> None:
+        for trust in ("untrusted", "full"):
+            config: dict[str, Any] = {"mcp_servers": {"agentchat": reg.server_entry(trust=trust)}}
+            assert reg.ensure_entry(config, decision=decision) == "present"
+            assert config["mcp_servers"]["agentchat"]["trust"] == trust
+
+    def test_an_earlier_release_entry_without_trust_is_left_without_it(self) -> None:
+        """No trust key reads as full in Hermes: allowed already, so not touched."""
+        config: dict[str, Any] = {"mcp_servers": {"agentchat": {**reg.server_entry(), "trust": None}}}
+        del config["mcp_servers"]["agentchat"]["trust"]
+        for decision in (None, "yes", "no", "carried_over"):
+            assert reg.ensure_entry(config, decision=decision) == "present"
+            assert "trust" not in config["mcp_servers"]["agentchat"]
+
+    def test_a_yes_on_an_entry_without_the_client_header_does_both_in_one(self) -> None:
+        config: dict[str, Any] = {"mcp_servers": {"agentchat": {**json.loads(json.dumps(OLD_ENTRY)), "trust": "untrusted"}}}
+        assert reg.ensure_entry(config, decision="yes") == "allowed"
+        entry = config["mcp_servers"]["agentchat"]
+        assert entry["trust"] == "full" and entry["headers"]["X-AgentChat-Client"] == "hermes"
+
+    def test_a_yes_never_touches_a_hand_written_entry(self) -> None:
+        theirs = {"url": "https://proxy.example/mcp", "headers": {"Authorization": "Bearer abc"}, "trust": "untrusted"}
+        config: dict[str, Any] = {"mcp_servers": {"agentchat": dict(theirs)}}
+        assert reg.ensure_entry(config, decision="yes") == "user_managed"
+        assert config["mcp_servers"]["agentchat"] == theirs
+
     def test_other_servers_are_kept(self) -> None:
         config: dict[str, Any] = {"mcp_servers": {"github": {"url": "https://x/mcp"}}}
-        reg.ensure_entry(config)
+        reg.ensure_entry(config, decision="yes")
         assert set(config["mcp_servers"]) == {"github", "agentchat"}
 
     def test_user_managed_entry_is_never_modified(self) -> None:
@@ -184,7 +232,7 @@ class TestDescribeEnsureRemove:
 
     def test_remove_only_ours_and_drops_empty_section(self) -> None:
         config: dict[str, Any] = {}
-        reg.ensure_entry(config)
+        reg.ensure_entry(config, decision="yes")
         assert reg.remove_entry(config) is True
         assert "mcp_servers" not in config
         config = {"mcp_servers": {"github": {}, "agentchat": reg.server_entry()}}
@@ -193,7 +241,7 @@ class TestDescribeEnsureRemove:
 
     def test_non_mapping_servers_section_is_replaced_only_when_adding(self) -> None:
         config: dict[str, Any] = {"mcp_servers": None}
-        assert reg.ensure_entry(config) == "added"
+        assert reg.ensure_entry(config, decision="yes") == "added"
         assert reg.describe_entry(config) == "ours"
 
 
@@ -249,17 +297,32 @@ def fake_hermes(monkeypatch: pytest.MonkeyPatch) -> _FakeHermesConfig:
 
 class TestHermesBacked:
     def test_install_writes_through_hermes_once(self, fake_hermes: _FakeHermesConfig) -> None:
-        assert reg.install_entry() == "added"
+        assert reg.install_entry(decision="yes") == reg.EntryPlacement("added", "full")
         assert len(fake_hermes.saved) == 1
-        assert fake_hermes.on_disk["mcp_servers"]["agentchat"] == reg.server_entry()
+        assert fake_hermes.on_disk["mcp_servers"]["agentchat"] == reg.server_entry(trust="full")
         assert fake_hermes.on_disk["model"] == {"default": "x"}, "other sections survive"
-        assert reg.install_entry() == "present"
+        assert reg.install_entry(decision="yes") == reg.EntryPlacement("present", "full")
         assert len(fake_hermes.saved) == 1, "present means no second write"
+
+    def test_with_nobody_asked_nothing_is_written(self, fake_hermes: _FakeHermesConfig) -> None:
+        assert reg.install_entry() == reg.EntryPlacement("missing", None)
+        assert fake_hermes.saved == []
+
+    def test_a_yes_on_an_untrusted_entry_is_one_write_and_read_back(self, fake_hermes: _FakeHermesConfig) -> None:
+        fake_hermes.on_disk = {"mcp_servers": {"agentchat": reg.server_entry(trust="untrusted")}}
+        assert reg.install_entry(decision="yes") == reg.EntryPlacement("allowed", "full")
+        assert len(fake_hermes.saved) == 1
+        assert fake_hermes.on_disk["mcp_servers"]["agentchat"]["trust"] == "full"
+
+    def test_the_header_and_the_yes_land_in_one_write(self, fake_hermes: _FakeHermesConfig) -> None:
+        fake_hermes.on_disk = {"mcp_servers": {"agentchat": {**json.loads(json.dumps(OLD_ENTRY)), "trust": "untrusted"}}}
+        assert reg.install_entry(decision="yes") == reg.EntryPlacement("allowed", "full", header_added=True)
+        assert len(fake_hermes.saved) == 1
 
     def test_inspect_reads_the_raw_file(self, fake_hermes: _FakeHermesConfig) -> None:
         assert reg.inspect_entry() == "missing"
         assert reg.inspect_entry_identity() == ("missing", None)
-        reg.install_entry()
+        reg.install_entry(decision="no")
         assert reg.inspect_entry() == "ours"
         assert reg.inspect_entry_identity() == ("ours", "current")
 
@@ -274,7 +337,7 @@ class TestHermesBacked:
 
     def test_upgrade_keeps_the_key_a_template(self, fake_hermes: _FakeHermesConfig) -> None:
         fake_hermes.on_disk = {"mcp_servers": {"agentchat": json.loads(json.dumps(OLD_ENTRY))}}
-        assert reg.install_entry() == "upgraded"
+        assert reg.install_entry().outcome == "upgraded"
         written = json.dumps(fake_hermes.saved)
         assert "secret_value" not in written, "the key must never be written into config.yaml"
         assert fake_hermes.on_disk["mcp_servers"]["agentchat"]["headers"]["Authorization"] == "Bearer ${AGENTCHAT_API_KEY}"
@@ -295,13 +358,20 @@ class TestHermesBacked:
             reg.install_entry()
         assert "X-AgentChat-Client" in str(info.value)
         assert fake_hermes.saved == []
+        fake_hermes.on_disk = {}
+        with pytest.raises(reg.McpRegistrationError, match="managed by a package manager") as info:
+            reg.install_entry(decision="yes")
+        assert "trust: full" in str(info.value), "the snippet carries the answer"
         fake_hermes.on_disk = {"mcp_servers": {"agentchat": reg.server_entry()}}
-        assert reg.install_entry() == "present", "nothing to write, nothing to refuse"
+        assert reg.install_entry().outcome == "present", "nothing to write, nothing to refuse"
 
     def test_a_save_that_does_not_land_is_an_error(self, fake_hermes: _FakeHermesConfig) -> None:
         fake_hermes.drop_saves = True
         with pytest.raises(reg.McpRegistrationError, match="did not save"):
-            reg.install_entry()
+            reg.install_entry(decision="yes")
+        fake_hermes.on_disk = {"mcp_servers": {"agentchat": reg.server_entry(trust="untrusted")}}
+        with pytest.raises(reg.McpRegistrationError, match="did not save"):
+            reg.install_entry(decision="yes")
 
     def test_install_then_inspect_agree(self, fake_hermes: _FakeHermesConfig) -> None:
         """doctor --fix and the check after it read the same file the same way."""
@@ -313,24 +383,25 @@ class TestHermesBacked:
     def test_install_upgrades_an_old_entry_with_one_write(self, fake_hermes: _FakeHermesConfig) -> None:
         fake_hermes.on_disk = {"model": {"default": "x"}, "mcp_servers": {"agentchat": json.loads(json.dumps(OLD_ENTRY))}}
         assert reg.inspect_entry_identity() == ("ours", "missing")
-        assert reg.install_entry() == "upgraded"
+        assert reg.install_entry().outcome == "upgraded"
         assert len(fake_hermes.saved) == 1
         assert fake_hermes.on_disk["mcp_servers"]["agentchat"]["headers"] == {
             "Authorization": "Bearer ${AGENTCHAT_API_KEY}",
             **CLIENT_HEADERS,
         }
-        assert reg.install_entry() == "present"
+        assert "trust" not in fake_hermes.on_disk["mcp_servers"]["agentchat"], "an earlier release's entry keeps no trust key"
+        assert reg.install_entry().outcome == "present"
         assert len(fake_hermes.saved) == 1
 
     def test_install_never_writes_a_user_managed_entry(self, fake_hermes: _FakeHermesConfig) -> None:
         theirs = {"url": "https://proxy.example/mcp", "headers": {"Authorization": "Bearer x"}}
         fake_hermes.on_disk = {"mcp_servers": {"agentchat": theirs}}
-        assert reg.install_entry() == "user_managed"
+        assert reg.install_entry(decision="yes").outcome == "user_managed"
         assert fake_hermes.saved == []
         assert reg.inspect_entry_identity() == ("user_managed", "missing")
 
     def test_uninstall_removes_ours_only(self, fake_hermes: _FakeHermesConfig) -> None:
-        reg.install_entry()
+        reg.install_entry(decision="yes")
         assert reg.uninstall_entry() is True
         assert "mcp_servers" not in fake_hermes.on_disk
         assert reg.uninstall_entry() is False
@@ -354,7 +425,7 @@ class TestHermesBacked:
         monkeypatch.setitem(sys.modules, "hermes_cli", None)
         monkeypatch.setitem(sys.modules, "hermes_cli.config", None)
         with pytest.raises(reg.McpRegistrationError, match="mcp_servers:"):
-            reg.install_entry()
+            reg.install_entry(decision="yes")
 
 
 class TestPortableDeclaration:
@@ -376,6 +447,7 @@ class TestPortableDeclaration:
     def test_config_yaml_entry_and_portable_entry_agree(self) -> None:
         portable = reg.mcp_json_document()["mcpServers"]["agentchat"]
         native = reg.server_entry()
+        assert native["trust"] == "untrusted", "the config.yaml entry names its tier; mcp.json has no such field"
         assert portable["url"] == native["url"]
         assert portable["headers"] == native["headers"]
 
@@ -383,3 +455,98 @@ class TestPortableDeclaration:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         assert reg.manual_snippet() in readme.replace("```yaml\n", "", 1)
         assert "X-AgentChat-Client-Version" not in readme
+
+
+class TestTrust:
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            (None, "unset"),
+            ("full", "full"),
+            (" FULL ", "full"),
+            ("untrusted", "untrusted"),
+            ("Untrusted", "untrusted"),
+            ("", "untrusted"),
+            ("yes", "untrusted"),
+            (True, "untrusted"),
+            (1, "untrusted"),
+        ],
+    )
+    def test_entry_trust_reads_like_hermes(self, raw: Any, expected: str) -> None:
+        entry: dict[str, Any] = {} if raw is None else {"trust": raw}
+        assert reg.entry_trust(entry) == expected
+        assert reg.effective_trust(reg.entry_trust(entry)) == ("full" if expected != "untrusted" else "untrusted")
+
+    def test_no_entry_has_no_trust(self) -> None:
+        assert reg.effective_trust(None) is None
+        assert reg.entry_trust("not a mapping") == "unset"
+
+
+def _config(trust: Any = "untrusted", **extra: Any) -> dict[str, Any]:
+    entry = reg.server_entry()
+    if trust is None:
+        del entry["trust"]
+    else:
+        entry["trust"] = trust
+    return {"mcp_servers": {"agentchat": entry}, **extra}
+
+
+class TestAllowance:
+    def test_no_entry_is_not_allowed(self) -> None:
+        allowance = reg.tools_allowance({}, environ={})
+        assert (allowance.entry, allowance.trust, allowance.via, allowance.allowed) == ("missing", None, None, False)
+
+    @pytest.mark.parametrize(("trust", "via"), [("full", "trust"), (None, "no_trust_key"), ("FULL", "trust")])
+    def test_the_tier_allows(self, trust: Any, via: str) -> None:
+        allowance = reg.tools_allowance(_config(trust), environ={})
+        assert allowance.allowed and allowance.via == via and allowance.by_tier
+
+    def test_untrusted_with_nothing_else_is_not_allowed(self) -> None:
+        allowance = reg.tools_allowance(_config("untrusted"), environ={})
+        assert not allowance.allowed and allowance.via is None and allowance.trust == "untrusted"
+
+    @pytest.mark.parametrize("mode", [False, "off", " OFF "])
+    def test_approvals_off_lets_writes_through(self, mode: Any) -> None:
+        allowance = reg.tools_allowance(_config(approvals={"mode": mode}), environ={})
+        assert allowance.allowed and allowance.via == "approvals_off" and not allowance.by_tier
+
+    @pytest.mark.parametrize("mode", [True, "manual", "smart", "auto", None])
+    def test_other_modes_do_not(self, mode: Any) -> None:
+        assert not reg.tools_allowance(_config(approvals={"mode": mode}), environ={}).allowed
+
+    @pytest.mark.parametrize(("value", "allowed"), [("1", True), ("true", True), (" Yes ", True), ("on", True), ("0", False), ("", False)])
+    def test_the_process_yolo(self, value: str, allowed: bool) -> None:
+        allowance = reg.tools_allowance(_config(), environ={"HERMES_YOLO_MODE": value})
+        assert allowance.allowed is allowed and (allowance.via == "yolo") is allowed
+
+    def test_an_always_approval_of_one_tool_does_not_count(self) -> None:
+        """An AgentChat turn calls several write tools: one remembered approval is not the switch."""
+        allowance = reg.tools_allowance(_config(command_allowlist=["mcp:agentchat/agentchat_send_message"]), environ={})
+        assert not allowance.allowed and allowance.via is None
+
+    def test_a_disabled_entry_is_never_allowed(self) -> None:
+        config = _config("full")
+        config["mcp_servers"]["agentchat"]["enabled"] = False
+        allowance = reg.tools_allowance(config, environ={"HERMES_YOLO_MODE": "1"})
+        assert allowance.entry == "disabled" and not allowance.allowed
+
+    def test_a_hand_written_entry_is_gated_the_same_way(self) -> None:
+        config = {"mcp_servers": {"agentchat": {"url": "https://proxy.example/mcp", "trust": "untrusted"}}}
+        allowance = reg.tools_allowance(config, environ={})
+        assert allowance.entry == "user_managed" and not allowance.allowed
+        config["mcp_servers"]["agentchat"]["trust"] = "full"
+        assert reg.tools_allowance(config, environ={}).allowed
+
+    def test_inspect_reads_the_raw_file(self, fake_hermes: _FakeHermesConfig) -> None:
+        assert reg.inspect_allowance().entry == "missing"
+        fake_hermes.on_disk = _config("full")
+        assert reg.inspect_allowance().allowed
+        fake_hermes.managed = True
+        assert reg.config_is_managed() is True
+
+    def test_without_hermes_the_config_is_not_managed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setitem(sys.modules, "hermes_cli", None)
+        monkeypatch.setitem(sys.modules, "hermes_cli.config", None)
+        assert reg.config_is_managed() is False
+        with pytest.raises(reg.McpRegistrationError):
+            reg.inspect_allowance()

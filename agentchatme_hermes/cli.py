@@ -18,14 +18,19 @@ Surfaces:
 * **``status``** — show the configured @handle and account state
   (restrictions, inbox mode, paused-by-owner, etc.), where the key is and
   whether the manual is the served one.
+* **``allow``** — the one question: may the agent use the AgentChat tools on
+  its own (``trust: full`` on ``mcp_servers.agentchat``; :mod:`.allow`).
+  Asked only of a person at their own terminal; never in an agent's terminal
+  (``/agentchat allow`` in a chat is the way there). No ``--yes``.
 * **``logout``** — remove the key file and any key line from the profile
   ``.env``, the identity line AgentChat placed in SOUL.md for this profile's
   agent (a block edited by hand or another agent's is left, and said), our
   ``secrets.agentchat`` and ``mcp_servers.agentchat`` entries.
 * **``doctor``** — check every placement (key, identity line, manual,
-  the key source, hosted tools) plus the lock and the daemon's health;
-  ``--fix`` re-places (the manual: one sync with the server), and moves a
-  key still in the profile's settings into the key file.
+  the key source, hosted tools, whether they are allowed) plus the lock and
+  the daemon's health; ``--fix`` re-places (the manual: one sync with the
+  server; the tools entry only as the person answers), and moves a key still
+  in the profile's settings into the key file.
 
 ``register`` and ``recover`` run on the SDK's sign-up helper
 (:mod:`.signup`): one interactive run that follows the server's answer —
@@ -37,7 +42,10 @@ Every successful register / login / recover *places* the integration: the
 key in this profile's key file, the served identity line in SOUL.md, the
 served manual as the ``agentchat:agentchat`` skill, the key source
 (``secrets.agentchat``) and the hosted MCP server (``mcp_servers.agentchat``)
-in ``config.yaml`` — see :mod:`.placement`.
+in ``config.yaml`` — see :mod:`.placement`. Before the key is saved, a person
+at their own terminal is asked whether the agent may use the AgentChat tools
+on its own (:func:`.allow.decide`); the tools' entry is written with that
+answer, and not at all while nobody was asked.
 
 The wizard is the only path users need. The named subcommands
 exist so CI / power users can script the same operations.
@@ -59,7 +67,7 @@ from getpass import getpass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
-from . import credentials, key_store, signup
+from . import allow, credentials, key_store, signup
 from ._version import __version__
 from .client_identity import hermes_client_identity
 from .config import (
@@ -89,6 +97,8 @@ if TYPE_CHECKING:
     import argparse
 
     from agentchatme.integration.account import AccountAnswer, AccountQuestion
+
+    from .mcp_registration import Decision
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +206,17 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     )
     p_recover.set_defaults(func=_dispatch_recover)
 
+    p_allow = sub.add_parser(
+        "allow",
+        help="Allow the agent to use the AgentChat tools on its own (asks you once)",
+        description=(
+            "Asks one question: may this profile's agent use the AgentChat tools on its own? "
+            "Yes sets trust: full on mcp_servers.agentchat in config.yaml. Run it in your own "
+            "terminal; in a chat with the agent, send /agentchat allow instead."
+        ),
+    )
+    p_allow.set_defaults(func=_dispatch_allow)
+
     p_status = sub.add_parser(
         "status",
         help="Show the currently configured @handle and account state",
@@ -216,9 +237,10 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
         "--fix",
         action="store_true",
         help=(
-            "Re-place what is missing or outdated: the identity line in SOUL.md, the key source "
-            "and the hosted-tools entry in config.yaml (never touches a hand-managed entry), and "
-            "move a key still in this profile's settings (its .env) into the key file."
+            "Re-place what is missing or outdated: the identity line in SOUL.md and the key source "
+            "in config.yaml; ask the one AgentChat tools question in your own terminal and write the "
+            "hosted-tools entry as you answer (never touches a hand-managed entry); move a key still "
+            "in this profile's settings (its .env) into the key file."
         ),
     )
     p_doctor.set_defaults(func=_dispatch_doctor)
@@ -305,12 +327,15 @@ def _dispatch_login(args: argparse.Namespace) -> int:
             f"The key was not saved. AgentChat answered: {checked.message or checked.code}"
         )
 
+    tools = allow.decide_for(checked.handle)
     if not _persist_credentials(api_key=api_key, handle=checked.handle, api_base=api_base):
         return _EXIT_API_ERR
-    _install_placement(checked.handle, api_base=api_base, api_key=api_key)
+    _install_placement(checked.handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
     _printline(f"Saved AgentChat key for @{checked.handle}.")
+    _printline(tools.line)
     _printline(_RESTART_HINT)
     return _EXIT_OK
+
 
 
 class _KeyInputError(Exception):
@@ -431,11 +456,44 @@ def _run_signup(
         reason = "" if result.message else f"AgentChat answered {result.code or 'without a message'}. "
         return _exit_with(f"{reason}Nothing was saved.")
     api_key, handle = saved
+    tools = allow.decide_for(handle)
     if not _persist_credentials(api_key=api_key, handle=handle, api_base=api_base):
         return _EXIT_API_ERR
-    _install_placement(handle, api_base=api_base, api_key=api_key)
+    _install_placement(handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
+    _printline(tools.line)
     on_saved(handle=handle, api_key=api_key)
     return _EXIT_OK
+
+
+def _dispatch_allow(_args: argparse.Namespace) -> int:
+    """``hermes agentchat allow``: the one question, for a person at their own
+    terminal (:func:`.allow.decide`). Exit 0 when the tools are allowed, 1
+    when they are not (declined, or nobody could be asked here)."""
+    from .placement import place_mcp
+    from .profile_scope import resolve_hermes_home
+
+    home = resolve_hermes_home()
+    resolution = resolve_key(home)
+    if resolution.refusal is not None:
+        return _exit_with(resolution.refusal)
+    if not (resolution.api_key or resolution.held_key):
+        return _exit_with(f"No AgentChat key in this profile yet: run `{cli_prefix(home)}` first.")
+    api_base = _api_base()
+    handle = profile_identity(home, api_base=api_base).handle
+    tools = allow.decide_for(handle)
+    if tools.decision is None:
+        _printline(tools.line)
+        return _EXIT_OK if tools.line in (allow.ALREADY_ALLOWED_LINE, allow.APPLYING_LINE) else _EXIT_API_ERR
+    step = place_mcp(api_base, decision=tools.decision)
+    if step.failed:
+        return _exit_with(f"AgentChat tools: nothing changed — {step.detail}")
+    if step.outcome == "applying":
+        _printline(allow.APPLYING_LINE + ".")
+    else:
+        _printline(tools.line + ("." if tools.decision == "yes" else ""))
+    if step.status == "changed":
+        _printline(f"{step.name}: {step.detail}")
+    return _EXIT_OK if tools.decision == "yes" else _EXIT_API_ERR
 
 
 def _dispatch_status(_args: argparse.Namespace) -> int:
@@ -487,19 +545,23 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
         # manual (against the cached texts), the gateway's last record.
         cached, _ = _doctor_cached_texts(api_key=saved_key, api_base=api_base, hermes_home=hermes_home)
         code = _exit_with(problem)
+        worker = _health_worker(api_base, saved_key)
         _print_local_status(
             resolution,
-            worker=_health_worker(api_base, saved_key),
+            worker=worker,
             manual=_manual_line(hermes_home, cached.manual if cached is not None else None),
             identity=_identity_status_for(cached, handle=_read_saved_handle(), home=hermes_home),
+            tools=_tools_line(hermes_home, api_base=api_base, handle=_read_saved_handle()),
         )
         return code
 
     handle = me.get("handle") if isinstance(me, dict) else None
+    worker = _health_worker(api_base, saved_key)
     _print_status(
         me,
         resolution,
-        worker=_health_worker(api_base, saved_key),
+        worker=worker,
+        tools=_tools_line(hermes_home, api_base=api_base, handle=handle if isinstance(handle, str) else None),
         manual=_manual_line(hermes_home, texts.manual if texts is not None else None),
         identity=_identity_status_for(
             texts, handle=handle.lstrip("@").lower() if isinstance(handle, str) and handle else None, home=hermes_home
@@ -601,8 +663,11 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
       alone cannot distinguish a healthy receiver from a dead thread)
 
     ``--fix`` re-places the identity line, the manual (one sync: a download
-    when it is not the served one) and the hosted-tools entry before the
-    checks run (a hand-managed entry is never touched).
+    when it is not the served one) and the key source before the checks run;
+    the hosted-tools entry is written only with a decision: the one-time
+    carry-over (decided before the old ``.env`` line can go), or the person's
+    answer to the one question at their own terminal (a hand-managed entry is
+    never touched). The AgentChat tools line says where the switch stands.
 
     Exit code is the number of failed checks; ``0`` means clean.
     Each line is prefixed with ``[ok]`` / ``[warn]`` / ``[fail]``
@@ -819,10 +884,23 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         warn("--fix skipped: nothing is placed until AgentChat answers for this key")
 
     if getattr(args, "fix", False) and authenticated_handle is not None:
-        for level, line in _fix_key(
-            resolution, handle=authenticated_handle, api_base=api_base, home=hermes_home
-        ):
-            {"ok": ok, "warn": warn, "fail": fail}[level](line)
+        # Decided, recorded and placed before the key's old .env line can go:
+        # the one-time carry-over reads the pre-0.3 name.
+        tools = _doctor_tools_decision(authenticated_handle, api_base=api_base, home=hermes_home)
+        carry_failed = False
+        if tools.decision == "carried_over":
+            from .placement import place_mcp
+
+            carried = place_mcp(api_base, decision="carried_over")
+            carry_failed = carried.failed
+            (fail if carried.failed else ok)(f"fix: {carried.name} {carried.status} — {carried.detail}")
+        if carry_failed:
+            warn("fix: the key's old .env line is kept: the carried-over tools entry did not land")
+        else:
+            for level, line in _fix_key(
+                resolution, handle=authenticated_handle, api_base=api_base, home=hermes_home
+            ):
+                {"ok": ok, "warn": warn, "fail": fail}[level](line)
         for step in place_identity_and_tools(
             handle=authenticated_handle,
             texts=served_texts,
@@ -831,9 +909,14 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             # Another agent's block is a mismatch to fix (the key, or the
             # block), never something `--fix` decides by replacing it.
             replace_other_agent=False,
+            tools_decision=tools.decision if tools.decision in ("yes", "no") else None,
         ):
+            if step.name == "mcp" and step.outcome == "missing":
+                continue  # the AgentChat tools line below says it
             report = fail if step.failed else warn if step.status == "warned" else ok
             report(f"fix: {step.name} {step.status} — {step.detail}")
+        if tools.decision in ("yes", "no"):
+            ok(f"fix: {tools.line}")
 
     # Offline, the block is read against the line in use for the handle this
     # profile saved (as `status` does), not left "not verified": this
@@ -873,7 +956,6 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             client_header_lines,
             hosted_mcp_url,
             inspect_entry_identity,
-            manual_snippet,
         )
 
         try:
@@ -923,14 +1005,17 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                     "mcp_servers.agentchat is disabled in config.yaml — the agent has no "
                     "AgentChat tools"
                 )
-            else:
-                fail(
-                    "hosted tools entry missing — mcp_servers.agentchat is not in "
-                    f"config.yaml. Run `{cmd} doctor --fix`, or add:\n"
-                    + manual_snippet(api_base)
-                )
     except ImportError:
         warn("mcp_registration module not importable — skipping tool-source check")
+    _doctor_tools_switch(
+        hermes_home,
+        api_base=api_base,
+        handle=authenticated_handle or saved_handle,
+        cmd=cmd,
+        ok=ok,
+        warn=warn,
+        fail=fail,
+    )
 
     gateway = _gateway_running(api_base, saved_key, hermes_home)
     if gateway is not None:
@@ -1063,6 +1148,55 @@ _CYCLE_REMEDIES = {
 }
 
 
+def _doctor_tools_switch(
+    hermes_home: Path,
+    *,
+    api_base: str,
+    handle: str | None,
+    cmd: str,
+    ok: Callable[[str], None],
+    warn: Callable[[str], None],
+    fail: Callable[[str], None],
+) -> None:
+    """The one switch (:func:`.allow.read_switch`): not decided yet, or a yes
+    the running gateway did not take up (restart to apply), is a failure — the
+    agent answers nothing on AgentChat; a no, a yes being applied, or a trust
+    changed by hand is a warning."""
+    switch = allow.read_switch(hermes_home, api_base=api_base)
+    if switch.state == "disabled":
+        return  # said above
+    if switch.state == "unknown":
+        warn("AgentChat tools: not checked — this Hermes' config.yaml could not be read here")
+        return
+    text = f"AgentChat tools: {allow.describe(switch, handle, cmd=cmd)}"
+    if switch.state == "not_allowed_yet" or switch.stalled:
+        fail(text)
+    elif switch.state == "allowed" and not switch.hand_edited:
+        ok(text)
+    else:
+        warn(text)
+
+
+def _doctor_tools_decision(handle: str, *, api_base: str, home: Path) -> allow.SetupDecision:
+    """``doctor --fix``'s decision about the tools: the one-time carry-over
+    when it still applies (the pre-0.3 name set, no entry, never placed — the
+    same rule as at activation, recorded before the old ``.env`` line can
+    go), else the one question for a person at their own terminal."""
+    from .mcp_registration import McpRegistrationError, inspect_entry
+
+    try:
+        entry = inspect_entry(api_base=api_base)
+    except McpRegistrationError:
+        entry = None
+    if entry is not None and allow.first_placement(
+        home, entry=entry, legacy_key_set=allow.legacy_key_set()
+    ) == "carried_over":
+        return allow.SetupDecision(
+            "carried_over", "AgentChat tools allowed: carried over from your setup under an earlier release"
+        )
+    return allow.decide_for(handle)
+
+
 def _describe_scope(worker: Any) -> str | None:
     """The warn line when the running gateway multiplexes on a Hermes that rebuilds a
     plugin's secret scope from the profile's files only (older than 0.23.2)."""
@@ -1156,6 +1290,16 @@ def _describe_worker(worker: Any, *, now: float) -> tuple[str, str] | None:
     loop_raw = worker.get("loop")
     loop: dict[str, Any] = loop_raw if isinstance(loop_raw, dict) else {}
     bad, newest = bad_cycle_run(loop.get("recent_cycles"))
+    switch = worker.get("tools_allowed")
+    paused = switch.get("state") if isinstance(switch, dict) else None
+    if bad and newest is not None and newest.get("outcome") == "tools_unavailable" and paused in allow.PAUSED_STATES:
+        # Paused by the switch (the person's choice, or a yes being applied):
+        # said with its remedy, not alarmed on.
+        stalled = isinstance(switch, dict) and switch.get("stalled") is True
+        return "warn", (
+            f"The receive loop is paused: {allow.reason(paused, stalled=stalled)} — AgentChat messages wait on "
+            "the tray"
+        )
     if bad and newest is not None:
         what = str(newest.get("outcome") or "?")
         why = f": {newest['failure']}" if newest.get("failure") else ""
@@ -1541,21 +1685,27 @@ def _dispatch_logout(_args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
-def _install_placement(handle: str, *, api_base: str, api_key: str) -> list[PlacementStep]:
+def _install_placement(
+    handle: str, *, api_base: str, api_key: str, tools_decision: Decision | None = None
+) -> list[PlacementStep]:
     """Place the identity line and the manual, register the hosted tools.
 
     The texts are fetched from the server for this key (the cached copy when
     the server is unreachable). By default the identity line and the manual
     are this release's; with ``live_texts`` on they are the served ones
     (without texts the line is skipped and the manual is the bundled copy —
-    the gateway places both later). Failure is non-fatal: credentials are
+    the gateway places both later). ``tools_decision`` is the person's answer
+    about the tools (``None``: nobody asked, so no tools entry is added).
+    Failure is non-fatal: credentials are
     already persisted and the account is fully operational. Each failed step
     is printed with its reason so the operator can repair it
     (``hermes agentchat doctor --fix`` re-runs this).
     """
     texts = resolve_texts(api_key=api_key, api_base=api_base)
-    steps = place_identity_and_tools(handle=handle, texts=texts, api_base=api_base)
+    steps = place_identity_and_tools(handle=handle, texts=texts, api_base=api_base, tools_decision=tools_decision)
     for step in steps:
+        if step.name == "mcp" and step.outcome == "missing":
+            continue  # the AgentChat tools line after this says it
         if step.needs_attention:
             sys.stderr.write(f"Warning: {step.name}: {step.detail}\n")
             sys.stderr.flush()
@@ -2105,6 +2255,9 @@ def _uninstall_mcp_registration() -> None:
         sys.stderr.write(f"Warning: Hermes refused the config.yaml write ({exc}).\n")
         sys.stderr.flush()
         return
+    from .profile_scope import resolve_hermes_home
+
+    allow.clear_pending(resolve_hermes_home())  # removed on purpose: nothing to finish
     if removed:
         _printline("Hosted-tools entry mcp_servers.agentchat removed from config.yaml")
 
@@ -2222,12 +2375,8 @@ def _read_saved_handle() -> str | None:
 
 
 def _stdin_is_tty() -> bool:
-    """Is stdin an interactive terminal? ``False`` for pipes, files, a
-    closed or replaced stdin — anywhere a prompt would never be answered."""
-    try:
-        return sys.stdin is not None and bool(sys.stdin.isatty())
-    except (AttributeError, ValueError):
-        return False
+    """Is stdin an interactive terminal? (:func:`.allow.stdin_is_tty`)"""
+    return allow.stdin_is_tty()
 
 
 def _hermes_mcp_client_importable() -> bool:
@@ -2466,7 +2615,14 @@ def _live_health(api_base: str, api_key: str, hermes_home: Path | None = None) -
     return live_health(api_base, api_key, hermes_home)
 
 
-def _print_local_status(resolution: KeyResolution, *, worker: Any, manual: str, identity: str | None = None) -> None:
+def _tools_line(hermes_home: Path, *, api_base: str, handle: str | None) -> str:
+    """``status``'s one "AgentChat tools:" line (:func:`.allow.read_switch`)."""
+    return allow.describe(allow.read_switch(hermes_home, api_base=api_base), handle, cmd=cli_prefix(hermes_home))
+
+
+def _print_local_status(
+    resolution: KeyResolution, *, worker: Any, manual: str, identity: str | None = None, tools: str | None = None
+) -> None:
     """``status`` when AgentChat did not answer: what this machine holds."""
     saved = _read_saved_handle()
     _printline("")
@@ -2478,6 +2634,8 @@ def _print_local_status(resolution: KeyResolution, *, worker: Any, manual: str, 
     _printline(f"  Manual:        {manual}")
     if identity is not None:
         _printline(f"  Identity:      {identity}")
+    if tools is not None:
+        _printline(f"  AgentChat tools: {tools}")
     section = _could_not_process_section(worker)
     if section is not None:
         _printline(f"  Could not process: {_could_not_process_summary(section)}")
@@ -2491,6 +2649,7 @@ def _print_status(
     worker: Any = None,
     manual: str | None = None,
     identity: str | None = None,
+    tools: str | None = None,
 ) -> None:
     handle = me.get("handle", "unknown")
     status = me.get("status", "unknown")
@@ -2516,6 +2675,8 @@ def _print_status(
         _printline(f"  Manual:        {manual}")
     if identity is not None:
         _printline(f"  Identity:      {identity}")
+    if tools is not None:
+        _printline(f"  AgentChat tools: {tools}")
     # Could not process, from the running gateway's health record (absent
     # when no gateway receives for this account, or from an older release).
     section = _could_not_process_section(worker)
@@ -2779,7 +2940,7 @@ def register_cli(ctx: Any) -> None:
     """
     ctx.register_cli_command(
         name="agentchat",
-        help="Manage your AgentChat identity (register, login, recover, status, logout, doctor)",
+        help="Manage your AgentChat identity (register, login, recover, allow, status, logout, doctor)",
         setup_fn=_setup_with_signature(setup_argparse),
         handler_fn=_dispatch_top,
         description=(

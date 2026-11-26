@@ -19,7 +19,7 @@ from fake_keys import api_key
 from key_files import save_key
 from sdk_wire import Wire, answer, api_error, connect_error, serve
 
-from agentchatme_hermes import cli, signup
+from agentchatme_hermes import allow, cli, signup
 from agentchatme_hermes.cli import _EXIT_API_ERR, _EXIT_ARG_ERR, _EXIT_OK, _EXIT_USER_CANCEL
 
 _KEY = api_key("cli_0000000000000000")
@@ -40,26 +40,35 @@ class _Cli:
         self.persisted: list[dict[str, str]] = []
         self.placed: list[str] = []
         self.waits: list[float] = []
+        # The one question (allow.decide) is its own test; here: what it
+        # answered, and when it was asked relative to the save.
+        self.tools = allow.SetupDecision("yes", allow.ALLOWED_LINE)
+        self.events: list[str] = []
+        self.tools_decisions: list[Any] = []
         for name in ("AGENTCHATME_HANDLE", "AGENTCHAT_API_KEY", "AGENTCHATME_API_KEY", "AGENTCHATME_API_BASE"):
             monkeypatch.delenv(name, raising=False)
         monkeypatch.setattr(cli, "_input", self._input)
         monkeypatch.setattr(
             cli,
             "_persist_credentials",
-            lambda *, api_key, handle, api_base: self.persisted.append(
-                {"api_key": api_key, "handle": handle, "api_base": api_base}
-            )
+            lambda *, api_key, handle, api_base: self.events.append("persist")
+            or self.persisted.append({"api_key": api_key, "handle": handle, "api_base": api_base})
             or True,
         )
-        monkeypatch.setattr(
-            cli, "_install_placement", lambda handle, *, api_base, api_key: self.placed.append(handle) or []
-        )
+        monkeypatch.setattr(allow, "decide_for", lambda handle: self.events.append(f"decide {handle}") or self.tools)
+        monkeypatch.setattr(cli, "_install_placement", self._place)
         monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
         monkeypatch.setattr(signup, "_pause", self.waits.append)
 
     def _input(self, prompt: str) -> str:
         self.prompts.append(prompt)
         return self.lines.pop(0) if self.lines else ""
+
+    def _place(self, handle: str, *, api_base: str, api_key: str, tools_decision: Any = None) -> list[Any]:
+        self.events.append("place")
+        self.placed.append(handle)
+        self.tools_decisions.append(tools_decision)
+        return []
 
 
 # ─── register ──────────────────────────────────────────────────────────────
@@ -586,3 +595,46 @@ class TestOfflineSubcommands:
         out = capsys.readouterr().out
         assert rc >= 1
         assert "[fail] Could not reach /v1/agents/me: dns" in out
+
+
+# ─── the one question about the tools ──────────────────────────────────────
+
+
+class TestToolsQuestion:
+    """Asked after the server answered with the key and before it is saved,
+    so the tools' entry is written once, with the answer."""
+
+    def test_register_asks_before_the_key_is_saved(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        serve(monkeypatch, {sw.REGISTER: sw.code_sent(), sw.REGISTER_VERIFY: sw.registered("alice", _KEY)})
+        run = _Cli(monkeypatch, ["123456"])
+        assert cli._dispatch_register(_ns(email="a@b.co", handle="alice", display_name=None)) == _EXIT_OK
+        assert run.events == ["decide alice", "persist", "place"]
+        assert run.tools_decisions == ["yes"]
+        assert allow.ALLOWED_LINE in capsys.readouterr().out
+
+    def test_recover_asks_before_the_key_is_saved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        serve(monkeypatch, {sw.RECOVER: sw.code_sent("recover"), sw.RECOVER_VERIFY: sw.recovered("alice", _KEY)})
+        run = _Cli(monkeypatch, ["123456"])
+        run.tools = allow.SetupDecision("no", allow.NOT_ALLOWED_LINE.format(who="@alice"))
+        assert cli._dispatch_recover(_ns(email="a@b.co", handle="alice")) == _EXIT_OK
+        assert run.events == ["decide alice", "persist", "place"]
+        assert run.tools_decisions == ["no"]
+
+    def test_login_asks_before_the_key_is_saved(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice", "status": "active"})})
+        run = _Cli(monkeypatch, [])
+        run.tools = allow.SetupDecision(None, allow.AGENT_TERMINAL_LINE.format(who="@alice"))
+        assert cli._dispatch_login(_ns(api_key=_KEY)) == _EXIT_OK
+        assert run.events == ["decide alice", "persist", "place"]
+        assert run.tools_decisions == [None], "nobody asked: no tools entry"
+        assert "/agentchat allow" in capsys.readouterr().out
+
+    def test_a_refused_key_asks_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        serve(monkeypatch, {sw.ME: api_error(401, "UNAUTHORIZED", "Invalid API key")})
+        run = _Cli(monkeypatch, [])
+        assert cli._dispatch_login(_ns(api_key=_KEY)) == _EXIT_API_ERR
+        assert run.events == []

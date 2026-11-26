@@ -31,7 +31,10 @@ minutes on v0.23.2; ``tools/mcp_tool.py`` ``_PARKED_RETRY_INTERVAL`` /
 Hermes has no public way for a plugin to ask for a reconnect, so this plugin
 does not: while the server is parked every wake ends ``tools_unavailable``,
 and the log line and ``doctor`` name the cause and the remedy — ``/reload-mcp``
-in a chat this gateway serves, or ``hermes gateway restart``.
+in a chat this gateway serves, or ``hermes gateway restart``. Once Hermes
+connects it again, the gateway's minute check
+(:meth:`.agent_invoker.AgentInvoker.check_tools`) wakes the receive loop for
+the cards that waited.
 :func:`hosted_server_state` is Hermes' own reading of the server (``hermes
 mcp list``'s), read only.
 """
@@ -40,12 +43,13 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from .turn import MCP_SERVER_NAME, MCP_TOOL_PREFIX
 
 if TYPE_CHECKING:
     import threading
+    from collections.abc import Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -92,17 +96,19 @@ class ServerState:
 StateProbe = Callable[[], Optional[ServerState]]
 
 
-def hosted_server_state() -> ServerState | None:
+def hosted_server_state(entry: Mapping[str, Any] | None = None) -> ServerState | None:
     """Hermes' status of the hosted tools server in the current profile scope;
     ``None`` when this is not a Hermes process or its MCP client has no such
-    reading (a Hermes that moved it): unknown. Reads Hermes' cached state,
-    never connects. Never raises."""
+    reading (a Hermes that moved it): unknown. ``entry``: read the status for
+    this entry rather than the one in ``config.yaml`` (Hermes' runtime state
+    for the name, also after the entry was removed). Reads Hermes' cached
+    state, never connects. Never raises."""
     try:
         from tools.mcp_tool_discovery import get_mcp_status
     except Exception:
         return None
     try:
-        rows = get_mcp_status()
+        rows = get_mcp_status() if entry is None else get_mcp_status(configured={MCP_SERVER_NAME: dict(entry)})
     except Exception as exc:
         _warn_once(f"hosted_tools: Hermes' MCP status raised ({exc!r}) — the server's state is not known")
         return None
@@ -117,6 +123,26 @@ def hosted_server_state() -> ServerState | None:
                 needs_auth=bool(row.get("needs_auth")),
             )
     return ServerState(status="missing")
+
+
+def hosted_server_reconnecting() -> bool | None:
+    """Whether Hermes' connection to ``mcp_servers.agentchat`` in the current
+    profile scope connected once in this process and is now between sessions
+    (a transport reconnect after a dropped session: its task alive, retrying
+    with the config it began with). ``get_mcp_status`` shows that state as
+    ``configured``. ``None`` when not readable (not Hermes, or a Hermes that
+    moved ``tools.mcp_tool_discovery.mcp_server_reconnecting``, which is not on
+    Hermes' published plugin API: a guarded read, ``docs/hermes-coupling.md``).
+    Reads Hermes' cached state, never connects. Never raises."""
+    try:
+        from tools.mcp_tool_discovery import mcp_server_reconnecting
+    except Exception:
+        return None
+    try:
+        return bool(mcp_server_reconnecting(MCP_SERVER_NAME))
+    except Exception as exc:
+        _warn_once(f"hosted_tools: Hermes' MCP reconnect state raised ({exc!r}) — not known")
+        return None
 
 
 def _cmd() -> str:
@@ -146,7 +172,10 @@ def describe_cause(state: ServerState | None) -> str:
     if state.status == "disabled":
         return "mcp_servers.agentchat is disabled in this profile's config.yaml — enable it, then `hermes gateway restart`"
     if state.status == "missing":
-        return f"mcp_servers.agentchat is not in this profile's config.yaml — `{cmd} doctor --fix` adds it"
+        return (
+            "mcp_servers.agentchat is not in this profile's config.yaml: AgentChat tools are not allowed yet "
+            f"— /agentchat allow in a chat with the agent, or `{cmd} allow`, adds it"
+        )
     if state.status == "connected":
         return (
             "Hermes reports mcp_servers.agentchat connected but no mcp__agentchat__ tool is registered for "

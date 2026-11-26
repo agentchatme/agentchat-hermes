@@ -4,6 +4,59 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+### Upgrade note
+
+- **Containers and other built configurations.** Until this release the plugin added `mcp_servers.agentchat` by
+  itself on every fresh start, so a deployment whose `config.yaml` is not kept between starts (a container image, a key
+  passed as `AGENTCHAT_API_KEY` in the environment) always had the tools. Now the entry is written only once a person
+  decided, and such a deployment has nobody to ask and no kept answer: its agent gets no AgentChat tools and answers
+  nothing. Bake the entry into the image's `config.yaml`, with `trust: full` if the agent should answer by itself
+  (the operator widening the server's trust, as Hermes documents it); the README's "The tools entry" section, the
+  gateway's log and the setup line print it. Profiles set up before 0.3 (only `AGENTCHATME_API_KEY`) keep working
+  without that: the carry-over below runs again on each fresh start when its record is not kept either.
+
+### Added
+
+- **One question: may the agent use the AgentChat tools on its own?** Setup asks it once, after the server answered
+  with the key and before the key is saved: `Allow @alice to use AgentChat tools on its own? [Y/n]` (Enter or `y` is a
+  yes, `n` a no; Ctrl-C and the end of input decide nothing). A yes writes `mcp_servers.agentchat` with `trust: full`,
+  which covers every AgentChat tool; a no writes it with `trust: untrusted` (the read-only tools work, each write
+  asks). The decision is recorded in `<profile home>/agentchat/mcp-entry.json`. It is never asked per tool, per peer or
+  in the middle of a turn, and not asked in a command an agent's terminal ran (Hermes marks those with
+  `HERMES_SESSION_ID`) or without a terminal. The plugin never offers or answers the question for the agent; this is
+  best effort, not a security boundary (an agent with a shell can edit `config.yaml`). There is no `--yes` flag.
+- **`/agentchat allow`** in a chat with the agent (Telegram, Desktop, the CLI): the same question, asked through
+  Hermes' own prompt (`ctx.ask_choice`) on the surface the command came from, so it is answered wherever that surface
+  is (an agent driving a Hermes CLI in a terminal of its own could answer it there: best effort, not a boundary).
+  `/agentchat` alone says where the tools stand.
+- **`hermes agentchat allow`**: the same question in your own terminal; the wizard's edit menu offers it while the
+  entry's tier does not allow the tools.
+- **`after-install.md`**: `hermes plugins install` now says the two steps (sign up, allow once).
+- **The switch is observable**: an `AgentChat tools:` line in `doctor` (not decided yet is a failure: setup is not
+  finished; a no, or a yes being applied, is a warning) and in `status`, `worker.tools_allowed` in the health record,
+  and one log line per change.
+- **The plugin setting `live_texts`** (`config_schema` in `plugin.yaml`, default off): *Keep the AgentChat manual and
+  identity line current*. On, the plugin keeps both current from agentchat.me, exactly as 0.6.x did. Set it in Desktop
+  (Settings → Plugins), with `hermes plugins config agentchat` or at `hermes plugins install` (a directory install), or
+  `hermes config set plugins.entries.agentchat.settings.live_texts true` (any install); it applies when the gateway
+  restarts.
+- **`scripts/refresh_bundled_texts.py`** brings the bundled manual, the identity-line template and their pins in
+  `tests/test_skill_bundle.py` to what the server serves (the manual through the SDK kit's `sync_manual`, checked against
+  the announced version and sha256, and the plugin's inline-shell guard); the same texts give the same bytes, and a refusal
+  writes nothing. The `refresh-texts` workflow runs it daily and opens (or updates) a pull request when the texts
+  change, and leaves it: it is merged at a release, because an unpinned git install tracks `main`. It skips with a notice
+  until it is set up, and opens an issue when a run fails (RUNBOOK § Refreshing the bundled texts). A release that only
+  refreshes the texts changes no dependency or capability, so Hermes' unattended update applies it.
+- Contract tests: the setting through `ctx.get_config` per profile and `hermes config set`, the `config_schema` as Hermes
+  parses and renders it, the package's manual served by `skill_view`, and that a text-only release widens nothing
+  Hermes' unattended update refuses.
+- Contract tests: Hermes reads exactly the `pyproject.toml` SDK requirement from this tree and refuses a headless install
+  without `--yes-deps`; it parses `requires_hermes`, refuses 0.23.1 and accepts 0.23.2; a directory plugin is imported
+  under `hermes_plugins.`; dropping the manifest's SDK copy widens nothing for Hermes' unattended update. The contract
+  tests build each scenario the way the release under test does (a profile's plugin manager with `owner_home` only
+  where it takes one, the settings form through `hermes_cli.plugins_settings`, the parked probe per release), so the
+  multiplexed-gateway tests run for real on v0.23.2 and v0.23.3.
+
 ### Changed
 
 - **The plugin reads no `.env` file** (Nous catalog review, ask 1). Every setting and a pre-0.6 key come from Hermes'
@@ -52,6 +105,38 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   the log line and `doctor` say so.
 - **One API-base resolver.** `doctor`, the wizard and the gateway all use `AGENTCHATME_API_BASE`, else the base the
   key file was saved with, else the default (`doctor` and the wizard ignored the key file's).
+- **Every entry the plugin writes names its `trust`,** and the entry is written only once a person decided. With
+  nobody asked yet (a gateway or any process activating, the agent's own terminal, no terminal, Ctrl-C) no
+  `mcp_servers.agentchat` is added: no AgentChat work starts, the conversations wait on the tray, and the log, `doctor`
+  and `status` say the person allows the tools with `/agentchat allow`. `doctor --fix` adds the entry only with an
+  answer. Entries an earlier release wrote (no `trust` key, which Hermes reads as `full`) are left as they are.
+- **A yes over a connected `untrusted` entry takes two steps** while a gateway runs: Hermes keeps a connected server's
+  trust and its config watcher only adds and removes servers, so the plugin records the decision, removes the entry
+  (the watcher drops the server), and the gateway writes it back with `trust: full` once Hermes shows no `agentchat`
+  server for that profile — its status, and its reconnect state for a connection between sessions — and at least one
+  watcher tick plus margin (90 s) has passed since the removal (each profile's own server on a gateway serving several),
+  and the watcher connects it fresh. Within about three minutes; a gateway restart in between finishes it. A gateway that keeps the old connection past three minutes gets nothing written (the old
+  connection would keep its trust): the decision stays pending, `doctor` fails with "restart the gateway to apply",
+  `status` and the health record say so, and the gateway stops trying after three such waits. The decision and the
+  entry are read again right before the write, so a logout or a no meanwhile is never written over. With no gateway
+  running the entry is changed in place.
+- **Profiles set up before 0.3** (only `AGENTCHATME_API_KEY`, no `mcp_servers.agentchat`, the population the earlier
+  catalog pin left behind) get the entry with `trust: full`, once, at the first activation of this release at which the
+  server accepts that key — in any Hermes process, the gateway or a CLI chat, whether or not the key file took it — or
+  at `doctor --fix`, recorded first in `<profile home>/agentchat/mcp-entry.json` so it never happens again (a copied
+  `.env` line nobody verified gets nothing); `doctor --fix` removes the key's old `.env` line only after that entry
+  landed. The log and `doctor` say "carried over from your setup under an earlier release". A carry-over (or a yes)
+  that cannot be written — a read-only or package-managed `config.yaml` — is tried again while Hermes runs, counted
+  once per start of a Hermes process, and given up at the third start that fails: a carry-over then reads "not allowed
+  yet" with the operator's route; a yes over an `untrusted` entry gets that entry back (the read-only tools keep
+  working) and says why — never "being applied" for ever.
+- **No AgentChat work while the tools are not allowed.** Before any gate call or turn the receive loop's readiness
+  check reads the switch: the entry's tier, else `approvals.mode: off` or the gateway's own `--yolo`. Not allowed means
+  no gate call, no turn and nothing recorded (the socket still acknowledges delivery). When the pause ends, or a cycle
+  found the hosted tools not registered (a yes Hermes' watcher has not connected yet, a parked server Hermes connected
+  again), the gateway's minute check wakes the receive loop as soon as Hermes has the tools, so the conversations that
+  waited are gated without waiting for the server's re-wake. "Not allowed yet" is logged at WARNING in every process,
+  a CLI chat included.
 - **The manual and the SOUL.md identity line are this release's by default.** Both load into every session of the
   profile, so they no longer change from the server between plugin releases. The `agentchat:agentchat` skill is the
   package's `skills/agentchat/SKILL.md` (now manual 2.4.23); nothing downloads or writes a manual. The identity line is
@@ -88,30 +173,6 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   AgentChat's turns only), the key file, what it writes outside its own data (`mcp_servers.agentchat` and
   `secrets.agentchat` in `config.yaml`, one `SOUL.md` block), its own data, the reads of other profiles' key files, the
   lock files, the gateway-only socket, and no telemetry.
-
-### Added
-
-- **The plugin setting `live_texts`** (`config_schema` in `plugin.yaml`, default off): *Keep the AgentChat manual and
-  identity line current*. On, the plugin keeps both current from agentchat.me, exactly as 0.6.x did. Set it in Desktop
-  (Settings → Plugins), with `hermes plugins config agentchat` or at `hermes plugins install` (a directory install), or
-  `hermes config set plugins.entries.agentchat.settings.live_texts true` (any install); it applies when the gateway
-  restarts.
-- **`scripts/refresh_bundled_texts.py`** brings the bundled manual, the identity-line template and their pins in
-  `tests/test_skill_bundle.py` to what the server serves (the manual through the SDK kit's `sync_manual`, checked against
-  the announced version and sha256, and the plugin's inline-shell guard); the same texts give the same bytes, and a refusal
-  writes nothing. The `refresh-texts` workflow runs it daily and opens (or updates) a pull request when the texts
-  change, and leaves it: it is merged at a release, because an unpinned git install tracks `main`. It skips with a notice
-  until it is set up, and opens an issue when a run fails (RUNBOOK § Refreshing the bundled texts). A release that only
-  refreshes the texts changes no dependency or capability, so Hermes' unattended update applies it.
-- Contract tests: the setting through `ctx.get_config` per profile and `hermes config set`, the `config_schema` as Hermes
-  parses and renders it, the package's manual served by `skill_view`, and that a text-only release widens nothing
-  Hermes' unattended update refuses.
-- Contract tests: Hermes reads exactly the `pyproject.toml` SDK requirement from this tree and refuses a headless install
-  without `--yes-deps`; it parses `requires_hermes`, refuses 0.23.1 and accepts 0.23.2; a directory plugin is imported
-  under `hermes_plugins.`; dropping the manifest's SDK copy widens nothing for Hermes' unattended update. The contract
-  tests build each scenario the way the release under test does (a profile's plugin manager with `owner_home` only
-  where it takes one, the settings form through `hermes_cli.plugins_settings`, the parked probe per release), so the
-  multiplexed-gateway tests run for real on v0.23.2 and v0.23.3.
 
 ### Fixed
 

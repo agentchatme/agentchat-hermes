@@ -370,6 +370,9 @@ class Receiver:
         hosted_status = getattr(self._invoker, "hosted_tools_status", None)
         if callable(hosted_status):
             status["hosted_tools"] = hosted_status()
+        switch_status = getattr(self._invoker, "tools_allowed_status", None)
+        if callable(switch_status):
+            status["tools_allowed"] = switch_status()
         if self._restarting:
             status["state"] = "restart_wait"
             status["since"] = self._restart_since
@@ -633,7 +636,8 @@ class Receiver:
         return RealtimeClient(**options)
 
     async def _heartbeat_loop(self) -> None:
-        """Every minute: the health record, and the wedge guard."""
+        """Every minute: the invoker's tools check and the health record (on a
+        worker thread), and the wedge guard."""
         while True:
             try:
                 await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
@@ -647,14 +651,35 @@ class Receiver:
                 connected = False
             if connected:
                 self._disconnected_since = None
-                self._write_health("connected")
+                if not await self._minute_off_loop("connected"):
+                    return
                 continue
             if self._disconnected_since is None:
                 self._disconnected_since = time.monotonic()
             down_for = time.monotonic() - self._disconnected_since
-            self._write_health("reconnecting")
+            if not await self._minute_off_loop("reconnecting"):
+                return
             if down_for >= _restart_after_s(rt):
                 raise RuntimeError(f"the socket stayed disconnected for {down_for:.0f}s")
+
+    async def _minute_off_loop(self, state: WSHealthState) -> bool:
+        """The minute's blocking reads and writes — the invoker's tools check
+        (``config.yaml`` and the plugin's record) and the health record — on a
+        worker thread, never on this event loop. ``False`` when cancelled."""
+        try:
+            await asyncio.to_thread(self._minute, state)
+        except asyncio.CancelledError:
+            return False
+        return True
+
+    def _minute(self, state: WSHealthState) -> None:
+        check = getattr(self._invoker, "check_tools", None)
+        if callable(check):
+            try:
+                check()
+            except Exception:
+                logger.debug("Receiver: the tools check raised", exc_info=True)
+        self._write_health(state)
 
     # -- socket and loop events --------------------------------------------------
 

@@ -505,6 +505,14 @@ class TestLoopHealth:
         receiver = _receiver(tmp_path, inv)
         assert receiver.worker_status()["hosted_tools"] == section
 
+    def test_the_health_record_carries_the_tools_switch(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """doctor and the worker line read the gateway's switch from its record."""
+        inv = AgentInvoker(config=SimpleNamespace(), identity=AgentIdentity(handle="me"), runtime=SimpleNamespace())
+        section = {"state": "applying", "trust": None, "via": None, "at": 1.0}
+        monkeypatch.setattr(inv, "tools_allowed_status", lambda: section)
+        receiver = _receiver(tmp_path, inv)
+        assert receiver.worker_status()["tools_allowed"] == section
+
     def test_the_debounce_setting_is_the_loops_quiet_window(self) -> None:
         from agentchatme_hermes.receiver import _quiet_window
 

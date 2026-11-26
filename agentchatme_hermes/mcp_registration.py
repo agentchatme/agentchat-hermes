@@ -29,8 +29,8 @@ the headers and reload rules again on v0.23.1 and main, 2026-11-11):
   the plugin's name (:func:`client_identity.hermes_mcp_headers`), so the
   server treats this agent as the Hermes socket integration and shows it no
   wake-webhook tools — the socket is its wake path. The entry is static (no
-  version header): it is written without a prompt, at plugin activation,
-  and must not change from release to release.
+  version header): once written it must not change from release to release
+  (only a person's yes changes its ``trust``).
 * A portable *Agent Plugins v1* package may declare the same server in a
   root ``mcp.json``, but Hermes reads that file only for ``plugin.json``
   packages; a directory that also has ``plugin.yaml`` is loaded as a native
@@ -53,16 +53,39 @@ plugin's (an earlier release's, or the documented snippet copied by hand;
 they cannot be told apart), with any keys the user added (``trust``,
 ``timeout``, ``tools``) kept. When it has no client header,
 :func:`ensure_entry` adds ``X-AgentChat-Client: hermes`` and changes
-nothing else: at most one write per install, never again. An entry that
+nothing else: at most one write per install, never again (apart from a
+person's yes, below). An entry that
 already says ``hermes`` is left as it is (a version header too, if one is
 there); a client header someone set to another name is left alone.
 Any other same-name entry is the user's and is never modified; ``doctor``
 says how to add the headers to it.
+
+The one switch (``trust``)
+──────────────────────────
+Hermes gates every tool of a ``trust: untrusted`` server that is not
+annotated read-only: each call asks the person, and a turn nobody can answer
+is declined (``tools/mcp_tool_handlers.py`` ``_trust_gate_check``). A missing
+``trust`` key means ``full`` (``tools/mcp_tool_registration.py``
+``_normalize_server_trust``). The entry is written only once a person has
+decided (:data:`Decision`): a yes writes ``trust: full`` (and turns an
+existing ``untrusted`` entry of ours to ``full``), a no writes ``trust:
+untrusted``; with nobody asked yet nothing is added. The one exception is the
+recorded carry-over for a profile set up before 0.3 (:mod:`.allow`). Every
+entry the plugin writes names its ``trust``; an entry an earlier release
+wrote without one is left as it is. Hermes records a server's tier when it
+connects it: a new entry is connected with the tier it was written with
+(the gateway's config reconcile, about once a minute), a changed tier on a
+connected server applies after ``/reload-mcp`` or a restart (so a yes over a
+connected ``untrusted`` entry is applied in two steps, :mod:`.allow`).
+:func:`tools_allowance` is what lets the AgentChat write tools run, read from
+the same file: the tier, ``approvals.mode: off``, ``HERMES_YOLO_MODE``.
 """
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Mapping, MutableMapping
+from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
 from .client_identity import CLIENT_HEADER, CLIENT_NAME, hermes_mcp_headers
@@ -79,7 +102,18 @@ AUTH_HEADER_TEMPLATE = f"Bearer ${{{ENV_API_KEY}}}"
 MCP_JSON_SCHEMA = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json"
 
 EntryState = Literal["missing", "ours", "user_managed", "disabled"]
-EnsureOutcome = Literal["added", "present", "upgraded", "user_managed", "disabled"]
+# ``added``: written with the decision's trust. ``allowed``: an existing entry
+# of ours turned to ``trust: full`` (a person's yes). ``upgraded``: the client
+# header added. ``missing``: no entry, and nobody decided, so none is written.
+EnsureOutcome = Literal["added", "allowed", "present", "upgraded", "missing", "user_managed", "disabled"]
+# The tiers the plugin writes, and what an entry says (``unset``: no ``trust``
+# key, which Hermes reads as ``full``).
+Trust = Literal["full", "untrusted"]
+TrustState = Literal["full", "untrusted", "unset"]
+# Who decided the entry's tier: a person's ``yes`` / ``no``, or the one-time
+# carry-over of a setup made before 0.3 (:mod:`.allow`).
+Decision = Literal["yes", "no", "carried_over"]
+TRUST_FOR: dict[str, Trust] = {"yes": "full", "no": "untrusted", "carried_over": "full"}
 # How an entry's headers name the client: ``current`` (hermes), ``missing`` (no
 # client header: placed before 0.5.1, or written by hand), ``other`` (a name
 # someone chose).
@@ -94,16 +128,18 @@ def hosted_mcp_url(api_base: str = DEFAULT_API_BASE) -> str:
     return api_base.rstrip("/") + MCP_PATH
 
 
-def server_entry(api_base: str = DEFAULT_API_BASE) -> dict[str, Any]:
-    """The ``mcp_servers.agentchat`` value this plugin writes."""
+def server_entry(api_base: str = DEFAULT_API_BASE, *, trust: Trust = "untrusted") -> dict[str, Any]:
+    """The ``mcp_servers.agentchat`` value this plugin writes, with its tier."""
     return {
         "url": hosted_mcp_url(api_base),
         "headers": {"Authorization": AUTH_HEADER_TEMPLATE, **hermes_mcp_headers()},
+        "trust": trust,
     }
 
 
-def manual_snippet(api_base: str = DEFAULT_API_BASE) -> str:
-    """The same entry as YAML, for the README and for operators placing it by hand."""
+def manual_snippet(api_base: str = DEFAULT_API_BASE, *, trust: Trust = "full") -> str:
+    """The same entry as YAML, for the README and for operators placing it by
+    hand (a person writing it has decided: ``full`` by default)."""
     return (
         "mcp_servers:\n"
         f"  {MCP_SERVER_NAME}:\n"
@@ -111,6 +147,7 @@ def manual_snippet(api_base: str = DEFAULT_API_BASE) -> str:
         "    headers:\n"
         f'      Authorization: "{AUTH_HEADER_TEMPLATE}"\n'
         + client_header_lines("      ")
+        + f"    trust: {trust}  # untrusted: each AgentChat write tool asks first\n"
     )
 
 
@@ -203,29 +240,67 @@ def _set_client_header(entry: MutableMapping[str, Any]) -> None:
     entry["headers"] = {**kept, **hermes_mcp_headers()}
 
 
-def ensure_entry(
-    config: MutableMapping[str, Any], *, api_base: str = DEFAULT_API_BASE
-) -> EnsureOutcome:
-    """Add the entry when absent; add the client header to our entry when it
-    has none (once per install).
+def entry_trust(entry: Any) -> TrustState:
+    """The tier an entry says, read as Hermes reads it: no ``trust`` key, or
+    one with no value (YAML ``trust:``), is ``unset`` (Hermes: ``full``);
+    ``full`` in any case and spacing is ``full``; anything else, an empty
+    string included, is ``untrusted`` (Hermes fails closed). The contract
+    suite checks it against Hermes'."""
+    raw = entry.get("trust") if isinstance(entry, Mapping) else None
+    if raw is None:
+        return "unset"
+    text = str(raw).strip().lower()
+    if text == "full":
+        return "full"
+    return "untrusted"
 
-    Never touches a user-managed or disabled entry, an entry that already
-    names a client (``hermes`` or another), or a version header.
+
+def effective_trust(state: TrustState | None) -> Trust | None:
+    """The tier Hermes applies for an entry's :func:`entry_trust` (``None``: no entry)."""
+    if state is None:
+        return None
+    return "untrusted" if state == "untrusted" else "full"
+
+
+def ensure_entry(
+    config: MutableMapping[str, Any],
+    *,
+    api_base: str = DEFAULT_API_BASE,
+    decision: Decision | None = None,
+) -> EnsureOutcome:
+    """Bring the entry to what ``decision`` asks; add the client header to our
+    entry when it has none (once per install).
+
+    * no entry: written with the decision's tier (``yes`` and
+      ``carried_over``: ``full``; ``no``: ``untrusted``); with no decision
+      nothing is added (``missing``);
+    * our entry: a ``yes`` turns an ``untrusted`` one to ``full``
+      (``allowed``); nothing else changes its ``trust``;
+    * a user-managed or disabled entry is never touched, nor an entry that
+      already names a client (``hermes`` or another), nor a version header.
     """
     state = describe_entry(config, api_base=api_base)
     if state == "missing":
+        if decision is None:
+            return "missing"
         servers = config.get("mcp_servers")
         if not isinstance(servers, MutableMapping):
             servers = {}
             config["mcp_servers"] = servers
-        servers[MCP_SERVER_NAME] = server_entry(api_base)
+        servers[MCP_SERVER_NAME] = server_entry(api_base, trust=TRUST_FOR[decision])
         return "added"
     if state == "ours":
         entry = config["mcp_servers"][MCP_SERVER_NAME]
-        if entry_identity(entry) == "missing" and isinstance(entry, MutableMapping):
+        if not isinstance(entry, MutableMapping):
+            return "present"
+        outcome: EnsureOutcome = "present"
+        if entry_identity(entry) == "missing":
             _set_client_header(entry)
-            return "upgraded"
-        return "present"
+            outcome = "upgraded"
+        if decision == "yes" and entry_trust(entry) == "untrusted":
+            entry["trust"] = "full"
+            outcome = "allowed"
+        return outcome
     return state
 
 
@@ -262,7 +337,7 @@ def _hermes_config_io() -> tuple[ConfigLoader, ConfigSaver, Callable[[], bool]]:
     except ImportError as exc:
         raise McpRegistrationError(
             "Hermes' config helpers are not importable here, so the tool source could not "
-            "be registered. Add this to the profile's config.yaml by hand:\n" + manual_snippet()
+            "be registered. Add this to the profile's config.yaml by hand:\n" + manual_snippet(trust="untrusted")
         ) from exc
     reader = next(
         (
@@ -276,7 +351,7 @@ def _hermes_config_io() -> tuple[ConfigLoader, ConfigSaver, Callable[[], bool]]:
     if reader is None or not callable(saver):
         raise McpRegistrationError(
             "this Hermes has no raw config reader or saver the plugin knows, so the tool source "
-            "could not be registered. Add this to the profile's config.yaml by hand:\n" + manual_snippet()
+            "could not be registered. Add this to the profile's config.yaml by hand:\n" + manual_snippet(trust="untrusted")
         )
     managed = getattr(hermes_config, "is_managed", None)
 
@@ -296,30 +371,63 @@ def _hermes_raw_config() -> dict[str, Any]:
     return read()
 
 
-def install_entry(*, api_base: str = DEFAULT_API_BASE) -> EnsureOutcome:
-    """Ensure the entry exists, naming this client, in the active
-    profile's ``config.yaml``. Writes only when something changes, and
-    raises :class:`McpRegistrationError` when the change did not land."""
+@dataclass(frozen=True)
+class EntryPlacement:
+    """What :func:`install_entry` did: the outcome, the entry's ``trust`` after
+    it (``None`` when there is no entry of ours), and whether the client header
+    was added on the way (an ``allowed`` entry can gain it too)."""
+
+    outcome: EnsureOutcome
+    trust: TrustState | None = None
+    header_added: bool = False
+
+
+def _our_entry(config: Mapping[str, Any]) -> Any:
+    servers = config.get("mcp_servers")
+    return servers.get(MCP_SERVER_NAME) if isinstance(servers, Mapping) else None
+
+
+def install_entry(*, api_base: str = DEFAULT_API_BASE, decision: Decision | None = None) -> EntryPlacement:
+    """Bring the entry in the active profile's ``config.yaml`` to what
+    ``decision`` asks (:func:`ensure_entry`), naming this client. One read,
+    one write only when something changes, then a read back: raises
+    :class:`McpRegistrationError` when the change did not land."""
     read, save_config, is_managed = _hermes_config_io()
     config = read()
-    outcome = ensure_entry(config, api_base=api_base)
-    if outcome not in ("added", "upgraded"):
-        return outcome
+    before = _our_entry(config)
+    header_missing = describe_entry(config, api_base=api_base) == "ours" and entry_identity(before) == "missing"
+    outcome = ensure_entry(config, api_base=api_base, decision=decision)
+    state = describe_entry(config, api_base=api_base)
+    trust = entry_trust(_our_entry(config)) if state == "ours" else None
+    if outcome not in ("added", "allowed", "upgraded"):
+        return EntryPlacement(outcome, trust)
+    snippet = manual_snippet(api_base, trust=effective_trust(trust) or "untrusted")
     if is_managed():
         raise McpRegistrationError(
             "Hermes' configuration is managed by a package manager, so the plugin cannot write "
-            "config.yaml. Declare the hosted tools there:\n" + manual_snippet(api_base)
+            "config.yaml. Declare the hosted tools there:\n" + snippet
         )
     save_config(config)
-    if ensure_entry(read(), api_base=api_base) != "present":
-        raise McpRegistrationError(
-            "Hermes did not save the change to config.yaml. Add this by hand:\n" + manual_snippet(api_base)
-        )
+    after = read()
+    landed = _our_entry(after)
+    if (
+        describe_entry(after, api_base=api_base) != "ours"
+        or entry_identity(landed) == "missing"
+        or entry_trust(landed) != trust
+    ):
+        raise McpRegistrationError("Hermes did not save the change to config.yaml. Add this by hand:\n" + snippet)
     if outcome == "added":
-        logger.info("mcp_registration: added mcp_servers.%s → %s", MCP_SERVER_NAME, hosted_mcp_url(api_base))
+        logger.info(
+            "mcp_registration: added mcp_servers.%s → %s (trust: %s)",
+            MCP_SERVER_NAME,
+            hosted_mcp_url(api_base),
+            trust,
+        )
+    elif outcome == "allowed":
+        logger.info("mcp_registration: mcp_servers.%s now has trust: full", MCP_SERVER_NAME)
     else:
         logger.info("mcp_registration: added the client header to mcp_servers.%s", MCP_SERVER_NAME)
-    return outcome
+    return EntryPlacement(outcome, trust, header_added=header_missing)
 
 
 def uninstall_entry(*, api_base: str = DEFAULT_API_BASE) -> bool:
@@ -342,6 +450,93 @@ def uninstall_entry(*, api_base: str = DEFAULT_API_BASE) -> bool:
 def inspect_entry(*, api_base: str = DEFAULT_API_BASE) -> EntryState:
     """State of the entry in the active profile's raw ``config.yaml`` (for ``doctor``)."""
     return describe_entry(_hermes_raw_config(), api_base=api_base)
+
+
+# ─── what Hermes' approval gate does with the reply tool ───────────────────
+
+Via = Literal["trust", "no_trust_key", "approvals_off", "yolo"]
+
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+@dataclass(frozen=True)
+class Allowance:
+    """Whether Hermes lets every write tool of the server named ``agentchat``
+    run without asking, read from this profile's ``config.yaml`` as written.
+    ``entry``: :func:`describe_entry` (a hand-written entry is gated the same
+    way); ``trust``: what the entry says (``None``: no entry); ``via``: what
+    lets the writes through (``None``: nothing, so each write would ask and an
+    unattended turn is declined). A remembered Always approval covers one tool
+    only (an AgentChat turn calls several), so it does not count."""
+
+    entry: EntryState
+    trust: TrustState | None
+    via: Via | None
+
+    @property
+    def allowed(self) -> bool:
+        return self.entry not in ("missing", "disabled") and self.via is not None
+
+    @property
+    def by_tier(self) -> bool:
+        """Allowed by the entry's own tier (``full``, or no ``trust`` key): the
+        person's switch is on. ``approvals.mode: off`` and ``--yolo`` let the
+        writes through too, but leave the switch off."""
+        return self.via in ("trust", "no_trust_key")
+
+
+def _approval_mode(raw: Any) -> str:
+    """``approvals.mode`` as Hermes normalises it: YAML reads a bare ``off`` as
+    ``False``; unknown values are ``manual`` (``tools/approval_context.py``
+    ``_normalize_approval_mode``; the contract suite checks it)."""
+    if isinstance(raw, bool):
+        return "off" if raw is False else "manual"
+    if isinstance(raw, str) and raw.strip().lower() in ("manual", "smart", "off"):
+        return raw.strip().lower()
+    return "manual"
+
+
+def tools_allowance(
+    config: Mapping[str, Any],
+    *,
+    api_base: str = DEFAULT_API_BASE,
+    environ: Mapping[str, str] | None = None,
+) -> Allowance:
+    """What lets the AgentChat write tools run in Hermes' approval gate, from
+    ``config.yaml``: the entry's tier, else ``approvals.mode: off`` or this
+    process's ``--yolo`` (``HERMES_YOLO_MODE``; read in the gateway, it is the
+    gateway's). Read only; the plugin never writes any of those keys."""
+    env = os.environ if environ is None else environ
+    state = describe_entry(config, api_base=api_base)
+    if state == "missing":
+        return Allowance("missing", None, None)
+    entry = _our_entry(config)
+    trust = entry_trust(entry)
+    if state == "disabled":
+        return Allowance("disabled", trust, None)
+    if trust != "untrusted":
+        return Allowance(state, trust, "trust" if trust == "full" else "no_trust_key")
+    approvals = config.get("approvals")
+    if isinstance(approvals, Mapping) and _approval_mode(approvals.get("mode", "manual")) == "off":
+        return Allowance(state, trust, "approvals_off")
+    if str(env.get("HERMES_YOLO_MODE", "")).strip().lower() in _TRUTHY:
+        return Allowance(state, trust, "yolo")
+    return Allowance(state, trust, None)
+
+
+def inspect_allowance(*, api_base: str = DEFAULT_API_BASE) -> Allowance:
+    """:func:`tools_allowance` for the active profile's raw ``config.yaml``."""
+    return tools_allowance(_hermes_raw_config(), api_base=api_base)
+
+
+def config_is_managed() -> bool:
+    """Whether Hermes' configuration is managed by a package manager (the
+    plugin cannot write it). ``False`` when that cannot be told."""
+    try:
+        _read, _save, is_managed = _hermes_config_io()
+    except McpRegistrationError:
+        return False
+    return is_managed()
 
 
 def inspect_entry_identity(*, api_base: str = DEFAULT_API_BASE) -> tuple[EntryState, IdentityState | None]:

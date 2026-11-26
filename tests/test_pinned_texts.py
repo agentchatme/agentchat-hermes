@@ -507,7 +507,7 @@ class TestOneLine:
     ) -> None:
         monkeypatch.setattr(placement, "resolve_hermes_home", lambda: home)
         monkeypatch.setattr(placement, "place_secrets", lambda: placement.PlacementStep("secrets", "ok", "x"))
-        monkeypatch.setattr(placement, "place_mcp", lambda api_base: placement.PlacementStep("mcp", "ok", "x"))
+        monkeypatch.setattr(placement, "place_mcp", lambda api_base, decision=None: placement.PlacementStep("mcp", "ok", "x"))
         monkeypatch.setattr(cli, "resolve_texts", lambda **_kw: _served())
         cli._install_placement("ops", api_base="https://api.agentchat.me", api_key=api_key("k"))
         placed = (home / "SOUL.md").read_bytes()

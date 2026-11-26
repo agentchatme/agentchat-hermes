@@ -140,13 +140,21 @@ class TestResolveTexts:
         )
 
 
+def _placed(outcome: str, trust: Any = None, header_added: bool = False) -> Any:
+    from agentchatme_hermes.mcp_registration import EntryPlacement
+
+    return lambda *, api_base, decision=None: EntryPlacement(outcome, trust, header_added)  # type: ignore[arg-type]
+
+
 class TestMcpStep:
     @pytest.mark.parametrize(
         ("outcome", "status"),
         [
             ("added", "changed"),
+            ("allowed", "changed"),
             ("upgraded", "changed"),
             ("present", "ok"),
+            ("missing", "skipped"),
             ("user_managed", "skipped"),
             ("disabled", "skipped"),
         ],
@@ -154,20 +162,139 @@ class TestMcpStep:
     def test_outcomes_map_to_statuses(
         self, monkeypatch: pytest.MonkeyPatch, outcome: str, status: str
     ) -> None:
-        monkeypatch.setattr(placement, "install_entry", lambda *, api_base: outcome)
+        monkeypatch.setattr(placement, "install_entry", _placed(outcome, "full"))
         step = placement.place_mcp("https://api.example.test")
-        assert step.name == "mcp" and step.status == status
+        assert step.name == "mcp" and step.status == status and step.outcome == outcome
 
     def test_an_upgraded_entry_says_what_changed_and_when_it_is_used(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(placement, "install_entry", lambda *, api_base: "upgraded")
+        monkeypatch.setattr(placement, "install_entry", _placed("upgraded"))
         detail = placement.place_mcp("https://api.example.test").detail
         assert "X-AgentChat-Client: hermes" in detail
         assert "gateway restart" in detail and "/reload-mcp" in detail
 
+    def test_the_decision_reaches_the_writer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        seen: list[Any] = []
+
+        def install(*, api_base: str, decision: Any = None) -> Any:
+            from agentchatme_hermes.mcp_registration import EntryPlacement
+
+            seen.append(decision)
+            return EntryPlacement("missing")
+
+        monkeypatch.setattr(placement, "install_entry", install)
+        placement.place_mcp("https://api.example.test")
+        placement.place_mcp("https://api.example.test", decision="yes")
+        assert seen == [None, "yes"]
+
+    def test_an_added_entry_names_its_trust_and_when_it_connects(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(placement, "install_entry", _placed("added", "full"))
+        detail = placement.place_mcp("https://api.example.test", decision="yes").detail
+        assert "trust: full" in detail and "within about a minute" in detail
+
+    def test_an_allowed_entry_says_how_to_apply_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(placement, "install_entry", _placed("allowed", "full", header_added=True))
+        detail = placement.place_mcp("https://api.example.test", decision="yes").detail
+        assert "trust: full" in detail and "/reload-mcp" in detail and "hermes gateway restart" in detail
+        assert "X-AgentChat-Client: hermes" in detail
+
+    def test_not_allowed_yet_names_the_slash_command(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(placement, "install_entry", _placed("missing"))
+        step = placement.place_mcp("https://api.example.test")
+        assert "not allowed yet" in step.detail and "/agentchat allow" in step.detail
+
+    @pytest.mark.parametrize(
+        ("outcome", "decision", "how"),
+        [("added", "yes", "asked"), ("added", "no", "asked"), ("added", "carried_over", "carried_over"), ("allowed", "yes", "asked")],
+    )
+    def test_a_written_entry_is_recorded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str, decision: str, how: str
+    ) -> None:
+        from agentchatme_hermes import allow
+
+        monkeypatch.setattr(placement, "resolve_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(placement, "install_entry", _placed(outcome, "full"))
+        placement.place_mcp("https://api.example.test", decision=decision)  # type: ignore[arg-type]
+        record = allow.read_record(tmp_path)
+        assert record is not None and record["how"] == how and record["trust"] == "full"
+
+    @pytest.mark.parametrize("outcome", ["present", "missing", "upgraded", "user_managed", "disabled"])
+    def test_nothing_decided_nothing_recorded(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
+    ) -> None:
+        from agentchatme_hermes import allow
+
+        monkeypatch.setattr(placement, "resolve_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(placement, "install_entry", _placed(outcome))
+        placement.place_mcp("https://api.example.test")
+        assert allow.read_record(tmp_path) is None
+
+    def _connected_untrusted(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, gateway: bool) -> list[str]:
+        from agentchatme_hermes import allow, mcp_registration
+        from agentchatme_hermes.mcp_registration import Allowance, EntryPlacement
+
+        log: list[str] = []
+        monkeypatch.setattr(placement, "resolve_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(mcp_registration, "inspect_allowance", lambda *, api_base: Allowance("ours", "untrusted", None))
+        monkeypatch.setattr(allow, "gateway_lives", lambda home, *, api_base: gateway)
+        monkeypatch.setattr(mcp_registration, "uninstall_entry", lambda *, api_base: log.append("removed") or True)
+        monkeypatch.setattr(
+            placement,
+            "install_entry",
+            lambda *, api_base, decision=None: log.append(f"install {decision}") or EntryPlacement("allowed", "full"),
+        )
+        return log
+
+    def test_a_yes_over_a_connected_untrusted_entry_takes_two_steps(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Hermes keeps a connected server's tier, and its watcher only adds and
+        removes servers: the decision is recorded, the entry removed; the
+        gateway writes it back full once the old connection is gone."""
+        from agentchatme_hermes import allow
+
+        log = self._connected_untrusted(monkeypatch, tmp_path, gateway=True)
+        step = placement.place_mcp("https://api.example.test", decision="yes")
+        assert (step.status, step.outcome) == ("changed", "applying")
+        assert "within about three minutes" in step.detail
+        assert log == ["removed"]
+        record = allow.read_record(tmp_path)
+        assert record is not None and (record["decision"], record["trust"], record["pending"]) == ("yes", "full", True)
+
+    def test_with_no_gateway_running_it_is_changed_in_place(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from agentchatme_hermes import allow
+
+        log = self._connected_untrusted(monkeypatch, tmp_path, gateway=False)
+        step = placement.place_mcp("https://api.example.test", decision="yes")
+        assert step.outcome == "allowed" and log == ["install yes"]
+        record = allow.read_record(tmp_path)
+        assert record is not None and record["pending"] is False and record["decision"] == "yes"
+
+    def test_a_removal_that_fails_leaves_the_entry_and_no_pending_yes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import allow, mcp_registration
+
+        self._connected_untrusted(monkeypatch, tmp_path, gateway=True)
+
+        def refused(*, api_base: str) -> bool:
+            raise mcp_registration.McpRegistrationError("managed")
+
+        monkeypatch.setattr(mcp_registration, "uninstall_entry", refused)
+        step = placement.place_mcp("https://api.example.test", decision="yes")
+        assert step.failed and "managed" in step.detail
+        record = allow.read_record(tmp_path)
+        assert record is not None and record["pending"] is False
+
+    @pytest.mark.parametrize("decision", [None, "no", "carried_over"])
+    def test_only_a_yes_takes_two_steps(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, decision: Any) -> None:
+        log = self._connected_untrusted(monkeypatch, tmp_path, gateway=True)
+        placement.place_mcp("https://api.example.test", decision=decision)
+        assert log == [f"install {decision}"]
+
     def test_registration_error_is_a_failed_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def boom(*, api_base: str) -> str:
+        def boom(*, api_base: str, decision: Any = None) -> Any:
             raise placement.McpRegistrationError("no hermes")
 
         monkeypatch.setattr(placement, "install_entry", boom)
@@ -179,13 +306,15 @@ class TestMcpStep:
     ) -> None:
         from agentchatme_hermes import secrets_registration
 
-        monkeypatch.setattr(placement, "install_entry", lambda *, api_base: "added")
+        monkeypatch.setattr(placement, "resolve_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(placement, "install_entry", _placed("added", "full"))
         monkeypatch.setattr(secrets_registration, "install_block", lambda: "added")
         steps = placement.place_identity_and_tools(
             handle="alice",
             texts=_served_texts(),
             api_base="https://api.example.test",
             soul_path=tmp_path / "SOUL.md",
+            tools_decision="yes",
         )
         # The key source before the tools' entry, which authenticates through it.
         assert [s.name for s in steps] == ["anchor", "manual", "secrets", "mcp"]
@@ -239,7 +368,8 @@ class TestNothingSecretLeaks:
     def test_steps_never_carry_the_key(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         from agentchatme_hermes import secrets_registration
 
-        monkeypatch.setattr(placement, "install_entry", lambda *, api_base: "added")
+        monkeypatch.setattr(placement, "resolve_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(placement, "install_entry", _placed("added", "full"))
         monkeypatch.setattr(secrets_registration, "install_block", lambda: "added")
         steps: list[Any] = placement.place_identity_and_tools(
             handle="alice",
