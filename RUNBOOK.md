@@ -81,8 +81,9 @@ It reads the health record the receiving process writes beside the lock every mi
 Two AgentChat texts load into every session of a profile: the manual (the `agentchat:agentchat` skill) and the identity
 line in `SOUL.md`. By default (the plugin setting `live_texts` off) both are this release's copies: the package's
 `skills/agentchat/SKILL.md`, and the identity-line template in `agentchatme_hermes/texts_snapshot.json` filled for the
-agent's handle. Nothing downloads or writes a manual, and the gateway places the identity line once at activation (no
-texts needed; a change of the served texts never writes `SOUL.md`). With `live_texts` on both are kept current from the
+agent's handle. Nothing downloads or writes a manual, and the gateway places the identity line at activation (no texts
+needed) and re-applies the same line whenever the served texts change (no write when it matches), so the served line never
+reaches `SOUL.md`. With `live_texts` on both are kept current from the
 server as before 0.7.0. The texts used only inside the turns and gate calls AgentChat starts are always the served ones.
 
 - Switch: `hermes config set plugins.entries.agentchat.settings.live_texts true` (or `false`; any install), Desktop
@@ -107,14 +108,17 @@ texts give the same bytes; a refusal writes nothing.
   agent), from the environment only, never printed. Exit 0: current or refreshed (it prints which); 1: refused, nothing
   written (it says why); 2: no key.
 - The `refresh-texts` workflow runs it once a day (and on dispatch). When the texts differ it opens one pull request (or
-  updates the open one) from `automation/refresh-texts`, with auto-merge on: CI runs on it as on any pull request. It skips
-  with a notice until the owner sets it up:
+  updates the open one) from `automation/refresh-texts` and leaves it: CI runs on it as on any pull request, and **it is
+  merged only as part of a release**, right before the tag. An install from git without `--ref` tracks `main`, and Hermes'
+  update (and `plugins.auto_apply`) pulls it, so a refresh merged early would change those users' texts without a
+  release. A failed run opens an issue (or comments on the open one); the next good run closes it. It skips with a notice
+  until the owner sets it up:
   - secret `AGENTCHAT_TEXTS_API_KEY`: the reader agent's key. **Put that agent in the analytics exclusion list**: the job
     calls `GET /v1/texts` with it every day;
   - variable `TEXTS_REFRESH_APP_CLIENT_ID` and secret `TEXTS_REFRESH_APP_KEY`: a GitHub App installed on this repository
     with Contents and Pull requests read and write. A pull request opened with the workflow's own `GITHUB_TOKEN` starts no CI.
-- Before every release tag, run the script against production (or check the workflow's last run), so the release carries
-  the texts AgentChat serves.
+- Before every release tag, run the script against production (or merge the open refresh pull request after checking
+  the workflow's last run), so the release carries the texts AgentChat serves.
 - A release that only refreshes the texts is a patch (`VERSIONING.md`: a change that could go either way is a patch). It
   changes no Python dependency and nothing in `plugin.yaml` but the version, so Hermes' own update applies it unattended
   (`plugins.auto_apply`) once the plugin catalog's pin moves (asking Nous to re-pin is an outward step: the founder's OK).

@@ -115,7 +115,15 @@ def register(ctx: Any) -> None:
     # Which manual and identity line this profile uses (the plugin setting
     # ``live_texts``), read here, where Hermes has bound this profile, and
     # used by every later step in this process (texts.mode_for).
-    record_mode(hermes_home, read_mode(ctx))
+    mode = read_mode(ctx)
+    record_mode(hermes_home, mode)
+    if mode.problem is not None:
+        logger.warning(
+            "agentchat plugin: profile=%s — %s; this release's manual and identity line are used "
+            "(`hermes agentchat doctor` says how to set it)",
+            profile_label(hermes_home),
+            mode.problem,
+        )
     gateway_mode = _is_gateway_context(ctx)
     problem = kit_problem()
     if problem is not None:
@@ -289,7 +297,8 @@ class ActivationWatcher:
         # backfills it for env-var-direct / scripted / container setups and
         # for profiles upgraded from a pre-v3 release — and refuses to stay
         # quiet when the anchor and the key disagree about who this profile is.
-        # By default the identity line is this release's, reconciled once, now.
+        # By default the identity line is this release's: placed now, and
+        # re-applied (a no-op when it matches) whenever the texts change.
         # With live_texts on it is served (GET /v1/texts); the anchor is
         # reconciled as soon as texts are loaded — now when the server (or
         # the cache) answered, later when the first fetch succeeds — and
@@ -519,21 +528,30 @@ def _try_start_runtime(
 
 
 def _reconcile_soul_anchor_when_texts_arrive(runtime: Any) -> None:
-    """Run :func:`_reconcile_soul_anchor` as soon as its line exists.
+    """Run :func:`_reconcile_soul_anchor` as soon as its line exists, and again
+    whenever the served texts change.
 
-    ``live_texts`` off (the default): the line is this release's, so once, now
-    (no texts needed), and no texts listener: a change of the served texts
-    never writes SOUL.md. On: ``runtime.on_texts`` calls back immediately when
-    texts are already loaded and again on every change; a runtime double
-    without it (tests) is reconciled directly.
+    ``runtime.on_texts`` calls back immediately when texts are already loaded
+    and again on every change. With ``live_texts`` off (the default) the line
+    is this release's and needs no texts: when none are loaded yet it is
+    placed now, and each texts change re-applies the same line (no write when
+    it matches; the retry after a write that met an edit in flight) — the
+    served line never reaches SOUL.md, because ``identity_text`` does not use
+    the served texts then. A runtime double without ``on_texts`` (tests) is
+    reconciled directly.
     """
-    if not mode_for(runtime.hermes_home).live:
+    on_texts = getattr(runtime, "on_texts", None)
+    if not callable(on_texts):
         _reconcile_soul_anchor(runtime)
         return
-    on_texts = getattr(runtime, "on_texts", None)
-    if callable(on_texts):
-        on_texts(lambda _texts: _reconcile_soul_anchor(runtime))
-    else:
+    called: list[bool] = []
+
+    def reconcile(_texts: Any) -> None:
+        called.append(True)
+        _reconcile_soul_anchor(runtime)
+
+    on_texts(reconcile)
+    if not called and not mode_for(runtime.hermes_home).live:
         _reconcile_soul_anchor(runtime)
 
 
@@ -667,7 +685,7 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
             result.detail,
         )
     elif outcome == "edited_meanwhile":
-        logger.info("agentchat plugin: SOUL.md — %s; tried again on the next texts change", result.detail)
+        logger.info("agentchat plugin: SOUL.md — %s; tried again when the served texts next change", result.detail)
     else:
         logger.warning("agentchat plugin: SOUL.md identity line not followed for profile=%s — %s", label, result.detail)
 

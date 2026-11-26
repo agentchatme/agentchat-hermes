@@ -30,6 +30,20 @@ from agentchatme_hermes.leader_lock import GATEWAY_ENV_MARKER
 # default, are tests/test_pinned_texts.py.
 pytestmark = pytest.mark.usefixtures("live_texts")
 
+
+def _live_get_config(key: str, default: Any = None) -> Any:
+    """``ctx.get_config`` of a profile with ``live_texts`` on, as this module's
+    fixture says: ``register()`` reads the setting from the ctx it is given."""
+    return True if key == "live_texts" else default
+
+
+def _ctx() -> MagicMock:
+    """Hermes' ``ctx`` as a mock whose plugin settings say ``live_texts`` on."""
+    ctx = MagicMock()
+    ctx.get_config.side_effect = _live_get_config
+    return ctx
+
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -90,10 +104,20 @@ class TestRegisterNoSessionEndHook:
     to that hook killed the WS daemon mid-conversation.
     """
 
+    def test_this_module_registers_with_live_texts_on(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from agentchatme_hermes import _register
+        from agentchatme_hermes.texts import mode_for
+
+        monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
+        monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: None)
+        for ctx in (_ctx(), _UnloadCtx()):
+            _register.register(ctx)
+            assert mode_for(tmp_path / ".hermes").live is True
+
     def test_no_on_session_end_registration(self) -> None:
         from agentchatme_hermes import _register
 
-        ctx = MagicMock()
+        ctx = _ctx()
         # CLI registration is unconditional; everything else short-circuits
         # because load_config will return None when AGENTCHATME_API_KEY
         # is absent in the test env.
@@ -132,7 +156,7 @@ class TestProfileScopedRegistration:
 
         monkeypatch.setattr(_register, "resolve_hermes_home", lambda: home)
         monkeypatch.setattr(_register, "load_config", fake_load_config)
-        _register.register(MagicMock())
+        _register.register(_ctx())
         assert captured["hermes_home"] == home
 
 
@@ -568,7 +592,7 @@ class TestSurface:
         monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
         monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: None)
         monkeypatch.setattr(sys, "argv", ["hermes", "chat"])  # CLI process: no watcher
-        ctx = MagicMock()
+        ctx = _ctx()
         _register.register(ctx)
 
         assert ctx.register_skill.called
@@ -590,8 +614,7 @@ class TestSurface:
         monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: None)
         monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
         monkeypatch.setattr(_register.ActivationWatcher, "start", lambda self: None)
-        ctx = MagicMock()
-        ctx.get_config.side_effect = lambda key, default=None: True if key == "live_texts" else default
+        ctx = _ctx()
         _register.register(ctx)
         target = tmp_path / ".hermes" / "plugin-data" / "agentchat" / "manual" / "SKILL.md"
         assert ctx.register_skill.call_args.kwargs["path"] == target
@@ -674,7 +697,7 @@ class TestActivationWatcher:
         monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
         monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: None)
         monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
-        _register.register(MagicMock())
+        _register.register(_ctx())
         assert len(started) == 1
 
     def test_cli_process_without_key_does_not_start_a_watcher(
@@ -687,7 +710,7 @@ class TestActivationWatcher:
         monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
         monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: None)
         monkeypatch.setattr(sys, "argv", ["hermes", "chat"])
-        _register.register(MagicMock())
+        _register.register(_ctx())
         assert started == []
 
 
@@ -696,6 +719,9 @@ class _UnloadCtx:
 
     def __init__(self) -> None:
         self.unloads: list[Any] = []
+
+    def get_config(self, key: str, default: Any = None) -> Any:
+        return _live_get_config(key, default)
 
     def on_unload(self, callback: Any) -> None:
         self.unloads.append(callback)
@@ -775,6 +801,9 @@ class TestUnload:
         from agentchatme_hermes import _register
 
         class _OldCtx:
+            def get_config(self, key: str, default: Any = None) -> Any:
+                return _live_get_config(key, default)
+
             def register_cli_command(self, *_args: Any, **_kwargs: Any) -> None:
                 return None
 
@@ -822,7 +851,7 @@ class TestWithoutTheKit:
             raise AssertionError("nothing starts without the kit")
 
         monkeypatch.setattr(_register, "ActivationWatcher", no_watcher)
-        ctx = MagicMock()
+        ctx = _ctx()
         with caplog.at_level(logging.DEBUG, logger="agentchatme_hermes"):
             _register.register(ctx)
         errors = [r for r in caplog.records if r.levelno >= logging.ERROR]

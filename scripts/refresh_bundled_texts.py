@@ -28,7 +28,8 @@ package installed (``pip install -e .``)::
 The key is any agent's (the texts are the same for every agent; the filled
 ``identity_line`` is not kept). It is read from the environment only and never
 printed. Exit 0: the files are current (``changed=true|false``, ``manual=`` and
-``summary=`` go to ``$GITHUB_OUTPUT`` when set); 1: refused, nothing written;
+``summary=`` go to ``$GITHUB_OUTPUT`` when set); 1: refused, nothing written (a
+write that failed is undone; should undoing fail too, the files left are named);
 2: no key.
 Run by ``.github/workflows/refresh-texts.yml``.
 """
@@ -61,7 +62,13 @@ _PROBE_HANDLE = "refresh-check"
 
 
 class RefreshError(Exception):
-    """Why the bundled texts were not refreshed (nothing was written)."""
+    """Why the bundled texts were not refreshed. Nothing was written, unless
+    ``left`` names files a failed write could not be put back for (each with
+    why): those hold what this run wrote."""
+
+    def __init__(self, message: str, *, left: tuple[str, ...] = ()) -> None:
+        super().__init__(message)
+        self.left = left
 
 
 @dataclass(frozen=True)
@@ -173,11 +180,8 @@ def refresh(
         try:
             write_atomic(target, data, mode=0o644)
         except OSError as exc:
-            for done in written:  # put back what this run already wrote
-                original = before[done]
-                if original is not None:
-                    write_atomic(done, original, mode=0o644)
-            raise RefreshError(f"could not write {target}: {exc}") from exc
+            left = _put_back(written, before, write_atomic)
+            raise RefreshError(f"could not write {target}: {exc}", left=left) from exc
         written.append(target)
     return Refresh(
         manual_before=manual_before,
@@ -185,6 +189,23 @@ def refresh(
         template_changed=old is None or old.identity_line_template != candidate.identity_line_template,
         written=tuple(path.relative_to(root) for path in written),
     )
+
+
+def _put_back(written: list[Path], before: dict[Path, bytes | None], write_atomic: Any) -> tuple[str, ...]:
+    """Undo this run's writes: each file back to its bytes before the run, or
+    removed when it did not exist. The files that could not be put back, each
+    with why (normally none)."""
+    left: list[str] = []
+    for done in written:
+        original = before[done]
+        try:
+            if original is None:
+                done.unlink()
+            else:
+                write_atomic(done, original, mode=0o644)
+        except OSError as exc:
+            left.append(f"{done} ({exc})")
+    return tuple(left)
 
 
 def _served_texts(client: Any, texts: Any) -> Any:
@@ -259,7 +280,14 @@ def main(argv: list[str] | None = None) -> int:
     try:
         outcome = refresh(client=client, api_base=api_base)
     except RefreshError as exc:
-        print(f"refresh refused, nothing written: {exc}", file=sys.stderr)
+        if exc.left:
+            print(
+                f"refresh refused: {exc}; these files hold what this run wrote and could not be put back: "
+                f"{'; '.join(exc.left)} (restore them with git)",
+                file=sys.stderr,
+            )
+        else:
+            print(f"refresh refused, nothing written: {exc}", file=sys.stderr)
         return 1
     finally:
         client.close()

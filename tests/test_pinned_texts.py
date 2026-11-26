@@ -9,8 +9,9 @@ anything that is not ``true``):
   with or without the kit; nothing downloads or writes a manual, and a file
   left in plugin storage from a time the setting was on is left as it is;
 * the SOUL.md identity line is this release's template filled for the
-  agent's handle by the kit — placed by the gateway once at activation (no
-  texts needed, no texts listener) and by every setup path, so the gateway
+  agent's handle by the kit — placed by the gateway at activation (no texts
+  needed), re-applied on each texts change (a no-op when it matches, never
+  the served line), and by every setup path, so the gateway
   and ``login`` place the same line;
 * ``doctor`` and ``status`` say which texts are in use, how they compare with
   what AgentChat serves now, and whether the running gateway uses the same
@@ -173,6 +174,20 @@ class TestSetting:
         _register.register(ctx)
         assert mode_for(home).live is True
         ctx.get_config.assert_any_call("live_texts", None)
+
+    def test_register_warns_once_about_a_value_it_cannot_use(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setattr(_register, "resolve_hermes_home", lambda: home)
+        monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: None)
+        monkeypatch.setattr(sys, "argv", ["hermes", "chat"])
+        ctx = MagicMock()
+        ctx.get_config.side_effect = lambda key, default=None: "true" if key == "live_texts" else default
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes"):
+            _register.register(ctx)
+        said = [r.getMessage() for r in caplog.records if "live_texts" in r.getMessage()]
+        assert len(said) == 1 and "'true'" in said[0] and "this release's manual and identity line" in said[0]
+        assert mode_for(home).live is False
 
     def test_both_manifests_declare_it_the_same_way(self) -> None:
         root = (ROOT / "plugin.yaml").read_bytes()
@@ -425,15 +440,42 @@ class TestGateway:
         runtime = _runtime(home)
         _register._reconcile_soul_anchor_when_texts_arrive(runtime)
         assert _release_line("ops") in (home / "SOUL.md").read_text(encoding="utf-8")
-        assert runtime._texts_listeners == [], "no texts listener: a served text never reaches SOUL.md"
+        assert len(runtime._texts_listeners) == 1, "re-applied on every texts change"
 
-    def test_a_change_of_the_served_texts_never_writes_soul_md(self, home: Path) -> None:
+    def test_texts_already_loaded_place_it_once(self, home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        runtime = _runtime(home)
+        runtime._set_texts(_served())
+        calls: list[Any] = []
+        real = _register._reconcile_soul_anchor
+        monkeypatch.setattr(_register, "_reconcile_soul_anchor", lambda rt: calls.append(rt) or real(rt))
+        _register._reconcile_soul_anchor_when_texts_arrive(runtime)
+        assert len(calls) == 1
+        assert _release_line("ops") in (home / "SOUL.md").read_text(encoding="utf-8")
+
+    def test_a_change_of_the_served_texts_never_writes_the_served_line(self, home: Path) -> None:
         runtime = _runtime(home)
         _register._reconcile_soul_anchor_when_texts_arrive(runtime)
         before = (home / "SOUL.md").read_bytes()
         runtime._set_texts(_served())
         runtime._set_texts(_served(template="I am @<handle>, reworded again."))
-        assert (home / "SOUL.md").read_bytes() == before
+        assert (home / "SOUL.md").read_bytes() == before, "the same line re-applied: no write"
+
+    def test_a_texts_change_retries_a_placement_that_did_not_land(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The first write met an edit in flight (the kit's ``edited_meanwhile``):
+        the next texts change places this release's line."""
+        runtime = _runtime(home)
+        soul_anchor.place_soul_anchor(_served().identity_line, handle="ops", template=SERVED_TEMPLATE)
+        real_follow = soul_anchor.follow_soul
+        busy = SimpleNamespace(outcome="edited_meanwhile", path=home / "SOUL.md", claimed=None, detail="changed meanwhile")
+        monkeypatch.setattr(soul_anchor, "follow_soul", lambda **_kw: busy)
+        _register._reconcile_soul_anchor_when_texts_arrive(runtime)
+        assert _release_line("ops") not in (home / "SOUL.md").read_text(encoding="utf-8")
+        monkeypatch.setattr(soul_anchor, "follow_soul", real_follow)
+        runtime._set_texts(_served())
+        text = (home / "SOUL.md").read_text(encoding="utf-8")
+        assert _release_line("ops") in text and _served().identity_line not in text
 
     def test_the_served_line_from_live_texts_on_is_brought_to_this_releases(self, home: Path) -> None:
         soul_anchor.place_soul_anchor(_served().identity_line, handle="ops", template=SERVED_TEMPLATE)
@@ -652,3 +694,55 @@ def test_doctor_on_a_clean_profile_passes_with_this_releases_texts(
     assert "Hermes serves agentchat:agentchat from" not in out, "said only when it is not this release's copy"
     assert "[fail]" not in out
     assert rc == 0, out
+
+
+class TestLogout:
+    """``hermes agentchat logout`` with the default setting: the block holding
+    this release's line is the one AgentChat placed, so it goes."""
+
+    def _profile(self, home: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+        from key_files import save_key
+
+        from agentchatme_hermes import mcp_registration, secrets_registration
+
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(cli, "_uninstall_secrets_registration", lambda: None)
+        monkeypatch.setattr(cli, "_uninstall_mcp_registration", lambda: None)
+        monkeypatch.setattr(secrets_registration, "uninstall_block", lambda *a, **k: False)
+        monkeypatch.setattr(mcp_registration, "uninstall_entry", lambda *a, **k: False)
+        save_key(api_key("logout-release"), handle="alice", home=home)
+        soul = home / "SOUL.md"
+        soul.write_text("# Persona\n", encoding="utf-8")
+        return soul
+
+    def _logout(self) -> int:
+        import argparse
+
+        return cli._dispatch_logout(argparse.Namespace())
+
+    def test_the_block_login_placed_is_removed(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        soul = self._profile(home, monkeypatch)
+        identity = identity_text(None, handle="alice", home=home)
+        assert identity.line is not None
+        soul_anchor.write_soul_anchor(identity.line, handle="alice", soul_path=soul)
+        assert self._logout() == 0
+        assert f"SOUL.md: removed the identity line for @alice from {soul}." in capsys.readouterr().out
+        assert soul.read_text(encoding="utf-8") == "# Persona\n"
+
+    def test_this_releases_text_without_a_handle_line_is_recognised(
+        self, home: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """No handle line: the block is AgentChat's because its text is exactly
+        this release's template filled in (``profile_identity`` hands the kit
+        that template)."""
+        soul = self._profile(home, monkeypatch)
+        soul.write_text(
+            f"# Persona\n\n<!-- agentchat:start -->\n{_release_line('alice')}\n<!-- agentchat:end -->\n", encoding="utf-8"
+        )
+        identity = placement.profile_identity(home, api_base="https://api.agentchat.me")
+        assert identity.template == SNAPSHOT.identity_line_template.strip()
+        assert self._logout() == 0
+        assert "removed the identity line for @alice" in capsys.readouterr().out
+        assert "agentchat:start" not in soul.read_text(encoding="utf-8")

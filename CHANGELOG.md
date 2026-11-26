@@ -10,7 +10,8 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   profile, so they no longer change from the server between plugin releases. The `agentchat:agentchat` skill is the
   package's `skills/agentchat/SKILL.md` (now manual 2.4.23); nothing downloads or writes a manual. The identity line is
   the served template this release bundles (`agentchatme_hermes/texts_snapshot.json`) filled for the agent's handle by the
-  SDK kit; the gateway places it once at activation, without any texts, and a change of the served texts never writes
+  SDK kit; the gateway places it at activation, without any texts, and re-applies the same line when the served texts
+  change (no write when it matches; a retry after a write that met an edit in flight), so the served line never reaches
   `SOUL.md`. Every path (the gateway, `register` / `login` / `recover`, the wizard, `doctor --fix`, `doctor`, `status`,
   `logout`) takes the line from one function, `texts.identity_text`, so they never place different lines. A manual kept
   current under an earlier release stays in `plugin-data/agentchat/manual/` as it is, unused. The texts used only inside
@@ -30,8 +31,9 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 - **`scripts/refresh_bundled_texts.py`** brings the bundled manual, the identity-line template and their pins in
   `tests/test_skill_bundle.py` to what the server serves (the manual through the SDK kit's `sync_manual`, checked against
   the announced version and sha256, and the plugin's inline-shell guard); the same texts give the same bytes, and a refusal
-  writes nothing. The `refresh-texts` workflow runs it daily and opens a pull request with auto-merge when the texts
-  change; it skips with a notice until its secrets are set (RUNBOOK § Refreshing the bundled texts). A release that only
+  writes nothing. The `refresh-texts` workflow runs it daily and opens (or updates) a pull request when the texts
+  change, and leaves it: it is merged at a release, because an unpinned git install tracks `main`. It skips with a notice
+  until it is set up, and opens an issue when a run fails (RUNBOOK § Refreshing the bundled texts). A release that only
   refreshes the texts changes no dependency or capability, so Hermes' unattended update applies it.
 - Contract tests: the setting through `ctx.get_config` per profile and `hermes config set`, the `config_schema` as Hermes
   parses and renders it, the package's manual served by `skill_view`, and that a text-only release widens nothing

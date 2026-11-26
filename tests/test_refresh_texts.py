@@ -272,3 +272,61 @@ def test_main_says_a_refusal_and_exits_1(root: Path, monkeypatch: pytest.MonkeyP
     serve(monkeypatch, {"/v1/texts": answer(200, _payload(sha=None))})
     assert script.main(["--api-base", API]) == 1
     assert "nothing written" in capsys.readouterr().err
+
+
+def _failing_writes(monkeypatch: pytest.MonkeyPatch, fail: Any) -> None:
+    """The kit's ``write_atomic`` as the script calls it, raising where ``fail(path, data)`` says."""
+    import agentchatme.integration as integration
+
+    real = integration.write_atomic
+
+    def write_atomic(path: Any, data: Any, *, mode: int = 0o644) -> None:
+        if fail(Path(path), data):
+            raise OSError(28, "No space left on device")
+        real(path, data, mode=mode)
+
+    monkeypatch.setattr(integration, "write_atomic", write_atomic)
+
+
+def _new_manual_routes() -> dict[str, Any]:
+    body = _body("9.9.9")
+    return {"/v1/texts": answer(200, _payload(manual=body, version="9.9.9")), "/skill.md": raw(200, body, "text/markdown")}
+
+
+def test_a_failed_write_puts_back_what_the_run_wrote(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The pins cannot be written: the manual goes back to its bytes, and the
+    snapshot, which did not exist before the run, is removed again."""
+    (root / script.SNAPSHOT_REL).unlink()
+    before = {relative: (root / relative).read_bytes() for relative in (script.MANUAL_REL, script.PINS_REL)}
+    _failing_writes(monkeypatch, lambda path, _data: path == root / script.PINS_REL)
+    with pytest.raises(script.RefreshError, match="could not write") as caught:
+        _run(root, monkeypatch, _new_manual_routes())
+    assert caught.value.left == ()
+    assert not (root / script.SNAPSHOT_REL).exists()
+    assert {relative: (root / relative).read_bytes() for relative in before} == before
+
+
+def test_a_put_back_that_fails_names_the_file_left(
+    root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The pins cannot be written, and the manual cannot be put back either:
+    the refusal names the manual as holding this run's bytes."""
+    manual = root / script.MANUAL_REL
+    original = manual.read_bytes()
+    _failing_writes(
+        monkeypatch, lambda path, data: path == root / script.PINS_REL or (path == manual and data == original)
+    )
+    with pytest.raises(script.RefreshError) as caught:
+        _run(root, monkeypatch, _new_manual_routes())
+    (left,) = caught.value.left
+    assert str(manual) in left and "No space left" in left
+    assert manual.read_bytes() == _body("9.9.9"), "the file named is the one left as the run wrote it"
+
+    monkeypatch.setenv(script.ENV_API_KEY, api_key("refresh"))
+    monkeypatch.setattr(script, "ROOT", root)
+    manual.write_bytes(original)
+    (root / script.SNAPSHOT_REL).write_bytes((ROOT / script.SNAPSHOT_REL).read_bytes())
+    serve(monkeypatch, _new_manual_routes())
+    assert script.main(["--api-base", API]) == 1
+    err = capsys.readouterr().err
+    assert "could not be put back" in err and str(manual) in err and "nothing written" not in err
