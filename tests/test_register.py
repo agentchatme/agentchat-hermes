@@ -1031,7 +1031,16 @@ class TestWithoutTheKit:
         rc = cli._dispatch_doctor(argparse.Namespace(fix=False))
         out = capsys.readouterr().out
         assert rc >= 1 and "SDK kit missing" in out and KIT_REQUIREMENT in out
-        assert f"Run `{sys.executable} -m pip install -U 'agentchatme>=1.8.0,<2'` and restart the gateway." in out
+        assert f"Run `{_pip_command()}` and restart the gateway." in out
+
+
+def _pip_command() -> str:
+    """The pip line for this interpreter as the person's shell takes it."""
+    import os
+
+    if os.name == "nt":
+        return f'{sys.executable} -m pip install -U "agentchatme>=1.8.0,<2"'
+    return f"{sys.executable} -m pip install -U 'agentchatme>=1.8.0,<2'"
 
 
 class TestTheCommandThatInstallsTheSdk:
@@ -1057,7 +1066,7 @@ class TestTheCommandThatInstallsTheSdk:
     def test_a_pip_install_gets_pip_in_hermes_environment(self) -> None:
         from agentchatme_hermes import kit
 
-        assert kit.sdk_update_command() == f"{sys.executable} -m pip install -U 'agentchatme>=1.8.0,<2'"
+        assert kit.sdk_update_command() == _pip_command()
         assert kit.sdk_update_sentence("run this again") == f"Run `{kit.sdk_update_command()}` and run this again."
 
     def test_a_directory_install_gets_hermes_plugins_update(

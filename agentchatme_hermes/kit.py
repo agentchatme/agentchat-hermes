@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -82,7 +83,7 @@ def sdk_update_command() -> str:
     except Exception:
         from_hermes, directory = False, None
     if not from_hermes:
-        return f"{shlex.quote(sys.executable)} -m pip install -U {shlex.quote(SDK_REQUIREMENT)}"
+        return f"{_quoted(sys.executable)} -m pip install -U {_quoted(SDK_REQUIREMENT, always=True)}"
     if directory is None:
         return "hermes plugins update agentchat"
     from .profile_scope import profile_label
@@ -94,10 +95,19 @@ def sdk_update_command() -> str:
         source = record.get("source")
         source = source if isinstance(source, str) and source else _REPO_URL
         return (
-            f"hermes{flag} plugins install {shlex.quote(source)} --force "
+            f"hermes{flag} plugins install {_quoted(source)} --force "
             "--ref <a release's 40-character commit SHA> --yes-deps"
         )
     return f"hermes{flag} plugins update {directory.name}"
+
+
+def _quoted(arg: str, *, always: bool = False) -> str:
+    """``arg`` as one word for the person's shell: POSIX quoting, or on
+    Windows double quotes (``cmd`` and PowerShell both take them; a
+    requirement's ``<`` / ``>`` must never reach ``cmd`` bare)."""
+    if os.name != "nt":
+        return shlex.quote(arg)
+    return f'"{arg}"' if always or any(char in arg for char in " \t&()^|<>") else arg
 
 
 def _install_source() -> tuple[bool, Path | None]:
