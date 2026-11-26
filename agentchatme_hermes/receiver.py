@@ -64,7 +64,7 @@ from typing import TYPE_CHECKING, Any, Callable
 from agentchatme import gate
 
 from .client_identity import hermes_client_identity
-from .profile_scope import profile_context, profile_label
+from .profile_scope import ProfileScope, profile_label, resolve_hermes_home
 from .turn import MCP_SERVER_NAME
 from .ws_health import WSHealthState, pause_end, write_ws_health
 
@@ -207,6 +207,7 @@ class Receiver:
         health: HealthBoard | None = None,
         health_path: Path | None = None,
         manual_sync_factory: ManualSyncFactory | None = None,
+        scope: ProfileScope | None = None,
     ) -> None:
         self._config = config
         self._identity = identity
@@ -215,6 +216,14 @@ class Receiver:
         self._on_texts = on_texts
         self._on_exit = on_exit
         self._hermes_home = hermes_home
+        # Everything on the receiver's thread — the texts listeners (SOUL.md),
+        # the loop's tray reads, the invoker's calls — runs in the profile's
+        # scope (the runtime passes its own; otherwise the constructing context's).
+        self._scope = (
+            scope
+            if scope is not None
+            else ProfileScope.capture(hermes_home if hermes_home is not None else resolve_hermes_home())
+        )
         self._health = health
         self._health_path = health_path
         self._manual_sync_factory = manual_sync_factory
@@ -264,7 +273,7 @@ class Receiver:
         with self._lock:
             if self._thread is not None:
                 return
-            self._thread = threading.Thread(target=self._run, name=_THREAD_NAME, daemon=True)
+            self._thread = self._scope.thread(self._supervise, name=_THREAD_NAME)
             self._thread.start()
             # Hermes has no shutdown hook for a plugin and never stops the
             # receiver on `hermes gateway stop`: at a clean interpreter exit
@@ -381,13 +390,6 @@ class Receiver:
         return status
 
     # -- the supervised thread -----------------------------------------------
-
-    def _run(self) -> None:
-        # Everything on this thread — the texts listeners (SOUL.md), the
-        # loop's tray reads — runs in this profile's context.
-        scope = profile_context(self._hermes_home) if self._hermes_home else contextlib.nullcontext()
-        with scope:
-            self._supervise()
 
     def _supervise(self) -> None:
         first = True

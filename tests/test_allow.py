@@ -22,6 +22,7 @@ from key_files import save_key
 
 from agentchatme_hermes import allow, hosted_tools, mcp_registration
 from agentchatme_hermes.mcp_registration import Allowance
+from agentchatme_hermes.profile_scope import ProfileScope, ProfileScopeError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -510,9 +511,10 @@ class TestCompletePending:
             return True
 
         monkeypatch.setattr(allow, "complete_pending", slow)
-        first = allow.start_completion(tmp_path, api_base="x")
+        scope = ProfileScope.capture(tmp_path)
+        first = allow.start_completion(scope, api_base="x")
         assert first is not None
-        assert allow.start_completion(tmp_path, api_base="x") is None, "one at a time"
+        assert allow.start_completion(scope, api_base="x") is None, "one at a time"
         release.set()
         first.join(5.0)
         assert runs == ["x"]
@@ -572,7 +574,7 @@ class TestSlashCommand:
         placed: list[Any] = []
         monkeypatch.setattr(allow, "read_switch", lambda home, *, api_base: allow.Switch(state, allowance))  # type: ignore[arg-type]
         monkeypatch.setattr(allow, "config_is_managed", lambda: False)
-        monkeypatch.setattr(allow, "start_completion", lambda home, *, api_base: placed.append("completion"))
+        monkeypatch.setattr(allow, "start_completion", lambda scope, *, api_base: placed.append("completion"))
         status = "failed" if outcome == "failed" else "changed"
         monkeypatch.setattr(
             placement,
@@ -583,7 +585,7 @@ class TestSlashCommand:
         return placed
 
     def _run(self, tmp_path: Path, chat: _Chat, args: str = "allow", session_id: str = "") -> str:
-        allow.register_allow_command(chat, tmp_path)
+        allow.register_allow_command(chat, ProfileScope.capture(tmp_path))
         handler, _description, hint = chat.commands["agentchat"]
         assert hint == "allow"
         return str(handler(args, session_id=session_id))
@@ -716,15 +718,26 @@ class TestSlashCommand:
         monkeypatch.setattr(allow, "read_switch", boom)
         assert "config backend down" in self._run(tmp_path, _Chat("allow"))
 
+    def test_a_scope_that_cannot_be_entered_runs_nothing(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        placed = self._wire(monkeypatch, tmp_path, state="not_allowed_yet", allowance=_allowance("missing", None))
+
+        def refused(self: ProfileScope, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+            raise ProfileScopeError("Hermes refused this profile's secret scope")
+
+        monkeypatch.setattr(ProfileScope, "run", refused)
+        chat = _Chat("allow")
+        reply = self._run(tmp_path, chat)
+        assert reply.startswith("AgentChat: this profile's scope could not be entered") and chat.asked == [] and placed == []
+
     def test_a_hermes_without_commands_registers_nothing(self, tmp_path: Path) -> None:
-        allow.register_allow_command(object(), tmp_path)  # no register_command: no error
+        allow.register_allow_command(object(), ProfileScope.capture(tmp_path))  # no register_command: no error
 
     def test_a_refused_registration_is_logged(self, tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
         class Refusing:
             def register_command(self, *a: Any, **kw: Any) -> None:
                 raise ValueError("conflicts with a built-in")
 
-        allow.register_allow_command(Refusing(), tmp_path)
+        allow.register_allow_command(Refusing(), ProfileScope.capture(tmp_path))
         assert any("/agentchat could not be registered" in r.getMessage() for r in caplog.records)
 
     def test_the_handler_takes_hermes_context_keywords(self, tmp_path: Path) -> None:
@@ -732,7 +745,7 @@ class TestSlashCommand:
         import inspect
 
         chat = _Chat()
-        allow.register_allow_command(chat, tmp_path)
+        allow.register_allow_command(chat, ProfileScope.capture(tmp_path))
         handler = chat.commands["agentchat"][0]
         params = inspect.signature(handler).parameters
         assert list(params) == ["raw_args", "session_id"]

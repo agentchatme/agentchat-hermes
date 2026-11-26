@@ -7,9 +7,13 @@ pending invite (one at a time), what is recorded after each turn (the D5
 rule), D5 pacing, and no retry ladder (the server re-wakes). :mod:`.receiver`
 hosts it. This module is what only Hermes can say, as the loop's callbacks:
 
+Each callback is an entry point: it runs in the profile's scope
+(:class:`.profile_scope.ProfileScope`, captured in ``register``), with the
+profile's secrets bound for that call on a multiplexed gateway.
+
 * :meth:`AgentInvoker.call_model` — the gate's one tool-less completion on
   the agent's own model: Hermes' ``ctx.llm`` (else its auxiliary client
-  pinned to the profile's model), inside the profile's runtime scope;
+  pinned to the profile's model), inside the profile's scope;
   cancelled when the loop stops waiting, where Hermes can (:mod:`.model_call`).
 * :meth:`AgentInvoker.check_runtime` — the kit's runtime check (could not
   process): does the agent's model answer right now? One minimal completion
@@ -61,7 +65,6 @@ instance stays a follower meanwhile, so no second turn starts for it).
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import inspect
 import logging
 import threading
@@ -92,12 +95,7 @@ from .config import (
     DEFAULT_TURN_IDLE_S,
     DEFAULT_TURN_MAX_S,
 )
-from .hosted_tools import (
-    hosted_server_state,
-    reconnect_record,
-    request_reconnect,
-    wait_for_hosted_tools,
-)
+from .hosted_tools import hosted_server_state, wait_for_hosted_tools
 from .model_call import (
     DEFAULT_MAX_TOKENS,
     GATE_CALL_PURPOSE,
@@ -111,18 +109,16 @@ from .model_call import (
     is_timeout,
 )
 from .profile_scope import (
+    ProfileScope,
     ProfileScopeError,
-    profile_context,
     profile_label,
-    profile_turn_scope,
     resolve_hermes_home,
+    scope_status,
 )
 from .turn import invite_session_id, wake_session_id, with_manual
 from .turn_runner import TurnLimits, TurnReport, run_turn
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-
     from agentchatme.integration import RunRequest, TurnHandle, TurnRequest
 
     from .allow import State
@@ -183,12 +179,16 @@ class AgentInvoker:
         runtime: Any,
         host_llm: Callable[[], Any] | None = None,
         tracker: TurnTracker | None = None,
+        scope: ProfileScope | None = None,
     ) -> None:
         self._config = config
         self._identity = identity
         # The runtime this invoker belongs to (one per profile and account):
         # supplies the profile home; never resolved from a registry.
         self._runtime = runtime
+        # The profile's scope: every callback below runs in it (the runtime
+        # passes the one ``register`` captured).
+        self._scope = scope if scope is not None else ProfileScope.capture(self._home())
         self._host_llm = host_llm
         self._host_llm_warned = False
 
@@ -286,32 +286,19 @@ class AgentInvoker:
                 "turns": self.turns,
                 "runs": self.runs,
                 "hung_total": self.hung_total,
+                "scope": scope_status(),
             }
 
     def beat(self) -> None:
         with self._state_lock:
             self._heartbeat_at = time.time()
 
-    def nudge_hosted_tools(self, reason: str) -> None:
-        """Ask Hermes to reconnect the hosted tools server if it parked it
-        (:func:`.hosted_tools.request_reconnect`): the runtime just activated,
-        so api.agentchat.me answers now. A no-op for a server connected or
-        connecting. Never raises."""
-        home = self._home()
-        try:
-            with profile_context(home):
-                request_reconnect(key=str(home), reason=reason, label=f" profile={profile_label(home)}")
-        except Exception:
-            logger.debug("AgentInvoker: hosted tools nudge raised", exc_info=True)
-
     def hosted_tools_status(self) -> dict[str, Any] | None:
         """Hermes' reading of the hosted tools server for the health record
         (``doctor`` reads it from the running gateway): its status, error and
-        tool count, and the reconnect requests made. ``None`` when not known."""
-        home = self._home()
+        tool count. ``None`` when not known."""
         try:
-            with profile_context(home):
-                state = hosted_server_state()
+            state = self._scope.run(hosted_server_state)
         except Exception:
             logger.debug("AgentInvoker: hosted tools status raised", exc_info=True)
             return None
@@ -322,7 +309,6 @@ class AgentInvoker:
             "error": state.error,
             "tools": state.tools,
             "needs_auth": state.needs_auth,
-            "reconnect": reconnect_record(str(home)),
             "at": time.time(),
         }
 
@@ -337,21 +323,26 @@ class AgentInvoker:
             return dict(self._switch) if self._switch is not None else None
 
     def _read_switch(self) -> State:
-        """Read the switch in the profile's scope (:func:`.allow.read_switch`),
+        """:meth:`_switch_now` as an entry point of its own, in the profile's
+        scope (the health record's writer, the second step's callback)."""
+        try:
+            return self._scope.run(self._switch_now)
+        except Exception:
+            logger.debug("AgentInvoker: the tools switch could not be read", exc_info=True)
+            return "unknown"
+
+    def _switch_now(self) -> State:
+        """Read the switch (:func:`.allow.read_switch`) in the calling scope,
         record it, log a change once, finish a yes being applied, and wake the
-        receive loop when the pause ends (the worker's readiness and the health
-        record's writer both read it)."""
-        from .allow import PAUSED_STATES, describe, read_switch, start_completion
+        receive loop when the pause ends."""
+        from .allow import PAUSED_STATES, Switch, describe, read_switch, start_completion
 
         home = self._home()
         api_base = str(getattr(self._config, "api_base", "") or DEFAULT_API_BASE)
         try:
-            with profile_context(home):
-                switch = read_switch(home, api_base=api_base)
+            switch = read_switch(home, api_base=api_base)
         except Exception:
             logger.debug("AgentInvoker: the tools switch could not be read", exc_info=True)
-            from .allow import Switch
-
             switch = Switch("unknown")
         state = switch.state
         allowance = switch.allowance
@@ -367,7 +358,7 @@ class AgentInvoker:
             if changed:
                 self._switch_said = state
         if state == "applying" and not self._stopped.is_set():
-            start_completion(home, api_base=api_base)
+            start_completion(self._scope, api_base=api_base)
         if changed:
             from .config import cli_prefix
 
@@ -446,7 +437,7 @@ class AgentInvoker:
         if self._stopped.is_set():
             raise GateCallCancelled("stopping")
         try:
-            return self._complete(prompt, cancel=cancel, timeout_s=self._gate_timeout_s)
+            return self._scope.run(self._complete, prompt, cancel=cancel, timeout_s=self._gate_timeout_s)
         except Exception as exc:
             # The request's own timeout (``AGENTCHATME_GATE_TIMEOUT_S``) comes
             # before the kit's gate-call deadline; raised as ``TimeoutError``
@@ -485,6 +476,15 @@ class AgentInvoker:
             cancel.set()
 
     def _runtime_check(self, cancel: threading.Event) -> Readiness:
+        """The check, in the profile's scope: resolving the turns' provider
+        reads the profile's secrets too, not only the call."""
+        try:
+            return self._scope.run(self._runtime_check_in_scope, cancel)
+        except ProfileScopeError as exc:
+            logger.info("AgentInvoker: runtime check failed — profile scope unavailable: %s", exc)
+            return Readiness(ready=False, reason=f"profile scope unavailable: {exc}")
+
+    def _runtime_check_in_scope(self, cancel: threading.Event) -> Readiness:
         if self._stopped.is_set():
             return Readiness(ready=False, reason="stopping")
         # The turns' own model: a turn runs on the model resolved from the
@@ -521,21 +521,20 @@ class AgentInvoker:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         purpose: str = GATE_CALL_PURPOSE,
     ) -> str:
-        """One tool-less completion on the agent's own model, in the
-        profile's scope: Hermes' ``ctx.llm``, else its auxiliary client
-        pinned to the profile's model (:func:`~.model_call.build_call_model`).
-        The gate call and the runtime check both go through here."""
-        with self._scope():
-            host_llm = self._host_llm_facade()
-            model_call = build_call_model(
-                main_runtime=self._gate_runtime() if host_llm is None else {},
-                timeout_s=timeout_s,
-                max_tokens=max_tokens,
-                host_llm=host_llm,
-                gate_loop=self._gate_loop,
-                purpose=purpose,
-            )
-            return model_call(prompt, cancel=cancel)
+        """One tool-less completion on the agent's own model: Hermes'
+        ``ctx.llm``, else its auxiliary client pinned to the profile's model
+        (:func:`~.model_call.build_call_model`). The gate call and the runtime
+        check both go through here, each already in the profile's scope."""
+        host_llm = self._host_llm_facade()
+        model_call = build_call_model(
+            main_runtime=self._gate_runtime() if host_llm is None else {},
+            timeout_s=timeout_s,
+            max_tokens=max_tokens,
+            host_llm=host_llm,
+            gate_loop=self._gate_loop,
+            purpose=purpose,
+        )
+        return model_call(prompt, cancel=cancel)
 
     def readiness(self) -> Readiness:
         """Could a turn started now reach AgentChat? (a worker thread)
@@ -553,12 +552,12 @@ class AgentInvoker:
                 ready=False,
                 reason=f"{hung} earlier turns overran and have not ended — no turn can start",
             )
-        state = self._read_switch()
+        try:
+            state, held = self._scope.run(self._switch_then_hold)
+        except ProfileScopeError as exc:
+            return Readiness(ready=False, reason=f"profile scope unavailable: {exc}")
         if state in PAUSED_STATES:
             return Readiness(ready=False, reason=reason(state))
-        home = self._home()
-        with profile_context(home):
-            held = wait_for_hosted_tools(label="turn", stopped=self._stopped, key=str(home))
         if held is None:
             return Readiness(ready=False, reason="stopping")
         if not held:
@@ -566,6 +565,16 @@ class AgentInvoker:
                 ready=False, reason="the hosted AgentChat tools are not registered in Hermes yet"
             )
         return Readiness(ready=True)
+
+    def _switch_then_hold(self) -> tuple[State, bool | None]:
+        """In the profile's scope (one entry point): the switch, then — when it
+        allows the tools — the hold for them."""
+        from .allow import PAUSED_STATES
+
+        state = self._switch_now()
+        if state in PAUSED_STATES:
+            return state, False
+        return state, wait_for_hosted_tools(label="turn", stopped=self._stopped)
 
     async def start_turn(self, request: TurnRequest) -> TurnAdmission:
         """Admit one reply or invite turn; ``done`` resolves when its thread has ended."""
@@ -595,11 +604,10 @@ class AgentInvoker:
         )
         with self._turns_lock:
             self._turns[turn.key] = turn
-        thread = threading.Thread(
-            target=self._turn_thread,
-            args=(with_manual(request.prompt), turn),
+        prompt = with_manual(request.prompt)
+        thread = self._scope.thread(
+            lambda: self._turn_thread(prompt, turn),
             name=f"agentchat-turn-start-{turn.session_id[-6:]}",
-            daemon=True,
         )
         try:
             thread.start()
@@ -797,8 +805,8 @@ class AgentInvoker:
             self._wake_loop()
 
     def _finish_in_thread(self, turn: _Turn, report: TurnReport | None) -> None:
-        threading.Thread(
-            target=self._finish_detached, args=(turn, report), name="agentchat-turn-record", daemon=True
+        self._scope.thread(
+            lambda: self._finish_detached(turn, report), name="agentchat-turn-record"
         ).start()
 
     def _finish_detached(self, turn: _Turn, report: TurnReport | None) -> None:
@@ -885,27 +893,10 @@ class AgentInvoker:
         if self._stopped.is_set():
             return None, "stopping"
         try:
-            with self._scope():
-                self._ensure_hermes_resolved()
-                agent = self._build_agent(session_id)
-                if agent is None:
-                    return None, "the Hermes agent could not be built"
-                with self._state_lock:
-                    self._current_turn = {"session_id": session_id, "started_at": time.time()}
-                try:
-                    report = run_turn(
-                        agent,
-                        prompt,
-                        session_id=session_id,
-                        limits=self._limits,
-                        stopped=self._stopped,
-                        on_finished=on_finished,
-                        on_poll=self.beat,
-                    )
-                finally:
-                    with self._state_lock:
-                        self._current_turn = None
-                        self._idle_since = time.time()
+            outcome = self._scope.run(self._run_in_scope, prompt, session_id, on_finished)
+            if isinstance(outcome, str):
+                return None, outcome
+            report = outcome
         except ProfileScopeError as exc:
             logger.warning("AgentInvoker: turn %s not started — %s", session_id, exc)
             return None, f"profile scope unavailable: {exc}"
@@ -935,21 +926,36 @@ class AgentInvoker:
 
     # -- Hermes integration (lazy imports) ----------------------------------
 
+    def _run_in_scope(
+        self, prompt: str, session_id: str, on_finished: Callable[[], None]
+    ) -> TurnReport | str:
+        """The turn itself; a ``str`` is why it did not start."""
+        self._ensure_hermes_resolved()
+        agent = self._build_agent(session_id)
+        if agent is None:
+            return "the Hermes agent could not be built"
+        with self._state_lock:
+            self._current_turn = {"session_id": session_id, "started_at": time.time()}
+        try:
+            return run_turn(
+                agent,
+                prompt,
+                session_id=session_id,
+                limits=self._limits,
+                stopped=self._stopped,
+                on_finished=on_finished,
+                on_poll=self.beat,
+            )
+        finally:
+            with self._state_lock:
+                self._current_turn = None
+                self._idle_since = time.time()
+
     def _home(self) -> Path:
         home = getattr(self._runtime, "hermes_home", None)
         if home is None:
             home = getattr(self._config, "hermes_home", None)
         return Path(home) if home is not None else resolve_hermes_home()
-
-    @contextlib.contextmanager
-    def _scope(self) -> Iterator[None]:
-        """The profile's home and runtime scope — the one the gateway uses for
-        this profile's own turns — so its provider key and secrets are its
-        own, never the launch profile's. :class:`ProfileScopeError` when a
-        multiplexed scope cannot be entered: nothing then runs unscoped."""
-        home = self._home()
-        with profile_context(home), profile_turn_scope(home):
-            yield
 
     def _ensure_hermes_resolved(self) -> None:
         if self._resolved_hermes:

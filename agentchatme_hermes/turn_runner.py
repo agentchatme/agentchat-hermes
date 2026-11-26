@@ -49,7 +49,6 @@ it could not look.
 """
 from __future__ import annotations
 
-import contextvars
 import inspect
 import json
 import logging
@@ -62,6 +61,7 @@ from typing import Any, Callable, Literal
 from agentchatme.integration import AgentChatCallCount, TurnEnd
 
 from .config import DEFAULT_TURN_IDLE_S, DEFAULT_TURN_MAX_S
+from .profile_scope import context_thread
 from .turn import MCP_SERVER_NAME, MCP_TOOL_PREFIX
 
 logger = logging.getLogger(__name__)
@@ -188,10 +188,9 @@ def run_turn(
                     logger.exception("AgentInvoker: turn %s end callback raised", session_id)
             finished.set()
 
-    context = contextvars.copy_context()
-    thread = threading.Thread(
-        target=context.run, args=(body,), name=f"agentchat-turn-{session_id[-6:]}", daemon=True
-    )
+    # In a copy of the caller's context: the turn's profile scope, bound by
+    # the invoker for this turn (home, secrets, the registry overlay).
+    thread = context_thread(body, name=f"agentchat-turn-{session_id[-6:]}")
     try:
         thread.start()
     except RuntimeError as exc:

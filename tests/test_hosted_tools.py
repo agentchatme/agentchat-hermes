@@ -195,19 +195,15 @@ class TestWait:
 class _ParkedHermes:
     """Hermes' MCP client with ``mcp_servers.agentchat`` parked, as a gateway
     started offline leaves it: ``get_mcp_status`` says ``failed`` with the
-    connect error, no ``mcp__agentchat__`` tool is registered, and only a
-    reconnect request (``reconnect_mcp_server``) brings the tools back — once
-    the network is back (``online``)."""
+    connect error and no ``mcp__agentchat__`` tool is registered until Hermes'
+    own probe (or ``/reload-mcp``, a restart) brings it back (``come_back``)."""
 
     TOOL = "mcp__agentchat__agentchat_inbox"
 
-    def __init__(self, monkeypatch: pytest.MonkeyPatch, *, online: bool = True, adopted: bool = True) -> None:
-        self.online = online
-        self.adopted = adopted
+    def __init__(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self.registered: list[str] = []
         self.status = "failed"
         self.error = "All connection attempts failed; [Errno 111] Connect call failed ('66.241.125.41', 443)"
-        self.requests: list[str] = []
         parked = self
 
         class Registry:
@@ -224,31 +220,27 @@ class _ParkedHermes:
                 row["error"] = parked.error
             return [row]
 
-        def reconnect_mcp_server(name: str) -> bool:
-            parked.requests.append(name)
-            if not parked.adopted:
-                return False
-            if parked.online:  # the revival connects and re-registers the tools
-                parked.status, parked.registered = "connected", [parked.TOOL]
-            return True
-
         tools_pkg = types.ModuleType("tools")
         tools_pkg.__path__ = []  # type: ignore[attr-defined]
         registry = types.ModuleType("tools.registry")
         registry.registry = Registry()  # type: ignore[attr-defined]
         discovery = types.ModuleType("tools.mcp_tool_discovery")
         discovery.get_mcp_status = get_mcp_status  # type: ignore[attr-defined]
-        loop = types.ModuleType("tools.mcp_tool_loop")
-        loop.reconnect_mcp_server = reconnect_mcp_server  # type: ignore[attr-defined]
         for name, module in (("tools", tools_pkg), ("tools.registry", registry),
-                             ("tools.mcp_tool_discovery", discovery), ("tools.mcp_tool_loop", loop)):
+                             ("tools.mcp_tool_discovery", discovery)):
             monkeypatch.setitem(sys.modules, name, module)
-        hosted_tools._gates.clear()
+        # The plugin asks Hermes for no reconnect: there is no such module to reach.
+        monkeypatch.setitem(sys.modules, "tools.mcp_tool_loop", None)
+
+    def come_back(self) -> None:
+        self.status, self.registered = "connected", [self.TOOL]
 
 
 class TestParked:
-    """MS-F19: the gateway started while api.agentchat.me could not be reached,
-    Hermes parked the hosted tools server, and nothing asked it to reconnect."""
+    """MS-F19: the gateway started while api.agentchat.me could not be reached
+    and Hermes parked the hosted tools server. Hermes has no public reconnect
+    for a plugin: the plugin holds the turn, names the cause and the remedy,
+    and Hermes' own probe brings the tools back."""
 
     def test_the_parked_state_is_read_from_hermes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         hermes = _ParkedHermes(monkeypatch)
@@ -257,80 +249,41 @@ class TestParked:
         assert state.error == hermes.error and state.tools == 0
         assert hosted_tools.hosted_tool_names() == []
 
-    def test_a_held_turn_asks_for_the_reconnect_and_starts(
+    def test_a_held_turn_starts_once_hermes_brings_the_tools_back(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         hermes = _ParkedHermes(monkeypatch)
         clock = _Clock()
-        with caplog.at_level(logging.INFO, logger="agentchatme_hermes.hosted_tools"):
-            ok = hosted_tools.wait_for_hosted_tools(timeout_s=30.0, poll_s=0.5, sleep=clock.sleep, now=clock.now, key="/p")
-        assert ok is True, "the tools came back within the hold: the turn starts in this cycle"
-        assert hermes.requests == ["agentchat"]
-        messages = [r.getMessage() for r in caplog.records]
-        assert any("asked Hermes to reconnect mcp_servers.agentchat (a turn is waiting for the tools" in m for m in messages)
-        assert any("Hermes parked mcp_servers.agentchat" in m and "a reconnect was requested" in m for m in messages)
-        assert hosted_tools.hosted_tool_names() == [_ParkedHermes.TOOL]
 
-    def test_still_offline_names_the_real_cause(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-        hermes = _ParkedHermes(monkeypatch, online=False)
+        def sleep(seconds: float) -> None:
+            clock.sleep(seconds)
+            if clock.t >= 5.0:
+                hermes.come_back()
+
+        with caplog.at_level(logging.INFO, logger="agentchatme_hermes.hosted_tools"):
+            ok = hosted_tools.wait_for_hosted_tools(timeout_s=30.0, poll_s=0.5, sleep=sleep, now=clock.now)
+        assert ok is True
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("Hermes parked mcp_servers.agentchat" in m and "holding the turn" in m for m in messages)
+        assert not any("reconnect" in m for m in messages), "nothing is asked of Hermes"
+
+    def test_still_offline_names_the_cause_and_the_remedy(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        _ParkedHermes(monkeypatch)
         clock = _Clock()
         with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.hosted_tools"):
-            ok = hosted_tools.wait_for_hosted_tools(timeout_s=2.0, poll_s=0.5, sleep=clock.sleep, now=clock.now, key="/p")
-        assert ok is False and hermes.requests == ["agentchat"], "asked once in the hold, not on every poll"
+            ok = hosted_tools.wait_for_hosted_tools(timeout_s=2.0, poll_s=0.5, sleep=clock.sleep, now=clock.now)
+        assert ok is False
         (line,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert "Cause: Hermes parked mcp_servers.agentchat after its connection failed (All connection attempts failed" in line
-        assert "a reconnect was just requested — if the tools do not come back, run `hermes gateway restart`" in line
+        assert "after 5 minutes, then at longer intervals up to an hour" in line
+        assert "/reload-mcp in a chat this gateway serves, or run `hermes gateway restart`" in line
         assert "mcp SDK" not in line, "not the wrong cause"
 
-    def test_requests_are_rate_limited_and_back_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        hermes = _ParkedHermes(monkeypatch, online=False)
-        clock = _Clock()
-        ask = lambda: hosted_tools.request_reconnect(key="/p", reason="t", now=clock.now).outcome  # noqa: E731
-        assert ask() == "requested"
-        clock.t += 59
-        assert ask() == "too_soon"
-        clock.t += 1
-        assert ask() == "requested", "60 s after the first"
-        clock.t += 119
-        assert ask() == "too_soon", "still parked after one: the next waits 120 s"
-        clock.t += 1
-        assert ask() == "requested"
-        for _ in range(10):
-            clock.t += hosted_tools.RECONNECT_MAX_INTERVAL_S
-            assert ask() == "requested"
-        clock.t += hosted_tools.RECONNECT_MAX_INTERVAL_S - 1
-        assert ask() == "too_soon", "capped at 30 min, never a loop"
-        assert len(hermes.requests) == 13
-        assert hosted_tools.request_reconnect(key="/other", reason="t", now=clock.now).outcome == "requested", "per profile"
-
-    def test_a_connected_server_is_never_asked_and_resets_the_interval(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        hermes = _ParkedHermes(monkeypatch, online=False)
-        clock = _Clock()
-        assert hosted_tools.request_reconnect(key="/p", reason="t", now=clock.now).outcome == "requested"
-        hermes.status = "connected"
-        assert hosted_tools.request_reconnect(key="/p", reason="t", now=clock.now).outcome == "not_parked"
-        hermes.status = "failed"
-        assert hosted_tools.request_reconnect(key="/p", reason="t", now=clock.now).outcome == "requested", "reset"
-        assert hermes.requests == ["agentchat", "agentchat"]
-
-    @pytest.mark.parametrize("status", ["connecting", "disabled", "configured", "lazy"])
-    def test_only_a_parked_server_is_asked(self, monkeypatch: pytest.MonkeyPatch, status: str) -> None:
-        hermes = _ParkedHermes(monkeypatch)
-        hermes.status = status
-        assert hosted_tools.request_reconnect(key="/p", reason="t").outcome == "not_parked"
-        assert hermes.requests == [], "a reconnect would tear down a live or connecting session"
-
-    def test_no_parked_connection_says_restart(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-        _ParkedHermes(monkeypatch, adopted=False)
-        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes.hosted_tools"):
-            assert hosted_tools.request_reconnect(key="/p", reason="t").outcome == "no_connection"
-        assert any("`hermes gateway restart`" in r.getMessage() for r in caplog.records)
-
-    def test_a_hermes_without_the_reconnect_request_is_unavailable(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        _ParkedHermes(monkeypatch)
-        monkeypatch.setitem(sys.modules, "tools.mcp_tool_loop", None)
-        hosted_tools._warned.clear()
-        assert hosted_tools.request_reconnect(key="/p", reason="t").outcome == "unavailable"
+    def test_the_plugin_has_no_reconnect_request(self) -> None:
+        assert not hasattr(hosted_tools, "request_reconnect")
+        assert not hasattr(hosted_tools, "_hermes_reconnect")
 
     def test_missing_entry_and_other_states_name_their_cause(self) -> None:
         S = hosted_tools.ServerState
@@ -362,18 +315,17 @@ class TestDoctorLines:
 
     def test_parked_is_a_failure_with_the_remedy(self) -> None:
         level, line = self._line({
-            "status": "failed", "error": "All connection attempts failed", "tools": 0,
-            "reconnect": {"requests": 2, "asked_ago_s": 40.0}, "at": 990.0,
+            "status": "failed", "error": "All connection attempts failed", "tools": 0, "at": 990.0,
         }) or ("", "")
         assert level == "fail"
         assert "Hermes parked mcp_servers.agentchat after its connection failed (All connection attempts failed)" in line
         assert "the agent is woken but cannot answer" in line
-        assert "asked Hermes to reconnect them 2 time(s), last 40s ago" in line
-        assert line.endswith("run `hermes gateway restart` to reconnect them now")
+        assert "Hermes probes it again on its own after 5 minutes" in line
+        assert line.endswith("send /reload-mcp in a chat this gateway serves, or run `hermes gateway restart`")
 
-    def test_parked_before_any_request(self) -> None:
-        level, line = self._line({"status": "failed", "error": None, "reconnect": {"requests": 0, "asked_ago_s": None}}) or ("", "")
-        assert level == "fail" and "asks Hermes to reconnect them when a wake needs them" in line
+    def test_a_record_from_an_older_release_still_reads(self) -> None:
+        level, line = self._line({"status": "failed", "error": None, "reconnect": {"requests": 2, "asked_ago_s": 4.0}}) or ("", "")
+        assert level == "fail" and "/reload-mcp" in line and "asked Hermes" not in line
 
     def test_connected_and_connecting(self) -> None:
         assert self._line({"status": "connected", "tools": 31, "at": 995.0}) == (
@@ -398,9 +350,9 @@ class TestDoctorLines:
                  "at": "2026-11-22T14:52:08.624Z"}
         level, line = _describe_worker({"state": "idle", "loop": {"recent_cycles": [cycle]}}, now=1000.0) or ("", "")
         assert level == "warn" and "tools_unavailable" in line
-        assert "`hermes gateway restart` reconnects them at once" in line
+        assert "/reload-mcp in a chat this gateway serves, or `hermes gateway restart`, reconnects them" in line
         level, line = _describe_worker({"state": "idle", "loop": {"recent_cycles": [cycle] * 3}}, now=1000.0) or ("", "")
-        assert level == "fail" and "`hermes gateway restart` reconnects them at once" in line
+        assert level == "fail" and "/reload-mcp in a chat this gateway serves" in line
 
     @pytest.mark.parametrize("state", ["not_allowed_yet", "not_allowed", "applying", "disabled"])
     def test_a_run_paused_by_the_switch_is_said_not_alarmed_on(self, state: str) -> None:

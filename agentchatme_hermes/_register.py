@@ -51,20 +51,22 @@ Called once per Hermes **profile**: once per process in a classic gateway,
 once per served profile in a multiplexed gateway (Hermes keeps one plugin
 manager per profile home). Every call resolves its own profile home and its
 own settings and gets its own :class:`runtime.Runtime`, keyed by profile
-and account — see :mod:`.profile_scope`.
+and account. ``register`` captures the context Hermes loaded it in
+(:class:`.profile_scope.ProfileScope`); every thread and cycle the plugin
+runs for the profile runs in that scope — see :mod:`.profile_scope`.
 """
 from __future__ import annotations
 
 import inspect
 import logging
 import threading
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from ._version import __version__
 from .config import ENV_API_KEY_LEGACY, KEY_SOURCE_STORE, ConfigError, KeyRefused, load_config
 from .kit import kit_problem
 from .leader_lock import is_hermes_gateway_process
-from .profile_scope import profile_context, profile_label, resolve_hermes_home
+from .profile_scope import ProfileScope, ProfileScopeError, profile_label, resolve_hermes_home
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -96,19 +98,6 @@ def register(ctx: Any) -> None:
             exc_info=True,
         )
 
-    # ``/agentchat allow``: the person allows the AgentChat tools from any chat
-    # with the agent (Hermes' own prompt). Registered unconditionally, like the
-    # CLI: it needs no key and no runtime.
-    try:
-        from .allow import note_process_origin, register_allow_command
-
-        # Before a chat session of this process sets its own session id: was
-        # this process started inside an agent's terminal? (best effort)
-        note_process_origin()
-        register_allow_command(ctx, resolve_hermes_home())
-    except Exception:
-        logger.error("agentchat plugin: /agentchat could not be registered", exc_info=True)
-
     # The key file reaches Hermes' MCP client (the hosted tools) through a
     # secret source, in every Hermes process: registered before anything else
     # can fail, so the tools authenticate even where nothing else runs.
@@ -123,10 +112,29 @@ def register(ctx: Any) -> None:
     # neither receive nor place the identity line. Say so once, loudly, and
     # keep the CLI so `hermes agentchat doctor` says it too.
     hermes_home = resolve_hermes_home()
+    # The profile's scope, as Hermes loaded this plugin for it: every thread
+    # and cycle below runs in it (profile_scope.ProfileScope).
+    scope = ProfileScope.capture(hermes_home)
+
+    # ``/agentchat allow``: the person allows the AgentChat tools from a chat
+    # with the agent (Hermes' own prompt), worked out in this profile's scope.
+    # Registered unconditionally, like the CLI: it needs no key and no runtime.
+    try:
+        from .allow import note_process_origin, register_allow_command
+
+        # Before a chat session of this process sets its own session id: was
+        # this process started inside an agent's terminal? (best effort)
+        note_process_origin()
+        register_allow_command(ctx, scope)
+    except Exception:
+        logger.error("agentchat plugin: /agentchat could not be registered", exc_info=True)
+
     gateway_mode = _is_gateway_context(ctx)
     problem = kit_problem()
     if problem is not None:
         logger.error("agentchat plugin: not receiving — %s", problem)
+        # The key source still masks a copied key for this process's tools.
+        _find_copy(scope)
         _register_surface(ctx, hermes_home, place=False)
         return
 
@@ -148,9 +156,10 @@ def register(ctx: Any) -> None:
         profile=profile,
         gateway_mode=gateway_mode,
         host_llm=host_llm_accessor(ctx),
+        scope=scope,
     )
     _close_on_unload(ctx, watcher)
-    outcome = watcher.try_activate()
+    outcome = watcher.attempt()
 
     if outcome == "active":
         return
@@ -190,6 +199,17 @@ def register(ctx: Any) -> None:
         )
 
 
+def _find_copy(scope: ProfileScope) -> None:
+    """Resolve the key once in the profile's scope, so a key this profile holds
+    as a copy of another profile's is known to the key source. Never raises."""
+    from .config import resolve_key
+
+    try:
+        scope.run(resolve_key, scope.home)
+    except Exception:
+        logger.debug("agentchat plugin: key resolution raised", exc_info=True)
+
+
 def _register_surface(ctx: Any, hermes_home: Path, *, place: bool = True) -> None:
     """Register the manual as the ``agentchat:agentchat`` skill (``place``: the
     gateway, which may write it). No tools — see module docstring. Never
@@ -224,9 +244,12 @@ class ActivationWatcher:
         profile: str,
         gateway_mode: bool,
         host_llm: Callable[[], Any] | None = None,
+        scope: ProfileScope | None = None,
     ) -> None:
         self._runtime: Runtime | None = None
         self._host_llm = host_llm
+        # The profile's scope (``register`` passes the one it captured).
+        self._scope = scope if scope is not None else ProfileScope.capture(hermes_home)
         # Guards ``_runtime`` and ``_closed`` between the activation thread
         # and :meth:`close` (the plugin's unload).
         self._state_lock = threading.Lock()
@@ -239,14 +262,51 @@ class ActivationWatcher:
         self._failures = 0
         # The last refusal logged, so a watcher re-checking every 30 s says it once.
         self._refusal: str | None = None
+        self._scope_problem: str | None = None
 
     @property
     def runtime(self) -> Runtime | None:
         return self._runtime
 
+    def attempt(self) -> str:
+        """One attempt, in the profile's scope: :meth:`try_activate`, or
+        ``"failed"`` when the scope cannot be entered (said once; nothing runs
+        unscoped, the next attempt tries again)."""
+        try:
+            return self._scope.run(self.try_activate)
+        except ProfileScopeError as exc:
+            self._failures += 1
+            message = str(exc)
+            if message != self._scope_problem:
+                self._scope_problem = message
+                logger.error(
+                    "agentchat plugin: not starting for profile=%s — this profile's scope could not "
+                    "be entered (%s); nothing runs outside it, and the next attempt tries again",
+                    self._profile,
+                    message,
+                )
+            return "failed"
+        except Exception as exc:
+            # register() must never raise into Hermes' plugin load: anything a
+            # Hermes helper raised (an unreadable config.yaml, a changed API)
+            # is said once and the next attempt tries again.
+            self._failures += 1
+            message = f"{type(exc).__name__}: {exc}"
+            if message != self._scope_problem:
+                self._scope_problem = message
+                logger.error(
+                    "agentchat plugin: activation attempt failed for profile=%s (%s); the next "
+                    "attempt tries again",
+                    self._profile,
+                    message,
+                    exc_info=True,
+                )
+            return "failed"
+
     def try_activate(self) -> str:
-        """One attempt. Returns ``"active"``, ``"unconfigured"``, ``"refused"``,
-        ``"failed"`` or ``"closed"`` (the plugin was unloaded)."""
+        """One attempt in the calling scope. Returns ``"active"``,
+        ``"unconfigured"``, ``"refused"``, ``"failed"`` or ``"closed"`` (the
+        plugin was unloaded)."""
         with self._state_lock:
             if self._closed:
                 return "closed"
@@ -258,13 +318,7 @@ class ActivationWatcher:
             # Not acting as an agent this profile must not be: no socket, no
             # placement. Said once; the watcher keeps checking, so fixing it
             # (logout, login) takes effect without a restart.
-            message = str(exc)
-            if message != self._refusal:
-                self._refusal = message
-                logger.error(
-                    "agentchat plugin: not starting for profile=%s — %s", self._profile, message
-                )
-            return "refused"
+            return self._refused(str(exc))
         except ConfigError as exc:
             logger.warning(
                 "agentchat plugin: configuration error (profile=%s) — %s",
@@ -275,9 +329,26 @@ class ActivationWatcher:
             return "failed"
         if config is None:
             return "unconfigured"
+        split = _split_identity(config)
+        if split is not None:
+            # The socket and the gate would be one agent, the hosted tools another.
+            return self._refused(split)
+        if getattr(config, "api_key_source", KEY_SOURCE_STORE) == ENV_API_KEY_LEGACY:
+            # Verified with the server, then copied into the key file under the
+            # per-account lock — before the runtime opens any socket, so a copy
+            # never holds the account's socket.
+            adopted = _adopt_legacy_key(config)
+            if adopted == "copy":
+                try:
+                    load_config(hermes_home=self._hermes_home)
+                except KeyRefused as exc:
+                    return self._refused(str(exc))
+            if adopted != "go":
+                self._failures += 1
+                return "failed"
 
         runtime = _try_start_runtime(
-            config, gateway_mode=self._gateway_mode, host_llm=self._host_llm
+            config, gateway_mode=self._gateway_mode, host_llm=self._host_llm, scope=self._scope
         )
         if runtime is None:
             self._failures += 1
@@ -288,6 +359,7 @@ class ActivationWatcher:
             # not keep the socket or the lock for code that is gone.
             _shutdown_runtime(runtime, profile=self._profile)
             return "closed"
+
         self._failures = 0
 
         # Placement reconciliation. Wizard users (`hermes agentchat
@@ -327,6 +399,13 @@ class ActivationWatcher:
         )
         return "active"
 
+    def _refused(self, message: str) -> str:
+        """Said once (the watcher re-checks every 30 s); nothing starts or is placed."""
+        if message != self._refusal:
+            self._refusal = message
+            logger.error("agentchat plugin: not starting for profile=%s — %s", self._profile, message)
+        return "refused"
+
     def retry_schedule(self) -> str:
         """What :meth:`next_delay` does from here, in words, for the log."""
         if self._failures == 0:
@@ -345,9 +424,7 @@ class ActivationWatcher:
     def start(self) -> None:
         if self._thread is not None:
             return
-        self._thread = threading.Thread(
-            target=self._loop, name="agentchat-activation", daemon=True
-        )
+        self._thread = self._scope.thread(self._loop, name="agentchat-activation")
         self._thread.start()
 
     def stop(self) -> None:
@@ -380,18 +457,17 @@ class ActivationWatcher:
             _shutdown_runtime(runtime, profile=self._profile)
 
     def _loop(self) -> None:
-        # A late activation builds the runtime from this thread: do it in the
-        # profile's own context, as register() did (multiplex: the launch
-        # profile's environment is not this profile's).
-        with profile_context(self._hermes_home):
-            while not self._stop.wait(self.next_delay()):
-                try:
-                    if self.try_activate() in ("active", "closed"):
-                        return
-                except Exception:
-                    # The watcher must outlive any surprise; log and keep going.
-                    logger.exception("agentchat plugin: activation attempt raised")
-                    self._failures += 1
+        # A late activation builds the runtime from this thread, each attempt
+        # in the profile's scope as register() did (freshly bound secrets on a
+        # multiplexed gateway: the launch profile's are not this profile's).
+        while not self._stop.wait(self.next_delay()):
+            try:
+                if self.attempt() in ("active", "closed"):
+                    return
+            except Exception:
+                # The watcher must outlive any surprise; log and keep going.
+                logger.exception("agentchat plugin: activation attempt raised")
+                self._failures += 1
 
 
 def _close_on_unload(ctx: Any, watcher: ActivationWatcher) -> None:
@@ -482,7 +558,11 @@ def host_llm_accessor(ctx: Any) -> Callable[[], Any] | None:
 
 
 def _try_start_runtime(
-    config: Any, *, gateway_mode: bool, host_llm: Callable[[], Any] | None = None
+    config: Any,
+    *,
+    gateway_mode: bool,
+    host_llm: Callable[[], Any] | None = None,
+    scope: ProfileScope | None = None,
 ) -> Any:
     """Construct + start the runtime. Returns the runtime or ``None`` on failure.
 
@@ -500,7 +580,7 @@ def _try_start_runtime(
     try:
         from .runtime import get_runtime
 
-        runtime = get_runtime(config, gateway_mode=gateway_mode, host_llm=host_llm)
+        runtime = get_runtime(config, gateway_mode=gateway_mode, host_llm=host_llm, scope=scope)
         runtime.start()
     except Exception as exc:
         from pathlib import Path as _Path
@@ -667,64 +747,161 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
         logger.warning("agentchat plugin: SOUL.md identity line not followed for profile=%s — %s", label, result.detail)
 
 
+def _split_identity(config: Any) -> str | None:
+    """Why the socket and the hosted tools would act as two agents, or ``None``.
+
+    With a key file the key source hands Hermes' MCP client the key file's key.
+    When the source is not on (``secrets.agentchat`` missing and not placeable,
+    disabled, or this Hermes has no secret sources), the client takes
+    ``AGENTCHAT_API_KEY`` from the profile's settings instead: a different key
+    there is another agent (:func:`.credentials.tools_key_conflict`, the line
+    ``doctor`` shows too). The block is placed first when it is missing, as
+    every activation does; a block this activation places is used by the
+    hosted tools after Hermes applies secret sources again — the re-pull right
+    after plugin discovery when it is placed while the gateway loads plugins,
+    else the next gateway restart. A ``config.yaml`` Hermes cannot read is a
+    refusal with its error (said once), never an exception out of
+    ``register()``.
+    """
+    if getattr(config, "api_key_source", KEY_SOURCE_STORE) != KEY_SOURCE_STORE:
+        return None
+    home = getattr(config, "hermes_home", None)
+    api_key = getattr(config, "api_key", None)
+    if home is None or not isinstance(api_key, str):
+        return None
+    from .credentials import key_bridge, tools_key_conflict
+
+    ready, _why = key_bridge()
+    if ready:
+        return None
+    return tools_key_conflict(home, api_key)
+
+
+def _adopt_legacy_key(config: Any) -> Literal["go", "copy", "retry"]:
+    """A key found only under the pre-v3 name: verify it with the server, then
+    copy it into the key file (:func:`.credentials.adopt_legacy_key`), before
+    the runtime starts. Never writes ``.env`` (``doctor --fix`` removes the old
+    line).
+
+    * The server must accept the key (``GET /v1/agents/me``, the wizard's
+      check): a revoked key is never saved. Unreachable or refused:
+      ``"retry"`` (the runtime would fail the same way).
+    * A named profile adopts only if it was set up as an agent before this
+      activation (:func:`.config.was_set_up_as_agent`): a ``.env`` that
+      ``hermes profile create`` copied must not take the default profile's
+      agent before the default profile starts. Said; ``"go"`` (it runs, and
+      its next start, set up by this one, adopts).
+    * ``"copy"``: another profile's key file holds the key — this profile is
+      that agent's copy and must not start. ``"retry"`` also when another
+      profile is adopting the same key right now. ``"go"``: adopted, or not
+      adopted for a reason that is said; the activation goes on, as before 0.7
+      (the hosted tools then lack the key).
+    """
+    from . import signup
+    from .config import cli_prefix, was_set_up_as_agent
+    from .credentials import adopt_legacy_key
+    from .profile_scope import hermes_root_of
+
+    home = getattr(config, "hermes_home", None)
+    api_key = getattr(config, "api_key", None)
+    if home is None or not isinstance(api_key, str):
+        return "go"
+    cmd = cli_prefix(home)
+    api_base = getattr(config, "api_base", "")
+    from .key_store import same_home
+
+    if not same_home(home, hermes_root_of(home)) and not was_set_up_as_agent(home):
+        logger.warning(
+            "agentchat plugin: only the pre-v3 name %s is set in profile %s, which was not set up as "
+            "an AgentChat agent before — the key is not copied into its key file now (a .env that "
+            "`hermes profile create` copied would take another profile's agent); the hosted tools "
+            "cannot authenticate until `%s doctor --fix` moves it, or this profile's next start does",
+            ENV_API_KEY_LEGACY,
+            profile_label(home),
+            cmd,
+        )
+        return "go"
+    try:
+        checked = signup.check_key(api_key, api_base=api_base)
+    except Exception as exc:
+        logger.info(
+            "agentchat plugin: the pre-v3 key could not be checked with AgentChat (%s) — tried again "
+            "shortly",
+            exc,
+        )
+        return "retry"
+    if not checked.ok:
+        logger.warning(
+            "agentchat plugin: AgentChat does not accept the key under the pre-v3 name %s (%s) — it is "
+            "not saved; run `%s login` with a current key",
+            ENV_API_KEY_LEGACY,
+            checked.message or checked.code,
+            cmd,
+        )
+        return "retry"
+    outcome = adopt_legacy_key(
+        home=home,
+        api_key=api_key,
+        api_base=api_base,
+        handle=checked.handle or "",
+        lock_dir=getattr(config, "lock_dir", None),
+    )
+    if outcome.status == "copy":
+        return "copy"
+    if outcome.status == "busy":
+        logger.info(
+            "agentchat plugin: another profile is saving the same pre-v3 key right now — "
+            "trying again shortly"
+        )
+        return "retry"
+    if outcome.status == "adopted":
+        logger.info(
+            "agentchat plugin: %s was the only key name set — the key is now also in %s, which the "
+            "hosted tools read (restart the gateway if they still report an unset variable); "
+            "`%s doctor --fix` removes the old line from the profile .env",
+            ENV_API_KEY_LEGACY,
+            outcome.path,
+            cmd,
+        )
+    elif outcome.status == "unsupported":
+        logger.warning(
+            "agentchat plugin: only the pre-v3 name %s is set and %s, so the hosted tools cannot "
+            "authenticate — run `%s login`",
+            ENV_API_KEY_LEGACY,
+            outcome.detail,
+            cmd,
+        )
+    else:
+        logger.warning(
+            "agentchat plugin: only the pre-v3 name %s is set, and the key was not copied into the "
+            "key file (%s) — the hosted tools cannot authenticate until it is; `%s doctor --fix` "
+            "moves it",
+            ENV_API_KEY_LEGACY,
+            outcome.detail,
+            cmd,
+        )
+    return "go"
+
+
 def _reconcile_key_store(config: Any) -> None:
     """Keep this profile's key file in shape at activation. Never writes ``.env``.
 
-    * A profile set up before v3 has only ``AGENTCHATME_API_KEY`` (in its
-      ``.env``): the hosted tools authenticate with ``AGENTCHAT_API_KEY``, so
-      the key is copied into the key file, which the key source hands to
-      Hermes as that name. (Until 0.5.3 this mirrored the key into ``.env``.)
-      The ``.env`` line is left for ``hermes agentchat doctor --fix``.
     * A key file moved here (profile renamed, home restored elsewhere) gets
       this profile recorded in it.
     * A key file the group or others can read is made ``0600``.
 
-    Non-fatal: failures are logged with the fix.
+    (A key found only under the pre-v3 name is copied into the key file once
+    the runtime has verified it: :func:`_adopt_legacy_key`.) Non-fatal:
+    failures are logged with the fix.
     """
     from . import key_store
     from .config import cli_prefix
 
     home = getattr(config, "hermes_home", None)
-    api_key = getattr(config, "api_key", None)
-    if home is None or not isinstance(api_key, str):
+    if home is None or getattr(config, "api_key_source", KEY_SOURCE_STORE) != KEY_SOURCE_STORE:
         return
-    source = getattr(config, "api_key_source", KEY_SOURCE_STORE)
-    api_base = getattr(config, "api_base", "")
     cmd = cli_prefix(home)
     try:
-        if source == ENV_API_KEY_LEGACY:
-            from .key_source import source_supported
-
-            if getattr(config, "key_notes", ()):
-                # Another profile holds this key too: copying it into this
-                # profile's key file would make this one the agent. Said, not done.
-                logger.warning(
-                    "agentchat plugin: only the pre-v3 name %s is set, and another profile holds the "
-                    "same key — not copied into this profile's key file; see `%s doctor`",
-                    ENV_API_KEY_LEGACY,
-                    cmd,
-                )
-                return
-            if not source_supported():
-                logger.warning(
-                    "agentchat plugin: only the pre-v3 name %s is set and this Hermes has no "
-                    "secret sources, so the hosted tools cannot authenticate — run `%s login`",
-                    ENV_API_KEY_LEGACY,
-                    cmd,
-                )
-                return
-            path = key_store.write_store(home, api_key=api_key, handle="", api_base=api_base)
-            logger.info(
-                "agentchat plugin: %s was the only key name set — the key is now also in %s, "
-                "which the hosted tools read (restart the gateway if they still report an unset "
-                "variable); `%s doctor --fix` removes the old line from the profile .env",
-                ENV_API_KEY_LEGACY,
-                path,
-                cmd,
-            )
-            return
-        if source != KEY_SOURCE_STORE:
-            return
         read = key_store.read_store(home)
         if read.status == "moved" and read.key is not None:
             path = key_store.write_store(
@@ -813,7 +990,8 @@ def _reconcile_mcp_registration(runtime: Any) -> None:
     label = profile_label(home)
     if read_switch(home, api_base=api_base).state == "applying":
         if keeps_placements_current(runtime):
-            start_completion(home, api_base=api_base)
+            # This attempt runs in the profile's scope: the thread gets a copy of it.
+            start_completion(ProfileScope.capture(home), api_base=api_base)
             logger.info("agentchat plugin: applying the allowed AgentChat tools for profile=%s", label)
         elif not gateway_lives(home, api_base=api_base):
             complete_pending(home, api_base=api_base, wait=False)
@@ -824,7 +1002,14 @@ def _reconcile_mcp_registration(runtime: Any) -> None:
     except McpRegistrationError:
         entry = None
     if entry is not None:
-        decision = first_placement(home, entry=entry, legacy_key_set=legacy_key_set())
+        # Only a profile the pre-0.3 key was adopted for at this activation
+        # (verified with the server, then copied into the key file before the
+        # runtime started: _adopt_legacy_key) — never a profile that only holds
+        # a copied .env line.
+        from .key_store import read_store
+
+        adopted = read_store(home).usable
+        decision = first_placement(home, entry=entry, legacy_key_set=adopted and legacy_key_set())
     step = place_mcp(api_base, decision=decision)
     if step.failed:
         logger.warning("agentchat plugin: hosted tools not registered for profile=%s — %s", label, step.detail)

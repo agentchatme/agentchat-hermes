@@ -83,6 +83,8 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
 
+    from .profile_scope import ProfileScope
+
 logger = logging.getLogger(__name__)
 
 COMMAND = "agentchat"
@@ -401,12 +403,18 @@ def decide_for(handle: str | None) -> SetupDecision:
     """:func:`decide` for this process: the profile, its API base, the
     profile's command and whether stdin is a terminal. The CLI, the wizard and
     ``doctor --fix`` ask through this."""
-    from .cli import _api_base  # the CLI's resolver, until there is one for every caller
     from .config import cli_prefix
     from .profile_scope import resolve_hermes_home
 
     home = resolve_hermes_home()
-    return decide(handle, api_base=_api_base(), tty=stdin_is_tty(), home=home, cmd=cli_prefix(home))
+    return decide(handle, api_base=_api_base(home), tty=stdin_is_tty(), home=home, cmd=cli_prefix(home))
+
+
+def _api_base(home: Path) -> str:
+    """This profile's API base (:func:`.config.resolve_api_base`, the one resolver)."""
+    from .config import resolve_api_base, stored_api_base
+
+    return resolve_api_base(stored_api_base(home), strict=False)
 
 
 # ─── the record, the one-time carry-over, a pending yes ────────────────────
@@ -591,11 +599,11 @@ def complete_pending(home: Path, *, api_base: str, wait: bool, stop: threading.E
     return True
 
 
-def start_completion(home: Path, *, api_base: str) -> threading.Thread | None:
+def start_completion(scope: ProfileScope, *, api_base: str) -> threading.Thread | None:
     """In the gateway: finish a pending yes on a daemon thread, once
-    (:func:`complete_pending` with ``wait``). ``None`` when one already runs."""
-    from .profile_scope import profile_context
-
+    (:func:`complete_pending` with ``wait``, in the profile's scope). ``None``
+    when one already runs."""
+    home = scope.home
     key = str(home)
     with _completions_lock:
         running = _completions.get(key)
@@ -604,12 +612,11 @@ def start_completion(home: Path, *, api_base: str) -> threading.Thread | None:
 
         def run() -> None:
             try:
-                with profile_context(home):
-                    complete_pending(home, api_base=api_base, wait=True)
+                scope.run(complete_pending, home, api_base=api_base, wait=True)
             except Exception:
                 logger.exception("agentchat plugin: applying the allowed AgentChat tools raised")
 
-        thread = threading.Thread(target=run, name="agentchat-tools-apply", daemon=True)
+        thread = scope.thread(run, name="agentchat-tools-apply")
         _completions[key] = thread
         thread.start()
         return thread
@@ -620,10 +627,10 @@ def start_completion(home: Path, *, api_base: str) -> threading.Thread | None:
 _CHOICES = [{"value": "allow", "label": "Allow"}, {"value": "no", "label": "Don't allow"}]
 
 
-def register_allow_command(ctx: Any, home: Path) -> None:
-    """Register ``/agentchat`` (``/agentchat allow``) for this profile. A Hermes
-    without ``ctx.register_command`` gets none (``hermes agentchat allow``
-    still works). Never raises."""
+def register_allow_command(ctx: Any, scope: ProfileScope) -> None:
+    """Register ``/agentchat`` (``/agentchat allow``) for this profile (its
+    scope, captured in ``register``). A Hermes without ``ctx.register_command``
+    gets none (``hermes agentchat allow`` still works). Never raises."""
     register = getattr(ctx, "register_command", None)
     if not callable(register):
         logger.debug("agentchat plugin: this Hermes has no ctx.register_command")
@@ -631,7 +638,7 @@ def register_allow_command(ctx: Any, home: Path) -> None:
 
     def agentchat(raw_args: str = "", *, session_id: str = "") -> str:
         return run_command(
-            raw_args, home=home, ask_choice=getattr(ctx, "ask_choice", None), session_id=session_id
+            raw_args, scope=scope, ask_choice=getattr(ctx, "ask_choice", None), session_id=session_id
         )
 
     try:
@@ -645,26 +652,28 @@ def register_allow_command(ctx: Any, home: Path) -> None:
         logger.warning("agentchat plugin: /agentchat could not be registered", exc_info=True)
 
 
-def run_command(raw_args: str, *, home: Path, ask_choice: Any, session_id: str = "") -> str:
-    """``/agentchat [allow]``: its reply. ``allow`` asks the person who sent it
-    (Hermes' own prompt, ``ctx.ask_choice``); nothing else changes anything."""
-    from .profile_scope import profile_context
+def run_command(raw_args: str, *, scope: ProfileScope, ask_choice: Any, session_id: str = "") -> str:
+    """``/agentchat [allow]``: its reply, worked out in the profile's scope.
+    ``allow`` asks the person who sent it (Hermes' own prompt,
+    ``ctx.ask_choice``); nothing else changes anything."""
+    from .profile_scope import ProfileScopeError
 
     try:
-        with profile_context(home):
-            return _run_command(raw_args, home=home, ask_choice=ask_choice, session_id=session_id)
+        return scope.run(_run_command, raw_args, scope=scope, ask_choice=ask_choice, session_id=session_id)
+    except ProfileScopeError as exc:
+        return f"AgentChat: this profile's scope could not be entered ({exc}). hermes agentchat doctor says more."
     except Exception as exc:
         logger.warning("agentchat plugin: /agentchat failed", exc_info=True)
         return f"AgentChat: the command failed ({exc}). hermes agentchat doctor says more."
 
 
-def _run_command(raw_args: str, *, home: Path, ask_choice: Any, session_id: str) -> str:
-    from .cli import _api_base  # the CLI's resolver, until there is one for every caller
+def _run_command(raw_args: str, *, scope: ProfileScope, ask_choice: Any, session_id: str) -> str:
     from .config import cli_prefix, resolve_key
     from .leader_lock import is_hermes_gateway_process
     from .placement import place_mcp, profile_identity
 
-    api_base = _api_base()
+    home = scope.home
+    api_base = _api_base(home)
     cmd = cli_prefix(home)
     resolution = resolve_key(home)
     if resolution.refusal is not None:
@@ -690,7 +699,7 @@ def _run_command(raw_args: str, *, home: Path, ask_choice: Any, session_id: str)
         return f"AgentChat tools are already allowed for {agent}."
     if switch.state == "applying":
         if in_gateway:
-            start_completion(home, api_base=api_base)
+            start_completion(scope, api_base=api_base)
         return f"AgentChat tools for {agent}: {describe(switch, handle, cmd=cmd)}."
     if switch.allowance is not None and switch.allowance.entry == "user_managed":
         return HAND_MANAGED_LINE
@@ -711,7 +720,7 @@ def _run_command(raw_args: str, *, home: Path, ask_choice: Any, session_id: str)
         return NOT_ALLOWED_LINE.format(who=agent)
     if step.outcome == "applying":
         if in_gateway:
-            start_completion(home, api_base=api_base)
+            start_completion(scope, api_base=api_base)
         return f"AgentChat tools allowed for {agent}; {APPLY_WORDS}."
     if step.outcome == "allowed":
         return f"AgentChat tools allowed for {agent}. This chat uses them after /reload-mcp."

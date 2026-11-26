@@ -21,7 +21,11 @@ Two safety nets cover the internals:
 Checked against hermes-agent v0.23.1 (3b42157) and `main` of 2026-11-11 (60f8163). No row is gone and every
 signature, keyword and result key the plugin uses is unchanged; `PluginContext` moved to
 `hermes_cli/plugins_context.py` (still importable from `hermes_cli.plugins`). None of the upstream asks below is
-met yet.
+met yet. The profile-scope, key and hosted-tools rows were re-checked against v0.23.4 and `main` of 2026-11-26
+(c8f866c48f), where `agent/secret_scope.py`, `hermes_scope.py`, `agent/runtime_scope.py` and
+`tui_gateway/launch_profile_policy.py` are the same; since 0.7 the plugin reads no `.env` file and imports none of
+`gateway.run`, `gateway.run_turn`, `hermes_cli.env_loader`, `tools.terminal_scope`, `tui_gateway.*` or
+`tools.mcp_tool_loop`.
 
 ## Loading and the plugin context — public
 
@@ -35,7 +39,7 @@ met yet.
 | `tools.skills_tool.find_all_skills` / `skill_search_dirs` / `locate_skill` (**public**, v0.22.5 and later) | `cli.py` (`doctor`) | Finds an `agentchat` skill in Hermes' own skill folders (a copy of the manual someone installed): reported, never removed. |
 | `ctx.llm.acomplete(...)` / `ctx.llm.complete(...)` | `model_call.py` | The gate call: one tool-less completion on the profile's main model (or a fallback the user declared). `acomplete` runs on one private event loop (its own thread, for the runtime's lifetime — Hermes binds its async client to a loop, so the client and its connection are reused) and is cancelled when the kit stops waiting (gate-call deadline, abandoned cycle): the request itself ends. An adapter whose async call is `asyncio.to_thread` over a sync one (the plugin-host child's `ctx.llm`, some auxiliary adapters) only stops being waited for; its worker thread runs until the provider timeout. `complete` (cannot be interrupted) where there is no `acomplete` or no cancel handle. Where `ctx.llm` exists, it replaces the rows marked *gate fallback* below. It resolves the profile from the calling thread's context, so the plugin still enters the profile's scope around it; **upstream ask:** bind `ctx.llm` to the profile whose manager created the `ctx`. |
 | `ctx.on_unload(callback)` | `_register.py` | A plugin reload, disable or remove in a running process: the runtime is stopped (socket, wake worker, timers) and dropped from the registry; the leader lock is released once no turn is left (none running, none whose outcome is still being recorded) and the receive loop's thread has exited, so the reloaded code takes the socket and the lock then, never a second turn for a conversation the old one may still answer. |
-| `agent.secret_scope.get_secret` (**public**) | `profile_scope.py` | Reading `AGENTCHAT_API_KEY` and the `AGENTCHATME_*` settings for the right profile. The plugin guide names this as the way plugins read secrets. |
+| `agent.secret_scope.get_secret` (**public**) | `profile_scope.resolve_setting` | Reading `AGENTCHAT_API_KEY` and the `AGENTCHATME_*` settings for the right profile, in the scope the caller runs in. The plugin guide names this as the way plugins read secrets. |
 | Top-level `__init__.py` shim | repo root | Hermes' directory (git clone) install path. |
 
 ## Process role — internal
@@ -45,23 +49,67 @@ met yet.
 | argv `hermes gateway run` (and the `_HERMES_GATEWAY=1` env marker, logged only) | `leader_lock.is_hermes_gateway_process` | Only the long-lived gateway may hold the socket. argv is the only signal: every child the gateway starts inherits the marker, so a process with the marker alone is a follower (logged at DEBUG). No signal at `register()` time says what kind of process this is. Under the opt-in `plugins.isolation: host`, third-party plugins run only in a host child (`python -m hermes_cli.plugin_host_child`), which is never the gateway: nothing holds the socket and the agent is never woken (the default is `in_process`). | **Upstream ask:** `ctx.process_role` (`"gateway"`, `"cli"`, `"tui"`, …) or gateway start/stop lifecycle hooks. |
 | `gateway.status.get_running_pid(<default home>/gateway.pid, cleanup_stale=False)` | `placement.default_gateway_pid` (logout's note), `cli._gateway_running` (unscoped, `doctor`) | Whether the gateway that holds a named profile's socket is the default profile's (a multiplexing gateway): then only `hermes gateway restart` frees it — `hermes -p <name> gateway restart` reconnects Hermes' adapters there, not this plugin's socket. Read-only. | Upstream ask: a served-profile restart that stops plugin runtimes too. |
 
-## Profile scope (multiplexed gateways)
+## Profile scope (multiplexed gateways) — public names only
 
-One gateway can serve several profiles. Hermes enters a profile's scope (home override, secret scope, terminal
-policy — all ContextVars) around that profile's own turns; a thread a plugin starts has none of it, so the
-plugin enters it itself: the receive loop's thread and the activation watcher for their lifetime, and every
-gate call and turn (the loop's callbacks) for its duration.
+One gateway can serve several profiles. Hermes binds a profile's scope (home override, secret scope, terminal
+policy — one ContextVar state, `hermes_scope.py`) around that profile's own turns; a thread a plugin starts has
+none of it. As the Nous review asked (the route documented in open core PR #126738), `register(ctx)` captures the
+context Hermes loaded the plugin in (`contextvars.copy_context()`, `profile_scope.ProfileScope.capture`), and every
+thread and cycle the plugin runs for the profile runs in a fresh copy of it (`ProfileScope.run` / `.thread`): the
+activation watcher and each of its attempts, the receive loop's thread, the gate call, the runtime check, the hold
+for the hosted tools, each turn and the thread that records a late turn's outcome, the leader-retry and
+lock-release threads, the follower's manual sync. The turn's own thread inherits the turn's scope
+(`profile_scope.context_thread`, the shape of `agent.memory_provider.spawn_context_thread`).
+
+On a multiplexed gateway each entry point (an activation attempt, a gate call, the runtime check, the hold, a
+turn) also binds the profile's secrets for its call, as the gateway rebinds per turn:
+`set_secret_scope({}, profile_home=<home>)` installs an empty mapping stamped with the home (with Hermes' runtime
+scope bound for the profile — a served profile loads inside one — it passes through `legacy_switch`), and
+`refresh_installed_secret_scope(<home>)` fills it in place with the mapping Hermes builds for that profile's own
+turns (`owner_secret_scope`: the launch profile's environment frozen at activation under its `.env` and sources —
+keys set only by systemd `Environment=` / `op run` / `docker -e` are kept — and any other profile's own `.env` and
+sources only). A single-profile process binds nothing: `get_secret` reads the process environment, which is the
+profile's own (Hermes' own standalone turns bind nothing either, `GatewayTurnMixin._standalone_launch_scope`).
+A bind that fails runs nothing: the entry point raises `ProfileScopeError` (the activation is retried, a turn is
+not started, the runtime check and the hold say "profile scope unavailable"), logged once. The `hermes agentchat`
+CLI never multiplexes; a setting read outside any scope on a multiplexed gateway is a typed failure, never a read
+of another source.
 
 | Surface | Where | Why | Public replacement |
 |---|---|---|---|
-| `hermes_constants.get_hermes_home` (**public**) | `profile_scope.resolve_hermes_home`, `soul_anchor.py` | The profile's home: SOUL.md, `config.yaml`, `.env`, lock root. | Upstream ask: `ctx.profile_home` (`ctx.profile_name` exists, the path does not). |
-| `hermes_constants.set/reset_hermes_home_override` (**public**) | `profile_scope.profile_context` | The plugin's own threads see the profile's home, tool registry overlay and config. | **Upstream ask:** `ctx.profile_scope()`. (`ctx.spawn_task` carries a scope only for asyncio tasks on a running loop.) |
-| `hermes_constants.hermes_home_key` (**public**) | `profile_scope.hermes_home_key` | Our runtime registry keys profiles the way Hermes' plugin managers do. | Part of the same ask. |
-| `gateway.run._profile_runtime_scope(home)` (private) | `profile_scope.profile_turn_scope` | Each cycle (tray, gate call, turn) runs with the profile's own credentials and terminal policy, as the gateway's own turns do. | **Upstream ask:** `ctx.profile_scope()`. |
-| `agent.secret_scope.set/reset_secret_scope` (**public**), `hermes_cli.env_loader.hydrate_profile_secret_sources`, `tools.terminal_scope.install_and_reset_profile_terminal_scope`, `tui_gateway.launch_profile_policy.owner_secret_scope` | `profile_scope._replicated_profile_scope` | Fallback when `_profile_runtime_scope` is not importable: the same pieces, all or nothing. | Same ask; deleted when it exists. |
-| `gateway.run_turn.GatewayTurnMixin._standalone_launch_scope` (private) | `profile_scope.profile_turn_scope` | The scope a single-profile gateway enters for its own turns. | Same ask. |
-| `agent.secret_scope.is_multiplex_active` (**public**) | `profile_scope._multiplexing` | Chooses between the two scopes above. | Same ask. |
-| `agent.secret_scope.UnscopedSecretError` (**public**) + reading the profile's `.env` directly | `profile_scope.resolve_setting` | Plugin discovery can run before any scope is bound under multiplex; the plugin then reads its own key from the profile's `.env`. The plugin guide says plugins must not read `.env` themselves. | Upstream ask: `get_secret` bound to the registering profile during `register()`. |
+| `hermes_constants.get_hermes_home` (**public**) | `profile_scope.resolve_hermes_home`, `soul_anchor.py` | The profile's home: SOUL.md, `config.yaml`, the key file, lock root. | Upstream ask: `ctx.profile_home` (`ctx.profile_name` exists, the path does not). |
+| `contextvars.copy_context()` in `register()` (stdlib) | `profile_scope.ProfileScope` | The profile's home override and, for a served profile, Hermes' runtime scope and terminal policy as bound when it loaded the plugin, for every plugin thread. | **Upstream ask:** `ctx.profile_scope()` / `ctx.run_in_profile(fn)`: the profile's full scope (secrets and terminal policy included) for plugin work, so a plugin binds nothing itself. |
+| `agent.secret_scope.is_multiplex_active` / `set_secret_scope` / `refresh_installed_secret_scope` / `reset_secret_scope` (**public**) | `ProfileScope._bind_secrets` | The profile's secrets for each entry point's call on a multiplexed gateway. `refresh_installed_secret_scope` builds through `owner_secret_scope` from v0.23.2; before (v0.23.1 and older) it rebuilt from the profile's files only, which drops the launch profile's environment-only keys. That is warned, not refused: one WARNING per process and a `doctor` line from the running gateway's health record (`worker.scope`). Hermes exposes no release number to a plugin (its distribution reports `0.0.0`; `hermes --version` reads the private `hermes_cli.version_info`), so `profile_scope.refresh_keeps_launch_env` asks the public function itself, in an empty context, whether it refills a scope stamped for another (nonexistent) home — its documented contract since 0.23.2 is that it does not. Contract-tested on a real two-profile multiplexed gateway (including a launch profile loaded before the gateway multiplexes), and mutation-checked: no bind fails it, a files-only bind loses the launch profile's environment-only key. | Same ask. |
+| `hermes_constants.hermes_home_key` (**public**) | `profile_scope.hermes_home_key`, `config.copy_of` | Our registries key profiles the way Hermes' plugin managers do. | Part of the same ask. |
+| `agent.secret_scope.get_secret` / `UnscopedSecretError` (**public**) | `profile_scope.resolve_setting` | Every setting, in the scope the caller runs in. An unscoped read under multiplex is a `ProfileScopeError` (no fallback reader). | — |
+
+Known limits (said to Nous):
+
+- **The launch profile's terminal policy.** A served profile's captured context carries the terminal policy Hermes
+  bound when it loaded the plugin (a snapshot: a `terminal:` change applies after a restart). The launch profile
+  loads with only its home bound (the boot's discovery thread), so its turns' commands read `TERMINAL_*` from the
+  process environment, which the gateway filled from the launch profile's own config at start. There is no public
+  way to bind a profile's terminal policy.
+- **The loader's in-load flag.** The context captured in `register()` carries `hermes_cli.plugins_loader`'s
+  `_IN_PLUGIN_LOAD`, so `in_plugin_load_worker()` is true in our threads and a `discover_plugins()` from them does
+  not wait for a sweep still running (`hermes_cli/plugins.py` `discover_and_load`, `_join_background_discovery`):
+  the boot sweep, or a forced reload — `discover_plugins(force=True)` from `/reload-plugins`, a plugin enable
+  (`hermes_cli/plugins_activation.py`), the gateway's plugin rewire (`gateway/run_plugin_rewire.py:112`), the
+  dashboard — which first unloads every plugin (their tools and hooks unregistered) and then loads them again. A
+  turn of ours that builds its agent during either can find the registry without the tools of plugins not loaded
+  (back) yet. A forced reload unloads this plugin too (`ctx.on_unload` stops its runtime), so no new turn of ours
+  starts during one; a turn already running keeps the tool list its agent was built with. Our turns run after
+  the socket connects and the gate answers, well after the boot sweep;
+  `test_a_plugin_loaded_after_ours_is_visible_from_our_scope` checks that a plugin loaded after ours is visible
+  from our scope once the sweep is done. With `plugins.load_timeout_seconds: 0` (inline loads) there is no flag.
+- **Source hydration.** The bind uses the external-source snapshot Hermes made for the profile
+  (`get_secret_source_values`); the plugin triggers no hydration itself. The gateway hydrates every served
+  profile at boot (its MCP discovery) and per turn.
+- **A hosted (Hermes Cloud) scope** refuses the bind (`ScopeSwitchRefused`): every entry point fails closed there.
+- **`plugins.isolation: host`.** The plugin runs in a host child process started with only that profile's
+  environment, which never multiplexes: nothing is bound and `get_secret` reads that environment, the profile's
+  own. The key source works (Hermes proxies `fetch`); there is no socket and no `hermes agentchat` command there
+  (see *Process role*).
 
 ## Turns (`run_agent`, the `AIAgent` import, is not on the public list)
 
@@ -83,8 +131,8 @@ A turn (one per `reply` card or pending invite, one at a time, started by the ki
 | Surface | Where | Why | Public replacement |
 |---|---|---|---|
 | `tools.registry.registry.get_tool_names_for_toolset("mcp-agentchat")` / `get_all_tool_names()` (**public**) | `hosted_tools.hosted_tool_names` | The loop's readiness check: no turn starts (bounded wait) until Hermes has registered the hosted tools; a turn without them cannot look. The kit's `probe_hosted_tools` asks the server, not Hermes, so it cannot answer this. | Upstream ask: an MCP-server-ready signal (hook or `ctx` query). |
-| `tools.mcp_tool_discovery.get_mcp_status()` (rows with `name`, `status`, `error`, `tools`, `needs_auth`) | `hosted_tools.hosted_server_state`, the health record's `worker.hosted_tools`, `doctor` | Hermes' own reading of `mcp_servers.agentchat` in this profile (what `hermes mcp list` shows): `failed` covers a server Hermes parked after its first connects failed. The tools_unavailable log line and `doctor` name that cause. Reads cached state, never connects. | Same ask: an MCP-server-ready signal with its state. |
-| `tools.mcp_tool_loop.reconnect_mcp_server(server_name)` | `hosted_tools.request_reconnect` (when the runtime activates, and when a turn is held for the tools) | A parked server waits for a reconnect request or its timed self-probe (300 s, doubling per failed probe to an hour on v0.23.3 and `main`); nothing in Hermes asks when the network returns. This is the request Hermes' own connectors make after a re-authorization; asked only for a `failed` server (a reconnect tears a live session down), once a minute at most per profile, doubling while it stays parked, capped at 30 min. Contract-tested against a real park: three refused connects, then the request brings the tools back. | Upstream ask: reconnect parked MCP servers when the network returns, or a public `ctx` reconnect. |
+| `tools.mcp_tool_discovery.get_mcp_status()` (rows with `name`, `status`, `error`, `tools`, `needs_auth`; private, diagnostics only) | `hosted_tools.hosted_server_state`, the health record's `worker.hosted_tools`, `doctor` | Hermes' own reading of `mcp_servers.agentchat` in this profile (what `hermes mcp list` shows): `failed` covers a server Hermes parked after its first connects failed. The tools_unavailable log line and `doctor` name that cause. Read only: cached state, never connects, changes nothing. | Same ask: an MCP-server-ready signal with its state. |
+| A parked server (`failed` in `get_mcp_status`): Hermes' own self-probe after 300 s, doubling to an hour (`tools.mcp_tool._PARKED_RETRY_INTERVAL` / `_PARKED_PROBE_BACKOFF_MAX`); `/reload-mcp` (`hermes_cli.commands`, a gateway chat command) | `hosted_tools.PARKED_REMEDY`, the tools_unavailable log line, `doctor` | Hermes has no public reconnect for a plugin, so the plugin asks for none (it used `tools.mcp_tool_loop.reconnect_mcp_server` until 0.6.5): it holds the turn, and says the cause and the remedy — `/reload-mcp` in a chat this gateway serves, or `hermes gateway restart`. Regression accepted: a gateway started offline gets its hosted tools back at Hermes' next probe (5 minutes, longer while the network stays down, up to an hour), not when the plugin's socket reconnects. Contract-tested: a real park is read, held and named; the probe constants and the command are pinned. | **Upstream ask:** reconnect parked MCP servers when the network returns, or a public `ctx` reconnect. |
 | Naming `mcp__<server>__<tool>` (`tools.mcp_tool_schema.MCP_TOOL_NAME_PREFIX`), toolset `mcp-<server>` | `turn.py`, `hosted_tools.py` | Tool names in prompts are spelled the way Hermes names them. Under tool search (the next row) the model sees them in the `tool_search` listing and passes them as the `name` inside `tool_call`. Shared with Claude Code, Codex, OpenCode. | A convention, not an import; the served texts can be spelled per runtime. |
 | Tool search: `tools.tool_search.enabled: auto` (the default since at least v0.22.5) defers every MCP tool, the hosted AgentChat tools included, behind `tool_search` / `tool_describe` / `tool_call` (`tools/tool_search.py`) | `turn_runner.count_agentchat_calls` | The model calls `tool_call` with `{"calls": [{"name": "mcp__agentchat__…", "arguments": …}]}`. Hermes unwraps the call, so its result message carries the real tool name and is counted. A `tool_call` naming several of them is refused before anything runs (only `connectors__…` tools batch). Two refusals reach no AgentChat tool yet count differently: a bridged call Hermes refuses before dispatch (its schema probe or scope block) keeps the wrapper name `tool_call` and is not counted, while on v0.23.1 a call by a deferred tool's real name is refused ("Tool '…' does not exist") under the real name and is counted as failed; `main` reroutes that call through the bridge (`agent/turn_tool_validation.py`). So on v0.23.1 a model that tries the real name first and then succeeds through `tool_call` never has "every call succeeded", and a second silent look is deferred, not dismissed (an extra re-wake, never a wrong read). Also not counted: a bridged call cut off by the interrupt gets a stub named `tool_call` (the turn was interrupted, so nothing is recorded unless the answer went out). Not checked by the contract test yet. | Same ask as the turn rows: per-tool-call outcomes in the run's result. |
 | `hermes_cli.config.read_user_config_raw` (or `read_raw_config`) / `save_config` / `is_managed` (**public**) | `mcp_registration.py` | Reads, changes and saves `config.yaml` as written (the switch reads `mcp_servers.agentchat.trust`, `approvals.mode` and `command_allowlist` from the same read): `load_config` expands `${AGENTCHAT_API_KEY}` from the `.env` a running Hermes has loaded, so read through it the plugin's own entry would carry a literal key and look hand-written. A managed install (`is_managed`) is not written. Writes `mcp_servers.agentchat` (with `${AGENTCHAT_API_KEY}` kept as a template, and the static `X-AgentChat-Client: hermes` header that tells the hosted tools this is Hermes) into the profile's `config.yaml`, and adds that header once to an entry an earlier release placed. `save_config` keeps comments, key order and quotes (a ruamel round trip, `utils.atomic_roundtrip_yaml_save`). Hermes sends configured headers on every request (`tools/mcp_tool_transport.py` `_http_endpoint`) and uses a changed entry once it reconnects: `/reload-mcp`, a gateway restart, or a reconnect (`_refresh_remote_config`). | `mcp.json` in a portable `plugin.json` package; Hermes (still on v0.23.1 and `main`) does not read it for native plugins. Upstream ask: native plugins declaring MCP servers in `plugin.yaml`. |
@@ -147,15 +195,56 @@ against hermes-agent v0.23.2 and `main` of 2026-11-18.
 | `ctx.register_secret_source`, `agent.secret_sources.base.SecretSource` / `FetchResult` / `ErrorKind` / `SECRET_SOURCE_API_VERSION` (**public**) | `key_source.py`, `_register.register` | The `agentchat` secret source supplies `AGENTCHAT_API_KEY` from the profile's key file to Hermes' MCP client (the hosted tools' bearer), per profile home; Hermes re-pulls plugin sources after discovery (`website/docs/developer-guide/secret-source-plugin.md`). Under `plugins.isolation: host` the host child serves it (`HOST_OBJECT_BASES`). | This is the public hook. |
 | `secrets.agentchat` in `config.yaml` (`enabled: true`, `api_key_env: AGENTCHAT_API_KEY`), through `read_user_config_raw` / `save_config` / `is_managed` (**public**) | `secrets_registration.py` | `enabled` turns the source on (Hermes' standard form). `api_key_env` is read by Hermes' child-environment policy (`tools/environments/local_env_policy.py` `_home_declared_key_env`, any `*_key_env` field outside `mcp_servers`; v0.23.2 and later) as naming a credential: stripped from terminal, background-process, script-runner and snapshot environments, refused by `env_passthrough`. `execute_code` already drops any `*KEY*` name. | **Upstream ask:** a declared credential name for standalone plugins (`requires_env` with `secret: true` honoured outside platform plugins, or `ctx.register_credential_env`). |
 | `tools.environments.local_env_policy._is_provider_env_blocklisted` (private) | `cli._hermes_strips_key_from_commands` (doctor) | `doctor` asks Hermes' own policy whether `AGENTCHAT_API_KEY` is stripped, instead of assuming it. A Hermes without it: "could not check". | Same ask. |
-| `agent.secret_scope.secret_source_label` (**public**) | `key_source.supplied_by_us` | Tells the plugin's own earlier write of the variable (Hermes' provenance) from a key someone exported. | — |
-| `hermes_constants.get_process_hermes_home` (**public**) | `config._is_process_home` | An exported variable belongs to the process's own profile; a profile a multiplexed gateway serves for another home is not judged by it. | — |
-| `hermes_cli.config.remove_env_value` / `get_env_path` (**public**) | `credentials.remove_env_key_lines` | Moving the key out of `.env` removes the line with Hermes' own writer (its lock and cache); outside Hermes, or for another profile's file, `credentials.remove_env_lines` drops only that line. | — |
+| `hermes_cli.config.remove_env_value` / `get_env_path` (**public**) | `credentials.remove_key_settings`, `move_env_key`, `clear_credentials` | The plugin never opens a `.env` file. Moving a pre-0.6 key into the key file (`doctor --fix`, `login`) and logout remove our names' lines with Hermes' own writer (its lock and cache), only for the profile the process runs for (`get_env_path()` in that home) and only from the CLI, never a gateway (`remove_env_value` also clears the variable from the process). Hermes loads the profile `.env` over the shell's exports (`hermes_cli/env_loader.py` `load_hermes_dotenv`), so the key a CLI process reads is the line when there is one: a removal that finds no line means the key came from the environment, and an `AGENTCHAT_API_KEY` move is undone then. Contract-tested. | — |
+| `hermes_cli.config.require_env_writable` (**public**) | `credentials._save_env_fallback` | The `.env` fallback for a key the server just issued asks Hermes' write lock first (a managed install refuses `save_env_value` without raising), instead of reading the file back. | — |
+
+**Which key, and one key is one agent.** With a key file the key file decides: the key source supplies its key over
+any `AGENTCHAT_API_KEY` set elsewhere, so a different value in `.env` or the environment is not used (0.6.5 refused
+such a profile; it now runs as the key file's agent, and `doctor` says the key file decides). Except when the source
+cannot carry it (`secrets.agentchat` disabled or not placeable, or no secret sources): then Hermes' MCP client takes
+`AGENTCHAT_API_KEY` from the settings, and a different key there would make the hosted tools another agent than the
+socket — nothing starts for the profile (`credentials.tools_key_conflict`, the same line `doctor` fails on;
+`doctor --fix` places the block). A block that an activation places is used by the hosted tools once Hermes applies
+secret sources again: right away when it is placed while the gateway loads plugins (Hermes re-pulls them after
+discovery), else at the next gateway restart. A `config.yaml` Hermes cannot read refuses activation with its error
+(said once), and `doctor` fails on it; `register()` never raises because of it. Without a key file, the key is the profile's setting as Hermes resolves it
+(`get_secret`), and is refused when it is certainly or likely another profile's:
+
+- another profile's **key file** holds it — found in each process (in `register()`, in the profile's scope) for the
+  key source, which then gives the copy's hosted tools an empty key (`fetch` reads only our key files and that finding);
+- a **named** profile that was never set up as an agent (no identity line in its `SOUL.md`, no hosted-tools entry in
+  its `config.yaml`: `config.was_set_up_as_agent`, which reads those two files, never `.env`) holds the key the
+  **default profile** resolved from its settings in this process — what `hermes profile create` makes of the default
+  profile's `.env`, on one gateway. Its remedy also says `hermes -p <name> agentchat login` if it is meant to be its
+  own agent. Nothing is placed for it (no identity line, no `secrets.agentchat`, no tools entry, so no hosted tools to
+  mask). Without that evidence a never-set-up named profile activates and is set up as before (a key a container or
+  a service exports, no wizard). Not caught any more: a never-set-up `.env` copy of a 0.5.x default profile served by
+  a gateway of its own — telling it apart needed reading the default profile's `.env`, which ask 1 removes.
+
+Profiles one process resolves with the same settings key (a multiplexed gateway, each in its own scope) are said to be
+one agent, the default profile first (`shared_with`, `where: settings`). Other profiles' `.env` files are never read,
+so two set-up pre-0.6 profiles holding one key only in `.env`, on gateways of their own, are not told apart until one
+of them saves it (`doctor --fix`, `login`).
+
+A key found only under the pre-v3 name `AGENTCHATME_API_KEY` (the August build) is copied into the key file — the
+hosted tools read `AGENTCHAT_API_KEY` — once the server has accepted it (`GET /v1/agents/me`, the wizard's check: a
+revoked key is never saved; its handle is recorded) and before the runtime opens a socket, in the default profile
+and in a named profile set up as an agent before this activation, under a per-account lock (`<hermes
+root>/agentchat-locks/adopt-<fingerprint>.lock`, beside the socket's leader lock, waited for 2 s at most) and only
+when no other profile's key file holds it. Of two profiles holding one key, the first to adopt it is the agent; the
+other is refused as the copy before it opens the account's socket (a busy lock stops the attempt, and the next one
+decides). A named profile not set up before runs as before and adopts at its next start (this one sets it up), so
+it does not take the default profile's agent first. At a multiplexed boot the launch profile loads first, so the default profile normally wins.
+Remaining edge: a `--clone` or `--clone-all` copy of an August setup (its identity line copied too) on per-profile
+gateways that start in any order — whichever adopts first is the agent, and the other one's `doctor` names the fix
+(`hermes -p <the copy> agentchat logout`, then `register` it as its own agent; if the wrong one won, log that one out
+and the other adopts at its next attempt).
 
 ## Settings and the wizard
 
 | Surface | Where | Why | Public replacement |
 |---|---|---|---|
-| `hermes_cli.config.get_env_value` / `save_env_value` (**public**) | `cli.py`, `wizard.py`, `credentials._save_env_fallback` | The wizard reads a pre-0.6 handle; the key goes to `.env` only as a fallback (the key file cannot be written, or this Hermes cannot read it for the hosted tools) so a key the server just issued is never dropped; `AGENTCHATME_API_BASE` when set. | The plugin settings schema (`type: secret`) covers Desktop; there is no public setter for a CLI wizard. |
+| `hermes_cli.config.save_env_value` (**public**) | `cli.py`, `credentials._save_env_fallback` | The key goes to `.env` only as a fallback (the key file cannot be written, or this Hermes cannot read it for the hosted tools) so a key the server just issued is never dropped; `AGENTCHATME_API_BASE` when set. | The plugin settings schema (`type: secret`) covers Desktop; there is no public setter for a CLI wizard. |
 | `hermes_cli.setup.{print_header, print_info, print_success, print_warning, prompt_choice, get_env_value, save_env_value}`, `hermes_cli.cli_output.{prompt, prompt_yes_no}` | `wizard.py` | The wizard looks and behaves like Hermes' own setup. Public: `hermes_cli.cli_output` (whole module) and `hermes_cli.setup.prompt_choice`; the other `setup` names are not. | `hermes_cli.cli_output`'s `print_*` and `hermes_cli.config`'s `get/save_env_value` would leave no non-public wizard import (`cli_output.print_header` looks different from setup's). |
 
 ## Not used yet, worth using
