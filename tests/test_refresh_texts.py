@@ -145,6 +145,21 @@ def test_a_new_manual_refreshes_all_three_files(root: Path, monkeypatch: pytest.
     assert sorted(p.name for p in (root / script.MANUAL_REL).parent.iterdir()) == ["SKILL.md"]
 
 
+def test_a_pins_file_with_crlf_line_breaks_keeps_them(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A Windows checkout converts the test file's line breaks to CRLF."""
+    pins = root / script.PINS_REL
+    pins.write_bytes(pins.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    body = _body("9.9.9")
+    _run(
+        root,
+        monkeypatch,
+        {"/v1/texts": answer(200, _payload(manual=body, version="9.9.9")), "/skill.md": raw(200, body, "text/markdown")},
+    )
+    data = pins.read_bytes()
+    assert b'MANUAL_VERSION = "9.9.9"\r\n' in data
+    assert b"\n" not in data.replace(b"\r\n", b""), "every line break is still CRLF"
+
+
 def test_the_same_texts_give_the_same_bytes(root: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     body = _body("9.9.9")
     routes = {"/v1/texts": answer(200, _payload(manual=body, version="9.9.9")), "/skill.md": raw(200, body, "text/markdown")}

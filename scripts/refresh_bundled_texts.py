@@ -232,7 +232,8 @@ def _pinned(data: bytes | None, path: Path, pins: dict[str, str]) -> bytes:
         raise RefreshError(f"{path} is missing")
     text = data.decode("utf-8")
     for name, value in pins.items():
-        pattern = re.compile(rf'^{name} = "[^"\n]*"$', re.MULTILINE)
+        # The file's own line breaks are kept (a Windows checkout has CRLF).
+        pattern = re.compile(rf'^{name} = "[^"\r\n]*"(?=\r?$)', re.MULTILINE)
         if len(pattern.findall(text)) != 1:
             raise RefreshError(f'{path}: `{name} = "…"` is not on exactly one line')
         text = pattern.sub(f'{name} = "{value}"', text)

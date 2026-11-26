@@ -177,7 +177,7 @@ class TestSetting:
     def test_both_manifests_declare_it_the_same_way(self) -> None:
         root = (ROOT / "plugin.yaml").read_bytes()
         assert root == (ROOT / "agentchatme_hermes" / "plugin.yaml").read_bytes()
-        text = root.decode("utf-8")
+        text = root.decode("utf-8").replace("\r\n", "\n")  # a Windows checkout has CRLF
         assert (
             "config_schema:\n"
             "  live_texts:\n"
