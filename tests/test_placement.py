@@ -197,6 +197,69 @@ class TestMcpStep:
         placement.place_mcp("https://api.example.test")
         assert allow.read_record(tmp_path) is None
 
+    def _connected_untrusted(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, gateway: bool) -> list[str]:
+        from agentchatme_hermes import allow, mcp_registration
+        from agentchatme_hermes.mcp_registration import Allowance, EntryPlacement
+
+        log: list[str] = []
+        monkeypatch.setattr(placement, "resolve_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(mcp_registration, "inspect_allowance", lambda *, api_base: Allowance("ours", "untrusted", None))
+        monkeypatch.setattr(allow, "gateway_lives", lambda home, *, api_base: gateway)
+        monkeypatch.setattr(mcp_registration, "uninstall_entry", lambda *, api_base: log.append("removed") or True)
+        monkeypatch.setattr(
+            placement,
+            "install_entry",
+            lambda *, api_base, decision=None: log.append(f"install {decision}") or EntryPlacement("allowed", "full"),
+        )
+        return log
+
+    def test_a_yes_over_a_connected_untrusted_entry_takes_two_steps(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Hermes keeps a connected server's tier, and its watcher only adds and
+        removes servers: the decision is recorded, the entry removed; the
+        gateway writes it back full once the old connection is gone."""
+        from agentchatme_hermes import allow
+
+        log = self._connected_untrusted(monkeypatch, tmp_path, gateway=True)
+        step = placement.place_mcp("https://api.example.test", decision="yes")
+        assert (step.status, step.outcome) == ("changed", "applying")
+        assert "within about two minutes" in step.detail
+        assert log == ["removed"]
+        record = allow.read_record(tmp_path)
+        assert record is not None and (record["decision"], record["trust"], record["pending"]) == ("yes", "full", True)
+
+    def test_with_no_gateway_running_it_is_changed_in_place(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from agentchatme_hermes import allow
+
+        log = self._connected_untrusted(monkeypatch, tmp_path, gateway=False)
+        step = placement.place_mcp("https://api.example.test", decision="yes")
+        assert step.outcome == "allowed" and log == ["install yes"]
+        record = allow.read_record(tmp_path)
+        assert record is not None and record["pending"] is False and record["decision"] == "yes"
+
+    def test_a_removal_that_fails_leaves_the_entry_and_no_pending_yes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import allow, mcp_registration
+
+        self._connected_untrusted(monkeypatch, tmp_path, gateway=True)
+
+        def refused(*, api_base: str) -> bool:
+            raise mcp_registration.McpRegistrationError("managed")
+
+        monkeypatch.setattr(mcp_registration, "uninstall_entry", refused)
+        step = placement.place_mcp("https://api.example.test", decision="yes")
+        assert step.failed and "managed" in step.detail
+        record = allow.read_record(tmp_path)
+        assert record is not None and record["pending"] is False
+
+    @pytest.mark.parametrize("decision", [None, "no", "carried_over"])
+    def test_only_a_yes_takes_two_steps(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, decision: Any) -> None:
+        log = self._connected_untrusted(monkeypatch, tmp_path, gateway=True)
+        placement.place_mcp("https://api.example.test", decision=decision)
+        assert log == [f"install {decision}"]
+
     def test_registration_error_is_a_failed_step(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def boom(*, api_base: str, decision: Any = None) -> Any:
             raise placement.McpRegistrationError("no hermes")

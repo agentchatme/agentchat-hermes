@@ -573,27 +573,19 @@ def test_approvals_mode_reads_as_hermes_reads_it() -> None:
         assert reg._approval_mode(raw) == normalize(raw), raw
 
 
-def test_the_always_approval_key_is_hermes_key() -> None:
-    from agentchatme_hermes import mcp_registration as reg
-
-    key = _import("tools.mcp_tool_handlers")._trust_approval_key
-    assert reg.grant_key() == key("agentchat", "agentchat_send_message")
-
-
 _GATE_CASES = [
-    (trust, mode, grant, yolo)
+    (trust, mode, yolo)
     for trust in (None, "full", "FULL", "untrusted", "bogus")
     for mode in (None, "off", "manual")
-    for grant in (False, True)
     for yolo in (False, True)
 ]
 
 
 def test_the_allowance_is_hermes_gate(_hermes_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """For every combination of the entry's trust, approvals.mode, an Always
-    approval of the reply tool and the process --yolo, the plugin's allowance
-    says what Hermes' own call-time gate does with agentchat_send_message:
-    runs it, or asks (a declined consent here)."""
+    """For every combination of the entry's trust, approvals.mode and the
+    process --yolo, the plugin's allowance says what Hermes' own call-time
+    gate does with an AgentChat write tool: runs it, or asks (a declined
+    consent here). Read-only tools run either way."""
     from types import SimpleNamespace
 
     from agentchatme_hermes import mcp_registration as reg
@@ -610,15 +602,13 @@ def test_the_allowance_is_hermes_gate(_hermes_home: Path, monkeypatch: pytest.Mo
 
     monkeypatch.setattr(prompt, "request_elicitation_consent", decline)
     config_path = _hermes_home / "config.yaml"
-    for n, (trust, mode, grant, yolo) in enumerate(_GATE_CASES):
+    for n, (trust, mode, yolo) in enumerate(_GATE_CASES):
         entry_lines = '    url: "https://api.agentchat.me/mcp"\n    headers:\n      Authorization: "Bearer ${AGENTCHAT_API_KEY}"\n'
         if trust is not None:
             entry_lines += f"    trust: {trust}\n"
         text = "mcp_servers:\n  agentchat:\n" + entry_lines
         if mode is not None:
             text += f"approvals:\n  mode: {mode}\n"  # a bare off: YAML reads False, as a person writes it
-        if grant:
-            text += "command_allowlist:\n  - mcp:agentchat/agentchat_send_message\n"
         text += f"# case {n:04d}\n"
         config_path.write_text(text, encoding="utf-8")
         os.utime(config_path, ns=(time.time_ns(), time.time_ns() + n * 1_000_000))
@@ -630,7 +620,7 @@ def test_the_allowance_is_hermes_gate(_hermes_home: Path, monkeypatch: pytest.Mo
         asked.clear()
         hermes_runs = handlers._trust_gate_check("agentchat", "agentchat_send_message") is None
         ours = reg.tools_allowance(reg._hermes_raw_config(), environ={"HERMES_YOLO_MODE": "1" if yolo else ""})
-        assert ours.allowed is hermes_runs, (trust, mode, grant, yolo, ours)
+        assert ours.allowed is hermes_runs, (trust, mode, yolo, ours)
         assert bool(asked) is not hermes_runs, "a gated call asks (declined here)"
 
 
@@ -675,9 +665,11 @@ def test_the_line_reader_tells_the_end_of_input_from_an_empty_line(monkeypatch: 
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     with pytest.raises(EOFError):
         cli_output.line_input("q? ")
-    assert allow.ask_in_terminal("q?") is False, "the end of input is a no"
+    assert allow.ask_in_terminal("q?") == "end_of_input", "the end of input decides nothing"
     monkeypatch.setattr(sys, "stdin", io.StringIO("\n"))
-    assert allow.ask_in_terminal("q?") is True, "Enter is a yes"
+    assert allow.ask_in_terminal("q?") == "yes", "Enter is a yes"
+    monkeypatch.setattr(sys, "stdin", io.StringIO("n\n"))
+    assert allow.ask_in_terminal("q?") == "no"
 
 
 def test_ask_choice_answers_only_where_someone_can(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1171,49 +1163,60 @@ def test_a_new_entry_connects_with_the_trust_it_was_written_with(
         lifecycle.shutdown_mcp_servers()
 
 
-def test_a_yes_on_a_connected_untrusted_server_applies_after_a_reload(
+def test_a_yes_over_a_connected_untrusted_server_is_applied_in_two_steps(
     _hermes_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A no, connected untrusted; then a yes: the reconcile does not touch a
-    live server, so the tier stays until /reload-mcp (shutdown, then
-    discovery), which registers the tools anew — new registry entries, the
-    plugin's sign that the tier was read again (allow.LiveTier)."""
+    """A no, connected untrusted; then a yes while the gateway runs. Hermes
+    keeps a connected server's tier and its config reconcile never re-reads
+    it, so the plugin removes the entry (the reconcile, one housekeeping tick,
+    drops the server), then writes it back full once no AgentChat tool is
+    registered (the next tick connects it fresh, with the new tier): two
+    ticks, about two minutes. The real discovery path, a localhost server."""
     pytest.importorskip("mcp.client.streamable_http")
-    from agentchatme_hermes import allow, hosted_tools
+    from fake_keys import api_key
+
+    from agentchatme_hermes import allow, hosted_tools, placement
     from agentchatme_hermes import mcp_registration as reg
 
     discovery = _import("tools.mcp_tool_discovery")
     lifecycle = _import("tools.mcp_tool_lifecycle")
     monkeypatch.setattr(_import("tools.approval_prompt"), "request_elicitation_consent", lambda *a, **k: "decline")
     monkeypatch.setattr(allow, "inspect_allowance", reg.inspect_allowance)  # the real file, not the unit suite's stand-in
-    from fake_keys import api_key
-
+    monkeypatch.setattr(allow, "gateway_lives", lambda home, *, api_base: True)  # this process is the gateway
+    monkeypatch.setattr(placement, "resolve_hermes_home", lambda: _hermes_home)
     monkeypatch.setenv("AGENTCHAT_API_KEY", api_key("contract_" + "0" * 32))
     port = _free_port()
     api_base = f"http://127.0.0.1:{port}"
     (_hermes_home / "config.yaml").write_text("model:\n  default: x\n", encoding="utf-8")
     try:
         with _McpStub(port, tools=("agentchat_inbox", "agentchat_send_message")):
-            assert reg.install_entry(api_base=api_base, decision="no").outcome == "added"
+            assert placement.place_mcp(api_base, decision="no").outcome == "added"
             discovery.discover_mcp_tools()
             assert hosted_tools.wait_for_hosted_tools(timeout_s=30.0) is True
-            first = hosted_tools.hosted_tool_entry()
-            assert first is not None
-            assert _gate() is False and _gate("agentchat_inbox") is False, "untrusted, and the stub marks nothing read-only"
-            assert allow.read_switch(_hermes_home, api_base=api_base)[0] == "not_allowed"
+            assert _gate() is False, "connected untrusted: the write asks"
+            assert allow.read_switch(_hermes_home, api_base=api_base).state == "not_allowed"
 
-            assert reg.install_entry(api_base=api_base, decision="yes").outcome == "allowed"
-            discovery.reconcile_mcp_servers_with_config()
-            assert hosted_tools.hosted_tool_entry() is first, "the same registration"
-            assert _gate() is False, "Hermes keeps the tier it connected with"
-            assert allow.read_switch(_hermes_home, api_base=api_base)[0] == "restart_to_apply"
+            # A yes: step one.
+            step = placement.place_mcp(api_base, decision="yes")
+            assert step.outcome == "applying"
+            assert reg.inspect_entry(api_base=api_base) == "missing"
+            assert allow.read_switch(_hermes_home, api_base=api_base).state == "applying"
+            assert _gate() is False, "until the gateway connects it again, Hermes keeps the old tier"
 
-            lifecycle.shutdown_mcp_servers()  # /reload-mcp: shutdown, then discovery
-            discovery.discover_mcp_tools()
+            # Hermes' watcher, one tick: the removed server is dropped.
+            assert discovery.reconcile_mcp_servers_with_config()["removed"] == ["agentchat"]
+            assert hosted_tools.hosted_tool_names() == []
+
+            # Step two (the gateway's): no AgentChat tool held, so it writes trust: full.
+            assert allow.complete_pending(_hermes_home, api_base=api_base, wait=False) is True
+            assert reg.inspect_allowance(api_base=api_base).trust == "full"
+            record = allow.read_record(_hermes_home)
+            assert record is not None and record["pending"] is False and record["decision"] == "yes"
+
+            # The next tick: connected fresh, with the new tier.
+            assert discovery.reconcile_mcp_servers_with_config()["added"] == ["agentchat"]
             assert hosted_tools.wait_for_hosted_tools(timeout_s=30.0) is True
-            again = hosted_tools.hosted_tool_entry()
-            assert again is not None and again is not first, "registered anew"
             assert _gate() is True
-            assert allow.read_switch(_hermes_home, api_base=api_base)[0] == "allowed"
+            assert allow.read_switch(_hermes_home, api_base=api_base).state == "allowed"
     finally:
         lifecycle.shutdown_mcp_servers()

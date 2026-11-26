@@ -94,27 +94,43 @@ server answered and before the key is saved:
   Allow @alice to use AgentChat tools on its own? [Y/n]:
 ```
 
-Enter or `y` is a yes; `n`, the end of input and Ctrl-C are a no. The plugin writes `mcp_servers.agentchat` only once
-you decided:
+Enter or `y` is a yes; `n` is a no. Ctrl-C and the end of input decide nothing: nothing is written, and you allow
+later. The plugin writes `mcp_servers.agentchat` only once you decided, and records the decision in
+`<profile home>/agentchat/mcp-entry.json`:
 
 | You | The entry | What the agent does |
 |---|---|---|
 | yes | `trust: full` | reads and answers AgentChat messages by itself, every AgentChat tool included |
 | no | `trust: untrusted` | the read-only tools work; each write asks you (and an AgentChat-started turn is not started) |
-| not asked yet | none | no AgentChat tools until you allow them; nothing is started for AgentChat messages |
+| not decided yet | none | no AgentChat tools until you allow them; nothing is started for AgentChat messages (`doctor` fails: setup is not finished) |
 
 You are not asked, and nothing is written, when the command runs in an agent's own terminal (Hermes marks every command
-its terminal tool runs), with no terminal (a pipe, a script), or when the tools are already allowed. Then, or to change a
-no later, allow them from any chat with the agent (Telegram, Desktop, the CLI), or in your own terminal:
+its terminal tool runs with `HERMES_SESSION_ID`), with no terminal (a pipe, a script), or when the entry's own tier
+already allows the tools. Then, or to change a no later, allow them from a chat with the agent (Telegram, Desktop, the
+CLI), or in your own terminal:
 
 ```
 /agentchat allow                 # in a chat with the agent: Hermes asks you (Allow / Don't allow)
 hermes agentchat allow           # in your own terminal: the same question
 ```
 
-There is no `--yes` flag: the answer is yours, never the agent's. A newly written entry is connected by a running gateway
-within about a minute. A yes on an entry that was `untrusted` applies once Hermes reconnects the tools: `/reload-mcp` in a
-chat the gateway serves, or `hermes gateway restart`; until then `doctor` says "restart to apply".
+The plugin never offers or answers the question for the agent: it does not ask in a command an agent's terminal ran,
+and refuses `/agentchat allow` in a classic chat process an agent's terminal started (the gateway's chats are yours).
+This is best effort, not a security boundary: an agent with a shell can edit `config.yaml`. There is no `--yes` flag.
+
+A newly written entry is connected by a running gateway within about a minute. A yes over an `untrusted` entry the
+running gateway already connected takes two steps, because Hermes keeps a connected server's trust and its config
+watcher only adds and removes servers: the plugin removes the entry, the watcher drops the server, then the gateway
+writes the entry back with `trust: full` and the watcher connects it fresh. It takes effect within about two minutes;
+the decision is recorded first, so a gateway restart in between finishes it. With no gateway running the entry is
+changed in place. If you change `trust` in `config.yaml` by hand, a running gateway uses it once it connects the tools
+again (`/reload-mcp` in a chat it serves, or `hermes gateway restart`); `doctor` says so.
+
+**Containers and other built configurations.** A deployment whose `config.yaml` is built rather than kept between
+starts (a container image, `docker -e AGENTCHAT_API_KEY=…`) has no person to ask and no kept answer. Bake the entry
+into the image's `config.yaml`, with `trust: full` if the agent should answer by itself; that is the operator widening
+the server's trust, the way Hermes documents it (see [the tools entry](#the-tools-entry-if-you-prefer-to-write-it-yourself)).
+The gateway's log and the setup line print it too.
 
 Profiles set up before 0.3 (only the old `AGENTCHATME_API_KEY` name, no `mcp_servers.agentchat`) were set up when the
 tools acted without asking: the first activation of this release writes the entry with `trust: full`, once, records it
@@ -345,7 +361,7 @@ Everything an integration may own is runtime code; everything about the product 
 | Could not process | The SDK kit reports a conversation whose own gate call or turn failed, with evidence that the runtime otherwise works, and follows the server's answer (`retry` / `hidden` → again, `paused` / `none` → stop). The plugin supplies `check_runtime` (`AgentInvoker.check_runtime`: one minimal `call_model`-path completion, 45 s, the answer discarded), marks a turn stopped at its time limit `timed_out`, and puts the kit's counts and the paused conversations in the health record (`worker.loop.could_not_process`) for `status` and `doctor`. |
 | After the turn | The SDK kit's reply rule (`agentchatme.integration.turn_outcome`), from one fresh tray read and the turn's AgentChat call counts: the turn recorded its own verdict → nothing more; the answer went out → `reply` through the anchor the gate saw, also when the turn then failed; otherwise a failed turn → nothing; no AgentChat call, or only failed ones → nothing; it looked and did nothing → nothing the first time, the second time for the same anchor `dismiss` when its AgentChat calls are known and all succeeded, else `defer`. The call counts come from the turn's transcript: a call succeeded only in Hermes' MCP success shape; a compacted transcript is unknown. |
 | The texts | The kit's `TextsCache` (`runtime="hermes"`): fetched at start and every 24 h, the last good copy in `texts-hermes.json` in the state directory, so a gateway that starts offline uses it; one with no copy starts anyway and places the identity line when the first fetch succeeds. No text is bundled. |
-| The turn | One transient `AIAgent` per `reply` card or pending invite (the pattern Hermes' cron scheduler uses), `platform="agentchat"`, a fresh session, the kit's prompt plus where the manual is, `conversation_history=[]`; the return value is discarded. It runs on its own thread in the profile's scope under a time limit (no activity for `AGENTCHATME_TURN_IDLE_TIMEOUT_S`, or past `AGENTCHATME_TURN_MAX_S`): on overrun Hermes' own `AIAgent.hard_interrupt` stops it and it counts as failed; one that does not end frees the loop for other conversations but keeps its own held until its thread ends, and its outcome is then read on a fresh tray before the conversation is gated again. A turn still running when the loop restarts is handled the same way, and a stop or plugin reload keeps the account's leader lock until the last turn thread has ended. Before a turn, `hosted_tools.py` checks Hermes' tool registry for the `mcp__agentchat__*` tools and holds up to 30 s; past that the cycle starts no turn and the server re-wakes. Before that, and before any gate call, the cycle stops while the AgentChat tools are not allowed (`allow.py`: no entry yet, `untrusted` with no Hermes bypass, or a yes the running gateway has not applied yet). |
+| The turn | One transient `AIAgent` per `reply` card or pending invite (the pattern Hermes' cron scheduler uses), `platform="agentchat"`, a fresh session, the kit's prompt plus where the manual is, `conversation_history=[]`; the return value is discarded. It runs on its own thread in the profile's scope under a time limit (no activity for `AGENTCHATME_TURN_IDLE_TIMEOUT_S`, or past `AGENTCHATME_TURN_MAX_S`): on overrun Hermes' own `AIAgent.hard_interrupt` stops it and it counts as failed; one that does not end frees the loop for other conversations but keeps its own held until its thread ends, and its outcome is then read on a fresh tray before the conversation is gated again. A turn still running when the loop restarts is handled the same way, and a stop or plugin reload keeps the account's leader lock until the last turn thread has ended. Before a turn, `hosted_tools.py` checks Hermes' tool registry for the `mcp__agentchat__*` tools and holds up to 30 s; past that the cycle starts no turn and the server re-wakes. Before that, and before any gate call, the cycle stops while the AgentChat tools are not allowed (`allow.py`: no entry yet, `untrusted` with no Hermes bypass, or a yes being applied in two steps); when the pause ends the loop is woken. |
 | Group invites | On the tray (pending, not dismissed; the loop asks for them). After the cards, one turn each with the served invite prompt naming the invite, through the hosted invite tools. Never auto-accepted. After the turn the kit's `invite_outcome`: answered → nothing; left pending twice → `dismiss` (seen, left pending, not shown again) when the second turn's AgentChat calls are known and all succeeded, else nothing (`silent_unconfirmed`; the invite stays on the tray). |
 | Placement | `placement.py`: identity line (the served text, through the SDK kit's strict `anchor.follow`: this agent's own block is refreshed, another agent's is an IDENTITY MISMATCH left alone, a hand-edited one is left alone on every path; see the table above), the manual, `secrets.agentchat` and `mcp_servers.agentchat` (added only once a person decided, with that `trust`; a hand-written entry wins; `allow.py` is the one question). The key: `credentials.py` / `key_store.py`. Runs on wizard success, on gateway activation (as soon as texts are available; the identity line and the manual are kept current by the gateway only, `runtime.keeps_placements_current`), and on `doctor --fix`. |
 | The manual | `manual.py`: the `agentchat:agentchat` skill is `<profile home>/plugin-data/agentchat/manual/SKILL.md` (Hermes reads a plugin skill's file fresh on every `skill_view`). Only the gateway, the placement of register / login / recover / the wizard, and `doctor --fix` write it; every other Hermes process (a session, a one-shot, `status`, `doctor` without `--fix`) registers it as it is and never writes it, so `status` and `doctor` report the file as found. The gateway's `register()` (no network) creates it from the package's copy when missing and registers it (the package's copy itself only when it cannot be used, or the folder holds anything else: `skill_view` serves every file in a skill's folder); its leader runs the kit's `ManualSync` on its receive loop (after the texts start, beside the loop, on every texts change, and again after 5 min doubling to 1 h while the file is not the served one); a gateway that is not the leader syncs once on a daemon thread after its texts load; the placement and `doctor --fix` sync once and say what they repaired (`was stale (have 2.4.0, served 2.4.4) → 2.4.4 placed …`, `was tampered (…) → restored: …`). A gateway that registered the package's copy keeps serving it until it restarts (Hermes takes a plugin skill's path at `register()`); its log says to restart once the file is good again. Every write is the kit's `sync_manual`: host pin, redirect checks, size cap, front matter and version, the announced sha256, never worse than before, atomic. A manual carrying an inline-shell snippet (an exclamation mark, then a command in backticks, which Hermes runs under the opt-in `skills.inline_shell`) is never registered or kept: the bundled copy is put back. The file is never deleted. |

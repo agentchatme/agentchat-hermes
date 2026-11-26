@@ -246,7 +246,18 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
     """``mcp_servers.agentchat`` as ``decision`` asks (:func:`.mcp_registration.install_entry`):
     with no decision nothing is added (``missing``). A written or allowed
     entry is recorded in the profile's own data (:func:`.allow.write_record`).
-    Never raises."""
+
+    A yes over our ``untrusted`` entry while a gateway runs for this profile
+    is the first of two steps (``applying``): the decision is recorded, the
+    entry removed (Hermes' watcher drops the connected server), and the
+    gateway writes it with ``trust: full`` once it holds no AgentChat tools
+    any more (:func:`.allow.start_completion`). With no gateway running the
+    entry is changed in place (``allowed``). Never raises."""
+    home = resolve_hermes_home()
+    if decision == "yes":
+        flip = _begin_two_step_yes(api_base, home)
+        if flip is not None:
+            return flip
     try:
         placed = install_entry(api_base=api_base, decision=decision)
     except McpRegistrationError as exc:
@@ -258,9 +269,10 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
         from .allow import write_record
 
         write_record(
-            resolve_hermes_home(),
+            home,
             how="carried_over" if decision == "carried_over" else "asked",
             trust=placed.trust,
+            decision=decision if decision in ("yes", "no") else None,
         )
     if outcome == "added":
         return PlacementStep(
@@ -304,6 +316,36 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
         )
     return PlacementStep(
         "mcp", "skipped", "mcp_servers.agentchat is managed by hand in config.yaml — left alone", outcome
+    )
+
+
+def _begin_two_step_yes(api_base: str, home: Path) -> PlacementStep | None:
+    """The first step of a yes over our connected ``untrusted`` entry
+    (:func:`place_mcp`), or ``None`` when it does not apply (no such entry,
+    or no gateway runs for this profile)."""
+    from .allow import APPLY_WORDS, gateway_lives, write_record
+    from .mcp_registration import inspect_allowance, uninstall_entry
+
+    try:
+        current = inspect_allowance(api_base=api_base)
+    except Exception:
+        return None
+    if current.entry != "ours" or current.trust != "untrusted" or not gateway_lives(home, api_base=api_base):
+        return None
+    if not write_record(home, how="asked", trust="full", decision="yes", pending=True):
+        return PlacementStep("mcp", "failed", "the decision could not be recorded, so nothing was changed")
+    try:
+        uninstall_entry(api_base=api_base)
+    except Exception as exc:
+        write_record(home, how="asked", trust="untrusted", decision="yes")
+        return PlacementStep("mcp", "failed", f"mcp_servers.agentchat could not be changed: {exc}")
+    return PlacementStep(
+        "mcp",
+        "changed",
+        f"trust: full is applied in two steps ({APPLY_WORDS}): mcp_servers.agentchat is removed so the "
+        "running gateway drops the connection it made untrusted, then the gateway writes it back with "
+        "trust: full and connects it again",
+        "applying",
     )
 
 

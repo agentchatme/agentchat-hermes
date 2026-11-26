@@ -75,10 +75,10 @@ entry the plugin writes names its ``trust``; an entry an earlier release
 wrote without one is left as it is. Hermes records a server's tier when it
 connects it: a new entry is connected with the tier it was written with
 (the gateway's config reconcile, about once a minute), a changed tier on a
-connected server applies after ``/reload-mcp`` or a restart.
-:func:`tools_allowance` is Hermes' predicate for the reply tool, read from
-the same file: the tier, ``approvals.mode: off``, ``HERMES_YOLO_MODE`` and a
-remembered Always approval.
+connected server applies after ``/reload-mcp`` or a restart (so a yes over a
+connected ``untrusted`` entry is applied in two steps, :mod:`.allow`).
+:func:`tools_allowance` is what lets the AgentChat write tools run, read from
+the same file: the tier, ``approvals.mode: off``, ``HERMES_YOLO_MODE``.
 """
 from __future__ import annotations
 
@@ -114,9 +114,6 @@ TrustState = Literal["full", "untrusted", "unset"]
 # carry-over of a setup made before 0.3 (:mod:`.allow`).
 Decision = Literal["yes", "no", "carried_over"]
 TRUST_FOR: dict[str, Trust] = {"yes": "full", "no": "untrusted", "carried_over": "full"}
-# The write tool a reply turn needs (Hermes keys a remembered approval by the
-# raw MCP tool name: ``mcp:<server>/<tool>``).
-REPLY_TOOL = "agentchat_send_message"
 # How an entry's headers name the client: ``current`` (hermes), ``missing`` (no
 # client header: placed before 0.5.1, or written by hand), ``other`` (a name
 # someone chose).
@@ -244,10 +241,11 @@ def _set_client_header(entry: MutableMapping[str, Any]) -> None:
 
 
 def entry_trust(entry: Any) -> TrustState:
-    """The tier an entry says, read as Hermes reads it: no ``trust`` key (or
-    an empty one) is ``unset`` (Hermes: ``full``); ``full`` / ``untrusted`` in
-    any case and spacing are themselves; anything else is ``untrusted``
-    (Hermes fails closed). The contract suite checks it against Hermes'."""
+    """The tier an entry says, read as Hermes reads it: no ``trust`` key, or
+    one with no value (YAML ``trust:``), is ``unset`` (Hermes: ``full``);
+    ``full`` in any case and spacing is ``full``; anything else, an empty
+    string included, is ``untrusted`` (Hermes fails closed). The contract
+    suite checks it against Hermes'."""
     raw = entry.get("trust") if isinstance(entry, Mapping) else None
     if raw is None:
         return "unset"
@@ -456,19 +454,20 @@ def inspect_entry(*, api_base: str = DEFAULT_API_BASE) -> EntryState:
 
 # ─── what Hermes' approval gate does with the reply tool ───────────────────
 
-Via = Literal["trust", "no_trust_key", "approvals_off", "yolo", "always_grant"]
+Via = Literal["trust", "no_trust_key", "approvals_off", "yolo"]
 
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 
 @dataclass(frozen=True)
 class Allowance:
-    """Whether Hermes lets the reply tool (:data:`REPLY_TOOL`) of the server
-    named ``agentchat`` run without asking, read from this profile's
-    ``config.yaml`` as written. ``entry``: :func:`describe_entry` (a
-    hand-written entry is gated the same way); ``trust``: what the entry says
-    (``None``: no entry); ``via``: what lets the writes through (``None``:
-    nothing, so each write would ask and an unattended turn is declined)."""
+    """Whether Hermes lets every write tool of the server named ``agentchat``
+    run without asking, read from this profile's ``config.yaml`` as written.
+    ``entry``: :func:`describe_entry` (a hand-written entry is gated the same
+    way); ``trust``: what the entry says (``None``: no entry); ``via``: what
+    lets the writes through (``None``: nothing, so each write would ask and an
+    unattended turn is declined). A remembered Always approval covers one tool
+    only (an AgentChat turn calls several), so it does not count."""
 
     entry: EntryState
     trust: TrustState | None
@@ -479,10 +478,11 @@ class Allowance:
         return self.entry not in ("missing", "disabled") and self.via is not None
 
     @property
-    def bypass(self) -> bool:
-        """Allowed by something Hermes reads at each call (not the tier it
-        recorded when it connected the server)."""
-        return self.via in ("approvals_off", "yolo", "always_grant")
+    def by_tier(self) -> bool:
+        """Allowed by the entry's own tier (``full``, or no ``trust`` key): the
+        person's switch is on. ``approvals.mode: off`` and ``--yolo`` let the
+        writes through too, but leave the switch off."""
+        return self.via in ("trust", "no_trust_key")
 
 
 def _approval_mode(raw: Any) -> str:
@@ -496,22 +496,16 @@ def _approval_mode(raw: Any) -> str:
     return "manual"
 
 
-def grant_key(tool: str = REPLY_TOOL) -> str:
-    """The key Hermes keeps an Always answer to its trust prompt under
-    (``tools/mcp_tool_handlers.py`` ``_trust_approval_key``)."""
-    return f"mcp:{MCP_SERVER_NAME}/{tool}"
-
-
 def tools_allowance(
     config: Mapping[str, Any],
     *,
     api_base: str = DEFAULT_API_BASE,
     environ: Mapping[str, str] | None = None,
 ) -> Allowance:
-    """Hermes' approval gate for :data:`REPLY_TOOL`, from ``config.yaml``: the
-    entry's tier, else ``approvals.mode: off``, the process ``--yolo``
-    (``HERMES_YOLO_MODE``), or an Always approval in ``command_allowlist``.
-    Read only; the plugin never writes any of those keys."""
+    """What lets the AgentChat write tools run in Hermes' approval gate, from
+    ``config.yaml``: the entry's tier, else ``approvals.mode: off`` or this
+    process's ``--yolo`` (``HERMES_YOLO_MODE``; read in the gateway, it is the
+    gateway's). Read only; the plugin never writes any of those keys."""
     env = os.environ if environ is None else environ
     state = describe_entry(config, api_base=api_base)
     if state == "missing":
@@ -527,9 +521,6 @@ def tools_allowance(
         return Allowance(state, trust, "approvals_off")
     if str(env.get("HERMES_YOLO_MODE", "")).strip().lower() in _TRUTHY:
         return Allowance(state, trust, "yolo")
-    allowlist = config.get("command_allowlist")
-    if isinstance(allowlist, list) and grant_key() in allowlist:
-        return Allowance(state, trust, "always_grant")
     return Allowance(state, trust, None)
 
 

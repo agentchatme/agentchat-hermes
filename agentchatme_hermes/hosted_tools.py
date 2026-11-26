@@ -317,31 +317,6 @@ def hosted_tool_names() -> list[str] | None:
     return sorted(names)
 
 
-def hosted_tool_entry() -> object | None:
-    """Hermes' registry entry for one hosted tool (the reply tool, else the
-    first one registered) in the current profile scope, or ``None``. Its
-    identity says which registration this is: Hermes makes new entries when it
-    registers the server's tools again (``/reload-mcp``, a restart) and keeps
-    them across a transport reconnect (:class:`.allow.LiveTier`). Never raises."""
-    from .mcp_registration import REPLY_TOOL
-
-    try:
-        from tools.registry import registry
-    except Exception:
-        return None
-    get_entry = getattr(registry, "get_entry", None)
-    if not callable(get_entry):
-        return None
-    try:
-        entry = get_entry(f"{HOSTED_TOOL_NAME_PREFIX}{REPLY_TOOL}")
-        if entry is None:
-            names = hosted_tool_names() or []
-            entry = get_entry(names[0]) if names else None
-    except Exception:
-        return None
-    return entry  # type: ignore[no-any-return]
-
-
 _warned: set[str] = set()
 
 

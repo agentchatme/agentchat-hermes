@@ -19,9 +19,10 @@ hosts it. This module is what only Hermes can say, as the loop's callbacks:
   version check.
 * :meth:`AgentInvoker.readiness` — may the agent use the AgentChat tools on
   its own (:mod:`.allow`: not while nobody allowed them, while they are not
-  allowed, or while the running gateway still holds the earlier tier), and
-  are the hosted ``mcp__agentchat__*`` tools registered in Hermes; a turn
-  without them cannot look. Holds up to 30 s (:mod:`.hosted_tools`).
+  allowed, or while a yes is being applied), and are the hosted
+  ``mcp__agentchat__*`` tools registered in Hermes; a turn without them
+  cannot look. Holds up to 30 s (:mod:`.hosted_tools`). When the pause ends
+  the receive loop is woken, so the cards that waited are gated.
 * :meth:`AgentInvoker.start_turn` — one turn: a transient ``AIAgent`` (the
   pattern Hermes' cron scheduler uses) on the kit's prompt plus where the
   manual is, in the profile's scope, under the time limit
@@ -239,7 +240,12 @@ class AgentInvoker:
 
     def set_wake(self, wake: Callable[[], None] | None) -> None:
         """How to wake the current receive loop from any thread (set by the receiver)."""
+        from .allow import on_applied
+
         self._wake = wake
+        # A yes applied in two steps finishes on its own thread: re-read the
+        # switch then (it wakes the loop when the pause ends).
+        on_applied(self._home(), self._read_switch if wake is not None else None)
 
     def stop(self) -> None:
         """No new turns; a running one is interrupted by its watch; a gate
@@ -324,25 +330,31 @@ class AgentInvoker:
         """The switch for the health record (``doctor`` reads it from the
         running gateway): ``state`` (:data:`.allow.State`), the entry's
         ``trust``, what lets the writes through (``via``), when read. Read now
-        (``config.yaml`` and the tools registered in this process), so a change
-        shows within a minute even while no wake arrives."""
+        (the health record is written every minute), so a change shows, and a
+        yes being applied is finished, even while no wake arrives."""
         self._read_switch()
         with self._switch_lock:
             return dict(self._switch) if self._switch is not None else None
 
     def _read_switch(self) -> State:
-        """Read the switch in the profile's scope, record it, log a change once
-        (the worker's readiness and the health record's writer both read it)."""
-        from .allow import PAUSED_STATES, describe, read_switch
+        """Read the switch in the profile's scope (:func:`.allow.read_switch`),
+        record it, log a change once, finish a yes being applied, and wake the
+        receive loop when the pause ends (the worker's readiness and the health
+        record's writer both read it)."""
+        from .allow import PAUSED_STATES, describe, read_switch, start_completion
 
         home = self._home()
         api_base = str(getattr(self._config, "api_base", "") or DEFAULT_API_BASE)
         try:
             with profile_context(home):
-                state, allowance = read_switch(home, api_base=api_base)
+                switch = read_switch(home, api_base=api_base)
         except Exception:
             logger.debug("AgentInvoker: the tools switch could not be read", exc_info=True)
-            state, allowance = "unknown", None
+            from .allow import Switch
+
+            switch = Switch("unknown")
+        state = switch.state
+        allowance = switch.allowance
         with self._switch_lock:
             self._switch = {
                 "state": state,
@@ -354,11 +366,13 @@ class AgentInvoker:
             previous = self._switch_said
             if changed:
                 self._switch_said = state
+        if state == "applying" and not self._stopped.is_set():
+            start_completion(home, api_base=api_base)
         if changed:
             from .config import cli_prefix
 
             handle = getattr(self._identity, "handle", None)
-            text = describe(state, allowance, handle, cmd=cli_prefix(home))
+            text = describe(switch, handle, cmd=cli_prefix(home))
             if state in PAUSED_STATES:
                 logger.warning(
                     "agentchat plugin: AgentChat tools %s (profile=%s) — no AgentChat work starts; the "
@@ -368,6 +382,14 @@ class AgentInvoker:
                 )
             elif previous is not None:
                 logger.info("agentchat plugin: AgentChat tools %s (profile=%s)", text, profile_label(home))
+            if previous in PAUSED_STATES and state not in PAUSED_STATES:
+                # The pause ended: the cards that waited on the tray are gated now.
+                wake = self._wake
+                if wake is not None:
+                    try:
+                        wake()
+                    except Exception:
+                        logger.debug("AgentInvoker: wake after the pause raised", exc_info=True)
         return state
 
     def live_turns(self) -> int:
@@ -519,11 +541,9 @@ class AgentInvoker:
         """Could a turn started now reach AgentChat? (a worker thread)
 
         Not while the AgentChat tools are not allowed (:mod:`.allow`): nobody
-        allowed them yet, they are not allowed, or the running gateway still
-        holds the earlier tier — then no gate call is made and nothing is
-        recorded (the cards stay on the tray). Checked first, before the hold
-        for the tools, and again after it (the tools just registered may hold
-        the earlier tier)."""
+        allowed them yet, they are not allowed, or a yes is being applied —
+        then no gate call is made and nothing is recorded (the cards stay on
+        the tray). Checked first, before the hold for the tools."""
         from .allow import PAUSED_STATES, reason
 
         hung = self.hung_turns
@@ -545,9 +565,6 @@ class AgentInvoker:
             return Readiness(
                 ready=False, reason="the hosted AgentChat tools are not registered in Hermes yet"
             )
-        state = self._read_switch()
-        if state in PAUSED_STATES:
-            return Readiness(ready=False, reason=reason(state))
         return Readiness(ready=True)
 
     async def start_turn(self, request: TurnRequest) -> TurnAdmission:

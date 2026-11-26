@@ -118,7 +118,7 @@ class TestEditMenuAllow:
         from agentchatme_hermes.placement import PlacementStep
 
         placed: list[object] = []
-        monkeypatch.setattr(wizard, "_tools_decision", lambda handle: allow.SetupDecision("yes", allow.ALLOWED_LINE))
+        monkeypatch.setattr(allow, "decide_for", lambda handle: allow.SetupDecision("yes", allow.ALLOWED_LINE))
         monkeypatch.setattr(
             placement, "place_mcp", lambda api_base, decision=None: placed.append(decision) or PlacementStep("mcp", "changed", "d", "allowed")
         )
@@ -127,26 +127,42 @@ class TestEditMenuAllow:
         assert placed == ["yes"]
         assert "✓ AgentChat tools allowed" in out and "/reload-mcp" in out
 
+    def test_a_yes_applied_in_two_steps_says_how_long(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from agentchatme_hermes import allow, placement, wizard
+        from agentchatme_hermes.placement import PlacementStep
+
+        monkeypatch.setattr(allow, "decide_for", lambda handle: allow.SetupDecision("yes", allow.ALLOWED_LINE))
+        monkeypatch.setattr(
+            placement, "place_mcp", lambda api_base, decision=None: PlacementStep("mcp", "changed", "d", "applying")
+        )
+        wizard._allow_tools_flow("alice", print_info=lambda t: None, print_warning=lambda t: None)
+        assert "within about two minutes" in capsys.readouterr().out
+
     def test_the_flow_asks_nothing_when_nobody_can_answer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from agentchatme_hermes import allow, placement, wizard
 
         said: list[str] = []
         monkeypatch.setattr(
-            wizard, "_tools_decision", lambda handle: allow.SetupDecision(None, allow.AGENT_TERMINAL_LINE.format(who="@alice"))
+            allow, "decide_for", lambda handle: allow.SetupDecision(None, allow.AGENT_TERMINAL_LINE.format(who="@alice"))
         )
         monkeypatch.setattr(placement, "place_mcp", lambda *a, **k: pytest.fail("nothing to write"))
         wizard._allow_tools_flow("alice", print_info=said.append, print_warning=said.append)
         assert said and "/agentchat allow" in said[0]
 
-    def test_not_allowed_reads_the_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from agentchatme_hermes import mcp_registration, wizard
+    def test_not_allowed_reads_the_switch(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import allow, wizard
         from agentchatme_hermes.mcp_registration import Allowance
 
         for allowance, offered in (
             (Allowance("missing", None, None), True),
             (Allowance("ours", "untrusted", None), True),
             (Allowance("ours", "full", "trust"), False),
+            (Allowance("ours", "unset", "no_trust_key"), False),
+            (Allowance("ours", "untrusted", "approvals_off"), True),
             (Allowance("user_managed", "untrusted", None), True),
+            (Allowance("disabled", "full", None), False),
         ):
-            monkeypatch.setattr(mcp_registration, "inspect_allowance", lambda *, api_base, a=allowance: a)
-            assert wizard._tools_not_allowed() is offered
+            monkeypatch.setattr(allow, "inspect_allowance", lambda *, api_base, a=allowance: a)
+            assert wizard._tools_not_allowed() is offered, allowance

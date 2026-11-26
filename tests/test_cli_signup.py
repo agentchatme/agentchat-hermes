@@ -55,7 +55,7 @@ class _Cli:
             or self.persisted.append({"api_key": api_key, "handle": handle, "api_base": api_base})
             or True,
         )
-        monkeypatch.setattr(cli, "_tools_decision", lambda handle: self.events.append(f"decide {handle}") or self.tools)
+        monkeypatch.setattr(allow, "decide_for", lambda handle: self.events.append(f"decide {handle}") or self.tools)
         monkeypatch.setattr(cli, "_install_placement", self._place)
         monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
         monkeypatch.setattr(signup, "_pause", self.waits.append)
@@ -638,13 +638,3 @@ class TestToolsQuestion:
         run = _Cli(monkeypatch, [])
         assert cli._dispatch_login(_ns(api_key=_KEY)) == _EXIT_API_ERR
         assert run.events == []
-
-    def test_the_decision_uses_the_profile_command_and_the_terminal(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        seen: list[Any] = []
-        monkeypatch.setattr(
-            allow, "decide", lambda handle, **kw: seen.append((handle, kw)) or allow.SetupDecision(None, "x")
-        )
-        monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
-        cli._tools_decision("alice")
-        assert seen and seen[0][0] == "alice" and seen[0][1]["tty"] is True
-        assert seen[0][1]["cmd"].endswith("agentchat")

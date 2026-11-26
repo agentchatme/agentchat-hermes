@@ -499,9 +499,9 @@ class TestLoopHealth:
         assert receiver.worker_status()["hosted_tools"] == section
 
     def test_the_health_record_carries_the_tools_switch(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """doctor reads a restart still to apply from the gateway's record."""
+        """doctor and the worker line read the gateway's switch from its record."""
         inv = AgentInvoker(config=SimpleNamespace(), identity=AgentIdentity(handle="me"), runtime=SimpleNamespace())
-        section = {"state": "restart_to_apply", "trust": "full", "via": "trust", "at": 1.0}
+        section = {"state": "applying", "trust": None, "via": None, "at": 1.0}
         monkeypatch.setattr(inv, "tools_allowed_status", lambda: section)
         receiver = _receiver(tmp_path, inv)
         assert receiver.worker_status()["tools_allowed"] == section

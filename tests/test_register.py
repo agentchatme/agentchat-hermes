@@ -545,6 +545,7 @@ class TestReconcileMcpRegistration:
         said = [r for r in caplog.records if "not allowed yet" in r.getMessage()]
         assert len(said) == 1 and said[0].levelno == logging.WARNING
         assert "/agentchat allow" in said[0].getMessage() and "hermes agentchat allow" in said[0].getMessage()
+        assert "An operator who builds config.yaml" in said[0].getMessage() and "trust: full" in said[0].getMessage()
         assert allow.read_record(tmp_path) is None, "nothing decided, nothing recorded"
 
     def test_outside_the_gateway_it_is_said_at_info(
@@ -602,6 +603,44 @@ class TestReconcileMcpRegistration:
         _register._reconcile_mcp_registration(self._runtime(tmp_path))
         assert calls == [("https://api.example.test", None)]
 
+    def _applying(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> list[Any]:
+        """A recorded yes not written yet (a crash between the two steps)."""
+        from agentchatme_hermes import allow
+        from agentchatme_hermes.mcp_registration import Allowance
+
+        allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True)
+        monkeypatch.setattr(allow, "inspect_allowance", lambda *, api_base: Allowance("missing", None, None))
+        done: list[Any] = []
+        monkeypatch.setattr(allow, "start_completion", lambda home, *, api_base: done.append(("thread", home)))
+        monkeypatch.setattr(
+            allow, "complete_pending", lambda home, *, api_base, wait, stop=None: done.append(("inline", wait)) or True
+        )
+        return done
+
+    def test_a_recorded_yes_is_finished_by_the_gateway_at_start(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import _register
+
+        calls = self._wire(monkeypatch, entry="missing", legacy=True)
+        done = self._applying(monkeypatch, tmp_path)
+        _register._reconcile_mcp_registration(self._runtime(tmp_path, gateway=True))
+        assert done == [("thread", tmp_path)] and calls == [], "nothing else is placed meanwhile"
+
+    def test_another_process_finishes_it_only_while_no_gateway_runs(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import _register, allow
+
+        calls = self._wire(monkeypatch, entry="missing", legacy=False)
+        done = self._applying(monkeypatch, tmp_path)
+        monkeypatch.setattr(allow, "gateway_lives", lambda home, *, api_base: True)
+        _register._reconcile_mcp_registration(self._runtime(tmp_path, gateway=False))
+        assert done == [] and calls == [], "the gateway still holds the old connection: its job"
+        monkeypatch.setattr(allow, "gateway_lives", lambda home, *, api_base: False)
+        _register._reconcile_mcp_registration(self._runtime(tmp_path, gateway=False))
+        assert done == [("inline", False)]
+
     def test_failure_is_logged_not_raised(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -618,6 +657,18 @@ class TestReconcileMcpRegistration:
 
 
 class TestAllowCommandRegistration:
+    def test_register_takes_the_agent_terminal_reading_once(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from agentchatme_hermes import _register, allow
+
+        monkeypatch.setattr(_register, "resolve_hermes_home", lambda: tmp_path / ".hermes")
+        monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: None)
+        monkeypatch.setattr(sys, "argv", ["hermes", "chat"])
+        monkeypatch.setattr(allow, "_origin_session", None)
+        monkeypatch.setenv("HERMES_SESSION_ID", "the-agents-session")
+        _register.register(MagicMock())
+        monkeypatch.setenv("HERMES_SESSION_ID", "this-chats-own-session")
+        assert allow.started_in_agent_terminal("this-chats-own-session") is True
+
     def test_register_adds_the_slash_command(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         from agentchatme_hermes import _register
 

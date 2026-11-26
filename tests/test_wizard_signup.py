@@ -83,7 +83,7 @@ class _Wizard:
         self.asked_with_key_saved: list[bool] = []
         monkeypatch.delenv("AGENTCHATME_API_BASE", raising=False)
         monkeypatch.setattr(wizard, "resolve_texts", lambda **_kw: None)
-        monkeypatch.setattr(wizard, "_tools_decision", self._decide)
+        monkeypatch.setattr(allow, "decide_for", self._decide)
         monkeypatch.setattr(wizard, "place_identity_and_tools", self._place)
         monkeypatch.setattr(signup, "_pause", self.waits.append)
         # A Hermes whose MCP client reads the key file (secret sources, secrets.agentchat).

@@ -402,7 +402,7 @@ class TestDoctorLines:
         level, line = _describe_worker({"state": "idle", "loop": {"recent_cycles": [cycle] * 3}}, now=1000.0) or ("", "")
         assert level == "fail" and "`hermes gateway restart` reconnects them at once" in line
 
-    @pytest.mark.parametrize("state", ["not_allowed_yet", "not_allowed", "restart_to_apply", "disabled"])
+    @pytest.mark.parametrize("state", ["not_allowed_yet", "not_allowed", "applying", "disabled"])
     def test_a_run_paused_by_the_switch_is_said_not_alarmed_on(self, state: str) -> None:
         from agentchatme_hermes import allow
         from agentchatme_hermes.cli import _describe_worker
@@ -419,14 +419,3 @@ class TestDoctorLines:
         cycle = {"outcome": "tools_unavailable", "failure": "the hosted AgentChat tools are not registered in Hermes yet"}
         worker = {"state": "idle", "loop": {"recent_cycles": [cycle] * 3}, "tools_allowed": {"state": "allowed"}}
         assert (_describe_worker(worker, now=1000.0) or ("", ""))[0] == "fail"
-
-    def test_the_running_gateway_still_to_apply(self) -> None:
-        from agentchatme_hermes.cli import _describe_tools_allowed
-
-        assert _describe_tools_allowed({"tools_allowed": {"state": "restart_to_apply"}}) == (
-            "warn",
-            "AgentChat tools: allowed in config.yaml, but the running gateway connected them "
-            "before that — send /reload-mcp in a chat it serves, or run hermes gateway restart",
-        )
-        for section in (None, {"state": "allowed"}, {"state": "not_allowed"}, "x"):
-            assert _describe_tools_allowed({"tools_allowed": section}) is None

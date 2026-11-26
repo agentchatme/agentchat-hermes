@@ -662,20 +662,57 @@ class TestToolsSwitch:
         held = self._held(monkeypatch)
         assert inv.readiness().ready is True and len(held) == 1
 
-    def test_a_flip_on_a_connected_server_waits_for_a_reload(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        inv = _invoker(monkeypatch, home=tmp_path / "p3")
-        box = self._switch(monkeypatch, "untrusted")
-        self._held(monkeypatch)
-        registration = [object()]
-        monkeypatch.setattr(hosted_tools_module, "hosted_tool_entry", lambda: registration[0])
-        assert inv.readiness().ready is False  # not allowed; the registration is seen untrusted
+    def test_a_yes_being_applied_pauses_and_is_finished_here(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from agentchatme_hermes import allow
+
+        home = tmp_path / "p3"
+        inv = _invoker(monkeypatch, home=home)
+        self._switch(monkeypatch, None, entry="missing")
+        allow.write_record(home, how="asked", trust="full", decision="yes", pending=True)
+        started: list[Any] = []
+        monkeypatch.setattr(allow, "start_completion", lambda h, *, api_base: started.append(h))
+        held = self._held(monkeypatch)
+        answer = inv.readiness()
+        assert answer.ready is False and "being applied" in (answer.reason or "")
+        assert held == [] and started == [home]
+
+    def test_the_pause_ending_wakes_the_loop(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """The cards that waited on the tray are gated as soon as the tools are allowed."""
         from agentchatme_hermes.mcp_registration import Allowance
 
+        inv = _invoker(monkeypatch, home=tmp_path / "p6")
+        woken: list[str] = []
+        inv.set_wake(lambda: woken.append("wake"))
+        box = self._switch(monkeypatch, "untrusted")
+        self._held(monkeypatch)
+        assert inv.readiness().ready is False
+        assert woken == []
         box[0] = Allowance("ours", "full", "trust")
-        answer = inv.readiness()
-        assert answer.ready is False and "not applied yet" in (answer.reason or "")
-        registration[0] = object()  # /reload-mcp: registered again, with the file's tier
+        inv.tools_allowed_status()  # the health record's minute read sees it first
+        assert woken == ["wake"]
         assert inv.readiness().ready is True
+        assert woken == ["wake"], "once per change"
+        inv.set_wake(None)
+
+    def test_a_yes_applied_elsewhere_reaches_the_loop(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        from agentchatme_hermes import allow
+        from agentchatme_hermes.mcp_registration import Allowance
+
+        home = tmp_path / "p7"
+        inv = _invoker(monkeypatch, home=home)
+        woken: list[str] = []
+        inv.set_wake(lambda: woken.append("wake"))
+        box = self._switch(monkeypatch, None, entry="missing")
+        inv.readiness()
+        box[0] = Allowance("ours", "full", "trust")
+        callback = allow._on_applied.get(str(home))
+        assert callback is not None, "the invoker listens for the second step"
+        callback()
+        assert woken == ["wake"]
+        inv.set_wake(None)
+        assert str(home) not in allow._on_applied
 
     def test_an_unreadable_config_does_not_pause(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         inv = _invoker(monkeypatch, home=tmp_path / "p4")

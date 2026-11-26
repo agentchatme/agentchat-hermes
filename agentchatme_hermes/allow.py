@@ -8,46 +8,55 @@ once, at setup, with one question::
 
     Allow @alice to use AgentChat tools on its own? [Y/n]
 
-Enter or ``y`` is a yes; ``n``, end of input and Ctrl-C are a no. It is never
-asked per tool, per peer or in the middle of a turn.
+Enter or ``y`` is a yes; ``n`` is a no. Ctrl-C and the end of input decide
+nothing (nobody answered). It is never asked per tool, per peer or in the
+middle of a turn.
 
 When the entry is written
 ─────────────────────────
-Only once a person has decided:
+Only once a person has decided, and the decision is recorded in the
+profile's own data (:func:`record_path`):
 
-* yes → the entry with ``trust: full`` (an existing ``untrusted`` entry of
-  ours is turned to ``full``: a connected server keeps its tier until
-  ``/reload-mcp`` or a restart, so only then does the answer name it);
+* yes → the entry with ``trust: full``;
 * no → the entry with ``trust: untrusted`` (the read-only tools work);
 * nobody asked yet → no entry at all: an agent's own terminal, no terminal,
-  a gateway or any other process activating with nobody present;
+  Ctrl-C, a gateway or any other process activating with nobody present;
 * the one exception: a profile set up before 0.3 (only the old
   ``AGENTCHATME_API_KEY`` name, no entry, never placed by this release line)
   gets ``trust: full``, once, recorded (:func:`first_placement`). The person
   set AgentChat up when its tools acted without asking.
 
+A yes over an ``untrusted`` entry a running gateway already connected is
+applied in two steps, because Hermes keeps a connected server's tier until
+the server is connected again and its config watcher (about once a minute)
+only adds and removes servers by name: the entry is removed (the watcher
+drops the server), then written with ``trust: full`` once the gateway holds
+no AgentChat tools any more (the watcher connects it fresh). The gateway does
+the second step (:func:`start_completion`); the decision is recorded first,
+so a crash between the steps completes at the next start. About two minutes.
+
 Entries an earlier release wrote are left as they are (no ``trust`` key reads
 as ``full``), apart from the client header :mod:`.mcp_registration` adds once.
 
-Who can say yes
-───────────────
-A person: at their own terminal (the CLI and wizard question), or from any
-chat with the agent (``/agentchat allow``, asked through Hermes' own
-``ctx.ask_choice``: buttons on Telegram, Discord and Slack, the clarify panel
-in the CLI and Desktop). The agent cannot type a slash command into its own
-chat. A terminal is no proof of a person (Hermes gives agents PTYs), so a CLI
-started inside an agent's terminal never asks: Hermes stamps
-``HERMES_SESSION_ID`` on every command its terminal tool runs, and no
-``hermes agentchat …`` process starts a session of its own. There is no
-``--yes`` flag.
+Who answers
+───────────
+A person: at their own terminal (the CLI and wizard question), or from a chat
+with the agent (``/agentchat allow``, asked through Hermes' own
+``ctx.ask_choice``). The plugin never offers or answers the question for the
+agent: it does not ask in a command an agent's terminal ran (Hermes stamps
+``HERMES_SESSION_ID`` on every command its terminal tool runs, and a
+``hermes agentchat …`` process starts no session of its own), and refuses
+``/agentchat allow`` in a classic chat process that an agent's terminal
+started. This is best effort, not a security boundary: an agent with a shell
+can edit ``config.yaml``. There is no ``--yes`` flag.
 
 While the switch is off
 ───────────────────────
 :class:`.agent_invoker.AgentInvoker` does not start AgentChat work: no gate
 call, no turn, nothing recorded; the socket still acknowledges delivery and
-the cards stay on the tray (the server reminds later). :func:`state_of` says
-which case it is; ``doctor``, ``status``, the health record and one log line
-per change say it too.
+the cards stay on the tray. :func:`read_switch` is the one reading of the
+switch, for the pause, ``doctor``, ``status``, the wizard and the slash
+command.
 """
 from __future__ import annotations
 
@@ -64,12 +73,10 @@ from .mcp_registration import (
     Allowance,
     Decision,
     EntryState,
-    McpRegistrationError,
-    Trust,
     TrustState,
     config_is_managed,
-    effective_trust,
     inspect_allowance,
+    manual_snippet,
 )
 
 if TYPE_CHECKING:
@@ -80,6 +87,10 @@ logger = logging.getLogger(__name__)
 
 COMMAND = "agentchat"
 QUESTION = "Allow {who} to use AgentChat tools on its own?"
+# Hermes' config watcher drops a removed server and connects an added one on
+# its housekeeping tick (60 s): the two steps of a yes over a connected
+# untrusted server take two ticks (contract-tested).
+APPLY_WORDS = "it takes effect within about two minutes"
 
 # ─── the words ─────────────────────────────────────────────────────────────
 
@@ -88,6 +99,10 @@ ALREADY_ALLOWED_LINE = "AgentChat tools: allowed"
 NOT_ALLOWED_LINE = (
     "AgentChat tools not allowed. {who} can read AgentChat but does not answer on its own. "
     "To allow later: send /agentchat allow in a chat with it."
+)
+NOT_ANSWERED_LINE = (
+    "AgentChat tools: not decided (the question was not answered). To allow: send /agentchat allow "
+    "in a chat with {who}, or run {cmd} allow in a terminal."
 )
 AGENT_TERMINAL_LINE = (
     "AgentChat tools: not allowed yet. This is an agent's terminal, so the plugin does not ask "
@@ -106,18 +121,29 @@ MANAGED_LINE = (
     "AgentChat tools: this Hermes install's configuration is managed by a package manager; "
     "declare mcp_servers.agentchat with trust: full there to allow."
 )
+APPLYING_LINE = "AgentChat tools allowed; " + APPLY_WORDS
 
-State = Literal["allowed", "not_allowed_yet", "not_allowed", "restart_to_apply", "disabled", "unknown"]
+
+def operator_route(api_base: str | None = None) -> str:
+    """For a deployment whose ``config.yaml`` is built, not kept between starts
+    (a container image): the operator declares the entry there, which is how
+    Hermes documents a person widening a server's trust."""
+    from .config import DEFAULT_API_BASE
+
+    return (
+        "An operator who builds config.yaml (a container image, a config not kept between starts) "
+        "declares the tools there instead:\n" + manual_snippet(api_base or DEFAULT_API_BASE, trust="full")
+    )
+
+
+State = Literal["allowed", "applying", "not_allowed_yet", "not_allowed", "disabled", "unknown"]
 # The states in which no AgentChat work starts.
-PAUSED_STATES: frozenset[str] = frozenset({"not_allowed_yet", "not_allowed", "restart_to_apply", "disabled"})
+PAUSED_STATES: frozenset[str] = frozenset({"applying", "not_allowed_yet", "not_allowed", "disabled"})
 
 _REASONS: dict[str, str] = {
     "not_allowed_yet": "AgentChat tools are not allowed yet (the person allows them with /agentchat allow)",
     "not_allowed": "AgentChat tools are not allowed (the person allows them with /agentchat allow)",
-    "restart_to_apply": (
-        "AgentChat tools are allowed but not applied yet (/reload-mcp in a chat the gateway serves, "
-        "or hermes gateway restart)"
-    ),
+    "applying": f"AgentChat tools are allowed and being applied ({APPLY_WORDS})",
     "disabled": "mcp_servers.agentchat is disabled in config.yaml",
 }
 
@@ -133,87 +159,152 @@ def reason(state: State) -> str:
     return _REASONS.get(state, state)
 
 
-def state_of(allowance: Allowance | None, live: Trust | None = None) -> State:
-    """Which case the switch is in. ``live`` is the tier Hermes holds for the
-    connected hosted tools in this process (:class:`LiveTier`), ``None`` when
-    not known; it matters only when ``config.yaml`` allows the tools through
-    their tier (approvals off, ``--yolo`` and an Always approval are read by
-    Hermes at each call)."""
+# ─── the one reading of the switch ─────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class Switch:
+    """The switch for one profile as ``config.yaml`` and the plugin's record say.
+
+    ``allowance``: :func:`.mcp_registration.tools_allowance` (``None`` when the
+    config could not be read); ``record``: :func:`read_record`."""
+
+    state: State
+    allowance: Allowance | None = None
+    record: dict[str, Any] | None = None
+
+    @property
+    def paused(self) -> bool:
+        return self.state in PAUSED_STATES
+
+    @property
+    def by_tier(self) -> bool:
+        """The entry's own tier allows the tools: the person's switch is on."""
+        return self.allowance is not None and self.allowance.by_tier
+
+    @property
+    def carried(self) -> bool:
+        return self.record is not None and self.record.get("how") == "carried_over"
+
+    @property
+    def hand_edited(self) -> bool:
+        """The entry's trust is not what the plugin last wrote (changed by hand):
+        a running gateway uses it once it connects the tools again."""
+        if self.record is None or self.allowance is None or self.allowance.trust is None:
+            return False
+        written = self.record.get("trust")
+        if written not in ("full", "untrusted"):
+            return False
+        now = "untrusted" if self.allowance.trust == "untrusted" else "full"
+        return bool(written != now)
+
+
+def state_of(allowance: Allowance | None, record: dict[str, Any] | None = None) -> State:
+    """Which case the switch is in."""
     if allowance is None:
         return "unknown"
     if allowance.entry == "missing":
-        return "not_allowed_yet"
+        return "applying" if record is not None and record.get("pending") is True else "not_allowed_yet"
     if allowance.entry == "disabled":
         return "disabled"
-    if not allowance.allowed:
-        return "not_allowed"
-    if not allowance.bypass and live == "untrusted":
-        return "restart_to_apply"
-    return "allowed"
+    return "allowed" if allowance.allowed else "not_allowed"
 
 
-def describe(
-    state: State,
-    allowance: Allowance | None,
-    handle: str | None,
-    *,
-    carried: bool = False,
-    cmd: str = "hermes agentchat",
-) -> str:
+def read_switch(home: Path, *, api_base: str) -> Switch:
+    """The switch for ``home`` (run inside the profile's scope): one config
+    read and the record. Never raises (``unknown`` when the config cannot be
+    read)."""
+    try:
+        allowance: Allowance | None = inspect_allowance(api_base=api_base)
+    except Exception:
+        logger.debug("allow: config.yaml not read", exc_info=True)
+        return Switch("unknown")
+    record = read_record(home)
+    return Switch(state_of(allowance, record), allowance, record)
+
+
+def describe(switch: Switch, handle: str | None, *, cmd: str = "hermes agentchat") -> str:
     """``doctor`` / ``status`` wording for the switch (no level prefix);
     ``cmd``: ``hermes agentchat`` spelled for the profile."""
     agent = who(handle)
-    if state == "allowed" and allowance is not None:
+    allowance = switch.allowance
+    if switch.state == "allowed" and allowance is not None:
+        if switch.hand_edited:
+            return (
+                "allowed in config.yaml (trust changed by hand there): a running gateway uses it once it "
+                "connects the tools again — /reload-mcp in a chat it serves, or hermes gateway restart"
+            )
         if allowance.via == "trust":
-            if carried:
+            if switch.carried:
                 return "allowed (carried over from your setup under an earlier release)"
             return "allowed (trust: full)"
         if allowance.via == "no_trust_key":
             return "allowed (the entry has no trust key, which Hermes reads as full)"
         if allowance.via == "approvals_off":
-            return "allowed by approvals.mode: off (mcp_servers.agentchat says trust: untrusted)"
+            return (
+                "allowed by approvals.mode: off (mcp_servers.agentchat says trust: untrusted; /agentchat allow "
+                "turns the tools themselves on)"
+            )
         if allowance.via == "yolo":
             return "allowed by --yolo (HERMES_YOLO_MODE; mcp_servers.agentchat says trust: untrusted)"
-        if allowance.via == "always_grant":
-            return (
-                "agentchat_send_message is allowed by an Always approval; the other AgentChat write tools "
-                "still ask — /agentchat allow covers them all"
-            )
-    if state == "not_allowed_yet":
+    if switch.state == "applying":
+        return (
+            f"allowed, being applied ({APPLY_WORDS}: the running gateway drops the old connection, then "
+            "connects the tools again) — if it does not, hermes gateway restart"
+        )
+    if switch.state == "not_allowed_yet":
         return (
             f"not allowed yet — {agent} has no AgentChat tools until the person allows them: send "
             f"/agentchat allow in a chat with it, or run {cmd} allow"
         )
-    if state == "not_allowed":
+    if switch.state == "not_allowed":
+        hand = " (trust changed by hand in config.yaml: a running gateway uses it once it reconnects)" if switch.hand_edited else ""
         return (
-            f"not allowed — {agent} can read AgentChat but does not answer on its own; send /agentchat "
+            f"not allowed — {agent} can read AgentChat but does not answer on its own{hand}; send /agentchat "
             f"allow in a chat with it, or run {cmd} allow"
         )
-    if state == "restart_to_apply":
-        return (
-            "allowed in config.yaml, but the running gateway connected them before that — send "
-            "/reload-mcp in a chat it serves, or run hermes gateway restart"
-        )
-    if state == "disabled":
+    if switch.state == "disabled":
         return "mcp_servers.agentchat is disabled in config.yaml — the agent has no AgentChat tools"
     return "not known (this Hermes' config.yaml could not be read)"
 
 
-# ─── who is at the terminal ────────────────────────────────────────────────
+# ─── who is at the terminal (best effort) ──────────────────────────────────
 
 
 def in_agent_terminal(environ: Mapping[str, str] | None = None) -> bool:
-    """Whether this process was started inside a Hermes agent's process tree:
-    Hermes puts ``HERMES_SESSION_ID`` in the environment of every command its
-    terminal tool runs (``tools/environments/local.py``
-    ``_inject_session_context_env``; ``gateway/session_context.py``
-    ``set_current_session_id``), and a ``hermes agentchat …`` process starts no
-    session of its own. The person's own terminal pane in Hermes Desktop is
-    marked ``HERMES_DESKTOP_TERMINAL=1`` and is not an agent's."""
+    """Whether this process was started inside a Hermes agent's process tree,
+    as far as can be told: Hermes puts ``HERMES_SESSION_ID`` in the
+    environment of every command its terminal tool runs
+    (``tools/environments/local.py`` ``_inject_session_context_env``;
+    ``gateway/session_context.py`` ``set_current_session_id``), and a
+    ``hermes agentchat …`` process starts no session of its own. A person's
+    shell that a Hermes process started (Desktop's terminal pane, a shell
+    escape) carries it too: there the person allows in a chat. Best effort:
+    an agent can unset the variable."""
     env = os.environ if environ is None else environ
-    if env.get("HERMES_DESKTOP_TERMINAL") == "1":
-        return False
     return bool((env.get("HERMES_SESSION_ID") or "").strip())
+
+
+# ``HERMES_SESSION_ID`` as this process found it when the plugin was registered
+# (before a chat session of this process sets its own), ``""`` when unset.
+_origin_session: str | None = None
+
+
+def note_process_origin(environ: Mapping[str, str] | None = None) -> None:
+    """Take the agent-terminal reading once, at ``register(ctx)``."""
+    global _origin_session
+    if _origin_session is None:
+        env = os.environ if environ is None else environ
+        _origin_session = (env.get("HERMES_SESSION_ID") or "").strip()
+
+
+def started_in_agent_terminal(current_session_id: str = "") -> bool:
+    """Whether this (non-gateway) process was started inside an agent's
+    terminal: a session id was there before this process's own chat session.
+    When the plugin was registered after this process's session began, the
+    reading is that session's own id, which says nothing: not an agent's."""
+    origin = _origin_session or ""
+    return bool(origin) and origin != (current_session_id or "").strip()
 
 
 def stdin_is_tty() -> bool:
@@ -225,12 +316,15 @@ def stdin_is_tty() -> bool:
         return False
 
 
-def ask_in_terminal(question: str) -> bool:
+Answer = Literal["yes", "no", "cancelled", "end_of_input"]
+
+
+def ask_in_terminal(question: str) -> Answer:
     """``question [Y/n]`` on the terminal: Enter, ``y`` or ``yes`` is a yes;
-    anything else, end of input and Ctrl-C are a no. Read with Hermes' own
-    line reader (``hermes_cli.cli_output.line_input``), which keeps the
-    end of input and Ctrl-C apart from an empty line (its ``prompt`` turns
-    both into ``""``)."""
+    anything else typed is a no; Ctrl-C (``cancelled``) and the end of input
+    decide nothing. Read with Hermes' own line reader
+    (``hermes_cli.cli_output.line_input``), which keeps those apart from an
+    empty line (its ``prompt`` turns all three into ``""``)."""
     text = f"  {question} [Y/n]: "
     reader: Callable[[str], str] = input
     try:
@@ -242,17 +336,21 @@ def ask_in_terminal(question: str) -> bool:
         logger.debug("allow: Hermes' line reader not importable; plain input()")
     try:
         answer = reader(text)
-    except (EOFError, KeyboardInterrupt):
+    except KeyboardInterrupt:
         sys.stdout.write("\n")
         sys.stdout.flush()
-        return False
-    return str(answer).strip().lower() in ("", "y", "yes")
+        return "cancelled"
+    except EOFError:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        return "end_of_input"
+    return "yes" if str(answer).strip().lower() in ("", "y", "yes") else "no"
 
 
 @dataclass(frozen=True)
 class SetupDecision:
     """What the person decided at setup: ``decision`` ``yes`` / ``no``, or
-    ``None`` when nobody was asked (and nothing changes); ``line`` says which."""
+    ``None`` when nobody decided (and nothing changes); ``line`` says which."""
 
     decision: Decision | None
     line: str
@@ -263,40 +361,55 @@ def decide(
     *,
     api_base: str,
     tty: bool,
-    ask: Callable[[str], bool] | None = None,
+    home: Path,
+    ask: Callable[[str], Answer] | None = None,
     environ: Mapping[str, str] | None = None,
     cmd: str = "hermes agentchat",
 ) -> SetupDecision:
     """Ask the one question when it is the person's to answer here, before
     the key is saved (the entry is then written once, with the answer).
-    Not asked when the tools are already allowed, when the entry is written by
-    hand or disabled, when the config is package-managed, in an agent's
-    terminal, or with no terminal."""
+    Not asked when the entry's tier already allows the tools, when the entry
+    is written by hand or disabled, when the config is package-managed, in an
+    agent's terminal, or with no terminal."""
     agent = who(handle)
-    try:
-        allowance: Allowance | None = inspect_allowance(api_base=api_base)
-    except McpRegistrationError:
-        allowance = None
-    if allowance is not None:
-        if allowance.allowed:
-            return SetupDecision(None, ALREADY_ALLOWED_LINE)
-        if allowance.entry == "user_managed":
-            return SetupDecision(None, HAND_MANAGED_LINE)
-        if allowance.entry == "disabled":
-            return SetupDecision(None, DISABLED_LINE)
+    switch = read_switch(home, api_base=api_base)
+    if switch.by_tier:
+        return SetupDecision(None, ALREADY_ALLOWED_LINE)
+    if switch.state == "applying":
+        return SetupDecision(None, APPLYING_LINE)
+    if switch.allowance is not None and switch.allowance.entry == "user_managed":
+        return SetupDecision(None, HAND_MANAGED_LINE)
+    if switch.state == "disabled":
+        return SetupDecision(None, DISABLED_LINE)
     if config_is_managed():
         return SetupDecision(None, MANAGED_LINE)
     if in_agent_terminal(environ):
         return SetupDecision(None, AGENT_TERMINAL_LINE.format(who=agent))
     if not tty:
-        return SetupDecision(None, NO_TERMINAL_LINE.format(who=agent, cmd=cmd))
-    yes = (ask or ask_in_terminal)(QUESTION.format(who=agent))
-    if yes:
+        return SetupDecision(None, NO_TERMINAL_LINE.format(who=agent, cmd=cmd) + "\n" + operator_route(api_base))
+    answer = (ask or ask_in_terminal)(QUESTION.format(who=agent))
+    if answer == "yes":
         return SetupDecision("yes", ALLOWED_LINE)
-    return SetupDecision("no", NOT_ALLOWED_LINE.format(who=agent))
+    if answer == "no":
+        return SetupDecision("no", NOT_ALLOWED_LINE.format(who=agent))
+    if answer == "end_of_input":
+        return SetupDecision(None, NO_TERMINAL_LINE.format(who=agent, cmd=cmd))
+    return SetupDecision(None, NOT_ANSWERED_LINE.format(who=agent, cmd=cmd))
 
 
-# ─── the one-time carry-over and its record ────────────────────────────────
+def decide_for(handle: str | None) -> SetupDecision:
+    """:func:`decide` for this process: the profile, its API base, the
+    profile's command and whether stdin is a terminal. The CLI, the wizard and
+    ``doctor --fix`` ask through this."""
+    from .cli import _api_base  # the CLI's resolver, until there is one for every caller
+    from .config import cli_prefix
+    from .profile_scope import resolve_hermes_home
+
+    home = resolve_hermes_home()
+    return decide(handle, api_base=_api_base(), tty=stdin_is_tty(), home=home, cmd=cli_prefix(home))
+
+
+# ─── the record, the one-time carry-over, a pending yes ────────────────────
 
 RECORD_FILENAME = "mcp-entry.json"
 RECORD_VERSION = 1
@@ -319,17 +432,28 @@ def read_record(home: Path) -> dict[str, Any] | None:
     return record if isinstance(record, dict) else None
 
 
-def write_record(home: Path, *, how: How, trust: TrustState | None) -> None:
-    """Record how this profile's entry was decided: ``asked`` (a person),
-    ``carried_over`` (the one-time carry-over), ``existing`` (an entry an
-    earlier release placed was there when this release line first looked).
-    Never raises: a record that cannot be written is logged."""
+def write_record(
+    home: Path,
+    *,
+    how: How,
+    trust: TrustState | None,
+    decision: Decision | None = None,
+    pending: bool = False,
+) -> bool:
+    """Record how this profile's entry was decided: ``asked`` (a person:
+    ``decision`` yes / no), ``carried_over`` (the one-time carry-over),
+    ``existing`` (an entry an earlier release placed was there when this
+    release line first looked). ``pending``: ``trust: full`` is decided but
+    not written yet (a yes being applied, a carry-over not placed yet).
+    ``False`` (logged) when the record could not be written."""
     from .state import write_json_atomic
 
     record = {
         "version": RECORD_VERSION,
         "how": how,
+        "decision": decision,
         "trust": trust,
+        "pending": pending,
         "release": __version__,
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -337,12 +461,15 @@ def write_record(home: Path, *, how: How, trust: TrustState | None) -> None:
         write_json_atomic(record_path(home), record)
     except OSError as exc:
         logger.warning("agentchat plugin: could not write %s (%s)", record_path(home), exc)
+        return False
+    return True
 
 
-def carried_over(home: Path) -> bool:
-    """Whether this profile's entry was the carry-over (doctor's wording)."""
+def clear_pending(home: Path) -> None:
+    """Drop a pending ``trust: full`` (logout removes the entry on purpose)."""
     record = read_record(home)
-    return record is not None and record.get("how") == "carried_over"
+    if record is not None and record.get("pending") is True:
+        write_record(home, how=record.get("how") or "asked", trust=record.get("trust"), decision=record.get("decision"))
 
 
 def legacy_key_set() -> bool:
@@ -361,86 +488,131 @@ def legacy_key_set() -> bool:
 def first_placement(home: Path, *, entry: EntryState, legacy_key_set: bool) -> Decision | None:
     """The one decision made for a profile with nobody present, at most once:
     ``carried_over`` when the profile was set up before 0.3 (the legacy key
-    name is set, there is no entry, and this release line never placed one);
-    else ``None``. An entry already there is recorded as ``existing``, so a
-    later removal never brings the carry-over back. The carry-over itself is
-    recorded when its entry is written (:func:`.placement.place_mcp`)."""
+    name is set, there is no entry, and this release line never placed one) —
+    recorded, as pending, before anything is written, so a placement that
+    does not land completes later and the old key line is never the only
+    trace of it; else ``None``. An entry already there is recorded as
+    ``existing``, so a later removal never brings the carry-over back."""
     if read_record(home) is not None:
         return None
     if entry != "missing":
         write_record(home, how="existing", trust=None)
         return None
-    return "carried_over" if legacy_key_set else None
+    if not legacy_key_set:
+        return None
+    if not write_record(home, how="carried_over", trust="full", pending=True):
+        return None  # not recorded: not carried over (it would not be once only)
+    return "carried_over"
 
 
-# ─── the tier Hermes holds for the connected tools ─────────────────────────
+# ─── a pending yes: the second step, in the gateway ────────────────────────
+
+DROP_TIMEOUT_S = 180.0
+CONNECT_TIMEOUT_S = 150.0
+POLL_S = 2.0
+
+_completions: dict[str, threading.Thread] = {}
+_completions_lock = threading.Lock()
+# What to call in this process once a profile's tools are allowed again (the
+# runtime's invoker: re-read the switch, wake the receive loop).
+_on_applied: dict[str, Callable[[], object]] = {}
 
 
-class LiveTier:
-    """The tier Hermes recorded when it registered the hosted tools in this
-    process. Hermes records it when it connects the server and keeps it until
-    the tools are registered again (``/reload-mcp``, a restart); a transport
-    reconnect keeps the registered tools and the tier. Registered tools are
-    told apart by the registry entry's identity (``tools.registry``:
-    ``ToolEntry`` compares by ``is``). A registration seen for the first time
-    takes the tier ``config.yaml`` says then (the reconcile and ``/reload-mcp``
-    read the file when they connect); in-process writers observe just before
-    they change the file (``/agentchat allow``), so a following
-    ``/reload-mcp`` is told apart from the change itself."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._entry: object | None = None
-        self._live: Trust | None = None
-
-    def observe(self, entry: object | None, config_trust: TrustState | None) -> Trust | None:
-        with self._lock:
-            if entry is None:
-                self._entry, self._live = None, None
-                return None
-            if entry is not self._entry:
-                self._entry, self._live = entry, effective_trust(config_trust)
-            return self._live
+def on_applied(home: Path, callback: Callable[[], object] | None) -> None:
+    """Have ``callback`` called when a pending yes for ``home`` is written."""
+    if callback is None:
+        _on_applied.pop(str(home), None)
+    else:
+        _on_applied[str(home)] = callback
 
 
-_trackers: dict[str, LiveTier] = {}
-_trackers_lock = threading.Lock()
+def gateway_lives(home: Path, *, api_base: str) -> bool:
+    """Whether a gateway runs for this profile's account (its health record
+    fresh, its pid alive, the leader lock held). Never raises."""
+    from .config import resolve_key
+    from .ws_health import live_health
+
+    try:
+        resolution = resolve_key(home)
+        stored = resolution.store.key
+        api_key = resolution.held_key or (stored.api_key if stored is not None else None)
+        if not api_key:
+            return False
+        return live_health(api_base, api_key, home) is not None
+    except Exception:
+        logger.debug("allow: gateway liveness not read", exc_info=True)
+        return False
 
 
-def live_tier(home: Path) -> LiveTier:
-    """This process's :class:`LiveTier` for ``home``'s profile."""
+def complete_pending(home: Path, *, api_base: str, wait: bool, stop: threading.Event | None = None) -> bool:
+    """Write the pending ``trust: full`` for ``home`` (the current profile
+    scope). With ``wait``, first until this process holds no hosted AgentChat
+    tools (Hermes' watcher dropped the removed server), at most
+    :data:`DROP_TIMEOUT_S`, and afterwards until the tools are registered
+    again, at most :data:`CONNECT_TIMEOUT_S`. ``True`` when the entry was
+    written."""
+    from .hosted_tools import hosted_tool_names
+    from .placement import place_mcp
+
+    record = read_record(home)
+    if record is None or record.get("pending") is not True:
+        return False
+    stop = stop or threading.Event()
+    if wait:
+        deadline = time.monotonic() + DROP_TIMEOUT_S
+        held = hosted_tool_names() or []
+        while held and time.monotonic() < deadline and not stop.is_set():
+            stop.wait(POLL_S)
+            held = hosted_tool_names() or []
+        if held:
+            logger.warning(
+                "agentchat plugin: Hermes still holds the earlier AgentChat tools after %.0fs; writing trust: "
+                "full anyway — if they keep asking, hermes gateway restart",
+                DROP_TIMEOUT_S,
+            )
+    decision: Decision = "carried_over" if record.get("how") == "carried_over" else "yes"
+    step = place_mcp(api_base, decision=decision)
+    if step.failed or step.outcome not in ("added", "present", "allowed"):
+        logger.warning("agentchat plugin: the allowed AgentChat tools were not written — %s", step.detail)
+        return False
+    logger.info("agentchat plugin: AgentChat tools allowed: %s", step.detail)
+    if wait:
+        # Wake the receive loop once the tools are back, so its first cycle finds them.
+        deadline = time.monotonic() + CONNECT_TIMEOUT_S
+        names = hosted_tool_names()
+        while names == [] and time.monotonic() < deadline and not stop.wait(POLL_S):
+            names = hosted_tool_names()
+    callback = _on_applied.get(str(home))
+    if callback is not None:
+        try:
+            callback()
+        except Exception:
+            logger.debug("allow: the applied callback raised", exc_info=True)
+    return True
+
+
+def start_completion(home: Path, *, api_base: str) -> threading.Thread | None:
+    """In the gateway: finish a pending yes on a daemon thread, once
+    (:func:`complete_pending` with ``wait``). ``None`` when one already runs."""
+    from .profile_scope import profile_context
+
     key = str(home)
-    with _trackers_lock:
-        tracker = _trackers.get(key)
-        if tracker is None:
-            tracker = _trackers[key] = LiveTier()
-        return tracker
+    with _completions_lock:
+        running = _completions.get(key)
+        if running is not None and running.is_alive():
+            return None
 
+        def run() -> None:
+            try:
+                with profile_context(home):
+                    complete_pending(home, api_base=api_base, wait=True)
+            except Exception:
+                logger.exception("agentchat plugin: applying the allowed AgentChat tools raised")
 
-def observe_live(home: Path, allowance: Allowance | None) -> Trust | None:
-    """Feed :func:`live_tier` with the hosted tools registered now (the
-    current profile scope) and what ``config.yaml`` says."""
-    from .hosted_tools import hosted_tool_entry
-
-    entry = hosted_tool_entry()
-    return live_tier(home).observe(entry, allowance.trust if allowance is not None else None)
-
-
-def read_switch(home: Path, *, api_base: str) -> tuple[State, Allowance | None]:
-    """The switch for ``home`` as this process sees it: ``config.yaml`` plus
-    the tier of the tools registered here. Run inside the profile's scope.
-    Never raises (``unknown`` when the config cannot be read)."""
-    try:
-        allowance: Allowance | None = inspect_allowance(api_base=api_base)
-    except Exception:
-        logger.debug("allow: config.yaml not read", exc_info=True)
-        return "unknown", None
-    try:
-        live = observe_live(home, allowance)
-    except Exception:
-        logger.debug("allow: the registered tools could not be read", exc_info=True)
-        live = None
-    return state_of(allowance, live), allowance
+        thread = threading.Thread(target=run, name="agentchat-tools-apply", daemon=True)
+        _completions[key] = thread
+        thread.start()
+        return thread
 
 
 # ─── /agentchat allow ──────────────────────────────────────────────────────
@@ -457,8 +629,10 @@ def register_allow_command(ctx: Any, home: Path) -> None:
         logger.debug("agentchat plugin: this Hermes has no ctx.register_command")
         return
 
-    def agentchat(raw_args: str = "") -> str:
-        return run_command(raw_args, home=home, ask_choice=getattr(ctx, "ask_choice", None))
+    def agentchat(raw_args: str = "", *, session_id: str = "") -> str:
+        return run_command(
+            raw_args, home=home, ask_choice=getattr(ctx, "ask_choice", None), session_id=session_id
+        )
 
     try:
         register(
@@ -471,22 +645,23 @@ def register_allow_command(ctx: Any, home: Path) -> None:
         logger.warning("agentchat plugin: /agentchat could not be registered", exc_info=True)
 
 
-def run_command(raw_args: str, *, home: Path, ask_choice: Any) -> str:
+def run_command(raw_args: str, *, home: Path, ask_choice: Any, session_id: str = "") -> str:
     """``/agentchat [allow]``: its reply. ``allow`` asks the person who sent it
     (Hermes' own prompt, ``ctx.ask_choice``); nothing else changes anything."""
     from .profile_scope import profile_context
 
     try:
         with profile_context(home):
-            return _run_command(raw_args, home=home, ask_choice=ask_choice)
+            return _run_command(raw_args, home=home, ask_choice=ask_choice, session_id=session_id)
     except Exception as exc:
         logger.warning("agentchat plugin: /agentchat failed", exc_info=True)
         return f"AgentChat: the command failed ({exc}). hermes agentchat doctor says more."
 
 
-def _run_command(raw_args: str, *, home: Path, ask_choice: Any) -> str:
+def _run_command(raw_args: str, *, home: Path, ask_choice: Any, session_id: str) -> str:
     from .cli import _api_base  # the CLI's resolver, until there is one for every caller
     from .config import cli_prefix, resolve_key
+    from .leader_lock import is_hermes_gateway_process
     from .placement import place_mcp, profile_identity
 
     api_base = _api_base()
@@ -501,18 +676,25 @@ def _run_command(raw_args: str, *, home: Path, ask_choice: Any) -> str:
         )
     handle = profile_identity(home, api_base=api_base).handle
     agent = who(handle)
-    state, allowance = read_switch(home, api_base=api_base)
+    switch = read_switch(home, api_base=api_base)
     words = raw_args.strip().lower().split()
     if not words or words[0] != "allow":
-        described = describe(state, allowance, handle, carried=carried_over(home), cmd=cmd)
-        return f"AgentChat tools for {agent}: {described}."
-    if state == "allowed":
+        return f"AgentChat tools for {agent}: {describe(switch, handle, cmd=cmd)}."
+    in_gateway = is_hermes_gateway_process()
+    if not in_gateway and started_in_agent_terminal(session_id):
+        return (
+            "This chat runs in a process an agent's terminal started, so the plugin does not ask here. "
+            f"Send /agentchat allow in your own chat with {agent} (Telegram, Desktop, or a terminal of your own)."
+        )
+    if switch.by_tier:
         return f"AgentChat tools are already allowed for {agent}."
-    if state == "restart_to_apply":
-        return f"AgentChat tools for {agent}: {describe(state, allowance, handle, cmd=cmd)}."
-    if allowance is not None and allowance.entry == "user_managed":
+    if switch.state == "applying":
+        if in_gateway:
+            start_completion(home, api_base=api_base)
+        return f"AgentChat tools for {agent}: {describe(switch, handle, cmd=cmd)}."
+    if switch.allowance is not None and switch.allowance.entry == "user_managed":
         return HAND_MANAGED_LINE
-    if state == "disabled":
+    if switch.state == "disabled":
         return DISABLED_LINE
     if config_is_managed():
         return MANAGED_LINE
@@ -522,21 +704,15 @@ def _run_command(raw_args: str, *, home: Path, ask_choice: Any) -> str:
     if picked not in ("allow", "no"):
         return "Nothing changed: the question was not answered."
     decision: Decision = "yes" if picked == "allow" else "no"
-    if decision == "yes":
-        # Before the change: the tools registered now keep the tier they have.
-        observe_live(home, allowance)
     step = place_mcp(api_base, decision=decision)
     if step.failed:
         return f"AgentChat tools: nothing changed — {step.detail}"
     if decision == "no":
         return NOT_ALLOWED_LINE.format(who=agent)
+    if step.outcome == "applying":
+        if in_gateway:
+            start_completion(home, api_base=api_base)
+        return f"AgentChat tools allowed for {agent}; {APPLY_WORDS}."
     if step.outcome == "allowed":
-        from .leader_lock import is_hermes_gateway_process
-
-        if is_hermes_gateway_process():
-            return f"AgentChat tools allowed for {agent}. Send /reload-mcp to apply it now."
-        return (
-            f"AgentChat tools allowed for {agent}. To apply: /reload-mcp in a chat the gateway serves, "
-            "or hermes gateway restart."
-        )
+        return f"AgentChat tools allowed for {agent}. This chat uses them after /reload-mcp."
     return f"AgentChat tools allowed for {agent}. The gateway connects them within about a minute."

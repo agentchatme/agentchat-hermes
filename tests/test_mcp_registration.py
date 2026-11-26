@@ -499,7 +499,7 @@ class TestAllowance:
     @pytest.mark.parametrize(("trust", "via"), [("full", "trust"), (None, "no_trust_key"), ("FULL", "trust")])
     def test_the_tier_allows(self, trust: Any, via: str) -> None:
         allowance = reg.tools_allowance(_config(trust), environ={})
-        assert allowance.allowed and allowance.via == via and not allowance.bypass
+        assert allowance.allowed and allowance.via == via and allowance.by_tier
 
     def test_untrusted_with_nothing_else_is_not_allowed(self) -> None:
         allowance = reg.tools_allowance(_config("untrusted"), environ={})
@@ -508,7 +508,7 @@ class TestAllowance:
     @pytest.mark.parametrize("mode", [False, "off", " OFF "])
     def test_approvals_off_lets_writes_through(self, mode: Any) -> None:
         allowance = reg.tools_allowance(_config(approvals={"mode": mode}), environ={})
-        assert allowance.allowed and allowance.via == "approvals_off" and allowance.bypass
+        assert allowance.allowed and allowance.via == "approvals_off" and not allowance.by_tier
 
     @pytest.mark.parametrize("mode", [True, "manual", "smart", "auto", None])
     def test_other_modes_do_not(self, mode: Any) -> None:
@@ -519,12 +519,10 @@ class TestAllowance:
         allowance = reg.tools_allowance(_config(), environ={"HERMES_YOLO_MODE": value})
         assert allowance.allowed is allowed and (allowance.via == "yolo") is allowed
 
-    def test_an_always_approval_for_the_reply_tool(self) -> None:
+    def test_an_always_approval_of_one_tool_does_not_count(self) -> None:
+        """An AgentChat turn calls several write tools: one remembered approval is not the switch."""
         allowance = reg.tools_allowance(_config(command_allowlist=["mcp:agentchat/agentchat_send_message"]), environ={})
-        assert allowance.allowed and allowance.via == "always_grant"
-        other = reg.tools_allowance(_config(command_allowlist=["mcp:agentchat/agentchat_mute", "ls"]), environ={})
-        assert not other.allowed
-        assert not reg.tools_allowance(_config(command_allowlist="mcp:agentchat/agentchat_send_message"), environ={}).allowed
+        assert not allowance.allowed and allowance.via is None
 
     def test_a_disabled_entry_is_never_allowed(self) -> None:
         config = _config("full")
@@ -538,9 +536,6 @@ class TestAllowance:
         assert allowance.entry == "user_managed" and not allowance.allowed
         config["mcp_servers"]["agentchat"]["trust"] = "full"
         assert reg.tools_allowance(config, environ={}).allowed
-
-    def test_the_grant_key_is_hermes_shape(self) -> None:
-        assert reg.grant_key() == "mcp:agentchat/agentchat_send_message"
 
     def test_inspect_reads_the_raw_file(self, fake_hermes: _FakeHermesConfig) -> None:
         assert reg.inspect_allowance().entry == "missing"

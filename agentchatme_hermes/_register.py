@@ -100,8 +100,11 @@ def register(ctx: Any) -> None:
     # with the agent (Hermes' own prompt). Registered unconditionally, like the
     # CLI: it needs no key and no runtime.
     try:
-        from .allow import register_allow_command
+        from .allow import note_process_origin, register_allow_command
 
+        # Before a chat session of this process sets its own session id: was
+        # this process started inside an agent's terminal? (best effort)
+        note_process_origin()
         register_allow_command(ctx, resolve_hermes_home())
     except Exception:
         logger.error("agentchat plugin: /agentchat could not be registered", exc_info=True)
@@ -772,19 +775,34 @@ def _reconcile_mcp_registration(runtime: Any) -> None:
     The entry is written only once a person decided whether the agent may use
     the AgentChat tools on its own (:mod:`.allow`); with nobody present (this
     path: a gateway or any other Hermes process activating) nothing is added,
-    with one exception, made at most once and recorded: a profile set up
-    before 0.3 (only the old ``AGENTCHATME_API_KEY``, no entry) gets the entry
-    with ``trust: full`` (:func:`.allow.first_placement`) — it was set up when
-    the tools acted without asking. An entry that is there gets the client
-    header once when it has none (the entry is static, so this writes at most
-    once per install); a user-managed entry is never touched. The gateway's
-    config reconcile connects a new entry within about a minute. Non-fatal:
-    failures are logged with the fix.
+    with two exceptions, both recorded decisions:
+
+    * a profile set up before 0.3 (only the old ``AGENTCHATME_API_KEY``, no
+      entry) gets the entry with ``trust: full``, once
+      (:func:`.allow.first_placement`) — it was set up when the tools acted
+      without asking;
+    * a recorded ``trust: full`` not written yet (a yes applied in two steps,
+      or a carry-over, interrupted) is written: by the gateway once it holds
+      no AgentChat tools (:func:`.allow.start_completion`), by another process
+      only while no gateway runs for the account.
+
+    An entry that is there gets the client header once when it has none (the
+    entry is static, so this writes at most once per install); a user-managed
+    entry is never touched. The gateway's config reconcile connects a new
+    entry within about a minute. Non-fatal: failures are logged with the fix.
     """
     try:
-        from .allow import first_placement, legacy_key_set
+        from .allow import (
+            complete_pending,
+            first_placement,
+            gateway_lives,
+            legacy_key_set,
+            read_switch,
+            start_completion,
+        )
         from .mcp_registration import McpRegistrationError, inspect_entry
         from .placement import place_mcp
+        from .runtime import keeps_placements_current
     except ImportError:
         logger.debug("agentchatme_hermes.placement not importable; skipping MCP registration")
         return
@@ -793,6 +811,13 @@ def _reconcile_mcp_registration(runtime: Any) -> None:
         return
     home = runtime.hermes_home
     label = profile_label(home)
+    if read_switch(home, api_base=api_base).state == "applying":
+        if keeps_placements_current(runtime):
+            start_completion(home, api_base=api_base)
+            logger.info("agentchat plugin: applying the allowed AgentChat tools for profile=%s", label)
+        elif not gateway_lives(home, api_base=api_base):
+            complete_pending(home, api_base=api_base, wait=False)
+        return
     decision = None
     try:
         entry = inspect_entry(api_base=api_base)
@@ -831,20 +856,22 @@ def _say_not_allowed_yet(runtime: Any, label: str) -> None:
     if key in _said_not_allowed:
         return
     _said_not_allowed.add(key)
-    from .allow import who
+    from .allow import operator_route, who
     from .config import cli_prefix
     from .runtime import keeps_placements_current
 
     handle = getattr(getattr(runtime, "identity", None), "handle", None)
     level = logging.WARNING if keeps_placements_current(runtime) else logging.INFO
+    api_base = getattr(getattr(runtime, "config", None), "api_base", None)
     logger.log(
         level,
         "agentchat plugin: AgentChat tools are not allowed yet for profile=%s (%s): no AgentChat work "
         "starts until the person allows them — /agentchat allow in a chat with it, or `%s allow` in a "
-        "terminal",
+        "terminal. %s",
         label,
         who(handle),
         cli_prefix(runtime.hermes_home),
+        operator_route(api_base if isinstance(api_base, str) else None),
     )
 
 
