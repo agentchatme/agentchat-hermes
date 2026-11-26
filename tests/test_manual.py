@@ -46,6 +46,11 @@ from agentchatme_hermes import cli, manual, placement
 from agentchatme_hermes.manual import BUNDLED_MANUAL_PATH, manual_path
 from agentchatme_hermes.skills import SKILL_DESCRIPTION, register_skill
 
+# The served manual and identity line, kept current: the plugin setting
+# live_texts on (tests/conftest.py ``live_texts``). This release's texts, the
+# default, are tests/test_pinned_texts.py.
+pytestmark = pytest.mark.usefixtures("live_texts")
+
 BUNDLE = BUNDLED_MANUAL_PATH.read_bytes()
 BUNDLE_VERSION = manual.bundled_version()
 API = "https://api.agentchat.me"
@@ -567,7 +572,7 @@ class TestLeader:
             receiver.stop()
         assert section["path"] == str(target)
         assert section["last_sync"]["state"] == "updated" and section["last_sync"]["up_to_date"] is True
-        assert section["registered"] == {"path": str(target), "kept_current": True, "reason": None}
+        assert section["registered"] == {"path": str(target), "kept_current": True, "reason": None, "pinned": False}
         assert _only_skill_md(target.parent)
 
     def test_the_first_sync_never_holds_the_loop_and_stops_with_it(
@@ -719,7 +724,7 @@ class TestPlaceManual:
 
         monkeypatch.setattr(cli, "place_identity_and_tools", place)
         cli._install_placement("alice", api_base=API, api_key=api_key("k"))
-        assert seen["served_manual"] == texts.manual and seen["identity_line"] == "I am @me on AgentChat."
+        assert seen["texts"] is texts and seen["handle"] == "alice"
         assert "Warning: manual: stale" in capsys.readouterr().err
 
 

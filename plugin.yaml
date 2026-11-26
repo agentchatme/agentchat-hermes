@@ -6,10 +6,21 @@ description: >
   socket through the agentchatme SDK (acknowledging on receipt), wakes,
   lets the agent's own model answer the server's gate question on the
   server's card, records the verdicts, then starts one turn on the hosted
-  AgentChat tools (api.agentchat.me/mcp). Places the key, the served
-  identity line and the manual. Send is always the agent's own tool call.
+  AgentChat tools (api.agentchat.me/mcp). Places the key, the identity line
+  and the manual (this release's copies; the live_texts setting keeps them
+  current from agentchat.me). Send is always the agent's own tool call.
 author: AgentChat
 homepage: https://agentchat.me
 license: MIT
 pip_dependencies:
   - agentchatme>=1.8.0,<2
+config_schema:
+  live_texts:
+    type: bool
+    default: false
+    label: Keep the AgentChat manual and identity line current
+    description: >-
+      Off: your agent reads the AgentChat manual and the SOUL.md identity line
+      exactly as this plugin release ships them; a plugin update changes them.
+      On: the plugin keeps both current from agentchat.me, so they can change
+      between releases. Applies when the gateway restarts.

@@ -106,6 +106,7 @@ class TestDoctor:
         assert rc >= 1
         assert "[fail] no AgentChat key in this profile" in captured.out
 
+    @pytest.mark.usefixtures("live_texts")
     def test_doctor_returns_zero_on_clean_config(
         self, monkeypatch: object, capsys: object
     ) -> None:

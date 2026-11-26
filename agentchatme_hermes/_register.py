@@ -7,7 +7,8 @@ process is loading us:
 * **Gateway mode** (the long-lived ``hermes gateway run`` process, AND it
   successfully grabbed the per-account WS leader lock): full runtime —
   identity resolution, the served texts, the WS daemon that wakes, the
-  invoker that gates and starts turns, the manual as a skill (kept current
+  invoker that gates and starts turns, the manual as a skill (this
+  release's copy; with the plugin setting ``live_texts`` on, kept current
   from the server by the receive loop).
 
 * **CLI mode** (every other Hermes process — TUI/REPL, named subcommands,
@@ -67,6 +68,7 @@ from .config import ENV_API_KEY_LEGACY, KEY_SOURCE_STORE, ConfigError, KeyRefuse
 from .kit import kit_problem
 from .leader_lock import is_hermes_gateway_process
 from .profile_scope import ProfileScope, ProfileScopeError, profile_label, resolve_hermes_home
+from .texts import mode_for, read_mode, record_mode
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -115,6 +117,18 @@ def register(ctx: Any) -> None:
     # The profile's scope, as Hermes loaded this plugin for it: every thread
     # and cycle below runs in it (profile_scope.ProfileScope).
     scope = ProfileScope.capture(hermes_home)
+    # Which manual and identity line this profile uses (the plugin setting
+    # ``live_texts``), read here, where Hermes has bound this profile, and
+    # used by every later step in this process (texts.mode_for).
+    mode = read_mode(ctx)
+    record_mode(hermes_home, mode)
+    if mode.problem is not None:
+        logger.warning(
+            "agentchat plugin: profile=%s — %s; this release's manual and identity line are used "
+            "(`hermes agentchat doctor` says how to set it)",
+            profile_label(hermes_home),
+            mode.problem,
+        )
     gateway_mode = _is_gateway_context(ctx)
     problem = kit_problem()
     if problem is not None:
@@ -127,7 +141,8 @@ def register(ctx: Any) -> None:
     profile = profile_label(hermes_home)
 
     # The manual is registered unconditionally as the ``agentchat:agentchat``
-    # skill: this profile's kept-current file. Only the gateway writes it
+    # skill: this release's copy by default; with live_texts on, this
+    # profile's kept-current file. Only the gateway writes that file
     # (from the bundled copy when missing; local only, no network); every
     # other process registers it as it is (see manual.py). ``gateway_mode``
     # is the same flag the runtime is built with, so this and
@@ -353,7 +368,9 @@ class ActivationWatcher:
         # backfills it for env-var-direct / scripted / container setups and
         # for profiles upgraded from a pre-v3 release — and refuses to stay
         # quiet when the anchor and the key disagree about who this profile is.
-        # The identity line is served (GET /v1/texts); the anchor is
+        # By default the identity line is this release's: placed now, and
+        # re-applied (a no-op when it matches) whenever the texts change.
+        # With live_texts on it is served (GET /v1/texts); the anchor is
         # reconciled as soon as texts are loaded — now when the server (or
         # the cache) answered, later when the first fetch succeeds — and
         # again whenever the served line changes.
@@ -375,13 +392,14 @@ class ActivationWatcher:
 
         logger.info(
             "agentchat plugin registered (version=%s, profile=%s, home=%s, "
-            "handle=@%s, api_base=%s, mode=%s)",
+            "handle=@%s, api_base=%s, mode=%s, texts=%s)",
             __version__,
             self._profile,
             self._hermes_home,
             runtime.identity.handle,
             config.api_base,
             "gateway" if self._gateway_mode else "cli",
+            "live" if mode_for(self._hermes_home).live else "release",
         )
         return "active"
 
@@ -589,16 +607,30 @@ def _try_start_runtime(
 
 
 def _reconcile_soul_anchor_when_texts_arrive(runtime: Any) -> None:
-    """Run :func:`_reconcile_soul_anchor` as soon as the served texts exist.
+    """Run :func:`_reconcile_soul_anchor` as soon as its line exists, and again
+    whenever the served texts change.
 
-    ``runtime.on_texts`` calls back immediately when texts are already
-    loaded and again on every change; a runtime double without it (tests)
-    is reconciled directly.
+    ``runtime.on_texts`` calls back immediately when texts are already loaded
+    and again on every change. With ``live_texts`` off (the default) the line
+    is this release's and needs no texts: when none are loaded yet it is
+    placed now, and each texts change re-applies the same line (no write when
+    it matches; the retry after a write that met an edit in flight) — the
+    served line never reaches SOUL.md, because ``identity_text`` does not use
+    the served texts then. A runtime double without ``on_texts`` (tests) is
+    reconciled directly.
     """
     on_texts = getattr(runtime, "on_texts", None)
-    if callable(on_texts):
-        on_texts(lambda _texts: _reconcile_soul_anchor(runtime))
-    else:
+    if not callable(on_texts):
+        _reconcile_soul_anchor(runtime)
+        return
+    called: list[bool] = []
+
+    def reconcile(_texts: Any) -> None:
+        called.append(True)
+        _reconcile_soul_anchor(runtime)
+
+    on_texts(reconcile)
+    if not called and not mode_for(runtime.hermes_home).live:
         _reconcile_soul_anchor(runtime)
 
 
@@ -616,7 +648,9 @@ def _say_once(path: Any, outcome: str, detail: str, message: str, *args: Any) ->
 
 
 def _reconcile_soul_anchor(runtime: Any) -> None:
-    """Keep this agent's SOUL.md identity block at the served line; backfill it
+    """Keep this agent's SOUL.md identity block at the line in use
+    (``runtime.identity_text()``: this release's, or with ``live_texts`` on the
+    served one — below, "the served line"); backfill it
     when there is none; flag an identity mismatch. Run only in a gateway-mode
     process (:func:`.runtime.keeps_placements_current`, the manual's rule):
     everywhere else SOUL.md is reported as found and never written.
@@ -637,8 +671,9 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
     labelled *Growth* sending as *Operations*. Logged at ERROR and left as it
     is: rewriting it would hide the credential mix-up; ``doctor`` reports it.
 
-    Without texts there is nothing to place yet; the runtime calls again when
-    they arrive. Non-fatal: failures are logged, not raised.
+    With ``live_texts`` on and no texts there is nothing to place yet; the
+    runtime calls again when they arrive. Non-fatal: failures are logged, not
+    raised.
     """
     try:
         from .soul_anchor import AnchorError, follow_soul, place_soul_anchor
@@ -647,20 +682,21 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
         return
 
     label = profile_label(runtime.hermes_home)
-    identity_line = runtime.identity_line() if callable(getattr(runtime, "identity_line", None)) else None
+    identity = runtime.identity_text()
+    identity_line = identity.line
     if not isinstance(identity_line, str) or not identity_line.strip():
-        logger.info(
-            "agentchat plugin: identity line not placed yet for profile=%s — /v1/texts "
-            "unreachable and nothing cached; it is placed when the server answers",
-            label,
-        )
+        if identity.source == "served":
+            logger.info(
+                "agentchat plugin: identity line not placed yet for profile=%s — /v1/texts "
+                "unreachable and nothing cached; it is placed when the server answers",
+                label,
+            )
+        else:
+            logger.warning("agentchat plugin: profile=%s — %s", label, identity.missing)
         return
-    # The served template: a block an earlier release wrote without a handle
-    # line is this agent's when its text is that template, filled in, exactly.
-    template_fn = getattr(runtime, "identity_line_template", None)
-    template = template_fn() if callable(template_fn) else None
-    if not isinstance(template, str):
-        template = None
+    # The template: a block an earlier release wrote without a handle line is
+    # this agent's when its text is that template, filled in, exactly.
+    template = identity.template
     actual = runtime.identity.handle
 
     try:
@@ -728,7 +764,7 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
             result.detail,
         )
     elif outcome == "edited_meanwhile":
-        logger.info("agentchat plugin: SOUL.md — %s; tried again on the next texts change", result.detail)
+        logger.info("agentchat plugin: SOUL.md — %s; tried again when the served texts next change", result.detail)
     else:
         logger.warning("agentchat plugin: SOUL.md identity line not followed for profile=%s — %s", label, result.detail)
 
