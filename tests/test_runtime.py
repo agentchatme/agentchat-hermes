@@ -28,6 +28,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fake_keys import api_key
 
+# The served manual and identity line, kept current: the plugin setting
+# live_texts on (tests/conftest.py ``live_texts``). This release's texts, the
+# default, are tests/test_pinned_texts.py.
+pytestmark = pytest.mark.usefixtures("live_texts")
+
 # The tests that take the real leader lock: fcntl is POSIX-only, as in
 # test_leader_lock.py (the plugin receives only where Hermes' gateway runs).
 _posix_only = pytest.mark.skipif(sys.platform == "win32", reason="the real leader lock is fcntl, POSIX-only")
@@ -458,7 +463,7 @@ class TestClientAndTexts:
 
                 fingerprint = account_fingerprint(rt.config.api_base, rt.config.api_key)
                 assert rt.state_dir == home / "agentchat-state" / fingerprint
-                assert rt.texts is None and rt.identity_line() is None
+                assert rt.texts is None and rt.identity_text().line is None
             finally:
                 rt.stop()
             ws_cls.return_value.stop.assert_called_once()
@@ -519,8 +524,9 @@ class TestClientAndTexts:
             rt.start()
             try:
                 assert rt.texts is served
-                assert rt.identity_line() == _SERVED["identity_line"]
-                assert rt.identity_line_template() == "I am @<handle> on AgentChat."
+                identity = rt.identity_text()
+                assert identity.source == "served" and identity.line == _SERVED["identity_line"]
+                assert identity.template == "I am @<handle> on AgentChat."
             finally:
                 rt.stop()
 

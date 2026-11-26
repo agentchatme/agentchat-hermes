@@ -1,10 +1,24 @@
-"""The AgentChat manual, kept current as the ``agentchat:agentchat`` skill.
+"""The AgentChat manual, as the ``agentchat:agentchat`` skill.
 
 The server owns the manual (``https://agentchat.me/skill.md``) and announces the
 current one in the served texts (``GET /v1/texts?runtime=hermes`` →
-``manual: {url, version, sha256}``). Hermes reads a plugin skill's file fresh
-from its registered path on every ``skill_view``, so the plugin registers a
-file it keeps current, not the copy in the package::
+``manual: {url, version, sha256}``).
+
+By default the skill is this release's copy, the package's
+``skills/agentchat/SKILL.md`` (the published manual byte for byte, refreshed
+by ``scripts/refresh_bundled_texts.py`` and pinned by
+``tests/test_skill_bundle.py``): :func:`prepare` registers it, nothing here
+downloads or writes a manual, and it changes only when the plugin is updated.
+A file in plugin storage (below) from a time ``live_texts`` was on is left as
+it is and not used. A pip upgrade replaces the package's files one by one: a
+``skill_view`` in a running process at that moment finds the file missing and
+Hermes drops the skill for that process until it restarts (Hermes' own
+``hermes plugins update`` swaps the plugin's folder with two renames).
+
+With the plugin setting ``live_texts`` on (:mod:`.texts`), the rest of this
+docstring applies. Hermes reads a plugin skill's file fresh from its
+registered path on every ``skill_view``, so the plugin registers a file it
+keeps current, not the copy in the package::
 
     <profile home>/plugin-data/agentchat/manual/SKILL.md
 
@@ -51,9 +65,9 @@ even once its sync has put a good file in place: Hermes takes a plugin skill's
 path at ``register()`` and has no supported way to change it later. The
 gateway says so in its log (:func:`note_registration_stale`).
 
-The package's ``skills/agentchat/SKILL.md`` is only those fallback bytes. This
-module imports nothing from the SDK at import time: the CLI must load where the
-kit is missing.
+With ``live_texts`` on, the package's ``skills/agentchat/SKILL.md`` is only
+those fallback bytes. This module imports nothing from the SDK at import time:
+the CLI must load where the kit is missing.
 """
 from __future__ import annotations
 
@@ -69,6 +83,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from .profile_scope import hermes_home_key
+from .texts import mode_for
 
 if TYPE_CHECKING:
     from agentchatme.integration import ManualSync, ManualSyncResult
@@ -82,7 +97,8 @@ PLUGIN_DATA_DIRNAME = "plugin-data"
 PLUGIN_NAME = "agentchat"
 MANUAL_DIRNAME = "manual"
 MANUAL_FILENAME = "SKILL.md"
-# The package's copy: the fallback bytes only (the offline floor for a first install).
+# The package's copy: this release's manual (``live_texts`` off), else the
+# fallback bytes only (the offline floor for a first install).
 BUNDLED_MANUAL_PATH = Path(__file__).parent / "skills" / "agentchat" / MANUAL_FILENAME
 
 # The kit's temp name for an atomic write of ``SKILL.md``
@@ -110,6 +126,14 @@ _INLINE_SHELL_REFUSED = (
     f"the served manual carries inline shell ({_SNIPPET}), which Hermes runs when "
     "skills.inline_shell is on — the bundled copy was put back"
 )
+
+
+
+def carries_inline_shell(data: bytes | str) -> bool:
+    """Whether a manual's text carries an inline-shell snippet (:data:`INLINE_SHELL`)."""
+    text = data.decode("utf-8", "replace") if isinstance(data, bytes) else data
+    return INLINE_SHELL.search(text) is not None
+
 
 ManualCheckState = Literal["current", "stale", "tampered", "unsafe", "unchecked", "missing"]
 
@@ -198,13 +222,21 @@ class ManualRegistration:
     """The bundled copy because this process places nothing and the file is
     not there yet (not a fault: the gateway, a login or ``doctor --fix``
     places it)."""
+    pinned: bool = False
+    """The bundled copy because the profile uses this release's texts
+    (``live_texts`` off, the default): not a fault, nothing is kept current."""
 
     @property
     def kept_current(self) -> bool:
         return self.path == self.target
 
     def as_record(self) -> dict[str, Any]:
-        return {"path": str(self.path), "kept_current": self.kept_current, "reason": self.reason}
+        return {
+            "path": str(self.path),
+            "kept_current": self.kept_current,
+            "reason": self.reason,
+            "pinned": self.pinned,
+        }
 
 
 _registrations: dict[str, ManualRegistration] = {}
@@ -225,6 +257,9 @@ def registration_for(home: Path) -> ManualRegistration | None:
 def prepare(home: Path, *, place: bool = True) -> ManualRegistration | None:
     """The file to register for the profile at ``home``. Local only — no network.
 
+    ``live_texts`` off (the default): the package's copy, whatever ``place``
+    says; nothing is written and the plugin-storage file, if any, is left as it
+    is (``pinned``; ``None`` when the package's copy is missing). With it on:
     ``place`` (the gateway): creates the kept-current file from the bundled
     bytes when there is none (the kit's ``sync_manual`` with nothing announced
     writes its fallback only then, atomically) and removes a temp file a dead
@@ -247,6 +282,11 @@ def prepare(home: Path, *, place: bool = True) -> ManualRegistration | None:
             )
             return None
         return ManualRegistration(path=bundled, target=target, reason=reason)
+
+    if not mode_for(home).live:
+        if bundled is None:
+            return frozen("live_texts is off, so the manual is this release's copy")
+        return ManualRegistration(path=bundled, target=target, pinned=True)
 
     try:
         from agentchatme.integration import sync_manual
@@ -343,7 +383,7 @@ def _unusable(target: Path, home: Path) -> str | None:
         return f"{target} cannot be read: {exc}"
     if _front_matter(data).get("name") != MANUAL_SKILL_NAME:
         return f"{target} is not the agentchat manual (left as it is; the next sync with the server replaces it)"
-    if INLINE_SHELL.search(data.decode("utf-8", "replace")):
+    if carries_inline_shell(data):
         return f"{target} carries inline shell ({_SNIPPET}), which Hermes runs when skills.inline_shell is on"
     return None
 
@@ -381,10 +421,10 @@ def refuse_inline_shell(home: Path, result: ManualSyncResult) -> ManualSyncResul
     if not result.written:
         return result
     try:
-        text = manual_path(home).read_bytes().decode("utf-8", "replace")
+        data = manual_path(home).read_bytes()
     except OSError:
         return result
-    if not INLINE_SHELL.search(text):
+    if not carries_inline_shell(data):
         return result
     logger.error("agentchat: %s (%s)", _INLINE_SHELL_REFUSED, manual_path(home))
     restored = _restore_bundled(home)
@@ -397,7 +437,7 @@ def _restore_bundled(home: Path) -> ManualSyncResult | None:
     bytes announced as themselves: no download)."""
     bundle = bundled_bytes()
     version = bundled_version()
-    if bundle is None or version is None or INLINE_SHELL.search(bundle.decode("utf-8", "replace")):
+    if bundle is None or version is None or carries_inline_shell(bundle):
         return None
     try:
         from agentchatme.integration import ServedManual, sync_manual
@@ -433,8 +473,9 @@ _exit_hook_installed = False
 def sync_in_background(*, home: Path, served: Any, api_base: str | None, label: str) -> threading.Thread | None:
     """One sync on a daemon thread (a gateway that holds no receive loop for
     this account: another gateway is the leader, or the integration is off).
-    ``None`` when nothing is announced: there is nothing to sync to."""
-    if served is None:
+    ``None`` when nothing is announced (there is nothing to sync to), or the
+    profile uses this release's manual (``live_texts`` off)."""
+    if served is None or not mode_for(home).live:
         return None
     global _exit_hook_installed
 
@@ -474,7 +515,10 @@ def manual_sync_for(
     texts: Any, *, home: Path, on_result: Callable[[ManualSyncResult], Any] | None = None
 ) -> ManualSync | None:
     """The kit's ``ManualSync`` for the gateway leader's texts cache; ``None``
-    when the kit is missing."""
+    when the kit is missing, or the profile uses this release's manual
+    (``live_texts`` off: the receive loop then keeps no manual current)."""
+    if not mode_for(home).live:
+        return None
     try:
         from agentchatme.integration import ManualSync
     except ImportError:
@@ -627,7 +671,7 @@ def check(path: Path, served: Any) -> ManualCheck:
         return result("tampered", "not the agentchat manual (its front matter does not name agentchat)")
     version = fields.get("version")
     have = version or "an unversioned file"
-    if INLINE_SHELL.search(data.decode("utf-8", "replace")):
+    if carries_inline_shell(data):
         return result("unsafe", f"unsafe (have {have}: it carries inline shell, {_SNIPPET})", version)
     if served_version is None:
         return result("unchecked", f"unchecked (have {have}; no served version in hand)", version)
@@ -687,6 +731,7 @@ __all__ = [
     "ManualRegistration",
     "bundled_bytes",
     "bundled_version",
+    "carries_inline_shell",
     "check",
     "describe_repair",
     "describe_result",

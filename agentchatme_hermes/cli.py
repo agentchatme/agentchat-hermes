@@ -80,6 +80,7 @@ from .placement import (
     resolve_texts,
 )
 from .soul_anchor import remove_soul_anchor
+from .texts import IdentitySource, identity_text, mode_for
 from .wizard import _mask_key
 
 if TYPE_CHECKING:
@@ -98,6 +99,10 @@ _ENV_HANDLE = ENV_HANDLE
 _ENV_API_BASE = ENV_API_BASE
 
 _DEFAULT_API_BASE = "https://api.agentchat.me"
+
+# Turns the plugin setting on in any install (a pip install has no settings
+# form: Hermes reads ``config_schema`` only from a plugin directory).
+_LIVE_TEXTS_ON = "hermes config set plugins.entries.agentchat.settings.live_texts true"
 
 _EXIT_OK = 0
 _EXIT_ARG_ERR = 2
@@ -478,22 +483,15 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
     if problem is not None:
         # What is on this machine still says something: the key, the
         # manual (against the cached texts), the gateway's last record.
-        cached_line, cached_template, cached, _ = _doctor_cached_texts(
-            api_key=saved_key, api_base=api_base, hermes_home=hermes_home
-        )
+        cached, _ = _doctor_cached_texts(api_key=saved_key, api_base=api_base, hermes_home=hermes_home)
         code = _exit_with(problem)
         _print_local_status(
             resolution,
             worker=_health_worker(api_base, saved_key),
             manual=_manual_line(hermes_home, cached.manual if cached is not None else None),
-            identity=_identity_line_status(
-                handle=_read_saved_handle(), identity_line=cached_line, template=cached_template, home=hermes_home
-            ),
+            identity=_identity_status_for(cached, handle=_read_saved_handle(), home=hermes_home),
         )
         return code
-
-    from .turn import identity_line as render_identity_line
-    from .turn import identity_line_template as render_identity_line_template
 
     handle = me.get("handle") if isinstance(me, dict) else None
     _print_status(
@@ -501,21 +499,32 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
         resolution,
         worker=_health_worker(api_base, saved_key),
         manual=_manual_line(hermes_home, texts.manual if texts is not None else None),
-        identity=_identity_line_status(
-            handle=handle.lstrip("@").lower() if isinstance(handle, str) and handle else None,
-            identity_line=render_identity_line(texts) if texts is not None else None,
-            template=render_identity_line_template(texts) if texts is not None else None,
-            home=hermes_home,
+        identity=_identity_status_for(
+            texts, handle=handle.lstrip("@").lower() if isinstance(handle, str) and handle else None, home=hermes_home
         ),
     )
     return _EXIT_OK
 
 
+def _identity_status_for(texts: Any, *, handle: str | None, home: Path) -> str | None:
+    """:func:`_identity_line_status` for the line in use (:func:`.texts.identity_text`)."""
+    identity = identity_text(texts, handle=handle, home=home)
+    return _identity_line_status(
+        handle=handle, identity_line=identity.line, template=identity.template, home=home, source=identity.source
+    )
+
+
 def _identity_line_status(
-    *, handle: str | None, identity_line: str | None, template: str | None, home: Path
+    *,
+    handle: str | None,
+    identity_line: str | None,
+    template: str | None,
+    home: Path,
+    source: IdentitySource = "served",
 ) -> str | None:
     """SOUL.md's identity block in one line, for ``status``: read as the refresh
-    would read it (the kit's strict rule), written never."""
+    would read it (the kit's strict rule), written never. ``source``: which
+    line ``identity_line`` is (this release's, or the served one)."""
     try:
         from .soul_anchor import AnchorError, inspect_soul
     except ImportError:
@@ -527,23 +536,31 @@ def _identity_line_status(
     cmd = cli_prefix(home)
     where = state.path
     outcome = state.outcome
+    release = source == "release"
     if outcome == "absent":
         return f"missing — {where} (`{cmd} doctor --fix` or `{cmd} login` places it)"
     if outcome == "unreadable":
         return f"not checked — {state.detail}"
     if outcome == "unchanged":
-        return f"served (@{state.claimed}) — {where}"
+        return f"{'this release' if release else 'served'} (@{state.claimed}) — {where}"
+    if outcome == "updated" and release:
+        return (
+            f"not this release's (@{state.claimed}: an older text, or the served one from live_texts on) — {where}; "
+            f"`{cmd} doctor --fix` places it (the gateway does at its next start)"
+        )
     if outcome == "updated":
         return f"not the served one (@{state.claimed}, an older text) — {where}; the gateway refreshes it, or `{cmd} doctor --fix`"
     if outcome == "hand_edited":
-        return f"edited by hand (yours, left alone) — {where}; to have the served line, delete that block, then `{cmd} doctor --fix`"
+        line = "this release's line" if release else "the served line"
+        return f"edited by hand (yours, left alone) — {where}; to have {line}, delete that block, then `{cmd} doctor --fix`"
     if outcome == "other_agent":
         return f"IDENTITY MISMATCH: @{state.claimed}'s block, but the key is @{handle}'s — {where}"
     if outcome == "several_blocks":
         return f"more than one AgentChat block (left alone) — {where}"
     if outcome == "unverified":
         who = f"@{state.claimed}'s" if state.claimed else "no handle line"
-        return f"{who} (not verified: no served texts in hand) — {where}"
+        why = "this profile's handle is not known" if release else "no served texts in hand"
+        return f"{who} (not verified: {why}) — {where}"
     return f"{state.detail}"
 
 
@@ -700,7 +717,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         from .kit import manual_retry_problem
 
         retry_problem = manual_retry_problem()
-        if retry_problem is not None:
+        if retry_problem is not None and mode_for(hermes_home).live:
             warn(f"SDK kit: {retry_problem}")
         from .soul_anchor import anchor_kit_problem
 
@@ -736,8 +753,6 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         client_identity=hermes_client_identity(),
     )
     authenticated_handle: str | None = None
-    identity_line: str | None = None
-    identity_template: str | None = None
     served_texts: Any = None
     me: Any = None
     try:
@@ -761,24 +776,27 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                 fail("Server response missing handle — refusing to trust")
                 return _doctor_finalize(failures, warnings_count)
 
-            # The served texts: the identity line the anchor check compares
-            # against, and proof that /v1/texts answers for this key.
-            identity_line, identity_template, served_texts = _doctor_identity_texts(
-                client, api_key=saved_key, api_base=api_base, hermes_home=hermes_home
-            )
-            if identity_line is not None:
+            # The served texts: proof that /v1/texts answers for this key, and
+            # (live_texts on) the identity line the anchor check compares against.
+            served_texts = _load_served_texts(client, api_key=saved_key, api_base=api_base, hermes_home=hermes_home)
+            if served_texts is not None:
                 ok("served texts available (/v1/texts, or the cached copy)")
-            else:
+            elif mode_for(hermes_home).live:
                 warn(
                     "/v1/texts unreachable and nothing cached — the identity line cannot be "
                     "placed or verified until the server answers"
+                )
+            else:
+                warn(
+                    "/v1/texts unreachable and nothing cached — what AgentChat serves now cannot be "
+                    "compared (the identity line and the manual are this release's)"
                 )
             _doctor_account_lines(me, ok=ok, warn=warn)
         else:
             # The local checks below still run (SOUL.md, the manual, the key
             # source, the tools entry, the gateway) against the texts this
             # account last cached; nothing is fetched again.
-            identity_line, identity_template, served_texts, fetched_at = _doctor_cached_texts(
+            served_texts, fetched_at = _doctor_cached_texts(
                 api_key=saved_key, api_base=api_base, hermes_home=hermes_home
             )
             if served_texts is not None:
@@ -811,11 +829,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             {"ok": ok, "warn": warn, "fail": fail}[level](line)
         for step in place_identity_and_tools(
             handle=authenticated_handle,
-            identity_line=identity_line,
+            texts=served_texts,
             api_base=api_base,
-            served_manual=served_texts.manual if served_texts is not None else None,
             hermes_home=hermes_home,
-            identity_template=identity_template,
             # Another agent's block is a mismatch to fix (the key, or the
             # block), never something `--fix` decides by replacing it.
             replace_other_agent=False,
@@ -823,15 +839,20 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             report = fail if step.failed else warn if step.status == "warned" else ok
             report(f"fix: {step.name} {step.status} — {step.detail}")
 
-    # Offline, the block is read against the cached texts for the handle this
-    # profile saved (as `status` does), not left "not verified".
+    # Offline, the block is read against the line in use for the handle this
+    # profile saved (as `status` does), not left "not verified": this
+    # release's line, or with live_texts on the cached texts.
+    worker = _health_worker(api_base, saved_key)
+    _doctor_texts_checks(hermes_home, served=served_texts, worker=worker, ok=ok, warn=warn, fail=fail)
     soul_handle = authenticated_handle
-    if soul_handle is None and identity_line is not None:
+    if soul_handle is None and (served_texts is not None or not mode_for(hermes_home).live):
         soul_handle = _read_saved_handle()
+    line_in_use = identity_text(served_texts, handle=soul_handle, home=hermes_home)
     _doctor_soul_checks(
         handle=soul_handle,
-        identity_line=identity_line,
-        template=identity_template,
+        identity_line=line_in_use.line,
+        template=line_in_use.template,
+        source=line_in_use.source,
         cmd=cmd,
         ok=ok,
         warn=warn,
@@ -841,7 +862,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
     _doctor_manual_checks(
         hermes_home,
         served=served_texts.manual if served_texts is not None else None,
-        worker=_health_worker(api_base, saved_key),
+        worker=worker,
         cmd=cmd,
         ok=ok,
         warn=warn,
@@ -1473,26 +1494,17 @@ def _dispatch_logout(_args: argparse.Namespace) -> int:
 def _install_placement(handle: str, *, api_base: str, api_key: str) -> list[PlacementStep]:
     """Place the identity line and the manual, register the hosted tools.
 
-    The texts (the identity line, the manual's announcement) are fetched from
-    the server for this key (the cached copy when the server is unreachable;
-    without either the line is skipped and the manual is the bundled copy —
+    The texts are fetched from the server for this key (the cached copy when
+    the server is unreachable). By default the identity line and the manual
+    are this release's; with ``live_texts`` on they are the served ones
+    (without texts the line is skipped and the manual is the bundled copy —
     the gateway places both later). Failure is non-fatal: credentials are
     already persisted and the account is fully operational. Each failed step
     is printed with its reason so the operator can repair it
     (``hermes agentchat doctor --fix`` re-runs this).
     """
-    from .turn import identity_line as render_identity_line
-
     texts = resolve_texts(api_key=api_key, api_base=api_base)
-    from .turn import identity_line_template as render_identity_line_template
-
-    steps = place_identity_and_tools(
-        handle=handle,
-        identity_line=render_identity_line(texts) if texts is not None else None,
-        api_base=api_base,
-        served_manual=texts.manual if texts is not None else None,
-        identity_template=render_identity_line_template(texts) if texts is not None else None,
-    )
+    steps = place_identity_and_tools(handle=handle, texts=texts, api_base=api_base)
     for step in steps:
         if step.needs_attention:
             sys.stderr.write(f"Warning: {step.name}: {step.detail}\n")
@@ -1500,6 +1512,65 @@ def _install_placement(handle: str, *, api_base: str, api_key: str) -> list[Plac
         else:
             _printline(f"{step.name}: {step.detail}")
     return steps
+
+
+def _doctor_texts_checks(
+    hermes_home: Path,
+    *,
+    served: Any,
+    worker: Any,
+    ok: Callable[[str], None],
+    warn: Callable[[str], None],
+    fail: Callable[[str], None],
+) -> None:
+    """Which manual and identity line this profile uses (the plugin setting
+    ``live_texts``, as ``register()`` read it in this process); with it off,
+    whether this release's copy of the identity line is intact and how it
+    compares with the one AgentChat serves now (``served``: the texts in hand);
+    and whether the running gateway (its health record, ``worker``) uses the
+    same setting — it reads the setting when it starts."""
+    from .texts import bundled_texts, bundled_texts_problem
+    from .turn import identity_line_template
+
+    mode = mode_for(hermes_home)
+    if mode.problem is not None:
+        warn(
+            f"texts: {mode.problem} — this release's manual and identity line are used; set it with "
+            f"`{_LIVE_TEXTS_ON}` (or `false`), then `hermes gateway restart`"
+        )
+    elif mode.live:
+        ok("texts: the manual and the SOUL.md identity line are kept current from agentchat.me (live_texts on)")
+    else:
+        ok(
+            f"texts: this release's manual and SOUL.md identity line ({mode.detail}): they change only with a "
+            f"plugin update — to keep them current from agentchat.me: `{_LIVE_TEXTS_ON}`, then "
+            "`hermes gateway restart`"
+        )
+    if not mode.live:
+        snapshot = bundled_texts()
+        if snapshot is None:
+            fail(f"this release's identity line is unreadable: {bundled_texts_problem()} — reinstall agentchatme-hermes")
+        elif served is not None and identity_line_template(served) != snapshot.identity_line_template.strip():
+            ok(
+                f"AgentChat now serves a different identity line from this release's (taken {snapshot.fetched_at}): "
+                "a plugin update brings it, or live_texts on"
+            )
+    section = worker.get("manual") if isinstance(worker, dict) else None
+    registered = section.get("registered") if isinstance(section, dict) else None
+    if not isinstance(registered, dict):
+        return
+    # A record from before 0.7.0 has no "pinned": that gateway keeps the texts current.
+    gateway_live = registered.get("pinned") is not True
+    if gateway_live and not mode.live:
+        warn(
+            "the running gateway uses the served manual and identity line (it started with live_texts on, or "
+            "runs a release before 0.7.0): restart it (`hermes gateway restart`) to use this release's"
+        )
+    elif mode.live and not gateway_live:
+        warn(
+            "the running gateway uses this release's manual and identity line (it started with live_texts off): "
+            "restart it (`hermes gateway restart`) to keep them current from agentchat.me"
+        )
 
 
 def _doctor_soul_checks(
@@ -1511,11 +1582,13 @@ def _doctor_soul_checks(
     ok: Callable[[str], None],
     warn: Callable[[str], None],
     fail: Callable[[str], None],
+    source: IdentitySource = "served",
 ) -> None:
     """The identity block in SOUL.md, read the way a refresh would: the kit's
-    ``decide`` with the served line in hand, else the strict ``owner``. A
+    ``decide`` with the line in use in hand, else the strict ``owner``. A
     block's words naming ``@handle`` do not make it this agent's (only its
-    handle line, or a text AgentChat served word for word, do)."""
+    handle line, or a text AgentChat served word for word, do). ``source``:
+    which line ``identity_line`` is (this release's, or the served one)."""
     try:
         from .soul_anchor import AnchorError, inspect_soul
     except ImportError:
@@ -1528,12 +1601,18 @@ def _doctor_soul_checks(
         return
     where = state.path
     outcome = state.outcome
+    release = source == "release"
     if outcome == "absent":
         warn(f"SOUL.md identity line missing — run `{cmd} doctor --fix` (or `{cmd} login`) to place it")
     elif outcome == "unreadable":
         warn(f"SOUL.md identity line not checked — {state.detail}")
     elif outcome == "unchanged":
-        ok(f"SOUL.md identity line present (@{state.claimed}, served text)")
+        ok(f"SOUL.md identity line present (@{state.claimed}, {'this release' if release else 'served'} text)")
+    elif outcome == "updated" and release:
+        warn(
+            f"SOUL.md identity line for @{state.claimed} is not this release's text (an older text, or the served one "
+            f"from live_texts on) — `{cmd} doctor --fix` places it (the gateway also does at its next start)"
+        )
     elif outcome == "updated":
         warn(
             f"SOUL.md identity line for @{state.claimed} is not the served one (older text, or the served text "
@@ -1549,16 +1628,20 @@ def _doctor_soul_checks(
         )
     elif outcome == "hand_edited":
         names = f"; its words name @{state.named}" if state.named else ""
+        line = "this release's identity line" if release else "the served identity line"
         warn(
             f"SOUL.md agentchat block was edited by hand: it has no handle line and is not a text AgentChat "
             f"served{names}. It is yours, left alone (also by `{cmd} doctor --fix` and `{cmd} login`) — to have "
-            f"the served identity line, delete that block, then run `{cmd} doctor --fix`"
+            f"{line}, delete that block, then run `{cmd} doctor --fix`"
         )
     elif outcome == "several_blocks":
         warn(
             f"{where} holds more than one AgentChat block — left alone (one write would remove the others); "
             f"remove the extra ones by hand, then `{cmd} doctor --fix`"
         )
+    elif outcome == "unverified" and release:
+        who = f" (@{state.claimed})" if state.claimed is not None else ""
+        warn(f"SOUL.md identity line present{who} — cannot verify it while this profile's handle is not known")
     elif outcome == "unverified" and state.claimed is not None:
         warn(f"SOUL.md identity line present (@{state.claimed}) — cannot verify its text while /v1/texts is unreachable")
     elif outcome == "unverified":
@@ -1600,37 +1683,19 @@ def _doctor_account_lines(me: Any, *, ok: Callable[[str], None], warn: Callable[
         )
 
 
-def _doctor_cached_texts(
-    *, api_key: str, api_base: str, hermes_home: Path
-) -> tuple[str | None, str | None, Any, str | None]:
-    """``(identity line, template, texts, cached at)`` from the account's cached
-    texts only — AgentChat did not answer, so nothing is fetched."""
+def _doctor_cached_texts(*, api_key: str, api_base: str, hermes_home: Path) -> tuple[Any, str | None]:
+    """``(texts, cached at)`` from the account's cached texts only — AgentChat
+    did not answer, so nothing is fetched. ``(None, None)`` when nothing is cached."""
     try:
         from .state import state_dir_for_account
         from .texts import cached_texts
-        from .turn import identity_line as render_identity_line
-        from .turn import identity_line_template as render_identity_line_template
     except ImportError:
-        return None, None, None, None
+        return None, None
     state_dir = state_dir_for_account(hermes_home=hermes_home, api_base=api_base, api_key=api_key)
     texts, fetched_at = cached_texts(state_dir)
     if texts is None:
-        return None, None, None, None
-    return render_identity_line(texts), render_identity_line_template(texts), texts, fetched_at
-
-
-def _doctor_identity_texts(
-    client: Any, *, api_key: str, api_base: str, hermes_home: Path
-) -> tuple[str | None, str | None, Any]:
-    """``(identity line, template, texts)`` for ``doctor``: one fetch on the
-    open client, else the cache; ``(None, None, None)`` without either."""
-    texts = _load_served_texts(client, api_key=api_key, api_base=api_base, hermes_home=hermes_home)
-    if texts is None:
-        return None, None, None
-    from .turn import identity_line as render_identity_line
-    from .turn import identity_line_template as render_identity_line_template
-
-    return render_identity_line(texts), render_identity_line_template(texts), texts
+        return None, None
+    return texts, fetched_at
 
 
 def _load_served_texts(client: Any, *, api_key: str, api_base: str, hermes_home: Path) -> Any:
@@ -1689,6 +1754,8 @@ def _manual_line(hermes_home: Path, served: Any) -> str:
     """The manual in one line, for ``status``."""
     from .manual import bundled_version, check, manual_path
 
+    if not mode_for(hermes_home).live:
+        return _release_manual_line(served)
     target = manual_path(hermes_home)
     state = check(target, served)
     held, reason = _registered_manual(hermes_home)
@@ -1705,6 +1772,68 @@ def _manual_line(hermes_home: Path, served: Any) -> str:
     return state.detail
 
 
+def _release_manual_state(served: Any) -> tuple[Any, str | None]:
+    """``(check, announced)``: this release's copy checked against the
+    announcement it shipped with (``texts_snapshot.json``), and the version
+    AgentChat announces now when it is another version (``served``:
+    ``texts.manual`` in hand), else ``None``."""
+    from .manual import BUNDLED_MANUAL_PATH, check
+    from .texts import bundled_texts
+
+    snapshot = bundled_texts()
+    state = check(BUNDLED_MANUAL_PATH, snapshot.manual if snapshot is not None else None)
+    against = check(BUNDLED_MANUAL_PATH, served) if served is not None else None
+    announced = against.served if against is not None and against.served != state.version else None
+    return state, announced
+
+
+def _release_manual_line(served: Any) -> str:
+    """``status``'s manual line with ``live_texts`` off."""
+    from .manual import BUNDLED_MANUAL_PATH
+
+    state, announced = _release_manual_state(served)
+    line = f"this release's copy {state.version or '?'} — {BUNDLED_MANUAL_PATH}"
+    if state.state != "current":
+        line += f" ({state.summary})"
+    if announced is not None:
+        line += f"; AgentChat announces {announced}"
+    return line
+
+
+def _doctor_release_manual_checks(
+    hermes_home: Path,
+    *,
+    served: Any,
+    ok: Callable[[str], None],
+    warn: Callable[[str], None],
+    fail: Callable[[str], None],
+) -> None:
+    """The manual with ``live_texts`` off: this release's copy (intact, and the
+    file Hermes serves), what AgentChat announces now, and a kept-current file
+    left from a time the setting was on (unused, never removed)."""
+    from .manual import BUNDLED_MANUAL_PATH, manual_path
+
+    state, announced = _release_manual_state(served)
+    where = BUNDLED_MANUAL_PATH
+    if state.state == "current":
+        ok(f"manual: this release's copy {state.version} — {where}")
+    elif state.state == "unchecked":
+        warn(f"manual: this release's copy {state.summary} — {where}")
+    else:
+        fail(
+            f"manual: this release's copy is {state.summary} at {where}, not the manual this release shipped — "
+            "reinstall agentchatme-hermes"
+        )
+    if announced is not None:
+        ok(f"AgentChat announces manual {announced}; this release carries {state.version or '?'} — a plugin update brings it, or live_texts on")
+    held, _reason = _registered_manual(hermes_home)
+    if held is not None and held != where:
+        warn(f"Hermes serves agentchat:agentchat from {held}, not this release's copy — restart the gateway and open sessions")
+    leftover = manual_path(hermes_home)
+    if leftover.is_file():
+        ok(f"{leftover} (kept current while live_texts was on) is left as it is and not used")
+
+
 def _doctor_manual_checks(
     hermes_home: Path,
     *,
@@ -1717,11 +1846,16 @@ def _doctor_manual_checks(
 ) -> None:
     """The manual: the kept-current file against the texts' announcement, the
     file Hermes serves as ``agentchat:agentchat``, the gateway's last sync,
-    the skill's folder, and any other ``agentchat`` skill in Hermes' own
-    skill folders (reported, never removed)."""
+    the skill's folder (``live_texts`` off: this release's copy instead,
+    :func:`_doctor_release_manual_checks`), and any other ``agentchat`` skill
+    in Hermes' own skill folders (reported, never removed)."""
     from .manual import MANUAL_URL, bundled_version, check, manual_path, other_files
 
     target = manual_path(hermes_home)
+    if not mode_for(hermes_home).live:
+        _doctor_release_manual_checks(hermes_home, served=served, ok=ok, warn=warn, fail=fail)
+        _warn_stray_skills(target, warn=warn)
+        return
     bundled = bundled_version() or "?"
     state = check(target, served)
     if state.state == "current":
@@ -1793,6 +1927,11 @@ def _doctor_manual_checks(
             "file in a skill's folder, so the plugin registers the bundled copy until they are moved out"
         )
 
+    _warn_stray_skills(target, warn=warn)
+
+
+def _warn_stray_skills(target: Path, *, warn: Callable[[str], None]) -> None:
+    """Any other ``agentchat`` skill in Hermes' own skill folders (reported, never removed)."""
     for path, version in _stray_agentchat_skills(exclude=(target,)):
         warn(
             f"another agentchat skill at {path} ({version or 'no version'}): Hermes lists it as "

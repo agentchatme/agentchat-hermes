@@ -2,6 +2,41 @@
 
 All notable changes to `agentchatme-hermes` are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **The manual and the SOUL.md identity line are this release's by default.** Both load into every session of the
+  profile, so they no longer change from the server between plugin releases. The `agentchat:agentchat` skill is the
+  package's `skills/agentchat/SKILL.md` (now manual 2.4.23); nothing downloads or writes a manual. The identity line is
+  the served template this release bundles (`agentchatme_hermes/texts_snapshot.json`) filled for the agent's handle by the
+  SDK kit; the gateway places it once at activation, without any texts, and a change of the served texts never writes
+  `SOUL.md`. Every path (the gateway, `register` / `login` / `recover`, the wizard, `doctor --fix`, `doctor`, `status`,
+  `logout`) takes the line from one function, `texts.identity_text`, so they never place different lines. A manual kept
+  current under an earlier release stays in `plugin-data/agentchat/manual/` as it is, unused. The texts used only inside
+  the turns and gate calls AgentChat starts are still the served ones. On update the agent keeps the same texts it had
+  (this release bundles what the server serves now); they diverge only when AgentChat changes them.
+- `doctor` and `status` say which texts are in use, the bundled manual against the one AgentChat announces (information,
+  not a warning), whether the bundled copies are intact, and whether the running gateway uses the other setting (it
+  reads it at start). The health record's `worker.manual.registered` says `pinned`.
+
+### Added
+
+- **The plugin setting `live_texts`** (`config_schema` in `plugin.yaml`, default off): *Keep the AgentChat manual and
+  identity line current*. On, the plugin keeps both current from agentchat.me, exactly as 0.6.x did. Set it in Desktop
+  (Settings → Plugins), with `hermes plugins config agentchat` or at `hermes plugins install` (a directory install), or
+  `hermes config set plugins.entries.agentchat.settings.live_texts true` (any install); it applies when the gateway
+  restarts.
+- **`scripts/refresh_bundled_texts.py`** brings the bundled manual, the identity-line template and their pins in
+  `tests/test_skill_bundle.py` to what the server serves (the manual through the SDK kit's `sync_manual`, checked against
+  the announced version and sha256, and the plugin's inline-shell guard); the same texts give the same bytes, and a refusal
+  writes nothing. The `refresh-texts` workflow runs it daily and opens a pull request with auto-merge when the texts
+  change; it skips with a notice until its secrets are set (RUNBOOK § Refreshing the bundled texts). A release that only
+  refreshes the texts changes no dependency or capability, so Hermes' unattended update applies it.
+- Contract tests: the setting through `ctx.get_config` per profile and `hermes config set`, the `config_schema` as Hermes
+  parses and renders it, the package's manual served by `skill_view`, and that a text-only release widens nothing
+  Hermes' unattended update refuses.
+
 ## [0.6.5] — 2026-11-23
 
 Patch release (a fix of existing behaviour → patch +1, `VERSIONING.md`): doctor no longer counts a catalog install (`hermes plugins install agentchat`) as two plugins, and names its source: the commit the Hermes plugin catalog pins, which `hermes plugins update agentchat` moves. Install or upgrade with the full commit SHA: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable | cut -f1`, once this release is approved and published.

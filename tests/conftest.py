@@ -133,6 +133,31 @@ def _manual_sync_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(manual, "manual_sync_for", lambda *_a, **_kw: None)
 
 
+@pytest.fixture(autouse=True)
+def _texts_mode_reset() -> Iterator[None]:
+    """The ``live_texts`` setting ``register()`` reads is recorded per profile
+    for the process (``texts.record_mode``): each test starts with none
+    recorded (this release's texts, the default) and leaves none behind."""
+    from agentchatme_hermes import texts
+
+    with texts._modes_lock:
+        texts._modes.clear()
+    yield
+    with texts._modes_lock:
+        texts._modes.clear()
+
+
+@pytest.fixture
+def live_texts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``live_texts`` on for every profile home the test touches, as if
+    ``register()`` had read it: the served manual and identity line, kept
+    current (the behaviour of releases before 0.7.0, which the tests that use
+    this fixture pin unchanged)."""
+    from agentchatme_hermes import texts
+
+    monkeypatch.setattr(texts, "_NOT_READ", texts.TextsMode(True, "live_texts on (test)"))
+
+
 _REAL_MANUAL_SYNC: dict[str, Any] = {}
 
 

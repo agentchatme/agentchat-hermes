@@ -25,6 +25,11 @@ from fake_keys import api_key
 from agentchatme_hermes._register import _is_gateway_context
 from agentchatme_hermes.leader_lock import GATEWAY_ENV_MARKER
 
+# The served manual and identity line, kept current: the plugin setting
+# live_texts on (tests/conftest.py ``live_texts``). This release's texts, the
+# default, are tests/test_pinned_texts.py.
+pytestmark = pytest.mark.usefixtures("live_texts")
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -144,6 +149,13 @@ _SERVED_TEMPLATE = (
 )
 
 
+def _identity(line: str | None, template: str | None) -> Any:
+    """``Runtime.identity_text()`` with ``live_texts`` on: the served line, or none yet."""
+    from agentchatme_hermes.texts import TEXTS_UNAVAILABLE_DETAIL, IdentityText
+
+    return IdentityText("served", line, template, None if line else TEXTS_UNAVAILABLE_DETAIL)
+
+
 def _owner(soul: Path, handle: str | None = None) -> str | None:
     from agentchatme.integration import anchor
 
@@ -168,8 +180,7 @@ class TestReconcileSoulAnchor:
         return SimpleNamespace(
             identity=SimpleNamespace(handle=handle),
             hermes_home=home,
-            identity_line=lambda: served_line if texts else None,
-            identity_line_template=lambda: served_template if texts else None,
+            identity_text=lambda: _identity(served_line if texts else None, served_template if texts else None),
         )
 
     def test_reworded_served_line_is_refreshed_and_recognised_again(
@@ -274,8 +285,7 @@ class TestReconcileSoulAnchor:
         runtime = SimpleNamespace(
             identity=SimpleNamespace(handle="ops"),
             hermes_home=tmp_path,
-            identity_line=lambda: state["line"],
-            identity_line_template=lambda: _SERVED_TEMPLATE if state["line"] else None,
+            identity_text=lambda: _identity(state["line"], _SERVED_TEMPLATE if state["line"] else None),
             on_texts=listeners.append,
         )
         _register._reconcile_soul_anchor_when_texts_arrive(runtime)
@@ -581,6 +591,7 @@ class TestSurface:
         monkeypatch.setattr(sys, "argv", ["hermes", "gateway", "run"])
         monkeypatch.setattr(_register.ActivationWatcher, "start", lambda self: None)
         ctx = MagicMock()
+        ctx.get_config.side_effect = lambda key, default=None: True if key == "live_texts" else default
         _register.register(ctx)
         target = tmp_path / ".hermes" / "plugin-data" / "agentchat" / "manual" / "SKILL.md"
         assert ctx.register_skill.call_args.kwargs["path"] == target
@@ -961,8 +972,7 @@ class TestGatewayOnlyReconcile:
             identity=SimpleNamespace(handle="ops"),
             hermes_home=tmp_path,
             gateway_mode_requested=gateway,
-            identity_line=lambda: _served_line("ops"),
-            identity_line_template=lambda: _SERVED_TEMPLATE,
+            identity_text=lambda: _identity(_served_line("ops"), _SERVED_TEMPLATE),
         )
         monkeypatch.setattr(_register, "load_config", lambda *, hermes_home=None: SimpleNamespace(api_base="https://api.example.test"))
         monkeypatch.setattr(_register, "_try_start_runtime", lambda cfg, *, gateway_mode, host_llm=None: runtime)

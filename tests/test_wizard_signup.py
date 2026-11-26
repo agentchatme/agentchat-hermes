@@ -81,7 +81,7 @@ class _Wizard:
         monkeypatch.setattr(
             wizard,
             "place_identity_and_tools",
-            lambda *, handle, identity_line, api_base, served_manual=None, **_kw: self.placed.append(handle) or [],
+            lambda *, handle, texts, api_base, **_kw: self.placed.append(handle) or [],
         )
         monkeypatch.setattr(signup, "_pause", self.waits.append)
         # A Hermes whose MCP client reads the key file (secret sources, secrets.agentchat).

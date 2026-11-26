@@ -234,10 +234,11 @@ def _plugin_manager(_hermes_home: Path) -> Iterator[Any]:
         manager.remove_plugin_skill("agentchat:agentchat")
 
 
+@pytest.mark.usefixtures("live_texts")
 def test_a_skill_outside_the_package_is_read_fresh_after_an_atomic_replace(
     _hermes_home: Path, _plugin_manager: Any
 ) -> None:
-    """The design the manual rests on, from Hermes' code rather than a
+    """With ``live_texts`` on, the design the manual rests on, from Hermes' code rather than a
     documented contract: ``register_skill`` takes any existing path (here
     ``<home>/plugin-data/agentchat/manual/SKILL.md``, outside the package),
     ``skill_view`` reads that file fresh on every call, and a file replaced
@@ -282,6 +283,119 @@ def test_a_skill_outside_the_package_is_read_fresh_after_an_atomic_replace(
     assert sorted(p.name for p in path.parent.iterdir()) == ["SKILL.md"]
     other = json.loads(skills_tool.skill_view("agentchat:agentchat", file_path="credentials.json"))
     assert other["success"] is False
+
+
+def test_this_releases_manual_is_served_from_the_package(_hermes_home: Path, _plugin_manager: Any) -> None:
+    """``live_texts`` off (the default): the skill Hermes serves is the
+    package's copy, read by ``skill_view`` as it is, alone in its folder; the
+    plugin's storage is not touched."""
+    from agentchatme_hermes import manual
+    from agentchatme_hermes.skills import register_skill
+
+    plugins = _import("hermes_cli.plugins")
+    skills_tool = _import("tools.skills_tool")
+    manifest = _import("hermes_cli.plugins_manifest").PluginManifest(name="agentchat", source="entrypoint")
+    ctx = plugins.PluginContext(manifest, _plugin_manager)
+
+    path = register_skill(ctx, hermes_home=_hermes_home, place=True)
+    assert path == manual.BUNDLED_MANUAL_PATH
+    assert Path(_plugin_manager.find_plugin_skill("agentchat:agentchat")) == path
+    served = json.loads(skills_tool.skill_view("agentchat:agentchat"))
+    assert served["success"] is True, served
+    assert f"version: {manual.bundled_version()}" in served["content"]
+    assert sorted(p.name for p in path.parent.iterdir()) == ["SKILL.md"]
+    assert not (_hermes_home / "plugin-data" / "agentchat").exists()
+
+
+# ─── the setting: live_texts (config_schema, ctx.get_config) ───────────────
+
+_REPO = Path(__file__).resolve().parents[1]
+
+
+def test_live_texts_reaches_each_profile_through_ctx_get_config(
+    _hermes_home: Path, _plugin_manager: Any, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``ctx.get_config`` reads ``plugins.entries.agentchat.settings`` of the
+    profile Hermes has bound (``register()`` runs bound to its profile); the
+    command doctor and the README give (``hermes config set …``) writes a
+    bool it reads back."""
+    from agentchatme_hermes.texts import read_mode
+
+    plugins = _import("hermes_cli.plugins")
+    constants = _import("hermes_constants")
+    config = _import("hermes_cli.config")
+    manifest = _import("hermes_cli.plugins_manifest").PluginManifest(name="agentchat", source="entrypoint")
+    ctx = plugins.PluginContext(manifest, _plugin_manager)
+
+    unset = read_mode(ctx)
+    assert unset.live is False and unset.problem is None and "not set" in unset.detail
+    config.set_config_value("plugins.entries.agentchat.settings.live_texts", "true")
+    capsys.readouterr()
+    assert read_mode(ctx).live is True
+
+    other = tmp_path / "profiles" / "b"
+    other.mkdir(parents=True)
+    (other / "config.yaml").write_text(
+        "plugins:\n  entries:\n    agentchat:\n      settings:\n        live_texts: false\n", encoding="utf-8"
+    )
+    token = constants.set_hermes_home_override(str(other))
+    try:
+        bound = read_mode(ctx)
+        assert bound.live is False and bound.detail == "live_texts off", "the bound profile's own setting"
+    finally:
+        constants.reset_hermes_home_override(token)
+    assert read_mode(ctx).live is True
+
+
+def test_our_config_schema_is_one_boolean_setting_hermes_shows() -> None:
+    """The manifest's ``config_schema`` as Hermes parses, validates and renders
+    it (the Desktop form, ``hermes plugins config``, the settings offer at
+    ``hermes plugins install``)."""
+    manifest_mod = _import("hermes_cli.plugins_manifest")
+    fields_mod = _import("hermes_cli.plugins_settings.fields")
+
+    parsed = manifest_mod.parse_manifest_file(_REPO / "plugin.yaml", _REPO, "user", "")
+    assert parsed is not None and set(parsed.config_schema) == {"live_texts"}
+    assert manifest_mod.validate_config_schema("agentchat", parsed.config_schema, {"live_texts": True}) == []
+    assert manifest_mod.validate_config_schema("agentchat", parsed.config_schema, {"live_texts": "yes"}) != []
+    (field,) = fields_mod.plugin_settings_fields("agentchat", _REPO)
+    assert field["key"] == "live_texts" and field["type"] == "boolean"
+    assert field["default"] is False and field["value"] is False
+    assert field["label"] == "Keep the AgentChat manual and identity line current"
+    assert field["description"].startswith("Off: your agent reads the AgentChat manual")
+
+
+def test_a_release_that_changes_only_the_texts_widens_nothing(tmp_path: Path) -> None:
+    """What Hermes' unattended update refuses (``plugins.auto_apply``): a wider
+    surface (``plugin_surface``: capabilities, tools, hooks, Python
+    dependencies, sign-ins, a Desktop half) or new Python dependencies. A
+    release that only refreshes the bundled texts, and this release's added
+    ``config_schema``, are neither, so Hermes' own update applies them."""
+    catalog = _import("hermes_cli.plugins_cmd_catalog")
+    declarations = _import("pm.plugin_declarations")
+    plugins_cmd = _import("hermes_cli.plugins_cmd")
+
+    manifest = (_REPO / "plugin.yaml").read_text(encoding="utf-8")
+    before_schema = manifest[: manifest.index("config_schema:")]
+    trees = {}
+    for name, text, manual_text in (
+        ("old", before_schema, "---\nname: agentchat\nversion: 2.4.4\n---\nold\n"),
+        ("new", manifest, "---\nname: agentchat\nversion: 2.4.99\n---\nnew\n"),
+    ):
+        tree = tmp_path / name
+        (tree / "agentchatme_hermes" / "skills" / "agentchat").mkdir(parents=True)
+        (tree / "plugin.yaml").write_text(text, encoding="utf-8")
+        (tree / "pyproject.toml").write_bytes((_REPO / "pyproject.toml").read_bytes())
+        (tree / "agentchatme_hermes" / "skills" / "agentchat" / "SKILL.md").write_text(manual_text, encoding="utf-8")
+        (tree / "agentchatme_hermes" / "texts_snapshot.json").write_text(f'{{"name": "{name}"}}', encoding="utf-8")
+        trees[name] = tree
+    old = catalog.plugin_surface(plugins_cmd._read_manifest(trees["old"]), trees["old"])
+    new = catalog.plugin_surface(plugins_cmd._read_manifest(trees["new"]), trees["new"])
+    assert catalog.surface_delta(old, new) == {}
+    assert (
+        declarations.read_python_declaration(trees["new"]).install_requirements
+        == declarations.read_python_declaration(trees["old"]).install_requirements
+    )
 
 
 def test_the_manual_lives_in_hermes_plugin_storage(_hermes_home: Path) -> None:

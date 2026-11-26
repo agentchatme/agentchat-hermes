@@ -29,6 +29,12 @@ from agentchatme_hermes.soul_anchor import (
     render_handle_marker,
     write_soul_anchor,
 )
+from agentchatme_hermes.texts import IdentityText
+
+# The served manual and identity line, kept current: the plugin setting
+# live_texts on (tests/conftest.py ``live_texts``). This release's texts, the
+# default, are tests/test_pinned_texts.py.
+pytestmark = pytest.mark.usefixtures("live_texts")
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -967,8 +973,7 @@ class TestEveryPath:
             SimpleNamespace(
                 identity=SimpleNamespace(handle="alice"),
                 hermes_home=home,
-                identity_line=_line,
-                identity_line_template=lambda: _line("<handle>"),
+                identity_text=lambda: IdentityText("served", _line(), _line("<handle>")),
             )
         )
 

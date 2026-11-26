@@ -1,0 +1,144 @@
+name: refresh-texts
+
+# Keeps the texts this release bundles at what AgentChat serves: the manual
+# (agentchatme_hermes/skills/agentchat/SKILL.md) and the identity-line template
+# (agentchatme_hermes/texts_snapshot.json), which a Hermes profile reads by
+# default (the plugin setting live_texts off). Once a day, and on dispatch,
+# scripts/refresh_bundled_texts.py takes them from the server (the manual
+# checked against the announced version and sha256); when they differ it opens
+# one pull request, or updates the open one, with auto-merge on. CI runs on it
+# like on any pull request. A bundle change reaches users only at a release.
+#
+# Set up by the repository owner; until then the job skips with a notice:
+# - secret AGENTCHAT_TEXTS_API_KEY: an AgentChat agent's API key (any agent:
+#   the texts are the same for every agent). Keep that agent in the analytics
+#   exclusion list: this job calls GET /v1/texts with it once a day.
+# - variable TEXTS_REFRESH_APP_CLIENT_ID and secret TEXTS_REFRESH_APP_KEY: a
+#   GitHub App installed on this repository with Contents and Pull requests
+#   read and write. Its token pushes the branch and opens the pull request: a
+#   pull request opened with the workflow's own GITHUB_TOKEN starts no CI.
+# RUNBOOK.md § Refreshing the bundled texts.
+#
+# Actions are pinned to commits (the version is in the trailing comment).
+
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refresh-texts
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Set up?
+        id: gate
+        env:
+          TEXTS_KEY: ${{ secrets.AGENTCHAT_TEXTS_API_KEY }}
+          APP_CLIENT_ID: ${{ vars.TEXTS_REFRESH_APP_CLIENT_ID }}
+          APP_KEY: ${{ secrets.TEXTS_REFRESH_APP_KEY }}
+        run: |
+          missing=()
+          [ -n "$TEXTS_KEY" ] || missing+=("secret AGENTCHAT_TEXTS_API_KEY")
+          [ -n "$APP_CLIENT_ID" ] || missing+=("variable TEXTS_REFRESH_APP_CLIENT_ID")
+          [ -n "$APP_KEY" ] || missing+=("secret TEXTS_REFRESH_APP_KEY")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::notice::refresh-texts is not set up, so it was skipped (missing: ${missing[*]}). RUNBOOK.md § Refreshing the bundled texts says how to set it up."
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: App token
+        if: steps.gate.outputs.ready == 'true'
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.TEXTS_REFRESH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.TEXTS_REFRESH_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          ref: main
+          token: ${{ steps.app.outputs.token }}
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        if: steps.gate.outputs.ready == 'true'
+        with:
+          python-version: "3.12"
+
+      - name: Install the package
+        if: steps.gate.outputs.ready == 'true'
+        run: python -m pip install -e .
+
+      - name: Refresh the bundled texts
+        if: steps.gate.outputs.ready == 'true'
+        id: refresh
+        env:
+          AGENTCHAT_API_KEY: ${{ secrets.AGENTCHAT_TEXTS_API_KEY }}
+        run: python scripts/refresh_bundled_texts.py
+
+      - name: Only the bundled texts changed
+        if: steps.gate.outputs.ready == 'true' && steps.refresh.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          allowed=$'agentchatme_hermes/skills/agentchat/SKILL.md\nagentchatme_hermes/texts_snapshot.json\ntests/test_skill_bundle.py'
+          unexpected=$(git status --porcelain --untracked-files=all | cut -c4- | grep -vxF "$allowed" || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::the refresh changed files other than the bundled texts: $unexpected"
+            exit 1
+          fi
+
+      - name: Open or update the pull request
+        if: steps.gate.outputs.ready == 'true' && steps.refresh.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          APP_SLUG: ${{ steps.app.outputs.app-slug }}
+          MANUAL: ${{ steps.refresh.outputs.manual }}
+          SUMMARY: ${{ steps.refresh.outputs.summary }}
+        run: |
+          set -euo pipefail
+          branch=automation/refresh-texts
+          bot="${APP_SLUG}[bot]"
+          bot_id=$(gh api "/users/${bot}" --jq .id)
+          git config user.name "$bot"
+          git config user.email "${bot_id}+${bot}@users.noreply.github.com"
+          git switch -C "$branch"
+          git add agentchatme_hermes/skills/agentchat/SKILL.md agentchatme_hermes/texts_snapshot.json tests/test_skill_bundle.py
+          git commit -q -m "Bundle the served texts: manual ${MANUAL}"
+          # The branch is the bot's own and is rebuilt from main on every run.
+          git push --force origin "$branch"
+          title="Bundle the served texts: manual ${MANUAL}"
+          body="$RUNNER_TEMP/pr-body.md"
+          cat > "$body" <<EOF
+          ## What changes
+
+          The texts this release bundles, brought to what AgentChat serves now by \`scripts/refresh_bundled_texts.py\` (the refresh-texts workflow): ${SUMMARY}. Profiles with \`live_texts\` off (the default) read them from the next release on.
+
+          ## Verification
+
+          - Tests: CI on this pull request (ruff, mypy, pytest on Python 3.9 to 3.13); \`tests/test_skill_bundle.py\` pins the new files
+          - Review: not needed: generated by the script from the served texts (the manual checked against the announced sha256); only the bundled texts and their pins change
+          - Live check: lab round before the release tag
+
+          ## Risk and rollback
+
+          Text only: no code, no dependency, no capability, so Hermes' own update can apply the release unattended. Revert this pull request to go back.
+          EOF
+          number=$(gh pr list --head "$branch" --state open --json number --jq '.[0].number // empty')
+          if [ -z "$number" ]; then
+            gh pr create --base main --head "$branch" --title "$title" --body-file "$body"
+          else
+            gh pr edit "$number" --title "$title" --body-file "$body"
+          fi
+          gh pr merge "$branch" --auto --squash

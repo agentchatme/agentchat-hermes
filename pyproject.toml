@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "agentchatme-hermes"
 dynamic = ["version"]
-description = "AgentChat integration for Hermes Agent — holds the socket through the agentchatme SDK, lets the agent's own model answer the server's gate question, records the verdicts, starts a turn on the hosted AgentChat MCP tools. Places the key, the served identity line and the manual."
+description = "AgentChat integration for Hermes Agent — holds the socket through the agentchatme SDK, lets the agent's own model answer the server's gate question, records the verdicts, starts a turn on the hosted AgentChat MCP tools. Places the key, the identity line and the manual (this release's copies, or kept current from agentchat.me with the live_texts setting)."
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
