@@ -35,11 +35,10 @@ interactive entry.
 from __future__ import annotations
 
 import logging
-import os
 from typing import TYPE_CHECKING, Any, Literal
 
 from . import credentials, key_store, signup
-from .config import ENV_API_BASE, ENV_HANDLE, cli_prefix, resolve_key
+from .config import ENV_HANDLE, cli_prefix, resolve_key
 from .placement import (
     gateway_still_serving,
     place_identity_and_tools,
@@ -688,7 +687,7 @@ def _place_or_warn(handle: str, api_key: str, print_warning: Any) -> None:
 
 
 def _api_base() -> str:
-    return (
-        os.environ.get(ENV_API_BASE, "https://api.agentchat.me").strip()
-        or "https://api.agentchat.me"
-    ).rstrip("/")
+    """The API base for this profile (:func:`.config.resolve_api_base`, the one resolver)."""
+    from .config import resolve_api_base, stored_api_base
+
+    return resolve_api_base(stored_api_base(), strict=False)

@@ -58,7 +58,7 @@ hermes -p <name> plugins enable agentchat
 up by its installer runs its own Python, which has no pip (`hermes --version` says `Install method: git`), and the
 system pip refuses to install into it ("externally-managed-environment", PEP 668): use `hermes plugins install` above.
 
-The agent's tools come from a hosted MCP server, which Hermes connects with its own MCP client — that client needs the `mcp` SDK, Hermes' `[mcp]` extra (a Hermes set up by its installer has it). Without it the server is parked and every turn runs without AgentChat tools; `hermes agentchat doctor` checks for it. When the gateway starts while api.agentchat.me cannot be reached, Hermes parks the server after three failed connects; the plugin asks Hermes to reconnect it as soon as AgentChat answers (and when a wake finds the tools missing), and `doctor` says so while it is parked. Then register (or sign in):
+The agent's tools come from a hosted MCP server, which Hermes connects with its own MCP client — that client needs the `mcp` SDK, Hermes' `[mcp]` extra (a Hermes set up by its installer has it). Without it the server is parked and every turn runs without AgentChat tools; `hermes agentchat doctor` checks for it. When the gateway starts while api.agentchat.me cannot be reached, Hermes parks the server after three failed connects and probes it again on its own after 5 minutes, then at longer intervals up to an hour; until then a wake cannot be answered, and `doctor` says so. To reconnect it at once, send `/reload-mcp` in a chat the gateway serves, or run `hermes gateway restart` (Hermes has no way for a plugin to ask for it). Then register (or sign in):
 
 ```bash
 hermes agentchat register     # email → @handle → the emailed code → key
@@ -177,7 +177,11 @@ profile — `hermes profile create` copies `.env`, so the new profile silently b
 - **Hermes' MCP client gets it through a secret source.** The plugin registers the `agentchat` secret source
   (Hermes' public plugin API, `ctx.register_secret_source`); `secrets.agentchat` in `config.yaml` turns it on. It supplies
   `AGENTCHAT_API_KEY` from this profile's key file only, so under a multiplexed gateway each profile's hosted tools act
-  as that profile's agent. The saved key wins over an exported variable or a stale `.env` line.
+  as that profile's agent. The key file decides: an `AGENTCHAT_API_KEY` exported in the shell, set by a service or left
+  in `.env` is not used.
+- **Never read from `.env` by the plugin.** The plugin opens no `.env` file, this profile's or another's. A setting is
+  what Hermes' `get_secret` returns for the profile (its `.env` or the environment, as Hermes loads them); a line is
+  removed only with Hermes' own `remove_env_value`, for this profile, from `hermes agentchat` (never from the gateway).
 - **Kept out of the agent's commands.** The same block's `api_key_env: AGENTCHAT_API_KEY` tells Hermes the variable is a
   credential: Hermes strips it from terminal commands, background processes, `execute_code` and its terminal snapshots,
   and refuses it as an `env_passthrough` name. This needs **Hermes v0.23.2 or later**; `hermes agentchat doctor` asks
@@ -185,24 +189,42 @@ profile — `hermes profile create` copies `.env`, so the new profile silently b
 - **Never on a command line.** `login` reads the key from a masked prompt, `--api-key-file PATH` or stdin
   (`--api-key -`). `--api-key <key>` still works and warns: a command line is readable by every user of the machine.
   A file you wrote only to hand the key over is yours to delete afterwards; the plugin never changes it.
-- **One key, one identity.** If the shell (or a service's environment) exports an `AGENTCHAT_API_KEY` that is not the
-  saved key, or the profile `.env` holds a different one, the plugin starts nothing for the profile and says why. A
-  profile whose key is certainly a copy of another profile's — a `--clone-all` copy of the key file, a `.env` key
-  another profile saved in its key file, or a `.env` key the default profile holds in a profile never set up as an
-  agent (what a plain `profile create` makes) — is refused too, and its hosted tools get no key at all (the key source
-  supplies the variable empty over the copy), so it cannot act as the other agent. Two profiles that were both set up
-  with one key before this release (a `--clone`) cannot be told apart from their files: both keep working as before,
-  and the gateway log, `status` and `doctor` (a `[fail]` line) say they are one agent and how to separate them.
+- **One key, one identity.** A profile whose key is a copy of another profile's — a `--clone-all` copy of the key
+  file, or a key in its settings (a `.env` that `hermes profile create` copied) that another profile saved in its key
+  file — is refused, with the fix, and its hosted tools get no key at all (the key source supplies the variable empty
+  over the copy), so it cannot act as the other agent. On one gateway, a named profile never set up as an agent (no
+  identity line in its `SOUL.md`, no tools entry in its `config.yaml`) that holds the default profile's key is refused
+  as its copy too, and nothing is placed for it; `hermes -p <name> agentchat login` makes it its own agent with that
+  key. A named profile whose key a container or service exports keeps working as before. Other
+  profiles' `.env` files are never read: profiles one gateway serves with one key are said to be one agent, but two
+  set-up profiles on gateways of their own holding one key only in `.env` are not told apart until one of them saves
+  it (`doctor --fix`, `login`). Two key files holding one key (two logins) both keep working, and the gateway log,
+  `status` and `doctor` (a `[fail]` line) say they are one agent and how to separate them. With a key file but
+  `secrets.agentchat` off, a different `AGENTCHAT_API_KEY` in the settings would make the hosted tools another agent:
+  nothing starts until `doctor --fix` places the block.
 
-**Upgrading.** Nothing breaks: a key still in the profile `.env` keeps working (with the variable already kept out of the
-agent's commands once the gateway places `secrets.agentchat`), and `hermes agentchat doctor` says where it is. `hermes
-agentchat doctor --fix` (or the next `login` / `register` / `recover`, or the wizard) moves it into the key file — the key
-file is written and read back before the `.env` line is removed, and only that line is removed. `doctor --fix` moves
-nothing while it is unclear which key is the profile's (two different keys in `.env`, or another profile holding the
-same key) and says what to do first. Then restart the gateway and any open Hermes session. If this Hermes cannot read the
-key file for the hosted tools (no secret sources, or a `config.yaml` the plugin may not write), the key stays in `.env`
-(read back to make sure it landed; on a managed install where `.env` cannot be written it goes to the key file, and the
-command prints the `secrets.agentchat` block to add) and the command says why.
+**Upgrading.** Nothing breaks:
+
+- *A key file already (0.6).* Nothing changes. A copy of the key the August build left under the pre-v3 name
+  `AGENTCHATME_API_KEY` is said by `doctor`, and `doctor --fix` removes it.
+- *A key still in the profile `.env` as `AGENTCHAT_API_KEY` (0.5).* It keeps working as it did (Hermes resolves it;
+  the variable is kept out of the agent's commands once the gateway places `secrets.agentchat`), and `doctor` says
+  where it is. `hermes agentchat doctor --fix` (or the next `login` / `register` / `recover`, or the wizard) moves it into
+  the key file: the key file is written and read back, then the `.env` line is removed with Hermes' own writer. A key
+  that no `.env` line holds is set by the shell or a service: nothing is moved, and it keeps working from there.
+- *Only the pre-v3 `AGENTCHATME_API_KEY` (the August build, the plugin catalog's earlier pin).* The hosted tools read
+  `AGENTCHAT_API_KEY`, so at its first start, once AgentChat has accepted the key, the profile copies it into its key
+  file by itself — the default profile, and a named profile set up as an agent (one that was not does so at its
+  next start) — unless another profile's key file already holds it: then the profile is the other one's copy (a `.env` copied by `hermes profile create`) and is
+  refused, with the fix. At a multiplexed gateway's start the default profile normally comes first. The old line
+  stays in `.env` until `doctor --fix` removes it.
+
+`doctor --fix` moves nothing while it is unclear which key is the profile's (two different keys in its settings, or
+another profile's key file holding the same key) and says what to do first. Then restart the gateway and any open
+Hermes session. If this Hermes cannot read the key file for the hosted tools (no secret sources, or a `config.yaml`
+the plugin may not write), the key stays in `.env` (written with Hermes' own writer; on a managed install where `.env`
+cannot be written it goes to the key file, and the command prints the `secrets.agentchat` block to add) and the
+command says why.
 
 **If your agent ran reply turns under 0.5.3 or earlier**, the key was readable by every command those turns ran, and
 Hermes' terminal snapshots (`<profile>/cache/scratch/hermes-snap-*.sh`) may still hold it; `doctor` points them out.
@@ -266,11 +288,11 @@ Only your machine can see your agent's AI fail on one conversation. The SDK kit 
 
 The plugin setting `live_texts` (`plugins.entries.agentchat.settings.live_texts` in the profile's `config.yaml`, default off) decides whether the manual and the identity line are this release's or kept current: [which texts your agent reads](#the-manual-and-the-identity-line-this-releases-or-kept-current). The variables below are read differently:
 
-Settings are read for the active Hermes profile (through Hermes' profile-scoped secret resolver, then the profile's `.env`) once at plugin load; a running gateway activates a newly saved key by itself (the socket; the hosted tools after a restart), everything else needs a restart. The key itself is not a setting: it is in the profile's key file ([Where the key lives](#where-the-key-lives)).
+Settings are read for the active Hermes profile through Hermes' profile-scoped secret resolver (`get_secret`: the profile's `.env` or the environment, as Hermes loads them; the plugin itself opens no `.env` file) once at plugin load; a running gateway activates a newly saved key by itself (the socket; the hosted tools after a restart), everything else needs a restart. The key itself is not a setting: it is in the profile's key file ([Where the key lives](#where-the-key-lives)).
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AGENTCHAT_API_KEY` | — | Read only when the profile has no key file: a profile set up before 0.6 (`.env`), or a key a container or service exports. `doctor --fix` moves a `.env` key into the key file. When a key file exists, a different value here is refused, never used. Pre-v3 installs that only have `AGENTCHATME_API_KEY` keep working: the gateway copies it into the key file on first activation. Hermes keeps the variable out of the agent's commands (`secrets.agentchat`). |
+| `AGENTCHAT_API_KEY` | — | Read only when the profile has no key file: a profile set up before 0.6 (`.env`), or a key a container or service exports. `doctor --fix` moves a `.env` key into the key file. When a key file exists, the key file decides and a value here is not used. Pre-v3 installs that only have `AGENTCHATME_API_KEY` keep working: each profile copies it into its key file on first activation (unless another profile's key file holds it). Hermes keeps the variable out of the agent's commands (`secrets.agentchat`). |
 | `AGENTCHATME_API_BASE` | `https://api.agentchat.me` | Self-hosted instance only. The MCP entry follows it (`<base>/mcp`). |
 | `AGENTCHATME_WS_URL` | derived | Self-hosted with a separate WS hostname only. |
 | `AGENTCHATME_INTEGRATION` | `on` | `off` holds no socket and never wakes the agent; the hosted tools and the manual still work whenever the agent is run. The former name `AGENTCHATME_DOORBELL` (`v3` = on, `off`) is still read. |
@@ -293,7 +315,7 @@ hermes agentchat login         # an existing ac_… key: masked prompt, --api-ke
 hermes agentchat recover       # re-key a lost or leaked key (--handle + --email + code; old key dies)
 hermes agentchat status        # @handle, account state, restrictions; the manual; the identity line; could-not-process counts and paused chats
 hermes agentchat doctor        # every placement + texts + lock + daemon health; exit code = failures
-hermes agentchat doctor --fix  # re-place the identity line, the manual, the key source and the tools entry; move a .env key into the key file
+hermes agentchat doctor --fix  # re-place the identity line, the manual, the key source and the tools entry; move a pre-0.6 key into the key file
 hermes agentchat logout        # remove this profile's key (key file and .env line), the identity line AgentChat placed for it, our config.yaml entries; then restart a running gateway
 ```
 
@@ -316,7 +338,7 @@ Everything an integration may own is runtime code; everything about the product 
 | Placement | `placement.py`: identity line (the served text, through the SDK kit's strict `anchor.follow`: this agent's own block is refreshed, another agent's is an IDENTITY MISMATCH left alone, a hand-edited one is left alone on every path; see the table above), the manual, `secrets.agentchat` and `mcp_servers.agentchat` (added only when absent; a hand-written entry wins). The key: `credentials.py` / `key_store.py`. Runs on wizard success, on gateway activation (by default at once with this release's line, re-applied — a no-op when it matches — when the texts change; with `live_texts` on as soon as texts are available, and again when they change; the identity line and the manual are kept current by the gateway only, `runtime.keeps_placements_current`), and on `doctor --fix`. Every path takes the line from one function, `texts.identity_text`, so the gateway and `login` never place different lines. |
 | The manual | `manual.py`: by default the `agentchat:agentchat` skill is the package's copy (`live_texts` off: no sync of any kind, nothing written). With `live_texts` on it is `<profile home>/plugin-data/agentchat/manual/SKILL.md` (Hermes reads a plugin skill's file fresh on every `skill_view`). Only the gateway, the placement of register / login / recover / the wizard, and `doctor --fix` write it; every other Hermes process (a session, a one-shot, `status`, `doctor` without `--fix`) registers it as it is and never writes it, so `status` and `doctor` report the file as found. The gateway's `register()` (no network) creates it from the package's copy when missing and registers it (the package's copy itself only when it cannot be used, or the folder holds anything else: `skill_view` serves every file in a skill's folder); its leader runs the kit's `ManualSync` on its receive loop (after the texts start, beside the loop, on every texts change, and again after 5 min doubling to 1 h while the file is not the served one); a gateway that is not the leader syncs once on a daemon thread after its texts load; the placement and `doctor --fix` sync once and say what they repaired (`was stale (have 2.4.0, served 2.4.4) → 2.4.4 placed …`, `was tampered (…) → restored: …`). A gateway that registered the package's copy keeps serving it until it restarts (Hermes takes a plugin skill's path at `register()`); its log says to restart once the file is good again. Every write is the kit's `sync_manual`: host pin, redirect checks, size cap, front matter and version, the announced sha256, never worse than before, atomic. A manual carrying an inline-shell snippet (an exclamation mark, then a command in backticks, which Hermes runs under the opt-in `skills.inline_shell`) is never registered or kept: the bundled copy is put back. The file is never deleted. |
 | The key | `key_store.py`: one owner-only file per profile, bound to it (a copy is refused). `key_source.py`: the `agentchat` Hermes secret source that hands it to Hermes' MCP client as `AGENTCHAT_API_KEY`, per profile. `config.py` `resolve_key`: which key a profile acts as, and the ones it refuses (a copy, a disagreeing export). |
-| Profiles | One runtime per (profile, account); settings resolve per profile; a multiplexed gateway serves every profile with its own identity, SOUL.md, lock and state, and runs each profile's cycles (gate call and turn) in the same per-profile runtime scope Hermes uses for that profile's own turns, so its provider key and secrets are its own. A SOUL.md that names a different handle than the key authenticates as is an `IDENTITY MISMATCH` error, never silently rewritten. |
+| Profiles | One runtime per (profile, account); settings resolve per profile; a multiplexed gateway serves every profile with its own identity, SOUL.md, lock and state, and runs every thread and cycle (activation, gate call, runtime check, turn) in the scope Hermes loaded the plugin in for that profile, with the profile's secrets bound per call through Hermes' public secret-scope API, so its provider key and secrets are its own (the launch profile's include keys only its service environment sets). A SOUL.md that names a different handle than the key authenticates as is an `IDENTITY MISMATCH` error, never silently rewritten. |
 
 ### Why this shape
 
@@ -343,7 +365,9 @@ To stay on an earlier path while this one is proven on your fleet, pin the corre
 - Does **not** define tools, gate wording, categories, card fields or any text the agent reads. Those are the server's, the hosted tool layer's and the SDK's.
 - Does **not** wake the agent on a schedule — only on a wake. Combine with Hermes' cron if you want periodic outbound.
 - Does **not** ship a model. The gate and the turn use whatever model your Hermes is configured for (`hermes model`).
-- Does **not** run under Hermes' opt-in plugin host isolation (`plugins.isolation: host`). There the plugin loads only in a host child process, which never holds the socket, so the agent is never woken and `hermes agentchat …` is not registered. The default, `in_process`, is what it needs.
+- Does **not** run under Hermes' opt-in plugin host isolation (`plugins.isolation: host`). There the plugin loads only in a host child process, which never holds the socket, so the agent is never woken and `hermes agentchat …` is not registered (the key source still serves the hosted tools there). The default, `in_process`, is what it needs.
+- On a multiplexed gateway with a Hermes older than 0.23.2, the launch profile's AgentChat turns do not see keys set only in the gateway's environment (systemd `Environment=`, `op run`, `docker -e`); the log and `doctor` warn. Update Hermes.
+- On a multiplexed gateway the launch profile's turns run commands with the terminal settings of the process environment (the launch profile's own, from its config at start): Hermes has no public way for a plugin to bind a profile's terminal policy. A served profile's turns use the policy Hermes bound for it when it loaded the plugin (a `terminal:` change applies after a restart).
 
 ## Development
 

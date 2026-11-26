@@ -836,8 +836,9 @@ class TestLogout:
 
         from agentchatme_hermes.config import ENV_API_KEY, ENV_HANDLE
 
-        home, soul = self._profile(tmp_path, monkeypatch)
-        (home / ".env").write_text(f"{ENV_API_KEY}={api_key('logout-env')}\n{ENV_HANDLE}=alice\n", encoding="utf-8")
+        _home, soul = self._profile(tmp_path, monkeypatch)
+        # The profile's settings as Hermes loads them from its .env.
+        monkeypatch.setenv(ENV_API_KEY, api_key("logout-env"))
         monkeypatch.setenv(ENV_HANDLE, "alice")
         write_soul_anchor(_line(), handle="alice", soul_path=soul)
         assert self._logout() == 0
@@ -850,9 +851,9 @@ class TestLogout:
 
         from agentchatme_hermes.config import ENV_API_KEY, ENV_HANDLE
 
-        home, soul = self._profile(tmp_path, monkeypatch)
+        _home, soul = self._profile(tmp_path, monkeypatch)
         monkeypatch.delenv(ENV_HANDLE, raising=False)
-        (home / ".env").write_text(f"{ENV_API_KEY}={api_key('logout-nohandle')}\n", encoding="utf-8")
+        monkeypatch.setenv(ENV_API_KEY, api_key("logout-nohandle"))
         write_soul_anchor(_line(), handle="alice", soul_path=soul)
         before = soul.read_bytes()
         assert self._logout() == 0

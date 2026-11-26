@@ -38,6 +38,7 @@ from .agent_invoker import AgentInvoker
 from .client_identity import hermes_client_identity
 from .leader_lock import lock_path_for, release_leader_lock, try_acquire_ws_leader_lock
 from .profile_scope import (
+    ProfileScope,
     account_fingerprint,
     hermes_home_key,
     profile_label,
@@ -111,6 +112,7 @@ class Runtime:
         *,
         gateway_mode: bool,
         host_llm: Callable[[], Any] | None = None,
+        scope: ProfileScope | None = None,
     ) -> None:
         self._config = config
         self._gateway_mode_requested = gateway_mode
@@ -122,6 +124,10 @@ class Runtime:
         # :class:`Config`, tests pass light doubles without these fields.
         home = getattr(config, "hermes_home", None)
         self._hermes_home: Path = Path(home) if home is not None else resolve_hermes_home()
+        # The profile's scope: every thread this runtime starts runs in it
+        # (``register`` passes the one it captured; otherwise the constructing
+        # context's — the activation attempt's, already in the scope).
+        self._scope = scope if scope is not None else ProfileScope.capture(self._hermes_home)
         fingerprint = getattr(config, "account_fingerprint", None)
         if not isinstance(fingerprint, str):
             fingerprint = account_fingerprint(config.api_base, config.api_key)
@@ -371,6 +377,7 @@ class Runtime:
             identity=self._identity,
             runtime=self,
             host_llm=self._host_llm,
+            scope=self._scope,
         )
         state_dir = self._state_dir
         home = self._hermes_home
@@ -387,14 +394,10 @@ class Runtime:
             manual_sync_factory=lambda texts, on_result: manual_module.manual_sync_for(
                 texts, home=home, on_result=on_result
             ),
+            scope=self._scope,
         )
         health.set_worker_status(self._receiver.worker_status)
         self._receiver.start()
-        # The runtime activated, so api.agentchat.me answers now: a hosted
-        # tools server Hermes parked while it did not (a gateway started
-        # offline) is asked to reconnect, or every wake ends tools_unavailable
-        # until Hermes' own self-probe (5 min, up to an hour).
-        self._invoker.nudge_hosted_tools("the AgentChat runtime activated")
 
     def _sync_manual_once(self) -> None:
         """One manual sync on a daemon thread, against the texts in use (a
@@ -408,6 +411,7 @@ class Runtime:
                 served=getattr(texts, "manual", None) if texts is not None else None,
                 api_base=self._config.api_base,
                 label=profile_label(self._hermes_home),
+                scope=self._scope,
             )
         except Exception:
             logger.warning("agentchat runtime: the manual sync could not start", exc_info=True)
@@ -417,11 +421,7 @@ class Runtime:
         if self._leader_retry_thread is not None:
             return
         self._retry_stop.clear()
-        thread = threading.Thread(
-            target=self._leader_retry_loop,
-            name="agentchat-leader-retry",
-            daemon=True,
-        )
+        thread = self._scope.thread(self._leader_retry_loop, name="agentchat-leader-retry")
         self._leader_retry_thread = thread
         thread.start()
 
@@ -507,7 +507,7 @@ class Runtime:
                     )
                 release()
 
-            threading.Thread(target=wait_then_release, name="agentchat-lock-release", daemon=True).start()
+            self._scope.thread(wait_then_release, name="agentchat-lock-release").start()
 
         if invoker is None or invoker.when_idle(after_the_receiver):
             if invoker is None:
@@ -683,7 +683,11 @@ _registry_lock = threading.Lock()
 
 
 def get_runtime(
-    config: Config, *, gateway_mode: bool, host_llm: Callable[[], Any] | None = None
+    config: Config,
+    *,
+    gateway_mode: bool,
+    host_llm: Callable[[], Any] | None = None,
+    scope: ProfileScope | None = None,
 ) -> Runtime:
     """Return the runtime for ``config``'s profile and account, constructing if needed.
 
@@ -701,7 +705,7 @@ def get_runtime(
     with _registry_lock:
         existing = _runtimes.get(key)
         if existing is None:
-            existing = Runtime(config, gateway_mode=gateway_mode, host_llm=host_llm)
+            existing = Runtime(config, gateway_mode=gateway_mode, host_llm=host_llm, scope=scope)
             _runtimes[key] = existing
         elif existing.gateway_mode_requested != gateway_mode:
             logger.warning(

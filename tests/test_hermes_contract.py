@@ -12,6 +12,7 @@ Nothing here reaches a network service: the model is a localhost stub and
 """
 from __future__ import annotations
 
+import contextlib
 import contextvars
 import importlib
 import importlib.util
@@ -64,6 +65,17 @@ def _params(fn: Any) -> set[str]:
     return set(inspect.signature(fn).parameters)
 
 
+@contextlib.contextmanager
+def _home_override(home: Path) -> Iterator[None]:
+    """Hermes' context-local profile home, as its loader binds it around ``register()``."""
+    constants = _import("hermes_constants")
+    token = constants.set_hermes_home_override(str(home))
+    try:
+        yield
+    finally:
+        constants.reset_hermes_home_override(token)
+
+
 # ─── a localhost model ──────────────────────────────────────────────────────
 
 
@@ -72,6 +84,8 @@ class _Stub:
 
     def __init__(self, *, hang: bool) -> None:
         self.requests: list[dict[str, Any]] = []
+        # The bearer each request carried: which provider key the call used.
+        self.auth: list[str] = []
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -79,6 +93,7 @@ class _Stub:
                 length = int(self.headers.get("content-length") or 0)
                 body = json.loads(self.rfile.read(length) or b"{}")
                 stub.requests.append({"path": self.path, "model": body.get("model"), "tools": "tools" in body})
+                stub.auth.append(str(self.headers.get("authorization") or ""))
                 if hang:
                     time.sleep(60)
                     return
@@ -681,7 +696,6 @@ def test_each_profile_gets_its_own_key_through_hermes_orchestrator(
     from fake_keys import api_key
 
     from agentchatme_hermes import key_source, key_store
-    from agentchatme_hermes.profile_scope import profile_context
 
     constants = _import("hermes_constants")
     other = _hermes_home / "profiles" / "b"
@@ -692,32 +706,40 @@ def test_each_profile_gets_its_own_key_through_hermes_orchestrator(
         assert _source_registry.register_source(key_source.build_key_source(), scope=scope) is True
     for home, key in keys.items():
         environ = {"AGENTCHAT_API_KEY": api_key("stale_or_exported")}
-        with profile_context(home):
+        with _home_override(home):
             report = _source_registry.apply_all({"agentchat": key_source.secrets_section()}, home, environ=environ)
         assert environ["AGENTCHAT_API_KEY"] == key, home
         assert [s.name for s in report.sources] == ["agentchat"]
 
 
 def test_a_cloned_profiles_tools_get_no_key_not_the_originals(
-    _hermes_home: Path, _source_registry: Any
+    _hermes_home: Path, _source_registry: Any, _multiplexed: Any
 ) -> None:
     """A profile whose .env holds a copy of the default profile's key (made by
-    ``profile create``): through Hermes' orchestrator the variable comes out
-    empty, so its hosted tools cannot act as the default profile's agent."""
+    ``profile create``) while the default saved it in its key file. The copy is
+    found in the clone's own scope — its settings through Hermes' ``get_secret``
+    on a multiplexed gateway, never by reading a file — and through Hermes'
+    orchestrator the clone's variable then comes out empty, so its hosted tools
+    cannot act as the default profile's agent."""
     from fake_keys import api_key
 
-    from agentchatme_hermes import key_source
-    from agentchatme_hermes.profile_scope import profile_context
+    from agentchatme_hermes import config, key_source, key_store
+    from agentchatme_hermes.profile_scope import ProfileScope
 
     key = api_key("contract_copied_value")
-    (_hermes_home / ".env").write_text(f"AGENTCHAT_API_KEY={key}\n", encoding="utf-8")
+    key_store.write_store(_hermes_home, api_key=key, handle="x", api_base="https://api.agentchat.me")
     clone = _hermes_home / "profiles" / "t5tmp"
     clone.mkdir(parents=True)
     (clone / ".env").write_text(f"AGENTCHAT_API_KEY={key}\n", encoding="utf-8")
-    scope = _import("hermes_constants").hermes_home_key(clone)
-    assert _source_registry.register_source(key_source.build_key_source(), scope=scope) is True
-    environ = {"AGENTCHAT_API_KEY": key}  # the copy, loaded from the clone's .env
-    with profile_context(clone):
+    _multiplexed()
+    with _home_override(clone):
+        scope = ProfileScope.capture(clone)
+    resolved = scope.run(config.resolve_key, clone)
+    assert resolved.refusal is not None and resolved.copy_of == _hermes_home
+    scope_key = _import("hermes_constants").hermes_home_key(clone)
+    assert _source_registry.register_source(key_source.build_key_source(), scope=scope_key) is True
+    environ = {"AGENTCHAT_API_KEY": key}  # the copy, as Hermes would load it
+    with _home_override(clone):
         _source_registry.apply_all({"agentchat": key_source.secrets_section()}, clone, environ=environ)
     assert environ["AGENTCHAT_API_KEY"] == ""
 
@@ -789,13 +811,35 @@ def test_the_secrets_block_round_trips_through_hermes_config(_hermes_home: Path)
     assert "agentchat" not in (_import("hermes_cli.config").read_user_config_raw().get("secrets") or {})
 
 
-def test_hermes_records_which_source_supplied_a_variable() -> None:
-    """``secret_source_label`` (public): how the plugin tells its own earlier
-    write from an exported key."""
-    assert callable(_import("agent.secret_scope").secret_source_label)
-    assert callable(_import("hermes_constants").get_process_hermes_home)
+def test_hermes_env_routes_for_this_profile(_hermes_home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """What the key migration relies on (``credentials``): Hermes loads the
+    profile .env over an exported value, so a key setting with a .env line
+    reads as that line; ``remove_env_value`` removes every line of a name,
+    clears it from the environment and says whether a line was there; its
+    writers edit the active profile's .env (``get_env_path``); its write lock
+    can be asked first (``require_env_writable``)."""
+    from fake_keys import api_key
+
     config = _import("hermes_cli.config")
-    assert callable(config.remove_env_value) and callable(config.get_env_path)
+    env_loader = _import("hermes_cli.env_loader")
+    for name in ("remove_env_value", "save_env_value", "get_env_path", "require_env_writable"):
+        assert callable(getattr(config, name, None)), name
+    assert Path(config.get_env_path()) == _hermes_home / ".env"
+    other = _hermes_home / "profiles" / "b"
+    other.mkdir(parents=True)
+    with _home_override(other):
+        assert Path(config.get_env_path()) == other / ".env", "the profile in scope"
+
+    line = api_key("contract_env_line")
+    (_hermes_home / ".env").write_text(f"KEEP=1\nAGENTCHAT_API_KEY={line}\nAGENTCHAT_API_KEY={line}\n", encoding="utf-8")
+    monkeypatch.setenv("AGENTCHAT_API_KEY", api_key("contract_exported"))
+    env_loader.load_hermes_dotenv(hermes_home=_hermes_home)
+    assert os.environ["AGENTCHAT_API_KEY"] == line, "the profile .env wins over the shell's export"
+    config.require_env_writable("AGENTCHAT_API_KEY", "remove")
+    assert config.remove_env_value("AGENTCHAT_API_KEY") is True
+    assert "AGENTCHAT_API_KEY" not in os.environ
+    assert (_hermes_home / ".env").read_text(encoding="utf-8").splitlines() == ["KEEP=1"]
+    assert config.remove_env_value("AGENTCHAT_API_KEY") is False, "no line: nothing found"
 
 
 def test_wizard_helpers() -> None:
@@ -814,18 +858,19 @@ def test_wizard_helpers() -> None:
 
 
 def test_profile_scope_pieces() -> None:
+    """Every Hermes name ``ProfileScope`` uses is a public one (``plugin_api.json``)."""
     constants = _import("hermes_constants")
     for name in ("get_hermes_home", "set_hermes_home_override", "reset_hermes_home_override", "hermes_home_key"):
         assert callable(getattr(constants, name, None)), name
     secret_scope = _import("agent.secret_scope")
-    for name in ("get_secret", "is_multiplex_active", "set_secret_scope", "reset_secret_scope"):
+    for name in ("get_secret", "is_multiplex_active", "set_secret_scope", "reset_secret_scope", "refresh_installed_secret_scope"):
         assert callable(getattr(secret_scope, name, None)), name
     assert issubclass(secret_scope.UnscopedSecretError, Exception)
-    assert callable(_import("gateway.run")._profile_runtime_scope)
-    assert callable(_import("gateway.run_turn").GatewayTurnMixin._standalone_launch_scope)
-    assert callable(_import("hermes_cli.env_loader").hydrate_profile_secret_sources)
-    assert callable(_import("tools.terminal_scope").install_and_reset_profile_terminal_scope)
-    assert callable(_import("tui_gateway.launch_profile_policy").owner_secret_scope)
+    spec = importlib.util.find_spec("hermes_cli")
+    assert spec is not None and spec.submodule_search_locations
+    api = json.loads((Path(next(iter(spec.submodule_search_locations))) / "data" / "plugin_api.json").read_text(encoding="utf-8"))
+    public = {entry for group in api["groups"] for entry in group["entries"]}
+    assert {"agent.secret_scope", "hermes_constants", "hermes_cli.config", "agent.secret_sources.base"} <= public
 
 
 def test_the_profile_home_reaches_a_turn_thread(tmp_path: Path) -> None:
@@ -847,12 +892,266 @@ def test_the_profile_home_reaches_a_turn_thread(tmp_path: Path) -> None:
 
 
 def test_the_plugin_resolves_its_home_through_hermes(tmp_path: Path) -> None:
-    from agentchatme_hermes.profile_scope import profile_context, resolve_hermes_home
+    """A scope captured where Hermes bound profile c's home runs every call there."""
+    from agentchatme_hermes.profile_scope import ProfileScope, resolve_hermes_home
 
     other = tmp_path / "profiles" / "c"
     other.mkdir(parents=True)
-    with profile_context(other):
-        assert resolve_hermes_home().resolve() == other.resolve()
+    with _home_override(other):
+        scope = ProfileScope.capture(other)
+    assert resolve_hermes_home().resolve() != other.resolve()
+    assert _in_a_worker(lambda: scope.run(resolve_hermes_home)).resolve() == other.resolve()
+
+
+@pytest.fixture
+def _multiplexed(monkeypatch: pytest.MonkeyPatch) -> Iterator[Any]:
+    """Make this process a multiplexed gateway, as Hermes does when it starts
+    hosting a second profile home (``activate_multi_profile_hosting``: the
+    environment frozen as the launch profile's, ``get_secret`` fail-closed).
+    Undone afterwards."""
+    policy = _import("tui_gateway.launch_profile_policy")
+    secret_scope = _import("agent.secret_scope")
+    monkeypatch.setattr(policy, "_snapshot", None)
+    monkeypatch.setattr(policy, "_source_writes", {})
+    active: list[bool] = []
+
+    def activate() -> None:
+        policy.activate_multi_profile_hosting()
+        active.append(True)
+
+    try:
+        yield activate
+    finally:
+        if active:
+            secret_scope.set_multiplex_active(False)
+
+
+def _probe_plugin(home: Path, name: str, body: str) -> None:
+    """A directory plugin in ``home``, enabled there, whose ``register(ctx)`` runs ``body``."""
+    plugin = home / "plugins" / name
+    plugin.mkdir(parents=True, exist_ok=True)
+    (plugin / "plugin.yaml").write_text(f"name: {name}\nversion: 0.1.0\ndescription: contract probe\n", encoding="utf-8")
+    (plugin / "__init__.py").write_text(f"def register(ctx):\n{body}\n", encoding="utf-8")
+    config = home / "config.yaml"
+    text = config.read_text(encoding="utf-8") if config.exists() else ""
+    if "plugins:" not in text:
+        text += "plugins:\n  enabled: []\n"
+    text = text.replace("  enabled: [", f"  enabled: [{name}, ", 1).replace(", ]", "]")
+    config.write_text(text, encoding="utf-8")
+
+
+_CAPTURE = """    import sys
+    from agentchatme_hermes.profile_scope import ProfileScope, resolve_hermes_home
+    home = resolve_hermes_home()
+    sys.modules["agentchat_contract_probe"].captured[str(home)] = ProfileScope.capture(home)"""
+
+
+@pytest.fixture
+def _probe_captures(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    import types as _types
+
+    module = _types.ModuleType("agentchat_contract_probe")
+    module.captured = {}  # type: ignore[attr-defined]
+    monkeypatch.setitem(__import__("sys").modules, "agentchat_contract_probe", module)
+    return module.captured  # type: ignore[attr-defined,no-any-return]
+
+
+def _load_plugins(home: Path, *, routed: bool) -> Any:
+    """Load ``home``'s plugins as a multiplexed gateway does, on a thread of its
+    own: the launch profile by a plain discovery (the boot's background
+    thread: only the home is bound), a served profile inside the runtime
+    scope the gateway binds for it (``gateway.run._profile_runtime_scope``)."""
+    plugins = _import("hermes_cli.plugins")
+    constants = _import("hermes_constants")
+    manager = plugins.PluginManager(scope_key=constants.hermes_home_key(home), owner_home=home)
+
+    def load() -> None:
+        if routed:
+            with _import("gateway.run")._profile_runtime_scope(home):
+                manager.discover_and_load()
+        else:
+            manager.discover_and_load()
+
+    thread = threading.Thread(target=contextvars.Context().run, args=(load,))
+    thread.start()
+    thread.join(60.0)
+    return manager
+
+
+def _two_profiles(root: Path, monkeypatch: pytest.MonkeyPatch, *, model_base: str | None = None) -> Path:
+    """The default profile (the launch profile) and profile ``s``, each with its
+    own settings in its own .env; one key only in the launch environment (as
+    systemd ``Environment=`` sets it)."""
+    served = root / "profiles" / "s"
+    served.mkdir(parents=True)
+    (root / ".env").write_text("AGENTCHATME_HANDLE=root-h\nCONTRACT_PROVIDER_KEY=root-file\n", encoding="utf-8")
+    (served / ".env").write_text("AGENTCHATME_HANDLE=s-h\nCONTRACT_PROVIDER_KEY=s-key\n", encoding="utf-8")
+    monkeypatch.setenv("CONTRACT_ENV_ONLY_KEY", "launch-only")
+    monkeypatch.delenv("AGENTCHATME_HANDLE", raising=False)
+    monkeypatch.delenv("CONTRACT_PROVIDER_KEY", raising=False)
+    if model_base is not None:
+        for home, ref in ((root, "CONTRACT_ENV_ONLY_KEY"), (served, "CONTRACT_PROVIDER_KEY")):
+            (home / "config.yaml").write_text(
+                f"model:\n  default: contract-main-model\n  provider: custom\n  base_url: {model_base}\n"
+                f"  api_key: ${{{ref}}}\n",
+                encoding="utf-8",
+            )
+    for home in (root, served):
+        _probe_plugin(home, "agentchat_scope_probe", _CAPTURE)
+    return served
+
+
+def test_profile_scope_on_a_real_two_profile_multiplexed_gateway(
+    _hermes_home: Path, monkeypatch: pytest.MonkeyPatch, _multiplexed: Any, _probe_captures: dict[str, Any]
+) -> None:
+    """Each profile's plugin work, run in the scope ``register()`` captured, sees
+    that profile's home and secrets — bound per call with public names only
+    (``set_secret_scope`` + ``refresh_installed_secret_scope``):
+
+    * the launch profile its own .env AND the keys only its process
+      environment has (``owner_secret_scope`` → the environment frozen at
+      activation), never the served profile's;
+    * the served profile its own .env only — never a launch-only key — and the
+      terminal policy Hermes bound for it when it loaded the plugin;
+    * nothing left bound after a call: an unscoped read still fails closed.
+    """
+    from agentchatme_hermes.profile_scope import resolve_setting
+
+    root = _hermes_home
+    served = _two_profiles(root, monkeypatch)
+    _multiplexed()
+    _load_plugins(root, routed=False)
+    _load_plugins(served, routed=True)
+    key = _import("hermes_constants").hermes_home_key
+    scopes = {key(Path(home)): scope for home, scope in _probe_captures.items()}
+    assert set(scopes) == {key(root), key(served)}, f"the probe loaded in both profiles: {list(_probe_captures)}"
+    secret_scope = _import("agent.secret_scope")
+    terminal_scope = _import("tools.terminal_scope")
+
+    def probe() -> dict[str, Any]:
+        get = secret_scope.get_secret
+        return {
+            "home": key(_import("hermes_constants").get_hermes_home()),
+            "handle": resolve_setting("AGENTCHATME_HANDLE"),
+            "provider": get("CONTRACT_PROVIDER_KEY"),
+            "env_only": get("CONTRACT_ENV_ONLY_KEY"),
+            "terminal": terminal_scope.get_terminal_scope() is not None,
+        }
+
+    seen: dict[str, dict[str, Any]] = {}
+    barrier = threading.Barrier(2, timeout=30.0)
+
+    def run(home_key: str) -> None:
+        barrier.wait()
+        seen[home_key] = scopes[home_key].run(probe)
+
+    threads = [threading.Thread(target=run, args=(k,)) for k in scopes]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60.0)
+    assert seen[key(root)] == {
+        "home": key(root), "handle": "root-h", "provider": "root-file", "env_only": "launch-only",
+        "terminal": seen[key(root)]["terminal"],
+    }
+    assert seen[key(served)] == {
+        "home": key(served), "handle": "s-h", "provider": "s-key", "env_only": None, "terminal": True,
+    }
+    with pytest.raises(secret_scope.UnscopedSecretError):
+        _in_a_worker(lambda: secret_scope.get_secret("CONTRACT_PROVIDER_KEY"))
+    left = _in_a_worker(lambda: (scopes[key(served)].run(lambda: None), secret_scope.current_secret_scope())[1])
+    assert left is None, "the call's binding is reset"
+
+
+def test_the_launch_profile_loaded_before_multiplexing_gets_its_scope_once_it_starts(
+    _hermes_home: Path, monkeypatch: pytest.MonkeyPatch, _multiplexed: Any, _probe_captures: dict[str, Any]
+) -> None:
+    """A gateway loads the launch profile's plugins before it starts hosting a
+    second profile (the eager activation is its last boot step). The scope
+    captured then binds the launch profile's secrets — its environment-only key
+    included — once the gateway multiplexes."""
+    root = _hermes_home
+    _two_profiles(root, monkeypatch)
+    _load_plugins(root, routed=False)  # before activation: single-profile semantics
+    key = _import("hermes_constants").hermes_home_key
+    (scope,) = [s for home, s in _probe_captures.items() if key(Path(home)) == key(root)]
+    secret_scope = _import("agent.secret_scope")
+    assert not secret_scope.is_multiplex_active()
+    _multiplexed()
+    seen = _in_a_worker(
+        lambda: scope.run(lambda: (secret_scope.get_secret("AGENTCHATME_HANDLE"), secret_scope.get_secret("CONTRACT_ENV_ONLY_KEY")))
+    )
+    assert seen == ("root-h", "launch-only")
+
+
+def test_the_refresh_contract_the_version_probe_reads() -> None:
+    """``profile_scope.refresh_keeps_launch_env`` asks Hermes' public refresh
+    whether it refills a scope stamped for another home: since 0.23.2 it does
+    not (it builds through ``owner_secret_scope``), so this Hermes keeps the
+    launch profile's environment-only keys and no warning is said."""
+    from agentchatme_hermes import profile_scope
+
+    profile_scope._keeps_launch_env.clear()
+    assert profile_scope.refresh_keeps_launch_env() is True
+
+
+def test_ctx_llm_in_each_profiles_scope_uses_its_own_key(
+    _hermes_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    _multiplexed: Any,
+    _probe_captures: dict[str, Any],
+    answering_model: _Stub,
+) -> None:
+    """The gate's ``ctx.llm`` (``PluginLlm``) resolves the calling thread's
+    profile: in each profile's scope it calls that profile's model with that
+    profile's key — the launch profile's from its environment only."""
+    from agentchatme_hermes.model_call import build_call_model
+
+    root = _hermes_home
+    served = _two_profiles(root, monkeypatch, model_base=answering_model.base_url)
+    _multiplexed()
+    _load_plugins(root, routed=False)
+    _load_plugins(served, routed=True)
+    key = _import("hermes_constants").hermes_home_key
+    scopes = {key(Path(home)): scope for home, scope in _probe_captures.items()}
+    plugin_llm = _import("agent.plugin_llm")
+    for home, bearer in ((root, "Bearer launch-only"), (served, "Bearer s-key")):
+        call_model = build_call_model(
+            main_runtime={}, timeout_s=20.0, host_llm=plugin_llm.PluginLlm(plugin_id="agentchat_scope_probe")
+        )
+        assert _in_a_worker(lambda s=scopes[key(home)], c=call_model: s.run(c, "THE PROMPT")) == "done"
+        assert answering_model.auth[-1] == bearer, home
+
+
+def test_a_plugin_loaded_after_ours_is_visible_from_our_scope(
+    _hermes_home: Path, _probe_captures: dict[str, Any]
+) -> None:
+    """The context ``register()`` captures carries Hermes' plugin-load flag
+    (``in_plugin_load_worker``): a discovery from our threads does not wait for
+    a sweep still running. Once the sweep is done, what a plugin loaded after
+    ours registered is visible from our scope, as a turn needs it."""
+    _probe_plugin(_hermes_home, "aaa_agentchat_probe", _CAPTURE)
+    _probe_plugin(
+        _hermes_home,
+        "zzz_late_probe",
+        "    ctx.register_tool(name='zzz_late_probe_tool', toolset='zzz_late_probe', "
+        "schema={'name': 'zzz_late_probe_tool', 'description': 'probe', 'parameters': {'type': 'object', 'properties': {}}}, "
+        "handler=lambda args, **kw: '{}')",
+    )
+    manager = _load_plugins(_hermes_home, routed=False)
+    try:
+        (scope,) = _probe_captures.values()
+        registry = _import("tools.registry").registry
+        loader = _import("hermes_cli.plugins_loader")
+
+        def look() -> tuple[bool, bool]:
+            names = registry.get_all_tool_names()
+            return "zzz_late_probe_tool" in names, loader.in_plugin_load_worker()
+
+        visible, _in_load_flag = _in_a_worker(lambda: scope.run(look))
+        assert visible, "the later plugin's tool is in the registry our turn reads"
+    finally:
+        manager.unload()
 
 
 # ─── hosted tools and names ─────────────────────────────────────────────────
@@ -934,86 +1233,22 @@ def test_gateway_marks_its_process() -> None:
 # ─── a parked hosted tools server (MS-F19) ──────────────────────────────────
 
 
-def test_hermes_mcp_status_and_reconnect_request_surface() -> None:
-    """``hosted_tools`` reads ``get_mcp_status()`` rows and asks ``reconnect_mcp_server(name)``."""
+def test_hermes_mcp_status_surface_and_the_parked_remedy() -> None:
+    """``hosted_tools`` reads ``get_mcp_status()`` rows (read only, diagnostics).
+    Its remedy for a parked server is true of this Hermes: a parked server
+    probes itself after 300 s, backing off to an hour, and ``/reload-mcp`` is a
+    command a chat on the gateway can send."""
+    from agentchatme_hermes import hosted_tools
+
     discovery = _import("tools.mcp_tool_discovery")
-    loop = _import("tools.mcp_tool_loop")
     assert {"configured"} <= _params(discovery.get_mcp_status)
-    assert list(_params(loop.reconnect_mcp_server)) == ["server_name"]
-    assert loop.reconnect_mcp_server("agentchat") is False, "no connection held: nothing to wake"
-
-
-class _McpStub:
-    """A Streamable HTTP MCP server on localhost: ``initialize``, ``tools/list``
-    with one ``agentchat_inbox`` tool, ``ping``. JSON answers, no SSE stream
-    (``GET`` is 405, which the client allows)."""
-
-    def __init__(self, port: int) -> None:
-        stub = self
-        self.methods: list[str] = []
-
-        class Handler(BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-
-            def log_message(self, *_args: Any) -> None:
-                return
-
-            def _send(self, code: int, body: Any = None, headers: dict[str, str] | None = None) -> None:
-                data = b"" if body is None else json.dumps(body).encode()
-                self.send_response(code)
-                if body is not None:
-                    self.send_header("content-type", "application/json")
-                self.send_header("content-length", str(len(data)))
-                for key, value in (headers or {}).items():
-                    self.send_header(key, value)
-                self.end_headers()
-                if data:
-                    self.wfile.write(data)
-
-            def do_HEAD(self) -> None:
-                self._send(405)
-
-            def do_GET(self) -> None:
-                self._send(405)
-
-            def do_DELETE(self) -> None:
-                self._send(200)
-
-            def do_POST(self) -> None:
-                length = int(self.headers.get("content-length") or 0)
-                message = json.loads(self.rfile.read(length) or b"{}")
-                method = message.get("method")
-                stub.methods.append(str(method))
-                if "id" not in message:
-                    self._send(202)
-                    return
-                if method == "initialize":
-                    result: Any = {
-                        "protocolVersion": (message.get("params") or {}).get("protocolVersion", "2025-06-18"),
-                        "capabilities": {"tools": {"listChanged": False}},
-                        "serverInfo": {"name": "agentchat-stub", "version": "1"},
-                    }
-                    self._send(200, {"jsonrpc": "2.0", "id": message["id"], "result": result}, {"mcp-session-id": "stub"})
-                    return
-                if method == "tools/list":
-                    tool = {"name": "agentchat_inbox", "description": "The tray.", "inputSchema": {"type": "object", "properties": {}}}
-                    self._send(200, {"jsonrpc": "2.0", "id": message["id"], "result": {"tools": [tool]}})
-                    return
-                if method == "ping":
-                    self._send(200, {"jsonrpc": "2.0", "id": message["id"], "result": {}})
-                    return
-                self._send(200, {"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "not here"}})
-
-        self.server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-        self.thread = threading.Thread(target=self.server.serve_forever, name="mcp-stub", daemon=True)
-
-    def __enter__(self) -> _McpStub:
-        self.thread.start()
-        return self
-
-    def __exit__(self, *_exc: Any) -> None:
-        self.server.shutdown()
-        self.server.server_close()
+    mcp_tool = _import("tools.mcp_tool")
+    assert mcp_tool._PARKED_RETRY_INTERVAL == 300
+    assert mcp_tool._PARKED_PROBE_BACKOFF_MAX == 3600
+    command = _import("hermes_cli.commands").resolve_command("reload-mcp")
+    assert command is not None and not getattr(command, "cli_only", False)
+    assert "after 5 minutes" in hosted_tools.PARKED_REMEDY and "up to an hour" in hosted_tools.PARKED_REMEDY
+    assert "/reload-mcp" in hosted_tools.PARKED_REMEDY
 
 
 def _free_port() -> int:
@@ -1024,13 +1259,11 @@ def _free_port() -> int:
         return int(probe.getsockname()[1])
 
 
-def test_a_parked_hosted_tools_server_comes_back_on_the_reconnect_request(_hermes_home: Path) -> None:
+def test_a_parked_hosted_tools_server_is_held_and_named(_hermes_home: Path) -> None:
     """The gateway starts while the hosted tools server cannot be reached:
-    Hermes' own MCP client tries three times and parks it (tools dropped,
-    waiting for a reconnect request or its timed self-probe). The server
-    comes back; :func:`hosted_tools.request_reconnect` (what the runtime does
-    when it activates and a held turn does) brings the tools back at once,
-    and a held turn starts."""
+    Hermes' own MCP client tries three times and parks it (tools dropped).
+    The plugin reads that state, holds the turn, and names the cause and the
+    remedy; it asks Hermes for no reconnect (there is no public one)."""
     pytest.importorskip("mcp.client.streamable_http")
     from agentchatme_hermes import hosted_tools
 
@@ -1041,22 +1274,13 @@ def test_a_parked_hosted_tools_server_comes_back_on_the_reconnect_request(_herme
         f"mcp_servers:\n  agentchat:\n    url: http://127.0.0.1:{port}/mcp\n    connect_timeout: 30\n",
         encoding="utf-8",
     )
-    hosted_tools._gates.clear()
     try:
         discovery.discover_mcp_tools()  # nothing listens: three refused attempts, then parked
         state = hosted_tools.hosted_server_state()
         assert state is not None and state.parked, f"Hermes parked the server: {state}"
         assert hosted_tools.hosted_tool_names() == []
-        assert hosted_tools.describe_cause(state).startswith("Hermes parked mcp_servers.agentchat")
-        with _McpStub(port) as stub:
-            asked = hosted_tools.request_reconnect(key=str(_hermes_home), reason="the contract test")
-            assert asked.outcome == "requested"
-            assert hosted_tools.wait_for_hosted_tools(timeout_s=30.0, key=str(_hermes_home)) is True
-            assert "mcp__agentchat__agentchat_inbox" in (hosted_tools.hosted_tool_names() or [])
-            after = hosted_tools.hosted_server_state()
-            assert after is not None and after.status == "connected"
-            assert "tools/list" in stub.methods
-            again = hosted_tools.request_reconnect(key=str(_hermes_home), reason="the contract test")
-            assert again.outcome == "not_parked", "a connected server is never asked to reconnect"
+        cause = hosted_tools.describe_cause(state)
+        assert cause.startswith("Hermes parked mcp_servers.agentchat") and "/reload-mcp" in cause
+        assert hosted_tools.wait_for_hosted_tools(timeout_s=0.2, poll_s=0.05) is False
     finally:
         lifecycle.shutdown_mcp_servers()

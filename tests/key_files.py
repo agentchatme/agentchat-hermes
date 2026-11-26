@@ -32,3 +32,13 @@ def saved(home: Path | None = None) -> key_store.StoredKey | None:
     """What the key file of ``home`` holds, or ``None``."""
     read = key_store.read_store(home if home is not None else profile_home())
     return read.key if read.usable else None
+
+
+def set_up_as_agent(home: Path, handle: str = "alice") -> None:
+    """``home`` as a profile set up as an AgentChat agent: the identity block in its SOUL.md."""
+    from agentchatme_hermes.soul_anchor import ANCHOR_START
+
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "SOUL.md").write_text(
+        f"{ANCHOR_START}\nI am @{handle} on AgentChat.\n<!-- agentchat:end -->\n", encoding="utf-8"
+    )
