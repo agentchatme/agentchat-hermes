@@ -590,6 +590,8 @@ class _Menus:
         monkeypatch.setattr(wizard, "_recover_lost_key_flow", recover)
         monkeypatch.setattr(wizard, "_register_new_agent_flow", register)
         monkeypatch.setattr(wizard, "_paste_existing_key_flow", paste)
+        # A gateway serves the profile (Hermes, where installed, reads this test home's as stopped).
+        monkeypatch.setattr(wizard, "gateway_runs_for", lambda home: True)
 
     def prompt_choice(self, question: str, choices: list[str], default: int = 0, **_: Any) -> int:
         self.choices = list(choices)
@@ -624,6 +626,13 @@ class TestMenuRouting:
         # A profile's first key, no gateway serving it: no restart line (lab R3, L1-F02).
         assert menus.person.said("info") == [credentials.NO_RESTART_LINE]
         assert not any("restart" in text.lower() and "no restart" not in text.lower() for _, text in menus.person.transcript)
+
+    def test_fresh_menu_with_no_gateway_running_says_it_waits_for_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        menus = _Menus(monkeypatch, pick=0)
+        monkeypatch.setattr(wizard, "gateway_runs_for", lambda home: False)
+        wizard._fresh_setup_menu(**menus.kwargs())
+        (said,) = menus.person.said("info")
+        assert said.startswith("No gateway runs for this profile now") and "`hermes gateway run`" in said
 
     def test_fresh_menu_skip_runs_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         menus = _Menus(monkeypatch, pick=3)

@@ -654,6 +654,14 @@ class TestKeyInUse:
     that gateway serving — and in an agent's own terminal the restart is the
     person's, never the agent's."""
 
+    @pytest.fixture(autouse=True)
+    def _a_gateway_runs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A gateway serves the profile unless a test says none does (with
+        Hermes installed, its liveness would read this test home's as stopped)."""
+        from agentchatme_hermes import placement
+
+        monkeypatch.setattr(placement, "gateway_runs_for", lambda home: True)
+
     def _register(self, monkeypatch: pytest.MonkeyPatch) -> None:
         serve(monkeypatch, {sw.REGISTER: sw.code_sent(), sw.REGISTER_VERIFY: sw.registered("alice", _KEY)})
         _Cli(monkeypatch, ["123456"])
