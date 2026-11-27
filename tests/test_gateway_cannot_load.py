@@ -121,14 +121,29 @@ class TestWhatIsSaid:
         assert line == credentials.LOAD_RESTART_LINE_AGENT
         assert "the person's, not yours" in line
 
-    def test_allow_names_the_restart_after_a_yes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("outcome", ["changed", "allowed", "applying"])
+    def test_allow_says_the_restart_instead_of_how_the_tools_connect(
+        self, monkeypatch: pytest.MonkeyPatch, outcome: str
+    ) -> None:
         from agentchatme_hermes.profile_scope import ProfileScope
 
-        monkeypatch.setattr(allow, "_written_answer", lambda decision, *, scope, agent: f"{decision} written.")
+        step = MagicMock(failed=False, outcome=outcome)
+        monkeypatch.setattr(placement, "place_mcp", lambda api_base, *, decision: step)
+        monkeypatch.setattr(allow, "read_switch", lambda home, *, api_base: allow.Switch("not_allowed_yet"))
         monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
         scope = ProfileScope.capture(profile_home())
-        assert allow._write_answer("yes", scope=scope, agent="@a") == f"yes written. {credentials.LOAD_RESTART_LINE}"
-        assert allow._write_answer("no", scope=scope, agent="@a") == "no written."
+        reply = allow._write_answer("yes", scope=scope, agent="@a")
+        assert reply == f"AgentChat tools allowed for @a. {credentials.LOAD_RESTART_LINE}"
+        assert "within about a minute" not in reply
+
+    def test_a_no_says_no_restart(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes.profile_scope import ProfileScope
+
+        step = MagicMock(failed=False, outcome="changed")
+        monkeypatch.setattr(placement, "place_mcp", lambda api_base, *, decision: step)
+        monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
+        scope = ProfileScope.capture(profile_home())
+        assert allow._write_answer("no", scope=scope, agent="@a") == allow.NOT_ALLOWED_LINE.format(who="@a")
 
     def test_the_setup_line_asks_for_the_restart_last(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)

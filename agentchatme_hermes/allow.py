@@ -1241,17 +1241,18 @@ def _write_answer(decision: Decision, *, scope: ProfileScope, agent: str) -> str
     gateway that cannot run AgentChat until it restarts (a first install
     into a running gateway, :func:`.placement.gateway_cannot_load`) says so:
     the restart is the last step, and the person's."""
-    reply = _written_answer(decision, scope=scope, agent=agent)
+    restart: str | None = None
     if decision == "yes":
         from .credentials import LOAD_RESTART_LINE
         from .placement import gateway_cannot_load
 
-        if gateway_cannot_load(scope.home):
-            return f"{reply} {LOAD_RESTART_LINE}"
-    return reply
+        restart = LOAD_RESTART_LINE if gateway_cannot_load(scope.home) else None
+    return _written_answer(decision, scope=scope, agent=agent, restart=restart)
 
 
-def _written_answer(decision: Decision, *, scope: ProfileScope, agent: str) -> str:
+def _written_answer(decision: Decision, *, scope: ProfileScope, agent: str, restart: str | None = None) -> str:
+    """The answer written, and what follows; ``restart``: the restart that
+    alone makes a yes take effect here, said instead of how it comes into use."""
     from .leader_lock import is_hermes_gateway_process
     from .placement import place_mcp
 
@@ -1264,6 +1265,10 @@ def _written_answer(decision: Decision, *, scope: ProfileScope, agent: str) -> s
     note = f" {host_isolation_note()}." if plugin_host_isolation() else ""
     if decision == "no":
         return NOT_ALLOWED_LINE.format(who=agent) + note
+    if restart is not None:
+        if step.outcome == "applying" and is_hermes_gateway_process():
+            start_completion(scope, api_base=api_base)
+        return f"AgentChat tools allowed for {agent}. {restart}{note}"
     if step.outcome == "applying":
         if is_hermes_gateway_process():
             start_completion(scope, api_base=api_base)
