@@ -65,8 +65,7 @@ class WSHealth(_WSHealthRequired, total=False):
 @functools.lru_cache(maxsize=1)
 def plugin_build() -> dict[str, str]:
     """The plugin this process runs: its version, and a fingerprint of its
-    code — sha256 over the package's ``.py`` files (their paths and bytes),
-    the first 12 hex digits. Taken once per process, first at ``register()``,
+    code and the package data that changes its behaviour (:func:`code_fingerprint`). Taken once per process, first at ``register()``,
     so a gateway's health record names the code it loaded: Hermes keeps
     imported code until the process restarts, while an update replaces the
     files. ``doctor`` takes the installed files' the same way; a same-version
@@ -76,17 +75,22 @@ def plugin_build() -> dict[str, str]:
     return {"version": __version__, "build": code_fingerprint(Path(__file__).resolve().parent)}
 
 
+# The package data that changes what the plugin does: its manifest, the
+# manual it registers by default and the pinned texts (the identity line).
+BUILD_DATA_FILES = ("plugin.yaml", "skills/agentchat/SKILL.md", "texts_snapshot.json")
+
+
 def code_fingerprint(root: Path) -> str:
-    """sha256 over the ``.py`` files under ``root`` (each one's relative path
-    and bytes, in path order), the first 12 hex digits; ``unknown`` when a
-    file cannot be read."""
+    """sha256 over the ``.py`` files under ``root`` and the package data in
+    :data:`BUILD_DATA_FILES` (each one's relative path and bytes, in path
+    order), the first 12 hex digits; ``unknown`` when a file cannot be read."""
     import hashlib
 
+    files = [path for path in root.rglob("*.py") if "__pycache__" not in path.parts]
+    files += [root / name for name in BUILD_DATA_FILES if (root / name).is_file()]
     digest = hashlib.sha256()
     try:
-        for path in sorted(root.rglob("*.py")):
-            if "__pycache__" in path.parts:
-                continue
+        for path in sorted(files):
             digest.update(path.relative_to(root).as_posix().encode("utf-8") + b"\0")
             digest.update(path.read_bytes() + b"\0")
     except OSError:

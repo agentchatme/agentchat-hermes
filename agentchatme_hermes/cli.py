@@ -1237,8 +1237,8 @@ def _describe_running_build(health: Any, hermes_home: Path) -> str | None:
             f"the gateway still runs a release before 0.7.0 (pid {health.get('pid')}) — restart it to load "
             f"{installed['version']}: {restart}"
         )
-    if running.get("build") == installed["build"] or installed["build"] == "unknown":
-        return None
+    if running.get("build") == installed["build"] or "unknown" in (running.get("build"), installed["build"]):
+        return None  # the same build, or one side could not read its files: nothing to tell
     same_version = running.get("version") == installed["version"]
 
     def label(build: Any) -> str:
@@ -2413,16 +2413,17 @@ def _resolve_recovery_handle(provided: str | None) -> str:
     from .config import leftover_handle_line, profile_handles
     from .profile_scope import resolve_hermes_home
 
-    saved, leftover = profile_handles()
-    if saved:
+    handles = profile_handles()
+    if handles.own:
         _printline(
-            f"Recovering the locally configured agent @{saved} "
+            f"Recovering the locally configured agent @{handles.own} "
             "(pass --handle to recover a different one)."
         )
-        return saved
-    if leftover is not None:
-        # Said, never used: it may be another profile's agent. The person types the handle.
-        sys.stderr.write(f"Note: {leftover_handle_line(leftover, resolve_hermes_home())}.\n")
+        return handles.own
+    if handles.leftover is not None:
+        # Said, never used: it may be (a refused copy: is) another profile's
+        # agent, whose key a recovery here would rotate. The person types it.
+        sys.stderr.write(f"Note: {leftover_handle_line(handles, resolve_hermes_home())}.\n")
         sys.stderr.flush()
     if not _stdin_is_tty():
         raise _MissingFlag(
@@ -2447,11 +2448,11 @@ def _handle_hint_line(hermes_home: Path) -> tuple[Literal["ok", "warn"], str] | 
     cleanup for this profile only (:func:`.config.leftover_handle_line`)."""
     from .config import leftover_handle_line, profile_handles
 
-    own, leftover = profile_handles(hermes_home)
-    if own is not None:
-        return "ok", f"Local handle hint: @{own}"
-    if leftover is not None:
-        return "warn", leftover_handle_line(leftover, hermes_home)
+    handles = profile_handles(hermes_home)
+    if handles.own is not None:
+        return "ok", f"Local handle hint: @{handles.own}"
+    if handles.leftover is not None:
+        return "warn", leftover_handle_line(handles, hermes_home)
     return None
 
 
@@ -2469,7 +2470,7 @@ def _read_saved_handle() -> str | None:
     """
     from .config import profile_handles
 
-    return profile_handles()[0]
+    return profile_handles().own
 
 
 def _stdin_is_tty() -> bool:

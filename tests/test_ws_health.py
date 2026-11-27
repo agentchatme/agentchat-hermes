@@ -271,6 +271,21 @@ class TestRunningBuild:
 
         assert self._line(tmp_path, dict(plugin_build())) is None
 
+    def test_a_build_the_gateway_could_not_read_says_nothing(self, tmp_path: Path) -> None:
+        """Review: a gateway running as a service user that cannot read a file
+        records ``unknown``: no "restart" for ever."""
+        from agentchatme_hermes.ws_health import plugin_build
+
+        assert self._line(tmp_path, {"version": plugin_build()["version"], "build": "unknown"}) is None
+
+    def test_a_build_this_process_could_not_read_says_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agentchatme_hermes import ws_health
+
+        monkeypatch.setattr(ws_health, "plugin_build", lambda: {"version": "0.6.5", "build": "unknown"})
+        assert self._line(tmp_path, {"version": "0.6.5", "build": "0123456789ab"}) is None
+
     def test_a_record_from_before_0_7_0(self, tmp_path: Path) -> None:
         from agentchatme_hermes._version import __version__
 
@@ -291,3 +306,29 @@ class TestRunningBuild:
         line = self._line(tmp_path, {"version": installed["version"], "build": "0123456789ab"}) or ""
         assert f"still runs {installed['version']} (build 0123456789ab)" in line
         assert f"restart it to load {installed['version']} (build {installed['build']})" in line
+
+
+@pytest.mark.parametrize("name", ["plugin.yaml", "skills/agentchat/SKILL.md", "texts_snapshot.json"])
+def test_the_fingerprint_follows_the_package_data_that_changes_behaviour(tmp_path: Path, name: str) -> None:
+    """Review: a same-version update that changes only the manifest, the
+    bundled manual or the pinned texts is another build too."""
+    from agentchatme_hermes.ws_health import BUILD_DATA_FILES, code_fingerprint
+
+    root = tmp_path / "pkg"
+    (root / "skills" / "agentchat").mkdir(parents=True)
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+    for data in BUILD_DATA_FILES:
+        (root / data).write_text("v1\n", encoding="utf-8")
+    first = code_fingerprint(root)
+    (root / name).write_text("v2\n", encoding="utf-8")
+    assert code_fingerprint(root) != first
+
+
+def test_the_installed_package_fingerprints_its_data() -> None:
+    from pathlib import Path as _Path
+
+    import agentchatme_hermes
+    from agentchatme_hermes.ws_health import BUILD_DATA_FILES
+
+    root = _Path(agentchatme_hermes.__file__).resolve().parent
+    assert all((root / name).is_file() for name in BUILD_DATA_FILES), "the names the build covers exist"

@@ -183,7 +183,8 @@ Found by the lab round on a real Hermes v0.23.2 box (R3):
 - **An update is loaded only at the gateway's restart, and doctor says so.** Hermes keeps the plugin code a running
   gateway imported, so an update (a reinstall at a new commit) is not in effect until it restarts, while
   `after-install.md` said "usually nothing to do" and `doctor` "All checks passed". The health record now names the
-  build the gateway runs (`plugin`: the version and a fingerprint of the package's code, taken at `register()`);
+  build the gateway runs (`plugin`: the version and a fingerprint of the package's code, its manifest, bundled manual
+  and pinned texts, taken at `register()`; a side that could not read its files is not compared);
   `doctor` warns "the gateway still runs <that> — restart it to load <the installed one>" (a record from a release
   before 0.7.0 names none, and says so). `after-install.md`: restart the gateway to load the update, then `doctor`.
 - **No "no restart needed" when no gateway runs.** With no gateway serving the profile, setup says AgentChat reaches the
@@ -196,8 +197,10 @@ Found by the lab round on a real Hermes v0.23.2 box (R3):
   leftover setting that may be another profile's agent, with the cleanup for this profile only (`hermes [-p <profile>]
   config unset AGENTCHATME_HANDLE`). The same rule holds everywhere the handle is read (`config.profile_handles`):
   `recover` no longer takes it as `--handle`'s default (it says it is a leftover, then asks, or names the flag), the
-  wizard says so before its menu and pre-fills nothing, and `status` does not show it. A profile that holds a key keeps
-  its handle as before.
+  wizard says so before its menu and pre-fills nothing, and `status` does not show it. The handle a refused copy of
+  another profile's key names (a `--clone-all` key file, a copied `.env`) is that profile's agent and is treated the
+  same way, since recovering it there would rotate the other profile's key. A profile that holds its own key keeps its
+  handle as before.
 
 - **The SOUL.md block the August 2026 build wrote is AgentChat's own.** Every profile updated from that build (the
   plugin catalog's earlier pin) was told at each gateway start, and by `doctor`, that its block "was edited by hand",

@@ -778,3 +778,24 @@ class TestLeftoverHandle:
         wizard._interactive_setup_body()
         assert menus and menus[0]["existing_handle"] == "alice"
         assert not [text for kind, text in said if kind == "print_warning" and "leftover" in text]
+
+    def test_a_refused_copy_gives_the_edit_menu_no_handle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Review: a `--clone-all` copy of another profile's key file names that
+        profile's agent; the replace branch's recover must not default to it."""
+        import shutil
+
+        from key_files import profile_home, save_key
+
+        for name in ("AGENTCHAT_API_KEY", "AGENTCHATME_API_KEY", "AGENTCHATME_HANDLE"):
+            monkeypatch.delenv(name, raising=False)
+        root = profile_home()
+        save_key(api_key("cloned_0000000000000"), handle="alice", home=root)
+        clone = root / "profiles" / "ops"
+        shutil.copytree(root, clone, ignore=shutil.ignore_patterns("profiles"))
+        monkeypatch.setenv("HERMES_HOME", str(clone))
+        said = self._hermes_cli(monkeypatch)
+        menus: list[dict[str, Any]] = []
+        monkeypatch.setattr(wizard, "_edit_menu", lambda **kw: menus.append(kw))
+        wizard._interactive_setup_body()
+        assert menus and menus[0]["existing_handle"] == ""
+        assert any("copy" in text for kind, text in said if kind == "print_warning"), "the refusal is said"

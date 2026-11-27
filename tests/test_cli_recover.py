@@ -15,6 +15,7 @@ The run itself (codes, several agents on one email, saving) is
 from __future__ import annotations
 
 import argparse
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -27,6 +28,9 @@ from agentchatme_hermes.cli import (
     _UserAbort,
     setup_argparse,
 )
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 @pytest.fixture
@@ -172,7 +176,82 @@ class TestReadSavedHandle:
 
         monkeypatch.setenv("AGENTCHATME_HANDLE", "@Fixtest-Lab-He-1")
         assert _read_saved_handle() is None
-        assert profile_handles() == (None, "fixtest-lab-he-1")
+        handles = profile_handles()
+        assert (handles.own, handles.leftover, handles.copy_of) == (None, "fixtest-lab-he-1", None)
+
+
+def _clone_all(monkeypatch: pytest.MonkeyPatch, name: str = "ops") -> tuple[Path, Path]:
+    """What `hermes profile create --clone-all` makes of a set-up default
+    profile: its key file (naming the default profile) copied whole."""
+    import shutil
+
+    from fake_keys import api_key
+    from key_files import profile_home, save_key
+
+    root = profile_home()
+    save_key(api_key("cloned_0000000000000"), handle="alice", home=root)
+    clone = root / "profiles" / name
+    shutil.copytree(root, clone, ignore=shutil.ignore_patterns("profiles"))
+    monkeypatch.setenv("HERMES_HOME", str(clone))
+    return root, clone
+
+
+class TestARefusedCopy:
+    """Review: a refused copy of another profile's key (``--clone-all`` key
+    file, or a copied ``.env``) names that profile's agent: its handle is a
+    leftover — never the local hint, never recover's default (recovering it
+    here would rotate the other profile's key)."""
+
+    def test_the_copied_key_files_handle_is_a_leftover(self, clean_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes.config import leftover_handle_line, profile_handles
+
+        root, clone = _clone_all(monkeypatch)
+        handles = profile_handles(clone)
+        assert (handles.own, handles.leftover, handles.copy_of, handles.in_settings) == (None, "alice", root, False)
+        assert _read_saved_handle() is None
+        line = leftover_handle_line(handles, clone)
+        assert "a refused copy of profile default's AgentChat key" in line and "(@alice) is that profile's agent" in line
+        assert "`hermes -p ops agentchat logout` removes the copy" in line and "config unset" not in line
+
+    def test_recover_does_not_default_to_it(
+        self, clean_env: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _clone_all(monkeypatch)
+        monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+        with pytest.raises(_MissingFlag):
+            _resolve_recovery_handle(None)
+        captured = capsys.readouterr()
+        assert "Recovering the locally configured agent" not in captured.out
+        assert "never recover or log in as it here" in captured.err
+
+    def test_doctor_does_not_show_it_as_the_local_hint(self, clean_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+        _root, clone = _clone_all(monkeypatch)
+        level, line = cli._handle_hint_line(clone) or ("", "")
+        assert level == "warn" and "Local handle hint" not in line and "refused copy" in line
+
+    def test_a_copied_settings_handle_next_to_a_refused_settings_key(
+        self, clean_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `.env` copied from another profile: its key refused (another
+        profile's key file holds it), its AGENTCHATME_HANDLE that agent's."""
+        from fake_keys import api_key
+        from key_files import profile_home, save_key
+
+        from agentchatme_hermes.config import leftover_handle_line, profile_handles
+
+        root = profile_home()
+        key = api_key("shared_0000000000000")
+        save_key(key, handle="alice", home=root)
+        clone = root / "profiles" / "he2"
+        clone.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(clone))
+        monkeypatch.setenv("AGENTCHAT_API_KEY", key)
+        monkeypatch.setenv("AGENTCHATME_HANDLE", "alice")
+        handles = profile_handles(clone)
+        assert (handles.own, handles.leftover, handles.copy_of, handles.in_settings) == (None, "alice", root, True)
+        line = leftover_handle_line(handles, clone)
+        assert "the handle its settings (AGENTCHATME_HANDLE) name (@alice)" in line
+        assert "`hermes -p he2 config unset AGENTCHATME_HANDLE` the handle" in line
 
     def test_blank(self, clean_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("AGENTCHATME_HANDLE", "  @ ")

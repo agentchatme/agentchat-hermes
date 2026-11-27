@@ -112,8 +112,8 @@ def _interactive_setup_body() -> None:
     existing_key = resolution.api_key or resolution.held_key or ""
     # This profile's own handle only: with no key, a settings handle is a
     # leftover (another profile's .env copied), said but never pre-filled.
-    own_handle, leftover_handle = profile_handles()
-    existing_handle = own_handle or ""
+    handles = profile_handles()
+    existing_handle = handles.own or ""
     if resolution.refusal is not None:
         print_warning(resolution.refusal)
         print()
@@ -133,8 +133,8 @@ def _interactive_setup_body() -> None:
         )
         return
 
-    if leftover_handle is not None:
-        print_warning(leftover_handle_line(leftover_handle, resolve_hermes_home()))
+    if handles.leftover is not None:
+        print_warning(leftover_handle_line(handles, resolve_hermes_home()))
         print()
     _fresh_setup_menu(
         prompt=prompt,
