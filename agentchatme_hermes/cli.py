@@ -67,7 +67,7 @@ from getpass import getpass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Literal
 
-from . import allow, credentials, key_store, signup
+from . import allow, credentials, key_store, signup, signup_steps
 from ._version import __version__
 from .client_identity import hermes_client_identity
 from .config import (
@@ -158,11 +158,21 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
     p_register = sub.add_parser(
         "register",
         help="Register a new AgentChat agent (email + verification code)",
+        description=(
+            "Register a new AgentChat agent. At your own terminal it is one run: it sends a code "
+            "to the email and asks for it. In an agent's terminal, or without a terminal, it runs "
+            "one step per command: --email and --handle send the code, then --code finishes."
+        ),
     )
     p_register.add_argument(
-        "--email", help="Email address the verification code is sent to. Prompts if omitted."
+        "--email",
+        help="Email address the verification code is sent to. Prompts if omitted at your own terminal.",
     )
-    p_register.add_argument("--handle", help="Desired @handle. Prompts if omitted.")
+    p_register.add_argument("--handle", help="Desired @handle. Prompts if omitted at your own terminal.")
+    p_register.add_argument(
+        "--code",
+        help="The code from the email: finishes the sign-up an earlier register --email --handle started.",
+    )
     p_register.add_argument(
         "--display-name",
         dest="display_name",
@@ -212,6 +222,10 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
             "several agents. Defaults to the handle this profile is configured as (never a "
             "leftover AGENTCHATME_HANDLE in a profile with no key); otherwise prompts if stdin is a TTY."
         ),
+    )
+    p_recover.add_argument(
+        "--code",
+        help="The code from the email: finishes the recovery an earlier recover --email started.",
     )
     p_recover.set_defaults(func=_dispatch_recover)
 
@@ -268,9 +282,48 @@ def _dispatch_wizard(_args: argparse.Namespace) -> int:
     (``register``/``login``/``status``/``logout``) remain in this file
     as scriptable shortcuts; the wizard is the human-facing entry.
     """
+    if signup_steps.one_step_per_run():
+        return _wizard_without_a_person()
     from .wizard import interactive_setup
 
     interactive_setup()
+    return _EXIT_OK
+
+
+# What ``hermes agentchat`` says where its questions cannot be answered.
+NO_WIZARD_HERE = (
+    "The setup questions are asked only at a person's own terminal (this is an agent's terminal, "
+    "or there is no terminal). Here, sign up one step per command:"
+)
+
+
+def _wizard_without_a_person() -> int:
+    """``hermes agentchat`` in an agent's terminal or without a terminal: the
+    wizard's menus would wait for keys nobody presses. A profile set up says
+    its status; one that is not says the two sign-up commands, or the one
+    that finishes the sign-up waiting for its code."""
+    from .profile_scope import resolve_hermes_home
+
+    home = resolve_hermes_home()
+    resolution = resolve_key(home)
+    if resolution.api_key is not None:
+        from argparse import Namespace
+
+        return _dispatch_status(Namespace())
+    cmd = cli_prefix(home)
+    pending = signup_steps.read_pending(home)
+    if pending is not None:
+        _printline(signup_steps.waiting_line(pending, cmd) + ".")
+        return _EXIT_OK
+    if resolution.refusal is not None:
+        _printline(resolution.refusal)
+    _printline(NO_WIZARD_HERE)
+    _printline(f"  1. {signup_steps.start_line('register', cmd)}  (sends a code to that email)")
+    _printline(f"  2. {cmd} register --code <code>")
+    _printline(
+        f"Then the person allows the AgentChat tools once by sending /agentchat allow in a chat with "
+        f"the agent. With a key already: {cmd} login --api-key-file <path>."
+    )
     return _EXIT_OK
 
 
@@ -287,16 +340,18 @@ def _dispatch_register(args: argparse.Namespace) -> int:
     problem = _signup_problem()
     if problem is not None:
         return _exit_with(problem)
+    code = getattr(args, "code", None)
+    if code is not None:
+        return _finish_step("register", code, on_saved=_print_registration_success)
     handle = signup.typed_value("handle", getattr(args, "handle", None) or "")
-    return _run_signup(
-        "register",
-        {
-            "email": (getattr(args, "email", None) or "").strip() or None,
-            "handle": handle or None,
-            "display_name": getattr(args, "display_name", None) or None,
-        },
-        on_saved=_print_registration_success,
-    )
+    given = {
+        "email": (getattr(args, "email", None) or "").strip() or None,
+        "handle": handle or None,
+        "display_name": getattr(args, "display_name", None) or None,
+    }
+    if signup_steps.one_step_per_run():
+        return _start_register_step(given)
+    return _run_signup("register", given, on_saved=_print_registration_success)
 
 
 def _dispatch_login(args: argparse.Namespace) -> int:
@@ -420,9 +475,17 @@ def _dispatch_recover(args: argparse.Namespace) -> int:
     TTY rule (there is no stored email to default to). Then the server's
     steps run as for ``register``.
     """
+    code = getattr(args, "code", None)
+    if code is not None:
+        problem = _signup_problem()
+        if problem is not None:
+            return _exit_with(problem)
+        return _finish_step("recover", code, on_saved=_print_recovery_success)
+    steps = signup_steps.one_step_per_run()
     try:
-        email = _resolve_recovery_email(getattr(args, "email", None))
-        handle = _resolve_recovery_handle(getattr(args, "handle", None))
+        # One step per command: nothing is asked, a missing flag is named.
+        email = _resolve_recovery_email(getattr(args, "email", None), ask=not steps)
+        handle = _resolve_recovery_handle(getattr(args, "handle", None), ask=not steps)
     except _MissingFlag as exc:
         return _exit_usage(str(exc))
     except (KeyboardInterrupt, _UserAbort):
@@ -436,9 +499,10 @@ def _dispatch_recover(args: argparse.Namespace) -> int:
         "Completing recovery rotates the API key — anything still using the "
         "old key stops working."
     )
-    return _run_signup(
-        "recover", {"email": email, "handle": handle}, on_saved=_print_recovery_success
-    )
+    given = {"email": email, "handle": handle}
+    if steps:
+        return _start_step("recover", given)
+    return _run_signup("recover", given, on_saved=_print_recovery_success)
 
 
 def _run_signup(
@@ -467,6 +531,13 @@ def _run_signup(
         reason = "" if result.message else f"AgentChat answered {result.code or 'without a message'}. "
         return _exit_with(f"{reason}Nothing was saved.")
     api_key, handle = saved
+    return _save_and_place(api_key=api_key, handle=handle, api_base=api_base, on_saved=on_saved)
+
+
+def _save_and_place(*, api_key: str, handle: str, api_base: str, on_saved: Callable[..., None]) -> int:
+    """A key the server just issued: the one question where a person is here
+    to answer it, then the key saved and the integration placed; the same for
+    the interactive run and the step that submits the code."""
     tools = allow.decide_for(handle)
     before, serving, runs = _held_and_serving(api_base)
     if not _persist_credentials(api_key=api_key, handle=handle, api_base=api_base):
@@ -475,6 +546,153 @@ def _run_signup(
     _print_tools_line(tools, steps)
     on_saved(handle=handle, api_key=api_key, before=before, serving=serving, runs=runs)
     return _EXIT_OK
+
+
+# ─── sign-up one step per command (an agent's terminal; no terminal) ──────
+
+
+def _start_register_step(given: dict[str, Any]) -> int:
+    """``register --email E --handle H`` where nobody answers prompts: both
+    flags are needed, and a profile already set up as an agent is not signed
+    up as a second one (a person replaces it with ``logout`` first)."""
+    from .config import profile_handles
+    from .profile_scope import resolve_hermes_home
+
+    home = resolve_hermes_home()
+    cmd = cli_prefix(home)
+    if resolve_key(home).api_key is not None:
+        own = profile_handles(home).own
+        return _exit_with(
+            f"This profile is already set up as {allow.who(own)} on AgentChat (`{cmd} status`). "
+            f"Nothing was sent. To sign it up as a new agent instead, a person runs `{cmd} logout` "
+            "first."
+        )
+    missing = [f"--{name}" for name in ("email", "handle") if not given.get(name)]
+    if missing:
+        return _exit_usage(
+            f"Missing {' and '.join(missing)}. Sign-up here runs one step per command: "
+            f"{signup_steps.start_line('register', cmd)} sends the code, then "
+            f"{cmd} register --code <code> finishes."
+        )
+    return _start_step("register", given)
+
+
+def _start_step(kind: signup.Kind, given: dict[str, Any]) -> int:
+    """The start call alone. A code sent: the flow is kept for ``--code`` and
+    the command ends. Exit codes: 0 code sent, 2 an input to change, 1 else."""
+    from agentchatme import ConnectionError as SDKConnectionError
+
+    from .profile_scope import resolve_hermes_home
+
+    home = resolve_hermes_home()
+    cmd = cli_prefix(home)
+    api_base = _api_base()
+    try:
+        result = signup_steps.start(kind, {k: v for k, v in given.items() if v}, api_base=api_base)
+    except SDKConnectionError as exc:
+        return _exit_with(f"Could not reach AgentChat ({exc}). No code was sent.")
+    if result.message:
+        _printline(result.message)
+    if result.action == "ask_code":
+        pending = signup_steps.Pending(
+            kind=kind,
+            flow=dict(result.flow),
+            api_base=api_base,
+            email=given.get("email"),
+            handle=given.get("handle"),
+            display_name=given.get("display_name"),
+        )
+        try:
+            signup_steps.save_pending(home, pending)
+        except OSError as exc:
+            return _exit_with(
+                f"The code was sent, but this profile could not keep the sign-up for --code "
+                f"({signup_steps.pending_path(home)}: {exc.strerror or exc}). Fix that, then run "
+                "the same command again for a new code."
+            )
+        _printline(signup_steps.finish_line(kind, cmd))
+        return _EXIT_OK
+    if result.action == "ask_param":
+        handles = signup.handles_text(result.handles)
+        if handles is not None:
+            _printline(handles)
+        param = result.flow.get("param")
+        return _exit_usage(
+            f"Run it again with a different --{param}." if isinstance(param, str) else "Nothing was sent."
+        )
+    if result.action == "wait_then_retry":
+        return _exit_with("Then run the same command again.")
+    return _stopped(result)
+
+
+def _stopped(result: Any) -> int:
+    """Exit 1 after an answer that ends the step: its message, printed
+    already, says why; a code is named only when no message came."""
+    if result.message:
+        return _EXIT_API_ERR
+    return _exit_with(f"AgentChat answered {result.code or 'without a message'}.")
+
+
+def _finish_step(kind: signup.Kind, code: str, *, on_saved: Callable[..., None]) -> int:
+    """``register --code C`` / ``recover --code C``: submit the code with the
+    flow the start step kept; on ``done``, save and place. Every other answer
+    is the server's message plus the command that goes on from there."""
+    from agentchatme import ConnectionError as SDKConnectionError
+
+    from .profile_scope import resolve_hermes_home
+
+    home = resolve_hermes_home()
+    cmd = cli_prefix(home)
+    pending = signup_steps.read_pending(home)
+    if pending is None:
+        return _exit_usage(signup_steps.no_pending_line(kind, cmd))
+    if pending.kind != kind:
+        return _exit_usage(signup_steps.other_kind_line(pending, cmd))
+    if not code.strip():
+        return _exit_usage(f"No code given: {cmd} {kind} --code <code>")
+    try:
+        result = signup_steps.submit(pending, code)
+    except SDKConnectionError as exc:
+        return _exit_with(
+            f"Could not reach AgentChat ({exc}). Nothing was saved; run the same command again."
+        )
+    if result.message:
+        _printline(result.message)
+    if result.action == "done" and result.api_key and result.handle:
+        # The code is spent whatever the save does next: nothing waits any more.
+        signup_steps.clear_pending(home)
+        return _save_and_place(
+            api_key=result.api_key, handle=result.handle, api_base=pending.api_base, on_saved=on_saved
+        )
+    again = signup_steps.start_line(kind, cmd, email=pending.email, handle=pending.handle)
+    if result.action == "ask_code":
+        # A wrong code: the server counted the try and keeps the code alive.
+        _keep_waiting(home, pending, result)
+        return _exit_with(f"Run it again with the right code: {cmd} {kind} --code <code>")
+    if result.action == "wait_then_retry":
+        _keep_waiting(home, pending, result)
+        return _exit_with("Then run the same command again.")
+    if result.action == "offer_new_code":
+        # The code is gone (expired, or too many wrong tries): a new start sends another.
+        signup_steps.clear_pending(home)
+        return _exit_with(f"For a new code: {again}")
+    if result.action == "ask_param":
+        signup_steps.clear_pending(home)
+        param = result.flow.get("param")
+        name = f"--{param}" if isinstance(param, str) else "the input named above"
+        return _exit_usage(f"Start again with a different {name}: {again}")
+    # ``stop``: the server's message says it all (after a 5xx the account may
+    # exist: never steer to a second one). The flow stays for a retry.
+    return _stopped(result)
+
+
+def _keep_waiting(home: Path, pending: signup_steps.Pending, result: Any) -> None:
+    """Keep the sign-up waiting with the flow of ``result``; a file that cannot
+    be written keeps the earlier flow, which the server still answers."""
+    try:
+        signup_steps.save_pending(home, signup_steps.waiting(pending, result))
+    except OSError:
+        logger.debug("agentchat: the waiting sign-up was not updated", exc_info=True)
 
 
 def _dispatch_allow(_args: argparse.Namespace) -> int:
@@ -519,6 +737,10 @@ def _dispatch_status(_args: argparse.Namespace) -> int:
         from .profile_scope import resolve_hermes_home as _home
 
         cmd = cli_prefix(_home())
+        pending = signup_steps.read_pending(_home())
+        if pending is not None:
+            _printline(f"No AgentChat key configured yet. {signup_steps.waiting_line(pending, cmd)}.")
+            return _EXIT_OK
         _printline(f"No AgentChat key configured. Run `{cmd} register` or `{cmd} login`.")
         return _EXIT_OK
 
@@ -1432,7 +1654,11 @@ def _doctor_key_checks(
                 f"`{cmd} doctor --fix` moves it to {store.path}"
             )
     else:
-        fail(f"no AgentChat key in this profile — run `{cmd} register` or `{cmd} login`")
+        pending = signup_steps.read_pending(store.path.parent.parent)
+        if pending is not None:
+            fail(f"no AgentChat key in this profile yet — {signup_steps.waiting_line(pending, cmd)}")
+        else:
+            fail(f"no AgentChat key in this profile — run `{cmd} register` or `{cmd} login`")
     for note in resolution.notes:
         warn(note)
     for holder in resolution.shared_with:
@@ -1697,6 +1923,9 @@ def _dispatch_logout(_args: argparse.Namespace) -> int:
     # What this profile's settings hold, read before anything is removed (Hermes
     # removes a line and clears the variable from this process together).
     in_settings = settings_key()
+    # A sign-up still waiting for its code goes too: logout leaves nothing to finish.
+    if signup_steps.clear_pending(home):
+        _printline("The sign-up waiting for its emailed code was dropped.")
     if not has_file and resolution.held_key is None and in_settings is None:
         _printline("No AgentChat key was configured. Nothing to clear.")
         return _EXIT_OK
@@ -2383,11 +2612,11 @@ def _ask_recovery_field(field: Literal["email", "handle"]) -> str:
     return value
 
 
-def _resolve_recovery_email(provided: str | None) -> str:
-    """``--email``; else prompt on a TTY; else fail naming the flag."""
+def _resolve_recovery_email(provided: str | None, *, ask: bool = True) -> str:
+    """``--email``; else prompt on a TTY (``ask``); else fail naming the flag."""
     if provided and provided.strip():
         return provided.strip()
-    if not _stdin_is_tty():
+    if not (ask and _stdin_is_tty()):
         raise _MissingFlag(
             "No email given and stdin is not a terminal. Re-run with: "
             "hermes agentchat recover --handle <handle> --email <email>"
@@ -2395,7 +2624,7 @@ def _resolve_recovery_email(provided: str | None) -> str:
     return _ask_recovery_field("email")
 
 
-def _resolve_recovery_handle(provided: str | None) -> str:
+def _resolve_recovery_handle(provided: str | None, *, ask: bool = True) -> str:
     """Which agent to recover.
 
     ``--handle`` wins (``@`` prefix and case are forgiven, people type
@@ -2403,7 +2632,8 @@ def _resolve_recovery_handle(provided: str | None) -> str:
     configured as (its key file's, or ``AGENTCHATME_HANDLE`` while it holds a
     key) — the operator is told which one and how to override it; a settings
     handle in a profile with no key is said to be a leftover and never used.
-    Otherwise prompt on a TTY. Otherwise fail naming the
+    Otherwise prompt on a TTY (``ask``: not where sign-up runs one step per
+    command). Otherwise fail naming the
     flag: an email can back several agents, so the server cannot pick
     one for us, and a script must not hang on a prompt.
     """
@@ -2425,7 +2655,7 @@ def _resolve_recovery_handle(provided: str | None) -> str:
         # agent, whose key a recovery here would rotate. The person types it.
         sys.stderr.write(f"Note: {leftover_handle_line(handles, resolve_hermes_home())}.\n")
         sys.stderr.flush()
-    if not _stdin_is_tty():
+    if not (ask and _stdin_is_tty()):
         raise _MissingFlag(
             "No @handle given and none is saved for this profile. Recovery "
             "needs the agent's handle as well as its email — re-run with: "

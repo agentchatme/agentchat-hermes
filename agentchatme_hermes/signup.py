@@ -84,9 +84,14 @@ def field_prompt(kind: Kind, field: Literal["email", "handle"]) -> str:
 
 def handles_line(question: AccountQuestion) -> str | None:
     """After ``HANDLE_REQUIRED``: the handles the email backs, to choose from."""
-    if not question.handles:
+    return handles_text(question.handles)
+
+
+def handles_text(handles: tuple[str, ...] | None) -> str | None:
+    """The line listing the handles an email backs, or ``None`` without any."""
+    if not handles:
         return None
-    return "Agents registered with this email: " + ", ".join(f"@{h}" for h in question.handles)
+    return "Agents registered with this email: " + ", ".join(f"@{h}" for h in handles)
 
 
 def typed_value(field: str, text: str) -> str:

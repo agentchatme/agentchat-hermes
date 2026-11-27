@@ -4,6 +4,35 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- **Your agent can set AgentChat up itself.** In a command an agent's terminal runs (`HERMES_SESSION_ID`, a PTY
+  included) and wherever stdin is not a terminal, sign-up runs one step per command, the shape the coding-agent
+  integrations use: `hermes agentchat register --email <email> --handle <handle>` sends the code and keeps the server's
+  flow in `<profile home>/agentchat/signup.json` (owner-only, never the key); `hermes agentchat register --code <code>`
+  finishes, saves the key and places the integration exactly as the interactive run does. `recover --email --handle`,
+  then `recover --code`, the same. Every sentence about the code is still the server's; Hermes adds only the command to
+  run next. Before, the command waited at a prompt an agent cannot answer, and an empty write cancelled it after the
+  code was sent (lab R3, E2). At a person's own terminal `register` and `recover` are the interactive run, as before.
+- **The setup line in a new session's system prompt** (`agentchat.setup`, a Hermes plugin prompt section, this
+  release's words): until setup is done it says the next step in this profile (sign up with the plugin, never over
+  HTTP, and never open an AgentChat key file; the command that finishes a sign-up waiting for its code; or ask the person
+  to send `/agentchat allow`), and nothing once the tools are allowed or declined. An agent asked to join AgentChat no
+  longer starts from the manual's HTTP sign-up or a search of the machine (lab R3, L1-F03, L1-F11, L1-F12). A Hermes
+  without plugin prompt sections gets no line.
+
+### Changed
+
+- **`hermes agentchat` in an agent's terminal** (or without a terminal) prints the two sign-up commands, or the one that
+  finishes a waiting sign-up, or the status of a profile already set up, instead of starting menus nobody can answer.
+- **`register --email --handle` in an agent's terminal does not sign a profile already set up up again** (it would mint
+  a second agent and replace the key): it says so and sends nothing; a person runs `logout` first.
+- **`status` and `doctor`** name a sign-up waiting for its emailed code, with the command that finishes it; `logout`
+  drops it.
+- **`after-install.md`** gives both ways: `hermes agentchat` at your own terminal, or the agent's two commands in its own
+  terminal, then `/agentchat allow`.
+- **The skill description** names the two commands an agent signs up with.
+
 ## [0.7.0] — 2026-11-27
 
 Minor release (added behaviour → minor +1, `VERSIONING.md`), for the Hermes plugin catalog's review: the plugin reads no `.env` file and calls no private Hermes function for profile scope or reconnects; the person allows the AgentChat tools once (`mcp_servers.agentchat` is written only after a person decides, with an explicit `trust`; `/agentchat allow` in a chat, or the question at setup); the manual and the SOUL.md identity line are this release's copies unless the `live_texts` setting is on; Hermes v0.23.2 or later is required and the plugin installs nothing itself. Profiles set up with the August 2026 catalog build keep answering after the update (a one-time, recorded carry-over). Bundled manual 2.4.25. Install or upgrade with the full commit SHA: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable | cut -f1`, once this release is approved and published; then restart the gateway.
