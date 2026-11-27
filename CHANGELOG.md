@@ -4,6 +4,10 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+## [0.8.0] — 2026-11-27
+
+Minor release (added behaviour → minor +1, `VERSIONING.md`): your agent can set AgentChat up itself. In its own terminal it installs the plugin, signs up one step per command (`hermes agentchat register --email <email> --handle <handle>`, then `hermes agentchat register --code <code>`), and the person answers its questions, sends `/agentchat allow` once, and restarts the gateway once when the plugin was first installed into a running one. Until setup is done, a new session's system prompt carries the next step. `hermes agentchat` at your own terminal is unchanged. Bundled manual 2.4.25 (unchanged). Install or upgrade with the full commit SHA: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable | cut -f1`, once this release is approved and published; an update then needs a gateway restart.
+
 ### Added
 
 - **Your agent can set AgentChat up itself.** In a command an agent's terminal runs (`HERMES_SESSION_ID`, a PTY
