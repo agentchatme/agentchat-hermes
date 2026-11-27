@@ -209,8 +209,8 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
         "--handle",
         help=(
             "@handle of the agent to recover. Required because an email can back "
-            "several agents. Defaults to the locally configured AGENTCHATME_HANDLE; "
-            "otherwise prompts if stdin is a TTY."
+            "several agents. Defaults to the handle this profile is configured as (never a "
+            "leftover AGENTCHATME_HANDLE in a profile with no key); otherwise prompts if stdin is a TTY."
         ),
     )
     p_recover.set_defaults(func=_dispatch_recover)
@@ -412,8 +412,9 @@ def _dispatch_recover(args: argparse.Namespace) -> int:
 
     Recovery sends the @handle with the email because an email can back
     several agents. When ``--handle`` is omitted the handle comes from, in
-    order: the locally configured ``AGENTCHATME_HANDLE`` (the "rotate my own
-    key" case, by far the most common), a prompt when stdin is a TTY,
+    order: the handle this profile is configured as (the "rotate my own key"
+    case, by far the most common; never a leftover ``AGENTCHATME_HANDLE`` in a
+    profile with no key), a prompt when stdin is a TTY,
     otherwise a hard failure that names the flag — a script must fail fast,
     not hang on a prompt nobody will answer. ``--email`` follows the same
     TTY rule (there is no stored email to default to). Then the server's
@@ -768,7 +769,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         ok(f"API base: {api_base} (from AGENTCHATME_API_BASE, or the base the key was saved with)")
 
     saved_handle = _read_saved_handle()
-    hint = _handle_hint_line(resolution, saved_handle, hermes_home)
+    hint = _handle_hint_line(hermes_home)
     if hint is not None:
         {"ok": ok, "warn": warn}[hint[0]](hint[1])
 
@@ -2398,22 +2399,31 @@ def _resolve_recovery_handle(provided: str | None) -> str:
     """Which agent to recover.
 
     ``--handle`` wins (``@`` prefix and case are forgiven, people type
-    handles the way they see them). Otherwise the locally configured
-    ``AGENTCHATME_HANDLE`` — the operator is told which one and how to
-    override it. Otherwise prompt on a TTY. Otherwise fail naming the
+    handles the way they see them). Otherwise the handle this profile is
+    configured as (its key file's, or ``AGENTCHATME_HANDLE`` while it holds a
+    key) — the operator is told which one and how to override it; a settings
+    handle in a profile with no key is said to be a leftover and never used.
+    Otherwise prompt on a TTY. Otherwise fail naming the
     flag: an email can back several agents, so the server cannot pick
     one for us, and a script must not hang on a prompt.
     """
     handle = signup.typed_value("handle", provided or "")
     if handle:
         return handle
-    saved = _read_saved_handle()
+    from .config import leftover_handle_line, profile_handles
+    from .profile_scope import resolve_hermes_home
+
+    saved, leftover = profile_handles()
     if saved:
         _printline(
             f"Recovering the locally configured agent @{saved} "
             "(pass --handle to recover a different one)."
         )
         return saved
+    if leftover is not None:
+        # Said, never used: it may be another profile's agent. The person types the handle.
+        sys.stderr.write(f"Note: {leftover_handle_line(leftover, resolve_hermes_home())}.\n")
+        sys.stderr.flush()
     if not _stdin_is_tty():
         raise _MissingFlag(
             "No @handle given and none is saved for this profile. Recovery "
@@ -2430,44 +2440,36 @@ def _prompt_api_key() -> str:
 # ───────────────────────── helpers ─────────────────────────
 
 
-def _handle_hint_line(
-    resolution: KeyResolution, saved_handle: str | None, hermes_home: Path
-) -> tuple[Literal["ok", "warn"], str] | None:
-    """doctor's handle line. A profile with no AgentChat key whose settings
-    still name a handle (``AGENTCHATME_HANDLE``) is not shown that handle as
-    its own: ``hermes profile create`` copies another profile's ``.env``, so
-    it is labelled a leftover that may be another profile's agent, with the
-    cleanup for this profile only (Hermes' ``config unset``)."""
-    if not saved_handle:
-        return None
-    holds_key = bool(resolution.api_key or resolution.held_key)
-    if holds_key:
-        return "ok", f"Local handle hint: @{saved_handle}"
-    from .profile_scope import profile_label
+def _handle_hint_line(hermes_home: Path) -> tuple[Literal["ok", "warn"], str] | None:
+    """doctor's handle line (:func:`.config.profile_handles`): this profile's
+    own handle as the local hint; a handle the settings name while the profile
+    holds no key is a leftover that may be another profile's agent, with the
+    cleanup for this profile only (:func:`.config.leftover_handle_line`)."""
+    from .config import leftover_handle_line, profile_handles
 
-    label = profile_label(hermes_home)
-    flag = "" if label == "default" else f"-p {label} "
-    return "warn", (
-        f"this profile holds no AgentChat key, but its settings still name a handle ({_ENV_HANDLE}=@{saved_handle}): "
-        "a leftover setting — `hermes profile create` copies another profile's .env — and it may be another "
-        f"profile's agent, not this profile's. Remove it for this profile only: `hermes {flag}config unset "
-        f"{_ENV_HANDLE}`"
-    )
+    own, leftover = profile_handles(hermes_home)
+    if own is not None:
+        return "ok", f"Local handle hint: @{own}"
+    if leftover is not None:
+        return "warn", leftover_handle_line(leftover, hermes_home)
+    return None
 
 
 def _read_saved_handle() -> str | None:
-    """The handle this profile is configured as, or ``None``.
+    """The handle this profile is configured as, or ``None``
+    (:func:`.config.profile_handles`).
 
     The key file holds the handle the server returned at register / login /
-    recover; a profile set up before 0.6 has it as ``AGENTCHATME_HANDLE``.
-    Its form is the server's to judge: a hand-edited value it does not accept
-    is answered with the server's message, and the handle is asked for again.
+    recover; a profile set up before 0.6 has it as ``AGENTCHATME_HANDLE``,
+    taken only while the profile holds a key: with none, a settings handle is
+    a leftover (a ``.env`` copied by ``hermes profile create``), never this
+    profile's. Its form is the server's to judge: a hand-edited value it does
+    not accept is answered with the server's message, and the handle is asked
+    for again.
     """
-    from .profile_scope import resolve_hermes_home, resolve_setting
+    from .config import profile_handles
 
-    read = key_store.read_store(resolve_hermes_home())
-    stored = read.key.handle if read.usable and read.key is not None else ""
-    return signup.typed_value("handle", stored or resolve_setting(_ENV_HANDLE) or "") or None
+    return profile_handles()[0]
 
 
 def _stdin_is_tty() -> bool:

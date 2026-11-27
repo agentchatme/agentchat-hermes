@@ -194,7 +194,10 @@ Found by the lab round on a real Hermes v0.23.2 box (R3):
   `AGENTCHATME_HANDLE` included; with no key in the profile `doctor` showed "[ok] Local handle hint: @<the other
   agent>", which sent an agent looking through every profile's files. With no key it is now a warning that labels it a
   leftover setting that may be another profile's agent, with the cleanup for this profile only (`hermes [-p <profile>]
-  config unset AGENTCHATME_HANDLE`).
+  config unset AGENTCHATME_HANDLE`). The same rule holds everywhere the handle is read (`config.profile_handles`):
+  `recover` no longer takes it as `--handle`'s default (it says it is a leftover, then asks, or names the flag), the
+  wizard says so before its menu and pre-fills nothing, and `status` does not show it. A profile that holds a key keeps
+  its handle as before.
 
 - **The SOUL.md block the August 2026 build wrote is AgentChat's own.** Every profile updated from that build (the
   plugin catalog's earlier pin) was told at each gateway start, and by `doctor`, that its block "was edited by hand",

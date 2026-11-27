@@ -43,7 +43,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Literal
 
 from . import allow, credentials, key_store, signup
-from .config import ENV_HANDLE, cli_prefix, resolve_key
+from .config import cli_prefix, leftover_handle_line, profile_handles, resolve_key
 from .placement import (
     gateway_runs_for,
     gateway_serves_profile,
@@ -110,11 +110,10 @@ def _interactive_setup_body() -> None:
 
     resolution = resolve_key()
     existing_key = resolution.api_key or resolution.held_key or ""
-    stored = resolution.store.key
-    existing_handle = (
-        (stored.handle if stored is not None else "")
-        or (get_env_value(ENV_HANDLE) or "").strip().lstrip("@")
-    )
+    # This profile's own handle only: with no key, a settings handle is a
+    # leftover (another profile's .env copied), said but never pre-filled.
+    own_handle, leftover_handle = profile_handles()
+    existing_handle = own_handle or ""
     if resolution.refusal is not None:
         print_warning(resolution.refusal)
         print()
@@ -134,6 +133,9 @@ def _interactive_setup_body() -> None:
         )
         return
 
+    if leftover_handle is not None:
+        print_warning(leftover_handle_line(leftover_handle, resolve_hermes_home()))
+        print()
     _fresh_setup_menu(
         prompt=prompt,
         prompt_yes_no=prompt_yes_no,

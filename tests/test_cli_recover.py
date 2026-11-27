@@ -71,12 +71,45 @@ class TestResolveRecoveryHandle:
     def test_saved_handle_used_and_announced(
         self, clean_env: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
+        """A profile set up before 0.6: its key and its handle in the settings."""
+        from fake_keys import api_key
+
+        monkeypatch.setenv("AGENTCHAT_API_KEY", api_key("recover_handle"))
         monkeypatch.setenv("AGENTCHATME_HANDLE", "@alice")
         monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
         assert _resolve_recovery_handle(None) == "alice"
         out = capsys.readouterr().out
         assert "@alice" in out
         assert "--handle" in out
+
+    def test_the_key_files_handle_is_the_default(
+        self, clean_env: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from fake_keys import api_key
+        from key_files import save_key
+
+        save_key(api_key("recover_kf"), handle="ops")
+        monkeypatch.setenv("AGENTCHATME_HANDLE", "someone-else")
+        monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+        assert _resolve_recovery_handle(None) == "ops"
+
+    def test_a_leftover_handle_is_said_but_never_the_default(
+        self, clean_env: None, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Lab R2-F04 / R3 L1-F11: with no key, AGENTCHATME_HANDLE is another
+        profile's copied .env line: said, and the person types the handle."""
+        monkeypatch.setenv("AGENTCHATME_HANDLE", "fixtest-lab-he-1")
+        monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+        with pytest.raises(_MissingFlag):
+            _resolve_recovery_handle(None)
+        err = capsys.readouterr().err
+        assert "a leftover setting" in err and "may be another profile's agent" in err
+        assert "`hermes config unset AGENTCHATME_HANDLE`" in err
+        monkeypatch.setattr(cli, "_stdin_is_tty", lambda: True)
+        prompts: list[str] = []
+        monkeypatch.setattr(cli, "_input", lambda p: prompts.append(p) or "@Typed")
+        assert _resolve_recovery_handle(None) == "typed"
+        assert prompts == ["@handle of the agent to recover (blank to cancel): "], "asked, not pre-filled"
 
     def test_non_tty_without_handle_fails_naming_flag(
         self, clean_env: None, monkeypatch: pytest.MonkeyPatch
@@ -126,8 +159,20 @@ class TestReadSavedHandle:
         assert _read_saved_handle() is None
 
     def test_present_normalised(self, clean_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
+        from fake_keys import api_key
+
+        monkeypatch.setenv("AGENTCHAT_API_KEY", api_key("saved_handle"))
         monkeypatch.setenv("AGENTCHATME_HANDLE", " @Alice-Bot ")
         assert _read_saved_handle() == "alice-bot"
+
+    def test_a_settings_handle_with_no_key_is_not_this_profiles(
+        self, clean_env: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agentchatme_hermes.config import profile_handles
+
+        monkeypatch.setenv("AGENTCHATME_HANDLE", "@Fixtest-Lab-He-1")
+        assert _read_saved_handle() is None
+        assert profile_handles() == (None, "fixtest-lab-he-1")
 
     def test_blank(self, clean_env: None, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("AGENTCHATME_HANDLE", "  @ ")

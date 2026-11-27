@@ -252,6 +252,46 @@ def shared_note(holder: key_store.Holder) -> str:
     )
 
 
+def profile_handles(home: Path | None = None) -> tuple[str | None, str | None]:
+    """``(own, leftover)``: the handle this profile is configured as — its key
+    file's, else ``AGENTCHATME_HANDLE`` when the profile holds a key (a
+    profile set up before 0.6) — and a handle its settings name while it holds
+    no key at all. That one is never presented or pre-filled as this
+    profile's: ``hermes profile create`` copies another profile's ``.env``, so
+    it may be another profile's agent (:func:`leftover_handle_line`). Handles
+    as typed: without ``@``, lower case."""
+    target = home if home is not None else resolve_hermes_home()
+
+    def typed(raw: str | None) -> str | None:
+        return (raw or "").strip().lstrip("@").lower() or None
+
+    read = key_store.read_store(target)
+    own = typed(read.key.handle if read.usable and read.key is not None else "")
+    if own is not None:
+        return own, None
+    setting = typed(resolve_setting(ENV_HANDLE))
+    if setting is None:
+        return None, None
+    resolution = resolve_key(target)
+    if resolution.api_key or resolution.held_key:
+        return setting, None
+    return None, setting
+
+
+def leftover_handle_line(handle: str, home: Path) -> str:
+    """What is said of a handle the settings name for a profile with no key
+    (:func:`profile_handles`): a leftover that may be another profile's agent,
+    and the cleanup for this profile only (Hermes' ``config unset``)."""
+    label = profile_label(home)
+    flag = "" if label == "default" else f"-p {label} "
+    return (
+        f"this profile holds no AgentChat key, but its settings still name a handle ({ENV_HANDLE}=@{handle}): "
+        "a leftover setting — `hermes profile create` copies another profile's .env — and it may be another "
+        f"profile's agent, not this profile's. Remove it for this profile only: `hermes {flag}config unset "
+        f"{ENV_HANDLE}`"
+    )
+
+
 def cli_prefix(home: Path) -> str:
     """``hermes agentchat`` spelled for ``home``'s profile (``hermes -p NAME agentchat``)."""
     label = profile_label(home)

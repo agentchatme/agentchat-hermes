@@ -287,7 +287,7 @@ class TestRecover:
             {sw.RECOVER: sw.code_sent("recover"), sw.RECOVER_VERIFY: sw.recovered("alice", _KEY)},
         )
         _Cli(monkeypatch, ["123456"])
-        monkeypatch.setenv("AGENTCHATME_HANDLE", "alice")
+        save_key(api_key("lost_but_saved_0000000"), handle="alice")
         rc = cli._dispatch_recover(_ns(email="a@b.co", handle=None))
         assert rc == _EXIT_OK
         assert wire.bodies()[0] == {"email": "a@b.co", "handle": "alice"}
