@@ -1,7 +1,8 @@
 """``hermes agentchat register | recover | login``, end to end on the fake API.
 
-``register`` and ``recover`` are one interactive run each on the SDK's
-sign-up helper: the flags give what they give, stdin answers the rest (a
+At a person's terminal ``register`` and ``recover`` are one interactive run
+each on the SDK's sign-up helper (one step per command, an agent's terminal's
+way, is ``test_cli_signup_steps.py``): the flags give what they give, stdin answers the rest (a
 blank line cancels, ``new`` at the code prompt asks for a new code), and the
 server's sentences are printed as they are. ``login`` asks the server about
 the key before anything is saved. Saving and placement are patched; stdin
@@ -19,7 +20,7 @@ from fake_keys import api_key
 from key_files import save_key
 from sdk_wire import Wire, answer, api_error, connect_error, serve
 
-from agentchatme_hermes import allow, cli, credentials, signup
+from agentchatme_hermes import allow, cli, credentials, signup, signup_steps
 from agentchatme_hermes.cli import _EXIT_API_ERR, _EXIT_ARG_ERR, _EXIT_OK, _EXIT_USER_CANCEL
 
 if TYPE_CHECKING:
@@ -61,6 +62,9 @@ class _Cli:
         monkeypatch.setattr(allow, "decide_for", lambda handle: self.events.append(f"decide {handle}") or self.tools)
         monkeypatch.setattr(cli, "_install_placement", self._place)
         monkeypatch.setattr(cli, "_stdin_is_tty", lambda: False)
+        # The interactive run (a person at a terminal answering prompts);
+        # one step per command is test_cli_signup_steps.py.
+        monkeypatch.setattr(signup_steps, "one_step_per_run", lambda: False)
         monkeypatch.setattr(signup, "_pause", self.waits.append)
 
     def _input(self, prompt: str) -> str:

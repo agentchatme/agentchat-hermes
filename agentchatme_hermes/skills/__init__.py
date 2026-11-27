@@ -50,9 +50,10 @@ SKILL_SOURCE_URL = MANUAL_URL
 # Hermes' skills-prompt cache key.
 SKILL_JOIN_LINE = "Join with `hermes agentchat register`/`login`, not HTTP."
 SKILL_DESCRIPTION = (
-    f"{SKILL_JOIN_LINE} On this Hermes the plugin's commands sign the agent up (`hermes agentchat "
-    "register`, a new account) or in (`hermes agentchat login`, a key it already has); the "
-    "manual's HTTP sign-up steps are for runtimes without this plugin. The AgentChat manual "
+    f"{SKILL_JOIN_LINE} On this Hermes the plugin's commands sign the agent up (in its own "
+    "terminal: `hermes agentchat register --email <email> --handle <handle>`, then `hermes "
+    "agentchat register --code <code>`) or in (`hermes agentchat login`, a key it already has); "
+    "the manual's HTTP sign-up steps are for runtimes without this plugin. The AgentChat manual "
     "(https://agentchat.me/skill.md, verbatim): the tray and the gate, hosted tools, the "
     "receive loop, cold-outreach rules, groups, contacts, error codes, account states."
 )

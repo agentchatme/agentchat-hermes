@@ -83,6 +83,18 @@ NO_RESTART_LINE = (
     "A running gateway that serves this profile starts AgentChat for it by itself within about a minute: "
     "no restart needed."
 )
+# The gateway that runs started before the plugin's dependency was installed
+# (a first install into a running gateway): Hermes never switches a running
+# process's dependency environment, so it runs AgentChat only after a restart
+# (:func:`.placement.gateway_cannot_load`). Hermes' own `/restart` drains the
+# runs first; it is a messaging-chat command.
+_LOAD_WHY = "The running gateway started before the AgentChat plugin was installed, so it cannot run AgentChat yet"
+_LOAD_HOW = "send /restart in a chat with the agent on Telegram or another messaging app, or run `hermes gateway restart`"
+LOAD_RESTART_LINE = f"{_LOAD_WHY}: restart it once, and AgentChat starts by itself ({_LOAD_HOW})."
+LOAD_RESTART_LINE_AGENT = (
+    f"{_LOAD_WHY}: it needs one restart, and that restart is the person's, not yours (it stops every turn the "
+    f"gateway serves, this one too). Ask your person to {_LOAD_HOW.replace('the agent', 'you')}."
+)
 
 
 def key_held(home: Path | None = None) -> str | None:
@@ -128,7 +140,10 @@ def key_in_use_line(
     terminal (:func:`.allow.in_agent_terminal`) the restart is said to be the
     person's, never the agent's."""
     from .allow import in_agent_terminal
+    from .placement import gateway_cannot_load
 
+    if gateway_cannot_load(home if home is not None else profile_scope.resolve_hermes_home()):
+        return LOAD_RESTART_LINE_AGENT if in_agent_terminal() else LOAD_RESTART_LINE
     if not serving and runs is False:
         return start_gateway_line(home if home is not None else profile_scope.resolve_hermes_home())
     if not serving or before == api_key:
@@ -194,6 +209,21 @@ def save_credentials(
         key_store.KeyStoreError: the key could be saved nowhere.
     """
     home = home if home is not None else profile_scope.resolve_hermes_home()
+    outcome = _save_credentials(
+        api_key=api_key, handle=handle, api_base=api_base, home=home, use_key_file=use_key_file, not_ready=not_ready
+    )
+    # A key saved here, by any path (register, login, recover, the wizard),
+    # ends a sign-up still waiting for its code: finishing it would replace it.
+    from .signup_steps import drop_pending
+
+    drop_pending(home)
+    return outcome
+
+
+def _save_credentials(
+    *, api_key: str, handle: str, api_base: str, home: Path, use_key_file: bool, not_ready: str
+) -> SaveOutcome:
+    """:func:`save_credentials`' save itself."""
     reason = not_ready or "the hosted tools could not read the key file"
     if use_key_file:
         try:

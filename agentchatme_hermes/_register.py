@@ -160,6 +160,17 @@ def register(ctx: Any) -> None:
     except Exception:
         logger.error("agentchat plugin: /agentchat could not be registered", exc_info=True)
 
+    # The setup line in each new session's system prompt, until setup is done
+    # (how to sign up; the code that finishes it; "/agentchat allow"): the
+    # agent asked to join AgentChat reads its next step here, not the manual's
+    # HTTP sign-up. Registered unconditionally, like the command; empty once set up.
+    try:
+        from .setup_prompt import register_setup_section
+
+        register_setup_section(ctx, scope)
+    except Exception:
+        logger.error("agentchat plugin: the setup section could not be registered", exc_info=True)
+
     # plugins.isolation: host runs this code outside the gateway: nothing can
     # hold the socket, so the agent is never woken. Said once per process
     # (Hermes calls register() once per profile and process); /agentchat says it too.
@@ -175,8 +186,29 @@ def register(ctx: Any) -> None:
 
     gateway_mode = _is_gateway_context(ctx)
     problem = kit_problem()
+    if gateway_mode:
+        # Whether this gateway can run AgentChat at all, for every other
+        # process to read (placement.gateway_cannot_load): a first install
+        # into a running gateway has no SDK here until the gateway restarts.
+        try:
+            from .placement import clear_gateway_cannot_load, note_gateway_cannot_load
+
+            if problem is not None:
+                note_gateway_cannot_load(hermes_home, problem)
+            else:
+                clear_gateway_cannot_load(hermes_home)
+        except Exception:
+            logger.debug("agentchat plugin: the gateway's plugin load was not recorded", exc_info=True)
     if problem is not None:
-        logger.error("agentchat plugin: not receiving — %s", problem)
+        if gateway_mode:
+            logger.error(
+                "agentchat plugin: not receiving — %s — a gateway that was already running when the plugin "
+                "was installed loads its dependency only after a restart: `hermes gateway restart` (or "
+                "/restart in a messaging chat)",
+                problem,
+            )
+        else:
+            logger.error("agentchat plugin: not receiving — %s", problem)
         # The key source still masks a copied key for this process's tools.
         _find_copy(scope)
         _register_surface(ctx, hermes_home, place=False)

@@ -236,6 +236,39 @@ def test_plugin_context_surface() -> None:
     assert list(inspect.signature(context.ask_choice).parameters) == ["self", "question", "choices"]
 
 
+# ─── the setup line: a plugin section in each new session's system prompt ──
+
+
+def test_the_setup_line_is_rendered_into_a_new_sessions_prompt_until_setup_is_done(
+    _hermes_home: Path, _plugin_manager: Any
+) -> None:
+    """``ctx.register_system_prompt_section`` takes a callable, renders it for a
+    new session, and skips it when it returns no text (set up: nothing to
+    say). A Hermes without plugin prompt sections is skipped by the plugin."""
+    from agentchatme_hermes import setup_prompt
+    from agentchatme_hermes.profile_scope import ProfileScope
+
+    plugins = _import("hermes_cli.plugins")
+    if not callable(getattr(plugins.PluginContext, "register_system_prompt_section", None)):
+        pytest.skip("this Hermes has no plugin system prompt sections (the plugin skips the line)")
+    params = inspect.signature(plugins.PluginContext.register_system_prompt_section).parameters
+    assert {"id", "content", "position", "max_chars"} <= set(params)
+    manifest = _import("hermes_cli.plugins_manifest").PluginManifest(name="agentchat", source="entrypoint")
+    ctx = plugins.PluginContext(manifest, _plugin_manager)
+    sections = _plugin_manager._system_prompt_sections
+    try:
+        assert setup_prompt.register_setup_section(ctx, ProfileScope.capture(_hermes_home)) is True
+        rendered = _plugin_manager.render_system_prompt_sections({"session_id": "s", "platform": "cli"})
+        texts = {item.id: item.content for item in rendered}
+        assert texts.get(setup_prompt.SECTION_ID) == setup_prompt.NOT_SET_UP.format(cmd="hermes agentchat")
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(setup_prompt, "section_text", lambda home, *, api_base: "")
+            rendered = _plugin_manager.render_system_prompt_sections({"session_id": "t", "platform": "cli"})
+        assert setup_prompt.SECTION_ID not in {item.id for item in rendered}, "an empty line is skipped"
+    finally:
+        sections.pop(setup_prompt.SECTION_ID, None)
+
+
 # ─── the manual: a plugin skill whose file the plugin keeps current ────────
 
 
