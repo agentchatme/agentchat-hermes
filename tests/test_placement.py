@@ -281,13 +281,14 @@ class TestMcpStep:
         from agentchatme_hermes import allow
 
         log = self._connected_untrusted(monkeypatch, tmp_path, gateway=False)
-        monkeypatch.setattr(allow, "hermes_gateway_pid", lambda home: 4242)
+        monkeypatch.setattr(allow, "hermes_gateway", lambda home: (4242, 31337))
         step = placement.place_mcp("https://api.example.test", decision="yes")
         assert (step.status, step.outcome) == ("warned", "restart") and step.needs_attention
         assert "not in effect yet" in step.detail and allow.RESTART_TO_APPLY in step.detail
         assert "pid 4242" in step.detail and log == ["install yes"]
         record = allow.read_record(tmp_path)
-        assert record is not None and record["trust"] == "full" and record["restart_pid"] == 4242
+        assert record is not None and record["trust"] == "full"
+        assert record["restart_gateway"] == {"pid": 4242, "start_time": 31337}
         assert allow.line_after(allow.SetupDecision("yes", allow.ALLOWED_LINE), step.outcome) is None
 
     def test_a_removal_that_fails_leaves_the_entry_and_no_pending_yes(

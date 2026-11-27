@@ -337,13 +337,13 @@ def _dispatch_login(args: argparse.Namespace) -> int:
         )
 
     tools = allow.decide_for(checked.handle)
-    before = credentials.key_held()
+    before, serving = _held_and_serving(api_base)
     if not _persist_credentials(api_key=api_key, handle=checked.handle, api_base=api_base):
         return _EXIT_API_ERR
     steps = _install_placement(checked.handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
     _printline(f"Saved AgentChat key for @{checked.handle}.")
     _print_tools_line(tools, steps)
-    _printline(credentials.key_in_use_line(before, api_key))
+    _printline(credentials.key_in_use_line(before, api_key, serving=serving))
     return _EXIT_OK
 
 
@@ -467,12 +467,12 @@ def _run_signup(
         return _exit_with(f"{reason}Nothing was saved.")
     api_key, handle = saved
     tools = allow.decide_for(handle)
-    before = credentials.key_held()
+    before, serving = _held_and_serving(api_base)
     if not _persist_credentials(api_key=api_key, handle=handle, api_base=api_base):
         return _EXIT_API_ERR
     steps = _install_placement(handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
     _print_tools_line(tools, steps)
-    on_saved(handle=handle, api_key=api_key, before=before)
+    on_saved(handle=handle, api_key=api_key, before=before, serving=serving)
     return _EXIT_OK
 
 
@@ -2517,22 +2517,31 @@ def _saved_where() -> str:
     return f"saved in {_last_saved_path}, readable by you only"
 
 
-def _print_registration_success(*, handle: str, api_key: str, before: str | None) -> None:
+def _held_and_serving(api_base: str) -> tuple[str | None, bool]:
+    """Before a save: the key this profile holds, and whether a running gateway
+    holds an AgentChat connection for it (:func:`.credentials.key_in_use_line`)."""
+    from .placement import gateway_serves_profile
+    from .profile_scope import resolve_hermes_home
+
+    return credentials.key_held(), gateway_serves_profile(resolve_hermes_home(), api_base=api_base)
+
+
+def _print_registration_success(*, handle: str, api_key: str, before: str | None, serving: bool) -> None:
     masked = _mask_key(api_key)
     _printline("")
     _printline(f"  Registered @{handle}")
     _printline(f"  Key:   {masked}   ({_saved_where()})")
     _printline("")
-    _printline(credentials.key_in_use_line(before, api_key))
+    _printline(credentials.key_in_use_line(before, api_key, serving=serving))
 
 
-def _print_recovery_success(*, handle: str, api_key: str, before: str | None) -> None:
+def _print_recovery_success(*, handle: str, api_key: str, before: str | None, serving: bool) -> None:
     masked = _mask_key(api_key)
     _printline("")
     _printline(f"  Recovered @{handle}")
     _printline(f"  New key:   {masked}   ({_saved_where()})")
     _printline("")
-    _printline(credentials.key_in_use_line(before, api_key))
+    _printline(credentials.key_in_use_line(before, api_key, serving=serving))
 
 
 def _could_not_process_section(worker: Any) -> dict[str, Any] | None:

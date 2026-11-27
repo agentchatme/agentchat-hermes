@@ -83,7 +83,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
 
 from ._version import __version__
 from .mcp_registration import (
@@ -212,9 +212,16 @@ class Switch:
     allowance: Allowance | None = None
     record: dict[str, Any] | None = None
     # The pid of the running gateway that still holds the connection made
-    # before a yes was written in place (:func:`hermes_gateway_pid`), else
-    # ``None``: the yes is in config.yaml, not in effect until it restarts.
+    # before a yes was written in place (the record's ``restart_gateway``, the
+    # same pid and process start time as Hermes reports now), else ``None``:
+    # the yes is in config.yaml, not in effect until that gateway restarts.
     awaits_restart: int | None = None
+
+    @property
+    def in_effect_state(self) -> State:
+        """The state the receive loop acts on: a yes written but not in effect
+        (:attr:`awaits_restart`) pauses like a yes being applied."""
+        return "applying" if self.awaits_restart is not None else self.state
 
     @property
     def paused(self) -> bool:
@@ -280,11 +287,54 @@ def read_switch(home: Path, *, api_base: str) -> Switch:
         return Switch("unknown")
     record = read_record(home)
     state = state_of(allowance, record)
-    held_by = record.get("restart_pid") if record is not None else None
+    held = _restart_gateway(record)
     awaits = None
-    if state == "allowed" and isinstance(held_by, int) and not isinstance(held_by, bool):
-        awaits = held_by if hermes_gateway_pid(home) == held_by else None
+    if held is not None:
+        now = hermes_gateway(home) if state == "allowed" else None
+        if now is not None and same_gateway(held, now):
+            awaits = held[0]
+        else:
+            # That gateway is gone (stopped, restarted, its pid reused, a
+            # container's PID 1 started again): the yes is in effect. Said once.
+            assert record is not None
+            _rewrite(home, record, restart_gateway=None)
+            record = read_record(home)
     return Switch(state, allowance, record, awaits)
+
+
+GatewayId = tuple[int, Optional[int]]
+"""A gateway process: its pid and its start-time fingerprint (Hermes'
+``gateway.status.get_process_start_time``; ``None`` where it cannot be read)."""
+
+
+def _restart_gateway(record: dict[str, Any] | None) -> GatewayId | None:
+    """The gateway the record says still held the connection when a yes was
+    written in place, or ``None``."""
+    held = record.get("restart_gateway") if record is not None else None
+    if not isinstance(held, dict):
+        return None
+    pid, start = held.get("pid"), held.get("start_time")
+    if not isinstance(pid, int) or isinstance(pid, bool):
+        return None
+    return pid, start if isinstance(start, int) and not isinstance(start, bool) else None
+
+
+def same_gateway(recorded: GatewayId, current: GatewayId) -> bool:
+    """One process, not a pid reused: the same pid and start-time fingerprints
+    that agree (Hermes' ``start_time_fingerprints_match``, its 2 s drift
+    tolerance). Where neither side's start time could be read, the pid alone;
+    where only one side's, not the same (it cannot be shown to be)."""
+    if recorded[0] != current[0]:
+        return False
+    before, now = recorded[1], current[1]
+    if before is None or now is None:
+        return before is None and now is None
+    try:
+        from gateway.status import start_time_fingerprints_match  # type: ignore[import-not-found]
+
+        return bool(start_time_fingerprints_match(before, now))
+    except Exception:
+        return abs(before - now) <= 200
 
 
 def describe(switch: Switch, handle: str | None, *, cmd: str = "hermes agentchat", cli: bool = True) -> str:
@@ -295,7 +345,7 @@ def describe(switch: Switch, handle: str | None, *, cmd: str = "hermes agentchat
     agent = who(handle)
     allowance = switch.allowance
     run_allow = f", or run {cmd} allow" if cli else ""
-    if switch.state == "allowed" and switch.awaits_restart is not None:
+    if switch.awaits_restart is not None:
         return f"allowed in config.yaml, not in effect yet — {AWAITS_RESTART_WORDS} (gateway pid {switch.awaits_restart})"
     if switch.state == "allowed" and allowance is not None:
         if switch.hand_edited:
@@ -526,7 +576,7 @@ def write_record(
     write_failures: int = 0,
     gave_up: str | None = None,
     decided_at: float | None = None,
-    restart_pid: int | None = None,
+    restart_gateway: GatewayId | None = None,
 ) -> bool:
     """Record how this profile's entry was decided: ``asked`` (a person:
     ``decision`` yes / no), ``carried_over`` (the one-time carry-over),
@@ -538,9 +588,10 @@ def write_record(
     process at which it could not be written; ``gave_up``: why it was given up
     after :data:`MAX_WRITE_FAILURES` of them; ``decided_at``: when a pending
     ``trust: full`` was decided (epoch seconds; for a yes over a connected
-    entry, when the entry was removed); ``restart_pid``: the running gateway
-    that kept the earlier connection when ``trust: full`` was written in place
-    (it applies at that gateway's restart, :attr:`Switch.awaits_restart`).
+    entry, when the entry was removed); ``restart_gateway``: the running
+    gateway (pid, start-time fingerprint) that kept the earlier connection when
+    ``trust: full`` was written in place (it applies at that gateway's restart,
+    :attr:`Switch.awaits_restart`).
     ``False`` (logged) when the record could not be written."""
     from .state import write_json_atomic
 
@@ -561,8 +612,8 @@ def write_record(
         record["gave_up"] = gave_up
     if decided_at is not None:
         record["decided_at"] = decided_at
-    if restart_pid is not None:
-        record["restart_pid"] = restart_pid
+    if restart_gateway is not None:
+        record["restart_gateway"] = {"pid": restart_gateway[0], "start_time": restart_gateway[1]}
     try:
         write_json_atomic(record_path(home), record)
     except OSError as exc:
@@ -591,6 +642,7 @@ def _rewrite(home: Path, record: dict[str, Any], **changes: Any) -> bool:
         "write_failures": _failures(record),
         "gave_up": record.get("gave_up") if isinstance(record.get("gave_up"), str) else None,
         "decided_at": _decided_at(record),
+        "restart_gateway": _restart_gateway(record),
     }
     fields.update(changes)
     return write_record(home, **fields)
@@ -751,17 +803,18 @@ def gateway_lives(home: Path, *, api_base: str) -> bool:
         return False
 
 
-def hermes_gateway_pid(home: Path) -> int | None:
-    """The pid of the gateway Hermes says serves ``home``'s profile, or ``None``
-    (none, or not readable): ``gateway.status.resolve_gateway_liveness``,
-    Hermes' one answer to "is the gateway up?" (the profile's pid file and
-    lock, its runtime status, a multiplexed gateway serving the profile),
-    read-only and uncached. Unlike :func:`gateway_lives` it does not need the
-    plugin to run in that gateway: under ``plugins.isolation: host`` the
-    gateway holds the hosted tools' connection while no AgentChat runtime runs
-    in it. Never raises."""
+def hermes_gateway(home: Path) -> GatewayId | None:
+    """The gateway Hermes says serves ``home``'s profile — its pid and its
+    process start-time fingerprint — or ``None`` (none, or not readable):
+    ``gateway.status.resolve_gateway_liveness``, Hermes' one answer to "is the
+    gateway up?" (the profile's pid file and lock, its runtime status, a
+    multiplexed gateway serving the profile), read-only and uncached, and
+    ``gateway.status.get_process_start_time``. Unlike :func:`gateway_lives`
+    it does not need the plugin to run in that gateway: under
+    ``plugins.isolation: host`` the gateway holds the hosted tools'
+    connection while no AgentChat runtime runs in it. Never raises."""
     try:
-        from gateway.status import resolve_gateway_liveness  # type: ignore[import-not-found]
+        from gateway.status import resolve_gateway_liveness
 
         liveness = resolve_gateway_liveness(profile_dir=home, use_cache=False)
     except Exception:
@@ -770,7 +823,51 @@ def hermes_gateway_pid(home: Path) -> int | None:
     pid = getattr(liveness, "pid", None)
     if getattr(liveness, "running", False) is not True or not isinstance(pid, int) or isinstance(pid, bool):
         return None
-    return pid
+    return pid, process_start_time(pid)
+
+
+def process_start_time(pid: int) -> int | None:
+    """Hermes' start-time fingerprint of a process (``gateway.status
+    .get_process_start_time``: Linux ``/proc`` ticks, else psutil), the
+    pid-reuse guard; ``None`` when it cannot be read. Never raises."""
+    try:
+        from gateway.status import get_process_start_time
+
+        start = get_process_start_time(pid)
+    except Exception:
+        return None
+    return start if isinstance(start, int) and not isinstance(start, bool) else None
+
+
+def held_by_this_process(switch: Switch) -> bool:
+    """The gateway that kept the earlier connection is this very process (an
+    in-process gateway whose AgentChat runtime was down when the yes was
+    written in place): it can apply the yes itself, in two steps."""
+    held = _restart_gateway(switch.record)
+    if switch.awaits_restart is None or held is None:
+        return False
+    me = os.getpid()
+    return same_gateway(held, (me, process_start_time(me)))
+
+
+def reapply_in_two_steps(scope: ProfileScope, *, api_base: str) -> bool:
+    """In the gateway that holds the earlier connection, once its AgentChat
+    runtime runs: the yes written in place is applied as any yes over a
+    connected entry — recorded as pending, the entry removed (Hermes' watcher
+    drops the connection), and written back by :func:`start_completion` once
+    the connection is gone. ``True`` when the first step was taken."""
+    from .placement import remove_for_two_steps
+
+    before = read_record(scope.home)
+    step = remove_for_two_steps(api_base, scope.home)
+    if step.failed:
+        if before is not None:
+            _rewrite(scope.home, before)  # still written in place, still not in effect
+        logger.warning("agentchat plugin: the allowed AgentChat tools could not be applied here (%s)", step.detail)
+        return False
+    logger.info("agentchat plugin: applying the AgentChat tools allowed while this gateway's runtime was down: %s", step.detail)
+    start_completion(scope, api_base=api_base)
+    return True
 
 
 def plugin_host_isolation() -> bool:
@@ -794,18 +891,17 @@ def plugin_host_isolation() -> bool:
     return str(raw or "").strip().lower().replace("-", "_") == "host"
 
 
-def host_isolation_note(home: Path) -> str:
-    """What ``plugins.isolation: host`` costs and what to do, naming only
-    Hermes' own commands (the plugin's do not exist there)."""
-    from .profile_scope import profile_label
-
-    label = profile_label(home)
-    flag = "" if label == "default" else f"-p {label} "
+def host_isolation_note() -> str:
+    """What ``plugins.isolation: host`` costs, and the trade-off, as a fact:
+    the choice stays the person's. It never advises turning the isolation off
+    (a guard Hermes offers for pooled deployments) and names no ``hermes
+    agentchat`` command (none exists there)."""
     return (
-        "AgentChat cannot wake this agent: plugins.isolation is host, so Hermes runs the AgentChat plugin "
-        "outside the gateway and no AgentChat connection is held for it (messages to it wait on AgentChat, "
-        "undelivered). The hosted AgentChat tools still work in chats. To have it woken: "
-        f"`hermes {flag}config set plugins.isolation in_process`, then restart the gateway (`hermes gateway restart`)"
+        "AgentChat cannot wake this agent while its plugins run in Hermes' plugin host (plugins.isolation: "
+        "host): no AgentChat connection is held for it, and messages to it wait on AgentChat, undelivered. "
+        "The hosted AgentChat tools still work in chats. Being woken needs the plugin inside the gateway "
+        "(plugins.isolation: in_process); that is the person's choice, and it is not advised for a pooled or "
+        "multi-tenant deployment, which is what the plugin host is for"
     )
 
 
@@ -1062,7 +1158,7 @@ def _read_command(raw_args: str, *, scope: ProfileScope) -> str | _Question:
     api_base = _api_base(home)
     cmd = cli_prefix(home)
     host = plugin_host_isolation()
-    note = f" {host_isolation_note(home)}." if host else ""
+    note = f" {host_isolation_note()}." if host else ""
     resolution = resolve_key(home)
     if resolution.refusal is not None:
         return f"AgentChat: {resolution.refusal}"
@@ -1108,7 +1204,7 @@ def _write_answer(decision: Decision, *, scope: ProfileScope, agent: str) -> str
     step = place_mcp(api_base, decision=decision)
     if step.failed:
         return f"AgentChat tools: nothing changed — {step.detail}"
-    note = f" {host_isolation_note(scope.home)}." if plugin_host_isolation() else ""
+    note = f" {host_isolation_note()}." if plugin_host_isolation() else ""
     if decision == "no":
         return NOT_ALLOWED_LINE.format(who=agent) + note
     if step.outcome == "applying":

@@ -79,7 +79,7 @@ from .texts import mode_for, read_mode, record_mode
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from .runtime import Runtime
+    from .runtime import Runtime, StartFailure
 
 logger = logging.getLogger(__name__)
 
@@ -90,9 +90,8 @@ logger = logging.getLogger(__name__)
 ACTIVATION_RETRY_S = 30.0
 ACTIVATION_RETRY_MAX_S = 300.0
 
-# Why the runtime last failed to start, per profile home (:func:`_start_failure`):
+# Why the runtime last failed to start, per profile home (:func:`.runtime.start_failure`):
 # ``register()`` says the matching remedy, never login for a network outage.
-StartFailure = Literal["unreachable", "key_refused", "other"]
 _last_start_failure: dict[str, StartFailure] = {}
 
 
@@ -160,7 +159,7 @@ def register(ctx: Any) -> None:
 
         if scope.run(plugin_host_isolation):
             logger.warning(
-                "agentchat plugin: profile=%s — %s", profile_label(hermes_home), host_isolation_note(hermes_home)
+                "agentchat plugin: profile=%s — %s", profile_label(hermes_home), host_isolation_note()
             )
     except Exception:
         logger.debug("agentchat plugin: plugins.isolation not read", exc_info=True)
@@ -637,6 +636,8 @@ def _try_start_runtime(
     """
     from pathlib import Path as _Path
 
+    from .runtime import start_failure
+
     home = getattr(config, "hermes_home", None)
     try:
         from .runtime import get_runtime
@@ -648,7 +649,7 @@ def _try_start_runtime(
 
         cmd = cli_prefix(_Path(home)) if home else "hermes agentchat"
         label = profile_label(_Path(home)) if home else "?"
-        failure = _start_failure(exc)
+        failure = start_failure(exc)
         if home:
             _last_start_failure[hermes_home_key(_Path(home))] = failure
         if failure == "unreachable":
@@ -684,24 +685,6 @@ def _try_start_runtime(
     if home:
         _last_start_failure.pop(hermes_home_key(_Path(home)), None)
     return runtime
-
-
-def _start_failure(exc: BaseException) -> StartFailure:
-    """Why the runtime did not start: ``unreachable`` — no answer from
-    AgentChat (the SDK's transport error: refused, DNS, a timeout, a reset);
-    ``key_refused`` — AgentChat answered 401 for the key; ``other`` — anything
-    else (a server error, a local fault)."""
-    import socket
-
-    unreachable: tuple[type[BaseException], ...] = (ConnectionError, TimeoutError, socket.gaierror)
-    try:
-        from agentchatme import ConnectionError as SDKConnectionError
-        from agentchatme import UnauthorizedError
-    except ImportError:
-        return "unreachable" if isinstance(exc, unreachable) else "other"
-    if isinstance(exc, UnauthorizedError):
-        return "key_refused"
-    return "unreachable" if isinstance(exc, (*unreachable, SDKConnectionError)) else "other"
 
 
 def _reconcile_soul_anchor_when_texts_arrive(runtime: Any) -> None:
@@ -1104,8 +1087,10 @@ def _reconcile_mcp_registration(runtime: Any) -> None:
             complete_pending,
             first_placement,
             gateway_lives,
+            held_by_this_process,
             note_write_failure,
             read_switch,
+            reapply_in_two_steps,
             start_completion,
         )
         from .mcp_registration import McpRegistrationError, inspect_entry
@@ -1119,7 +1104,13 @@ def _reconcile_mcp_registration(runtime: Any) -> None:
         return
     home = runtime.hermes_home
     label = profile_label(home)
-    if read_switch(home, api_base=api_base).state == "applying":
+    switch = read_switch(home, api_base=api_base)
+    if switch.awaits_restart is not None and keeps_placements_current(runtime) and held_by_this_process(switch):
+        # This gateway kept the earlier connection while its AgentChat runtime
+        # was down; now that it runs, it applies the yes itself, in two steps.
+        reapply_in_two_steps(ProfileScope.capture(home), api_base=api_base)
+        return
+    if switch.state == "applying":
         if keeps_placements_current(runtime):
             # This attempt runs in the profile's scope: the thread gets a copy of it.
             start_completion(ProfileScope.capture(home), api_base=api_base)

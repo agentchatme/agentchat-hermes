@@ -254,7 +254,7 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
     a gateway serves the profile but no AgentChat runtime runs in it
     (``plugins.isolation: host``), it is ``restart`` (warned): that gateway
     keeps the earlier connection and its trust until it restarts, and the
-    record names its pid (:attr:`.allow.Switch.awaits_restart`). Never raises."""
+    record names it, by pid and process start time (:attr:`.allow.Switch.awaits_restart`). Never raises."""
     home = resolve_hermes_home()
     if decision == "yes":
         flip = _begin_two_step_yes(api_base, home)
@@ -271,11 +271,11 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
     # (_begin_two_step_yes did not apply), while Hermes says a gateway serves
     # this profile: that gateway keeps the connection, and its trust, it made
     # before (plugins.isolation: host runs no plugin code in it).
-    held_by: int | None = None
+    held_by = None
     if outcome == "allowed":
-        from .allow import hermes_gateway_pid
+        from .allow import hermes_gateway
 
-        held_by = hermes_gateway_pid(home)
+        held_by = hermes_gateway(home)
     if outcome in ("added", "allowed"):
         from .allow import write_record
 
@@ -284,7 +284,7 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
             how="carried_over" if decision == "carried_over" else "asked",
             trust=placed.trust,
             decision=decision if decision in ("yes", "no") else None,
-            restart_pid=held_by,
+            restart_gateway=held_by,
         )
     if outcome == "added":
         return PlacementStep(
@@ -301,7 +301,7 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
         return PlacementStep(
             "mcp",
             "warned",
-            f"not in effect yet: {AWAITS_RESTART_WORDS} (gateway pid {held_by}){named}",
+            f"not in effect yet: {AWAITS_RESTART_WORDS} (gateway pid {held_by[0]}){named}",
             "restart",
         )
     if outcome == "allowed":
@@ -345,8 +345,8 @@ def _begin_two_step_yes(api_base: str, home: Path) -> PlacementStep | None:
     """The first step of a yes over our connected ``untrusted`` entry
     (:func:`place_mcp`), or ``None`` when it does not apply (no such entry,
     or no gateway runs for this profile)."""
-    from .allow import APPLY_WORDS, gateway_lives, write_record
-    from .mcp_registration import inspect_allowance, uninstall_entry
+    from .allow import gateway_lives
+    from .mcp_registration import inspect_allowance
 
     try:
         current = inspect_allowance(api_base=api_base)
@@ -354,6 +354,17 @@ def _begin_two_step_yes(api_base: str, home: Path) -> PlacementStep | None:
         return None
     if current.entry != "ours" or current.trust != "untrusted" or not gateway_lives(home, api_base=api_base):
         return None
+    return remove_for_two_steps(api_base, home)
+
+
+def remove_for_two_steps(api_base: str, home: Path) -> PlacementStep:
+    """The first of the two steps (``applying``): the yes recorded as pending,
+    then our entry removed, so Hermes' watcher drops the connection that keeps
+    the earlier tier; the gateway writes the entry back with ``trust: full``
+    once it is gone (:func:`.allow.start_completion`)."""
+    from .allow import APPLY_WORDS, write_record
+    from .mcp_registration import uninstall_entry
+
     if not write_record(home, how="asked", trust="full", decision="yes", pending=True, decided_at=time.time()):
         return PlacementStep("mcp", "failed", "the decision could not be recorded, so nothing was changed")
     try:
@@ -457,15 +468,15 @@ def profile_identity(home: Path, *, api_base: str) -> ProfileIdentity:
     return ProfileIdentity(handle, identity.line, identity.template)
 
 
-def gateway_still_serving(home: Path, *, api_base: str) -> str | None:
-    """What to say when logout leaves a running gateway behind: read BEFORE the
-    key is removed. A gateway that lives for this profile's account (its health
-    record fresh, its pid alive, the leader lock held: the rule ``doctor`` and
-    ``status`` use) keeps the socket it opened with the key, so the agent is
-    still woken and gated, now without the hosted tools, until it restarts.
-    ``None`` when no gateway lives for it. No network. Never raises."""
+SERVING_GATEWAY_FILENAME = "serving-gateway.json"
+
+
+def serving_gateway(home: Path, *, api_base: str) -> dict[str, Any] | None:
+    """The health record of a gateway that holds this profile's AgentChat
+    connection now, for the key the profile holds (fresh, its pid alive, the
+    leader lock held: the rule ``doctor`` and ``status`` use), or ``None``.
+    No network. Never raises."""
     from .config import resolve_key
-    from .profile_scope import profile_label
     from .ws_health import live_health
 
     try:
@@ -475,13 +486,75 @@ def gateway_still_serving(home: Path, *, api_base: str) -> str | None:
         if not api_key:
             return None
         health = live_health(api_base, api_key, home)
-        if health is None:
-            return None
-        label = profile_label(home)
     except Exception:
         logger.debug("placement: gateway liveness not read", exc_info=True)
         return None
-    restart = _gateway_restart_command(home, label, health.get("pid"))
+    return dict(health) if health is not None else None
+
+
+def gateway_serves_profile(home: Path, *, api_base: str) -> bool:
+    """Whether a running gateway holds an AgentChat connection for this
+    profile now, read BEFORE a key is saved: for the key it holds
+    (:func:`serving_gateway`), or — after a logout, which keeps that gateway's
+    socket open until it restarts — the gateway logout found serving it
+    (:func:`gateway_still_serving` recorded it, by pid and process start time,
+    in ``<profile home>/agentchat/serving-gateway.json``; forgotten the first
+    time that gateway is seen gone). Such a gateway keeps the key it started
+    with, so a new key needs its restart. Never raises."""
+    if serving_gateway(home, api_base=api_base) is not None:
+        return True
+    from .allow import process_start_time, same_gateway
+    from .key_store import store_dir
+    from .state import read_json
+    from .ws_health import pid_alive
+
+    path = store_dir(home) / SERVING_GATEWAY_FILENAME
+    try:
+        held = read_json(path)
+        pid = held.get("pid") if isinstance(held, dict) else None
+        start = held.get("start_time") if isinstance(held, dict) else None
+        recorded = (pid, start if isinstance(start, int) else None) if isinstance(pid, int) else None
+        if (
+            recorded is not None
+            and not isinstance(pid, bool)
+            and pid_alive(recorded[0]) is not False
+            and same_gateway(recorded, (recorded[0], process_start_time(recorded[0])))
+        ):
+            return True
+        if held is not None:
+            path.unlink(missing_ok=True)  # that gateway is gone
+    except Exception:
+        logger.debug("placement: the gateway logout left serving was not read", exc_info=True)
+    return False
+
+
+def gateway_still_serving(home: Path, *, api_base: str) -> str | None:
+    """What to say when logout leaves a running gateway behind: read BEFORE the
+    key is removed. A gateway that lives for this profile's account
+    (:func:`serving_gateway`) keeps the socket it opened with the key, so the
+    agent is still woken and gated, now without the hosted tools, until it
+    restarts. That gateway is recorded for the next setup in this profile,
+    which needs its restart too (:func:`gateway_serves_profile`). ``None`` when
+    no gateway lives for it. No network. Never raises."""
+    from .allow import process_start_time
+    from .key_store import store_dir
+    from .profile_scope import profile_label
+    from .state import write_json_atomic
+
+    health = serving_gateway(home, api_base=api_base)
+    if health is None:
+        return None
+    label = profile_label(home)
+    pid = health.get("pid")
+    try:
+        if isinstance(pid, int) and not isinstance(pid, bool):
+            write_json_atomic(
+                store_dir(home) / SERVING_GATEWAY_FILENAME,
+                {"pid": pid, "start_time": process_start_time(pid), "handle": health.get("handle")},
+            )
+    except Exception:
+        logger.debug("placement: the serving gateway was not recorded", exc_info=True)
+    restart = _gateway_restart_command(home, label, pid)
     return (
         f"The running gateway (pid {health['pid']}) still holds @{health['handle']}'s AgentChat connection, so this "
         f"profile is still woken and gated, now without the hosted tools: restart it ({restart}) so it stops "

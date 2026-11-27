@@ -2124,7 +2124,7 @@ def test_plugins_isolation_is_read_as_hermes_reads_it(
 
 
 def test_hermes_says_whether_a_gateway_serves_the_profile(_hermes_home: Path) -> None:
-    """``allow.hermes_gateway_pid`` asks Hermes' one liveness answer for a
+    """``allow.hermes_gateway`` asks Hermes' one liveness answer for a
     profile (``gateway.status.resolve_gateway_liveness``: pid file and lock,
     runtime status, a multiplexed gateway serving it) — no plugin code needs
     to run in that gateway, as under ``plugins.isolation: host``."""
@@ -2134,4 +2134,13 @@ def test_hermes_says_whether_a_gateway_serves_the_profile(_hermes_home: Path) ->
     assert {"profile_dir", "use_cache"} <= _params(status.resolve_gateway_liveness)
     liveness = status.resolve_gateway_liveness(profile_dir=_hermes_home, use_cache=False)
     assert liveness.running is False and liveness.pid is None
-    assert allow.hermes_gateway_pid(_hermes_home) is None
+    assert allow.hermes_gateway(_hermes_home) is None
+    # The pid-reuse guard: Hermes' start-time fingerprint and its comparator.
+    import os
+
+    assert {"pid"} <= _params(status.get_process_start_time)
+    start = allow.process_start_time(os.getpid())
+    assert isinstance(start, int) and start == status.get_process_start_time(os.getpid())
+    assert status.start_time_fingerprints_match(start, start) is True
+    assert status.start_time_fingerprints_match(start, start + 10_000) is False
+    assert allow.same_gateway((os.getpid(), start), (os.getpid(), allow.process_start_time(os.getpid())))

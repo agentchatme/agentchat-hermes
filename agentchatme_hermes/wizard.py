@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from . import allow, credentials, key_store, signup
 from .config import ENV_HANDLE, cli_prefix, resolve_key
 from .placement import (
+    gateway_serves_profile,
     gateway_still_serving,
     place_identity_and_tools,
     profile_identity,
@@ -245,6 +246,8 @@ def _fresh_setup_menu(
     if idx == 3:
         return
 
+    # Read before a key is saved: a gateway a logout left serving keeps its key.
+    serving = gateway_serves_profile(resolve_hermes_home(), api_base=_api_base())
     if idx == 0:
         ok = _register_new_agent_flow(
             prompt=prompt,
@@ -271,8 +274,7 @@ def _fresh_setup_menu(
     if not ok:
         return
 
-    # A profile's first key: a running gateway takes it up by itself.
-    print_info(credentials.NO_RESTART_LINE)
+    print_info(credentials.key_in_use_line(None, resolve_key().api_key or "", serving=serving))
     print_success("AgentChat ready")
 
 
@@ -318,6 +320,7 @@ def _replace_key_branch(
     if idx == 3:
         return
 
+    serving = gateway_serves_profile(resolve_hermes_home(), api_base=_api_base())
     if idx == 0:
         ok = _paste_existing_key_flow(
             prompt, print_info, print_success, print_warning, save_env_value
@@ -345,7 +348,7 @@ def _replace_key_branch(
     if ok:
         # A different key needs a restart (a running Hermes keeps the one it
         # started with); the same key pasted again does not.
-        print_info(credentials.key_in_use_line(existing_key, resolve_key().api_key or ""))
+        print_info(credentials.key_in_use_line(existing_key, resolve_key().api_key or "", serving=serving))
 
 
 def _logout_flow(

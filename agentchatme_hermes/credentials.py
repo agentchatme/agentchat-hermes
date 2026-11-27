@@ -14,7 +14,8 @@
   line stays for ``doctor --fix``.
 * :func:`clear_credentials` — logout: the key file and the key settings.
 * :func:`key_in_use_line` — after a save: whether a restart is needed for the
-  key to be used (only when it replaced another), said to the person.
+  key to be used (only when a running gateway held another key for the
+  profile), said to the person.
 
 This module never opens a ``.env`` file. The key is read from the profile's
 settings as Hermes resolves them (:func:`.config.settings_key`); lines are
@@ -96,18 +97,21 @@ def key_held(home: Path | None = None) -> str | None:
     return held
 
 
-def key_in_use_line(before: str | None, api_key: str) -> str:
-    """How a key just saved comes into use (``before``: :func:`key_held` before
-    the save). A profile's first key, or the same key again, needs no restart:
-    a running gateway activates it by itself (its activation re-checks every
-    30 s) and connects the hosted tools with it (Hermes fetches the key source
-    for a profile it had nothing for). A key that replaces another needs one: a
-    running Hermes keeps the key it started with. In an agent's own terminal
-    (:func:`.allow.in_agent_terminal`) that restart is said to be the
-    person's, never the agent's."""
+def key_in_use_line(before: str | None, api_key: str, *, serving: bool) -> str:
+    """How a key just saved comes into use. ``serving``: a running gateway held
+    an AgentChat connection for this profile before the save
+    (:func:`.placement.gateway_serves_profile`: for the key it held, or the
+    gateway a logout left serving); ``before``: :func:`key_held` before the
+    save. Such a gateway keeps the key it started with (the socket, and Hermes
+    the hosted tools' key), so a different key needs its restart — the same
+    line logout says. With none, or the same key again, no restart: a running
+    gateway activates a profile's first key by itself (its activation
+    re-checks every 30 s) and connects the hosted tools with it. In an agent's
+    own terminal (:func:`.allow.in_agent_terminal`) the restart is said to be
+    the person's, never the agent's."""
     from .allow import in_agent_terminal
 
-    if before is None or before == api_key:
+    if not serving or before == api_key:
         return NO_RESTART_LINE
     return RESTART_HINT_AGENT if in_agent_terminal() else RESTART_HINT
 

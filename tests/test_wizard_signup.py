@@ -621,7 +621,7 @@ class TestMenuRouting:
             "Skip for now",
         ]
         assert menus.person.said("success") == ["AgentChat ready"]
-        # A profile's first key: no restart line (lab R3, L1-F02).
+        # A profile's first key, no gateway serving it: no restart line (lab R3, L1-F02).
         assert menus.person.said("info") == [credentials.NO_RESTART_LINE]
         assert not any("restart" in text.lower() and "no restart" not in text.lower() for _, text in menus.person.transcript)
 
@@ -654,13 +654,14 @@ class TestMenuRouting:
         assert menus.person.said("info")[-1:] != [credentials.RESTART_HINT], "nothing replaced"
 
     @pytest.mark.parametrize(("saved_key", "said"), [("new", "restart"), ("old", "none")], ids=["another-key", "the-same-key"])
-    def test_replace_branch_says_restart_only_for_another_key(
+    def test_replace_branch_says_restart_only_for_another_key_while_a_gateway_serves(
         self, monkeypatch: pytest.MonkeyPatch, saved_key: str, said: str
     ) -> None:
         from types import SimpleNamespace
 
         menus = _Menus(monkeypatch, pick=0)
         monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        monkeypatch.setattr(wizard, "gateway_serves_profile", lambda home, *, api_base: True)
         monkeypatch.setattr(wizard, "resolve_key", lambda: SimpleNamespace(api_key=api_key(saved_key)))
         wizard._replace_key_branch(existing_key=api_key("old"), existing_handle="alice", **menus.kwargs())
         expected = credentials.RESTART_HINT if said == "restart" else credentials.NO_RESTART_LINE

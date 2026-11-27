@@ -367,9 +367,12 @@ class AgentInvoker:
 
     def _switch_now(self) -> State:
         """Read the switch (:func:`.allow.read_switch`) in the calling scope,
-        record it, log a change once, and finish a yes being applied. When a
-        pause ends the cards that waited are wanted: :meth:`check_tools` wakes
-        the loop for them once the tools are registered."""
+        record it, log a change once, and finish a yes being applied. A yes
+        written but not in effect (the running gateway keeps the earlier
+        connection: :attr:`.allow.Switch.awaits_restart`) pauses like one being
+        applied that the gateway did not take up. When a pause ends the cards
+        that waited are wanted: :meth:`check_tools` wakes the loop for them once
+        the tools are registered."""
         from .allow import PAUSED_STATES, Switch, describe, read_switch, start_completion
 
         home = self._home()
@@ -379,14 +382,14 @@ class AgentInvoker:
         except Exception:
             logger.debug("AgentInvoker: the tools switch could not be read", exc_info=True)
             switch = Switch("unknown")
-        state = switch.state
+        state = switch.in_effect_state
         allowance = switch.allowance
         with self._switch_lock:
             self._switch = {
                 "state": state,
                 "trust": allowance.trust if allowance is not None else None,
                 "via": allowance.via if allowance is not None else None,
-                "stalled": switch.stalled,
+                "stalled": switch.stalled or switch.awaits_restart is not None,
                 "at": time.time(),
             }
             changed = state != self._switch_said and state != "unknown"
@@ -395,7 +398,7 @@ class AgentInvoker:
                 self._switch_said = state
             if changed and previous in PAUSED_STATES and state not in PAUSED_STATES:
                 self._tools_wanted = True  # the cards that waited on the tray
-        if state == "applying" and not self._stopped.is_set():
+        if switch.state == "applying" and not self._stopped.is_set():
             start_completion(self._scope, api_base=api_base)
         if changed:
             from .config import cli_prefix

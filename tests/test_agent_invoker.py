@@ -562,6 +562,26 @@ class TestToolsSwitch:
         assert answer.ready is False and "being applied" in (answer.reason or "")
         assert held == [] and started == [home]
 
+    def test_a_yes_written_but_not_in_effect_pauses(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        """Review: trust: full is in config.yaml, but the running gateway that
+        holds the untrusted connection has not restarted — no turn starts
+        (each write would ask, and nobody answers in an AgentChat turn)."""
+        from agentchatme_hermes import allow
+
+        home = tmp_path / "p4"
+        inv = _invoker(monkeypatch, home=home)
+        self._switch(monkeypatch, "full", via="trust")
+        allow.write_record(home, how="asked", trust="full", decision="yes", restart_gateway=(4242, 1000))
+        monkeypatch.setattr(allow, "hermes_gateway", lambda home: (4242, 1000))
+        started: list[Any] = []
+        monkeypatch.setattr(allow, "start_completion", lambda scope, *, api_base: started.append(scope.home))
+        held = self._held(monkeypatch)
+        answer = inv.readiness()
+        assert answer.ready is False and allow.RESTART_TO_APPLY in (answer.reason or "")
+        assert held == [] and started == [], "nothing pending to complete: only that gateway's restart applies it"
+        monkeypatch.setattr(allow, "hermes_gateway", lambda home: (4242, 99999))  # restarted
+        assert inv.readiness().ready is True
+
     def _registered(self, monkeypatch: pytest.MonkeyPatch, names: list[str] | None = None) -> list[list[str] | None]:
         """What Hermes has registered of the hosted tools (``hosted_tool_names``)."""
         box: list[list[str] | None] = [[] if names is None else names]

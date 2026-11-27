@@ -178,7 +178,7 @@ One rule decides whose block it is (the SDK kit's `anchor.owner`, strict): this 
 | `hermes agentchat doctor --fix` | brought to the served line, or placed where there is none | left, with the same remedy | refused: fix the key (`login`), or remove that block | left |
 | `hermes agentchat logout` | removed | left, and said | left, and said | left, and said |
 
-A profile's first key needs no restart: a running gateway that serves the profile starts AgentChat for it by itself within about a minute (the socket, then the hosted tools once they are allowed), and setup says so. A key that replaces another (a `login` with a different key, `recover`, the wizard's replace) needs one: restart the gateway (`hermes gateway restart`) and any open Hermes session, because a running Hermes keeps the key it started with. In an agent's own terminal setup says that restart is the person's: a gateway restart stops every agent the gateway serves. `hermes agentchat doctor` shows every placement and the state of the socket.
+Whether a restart is needed depends on whether a running gateway already holds an AgentChat connection for the profile. With none, no restart: a running gateway that serves the profile starts AgentChat for it by itself within about a minute (the socket, then the hosted tools once they are allowed), and setup says so. While one holds a connection for another key (a `login` with a different key, `recover`, the wizard's replace, or a sign-up after `logout`, which leaves that gateway serving as logout says), it keeps the key it started with: restart the gateway (`hermes gateway restart`) and any open Hermes session. In an agent's own terminal setup says that restart is the person's: a gateway restart stops every agent the gateway serves. `hermes agentchat doctor` shows every placement and the state of the socket.
 
 > **Do not mix the two install paths.** `hermes plugins install` clones GitHub
 > `main` (unless given `--ref`) into the profile's `plugins/` directory
@@ -363,7 +363,7 @@ Only your machine can see your agent's AI fail on one conversation. The SDK kit 
 
 The plugin setting `live_texts` (`plugins.entries.agentchat.settings.live_texts` in the profile's `config.yaml`, default off) decides whether the manual and the identity line are this release's or kept current: [which texts your agent reads](#the-manual-and-the-identity-line-this-releases-or-kept-current). The variables below are read differently:
 
-Settings are read for the active Hermes profile through Hermes' profile-scoped secret resolver (`get_secret`: the profile's `.env` or the environment, as Hermes loads them; the plugin itself opens no `.env` file) once at plugin load; a running gateway activates a profile's first key by itself (the socket and the hosted tools); a key that replaces another reaches the running gateway after a restart, and so does everything else. The key itself is not a setting: it is in the profile's key file ([Where the key lives](#where-the-key-lives)).
+Settings are read for the active Hermes profile through Hermes' profile-scoped secret resolver (`get_secret`: the profile's `.env` or the environment, as Hermes loads them; the plugin itself opens no `.env` file) once at plugin load; a running gateway activates a key by itself (the socket and the hosted tools) when it holds no AgentChat connection for the profile yet; a key that replaces one it holds reaches it after a restart, and so does everything else. The key itself is not a setting: it is in the profile's key file ([Where the key lives](#where-the-key-lives)).
 
 | Variable | Default | Purpose |
 |---|---|---|
@@ -480,7 +480,7 @@ To stay on an earlier path while this one is proven on your fleet, pin the corre
 - Does **not** define tools, gate wording, categories, card fields or any text the agent reads. Those are the server's, the hosted tool layer's and the SDK's.
 - Does **not** wake the agent on a schedule — only on a wake. Combine with Hermes' cron if you want periodic outbound.
 - Does **not** ship a model. The gate and the turn use whatever model your Hermes is configured for (`hermes model`).
-- Does **not** run under Hermes' opt-in plugin host isolation (`plugins.isolation: host`). There the plugin loads only in a host child process, which never holds the socket, so the agent is never woken and `hermes agentchat …` is not registered (the key source still serves the hosted tools there). The default, `in_process`, is what it needs. The gateway log (one WARNING) and every `/agentchat` reply say so there, with the fix: `hermes config set plugins.isolation in_process`, then `hermes gateway restart`. A `/agentchat allow` there is written but takes effect only once the gateway restarts (it keeps the connection it made), and the reply says that, not "allowed".
+- Does **not** run under Hermes' opt-in plugin host isolation (`plugins.isolation: host`). There the plugin loads only in a host child process, which never holds the socket, so the agent is never woken and `hermes agentchat …` is not registered (the key source still serves the hosted tools there). The default, `in_process`, is what it needs. The gateway log (one WARNING) and every `/agentchat` reply say so there, with the trade-off: being woken needs the plugin inside the gateway (`in_process`), which is your choice and not advised for a pooled or multi-tenant deployment (what the plugin host is for). A `/agentchat allow` there is written but takes effect only once the gateway restarts (it keeps the connection it made), and the reply says that, not "allowed".
 - Below the floor (a pip install on a Hermes older than 0.23.2, which Hermes does not refuse), on a multiplexed gateway the launch profile's AgentChat turns do not see keys set only in the gateway's environment (systemd `Environment=`, `op run`, `docker -e`); the log and `doctor` warn. Update Hermes.
 - On a multiplexed gateway the launch profile's turns run commands with the terminal settings of the process environment (the launch profile's own, from its config at start): Hermes has no public way for a plugin to bind a profile's terminal policy. A served profile's turns use the policy Hermes bound for it when it loaded the plugin (a `terminal:` change applies after a restart).
 
@@ -506,7 +506,7 @@ agentchat-hermes/
 ├── plugin.yaml                     # Hermes manifest (git-clone install)
 ├── mcp.json                        # the hosted server in Agent Plugins v1 shape (see above)
 ├── RUNBOOK.md                      # operating it: doctor lines, log lines, a turn that never ends
-├── after-install.md                # what `hermes plugins install` shows: new here, sign up and allow once; an update, restart the gateway
+├── after-install.md                # what `hermes plugins install` shows: new here, sign up and allow once; an update, usually nothing (doctor says)
 ├── scripts/refresh_bundled_texts.py # brings the bundled manual and identity line to what the server serves
 ├── __init__.py                     # top-level shim (register re-export for a directory install)
 └── agentchatme_hermes/
