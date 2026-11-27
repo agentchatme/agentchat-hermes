@@ -59,6 +59,7 @@ command never opens a ``.env`` file: settings are read through Hermes'
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import re
 import sys
@@ -292,8 +293,8 @@ def _dispatch_wizard(_args: argparse.Namespace) -> int:
 
 # What ``hermes agentchat`` says where its questions cannot be answered.
 NO_WIZARD_HERE = (
-    "The setup questions are asked only at a person's own terminal (this is an agent's terminal, "
-    "or there is no terminal). Here, sign up one step per command:"
+    "The setup questions are not asked here (a terminal Hermes started, such as an agent's, or no "
+    "terminal at all). Here, sign up one step per command:"
 )
 
 
@@ -316,7 +317,8 @@ def _wizard_without_a_person() -> int:
         _printline(signup_steps.waiting_line(pending, cmd) + ".")
         return _EXIT_OK
     if resolution.refusal is not None:
-        _printline(resolution.refusal)
+        sys.stderr.write(resolution.refusal.rstrip() + "\n")
+        sys.stderr.flush()
     _printline(NO_WIZARD_HERE)
     _printline(f"  1. {signup_steps.start_line('register', cmd)}  (sends a code to that email)")
     _printline(f"  2. {cmd} register --code <code>")
@@ -324,7 +326,7 @@ def _wizard_without_a_person() -> int:
         f"Then the person allows the AgentChat tools once by sending /agentchat allow in a chat with "
         f"the agent. With a key already: {cmd} login --api-key-file <path>."
     )
-    return _EXIT_OK
+    return _EXIT_OK if resolution.refusal is None else _EXIT_API_ERR
 
 
 def _dispatch_register(args: argparse.Namespace) -> int:
@@ -555,18 +557,13 @@ def _start_register_step(given: dict[str, Any]) -> int:
     """``register --email E --handle H`` where nobody answers prompts: both
     flags are needed, and a profile already set up as an agent is not signed
     up as a second one (a person replaces it with ``logout`` first)."""
-    from .config import profile_handles
     from .profile_scope import resolve_hermes_home
 
     home = resolve_hermes_home()
     cmd = cli_prefix(home)
-    if resolve_key(home).api_key is not None:
-        own = profile_handles(home).own
-        return _exit_with(
-            f"This profile is already set up as {allow.who(own)} on AgentChat (`{cmd} status`). "
-            f"Nothing was sent. To sign it up as a new agent instead, a person runs `{cmd} logout` "
-            "first."
-        )
+    held = _set_up_already(home, cmd)
+    if held is not None:
+        return _exit_with(f"{held} Nothing was sent.")
     missing = [f"--{name}" for name in ("email", "handle") if not given.get(name)]
     if missing:
         return _exit_usage(
@@ -577,9 +574,31 @@ def _start_register_step(given: dict[str, Any]) -> int:
     return _start_step("register", given)
 
 
+def _set_up_already(home: Path, cmd: str) -> str | None:
+    """Why a new agent must not be signed up in this profile from a command
+    nobody answers, or ``None``: it holds a key of its own, or a key file
+    refused as unsafe or unreadable (it still names this profile's agent:
+    signing up would replace it). A copy of another profile's key file is
+    not this profile's agent: its refusal already says to register."""
+    from .config import profile_handles
+
+    resolution = resolve_key(home)
+    if resolution.api_key is not None:
+        own = profile_handles(home).own
+        return (
+            f"This profile is already set up as {allow.who(own)} on AgentChat (`{cmd} status`). To sign "
+            f"it up as a new agent instead, a person runs `{cmd} logout` first."
+        )
+    if resolution.store.status in ("unsafe", "unreadable"):
+        return resolution.refusal or f"This profile's AgentChat key file cannot be used: `{cmd} doctor` says why."
+    return None
+
+
 def _start_step(kind: signup.Kind, given: dict[str, Any]) -> int:
     """The start call alone. A code sent: the flow is kept for ``--code`` and
-    the command ends. Exit codes: 0 code sent, 2 an input to change, 1 else."""
+    the command ends. Exit codes: 0 code sent, 2 an input to change, 1 else.
+    A sign-up already waiting is left as it is unless a new code was sent
+    (its code still works)."""
     from agentchatme import ConnectionError as SDKConnectionError
 
     from .profile_scope import resolve_hermes_home
@@ -588,7 +607,7 @@ def _start_step(kind: signup.Kind, given: dict[str, Any]) -> int:
     cmd = cli_prefix(home)
     api_base = _api_base()
     try:
-        result = signup_steps.start(kind, {k: v for k, v in given.items() if v}, api_base=api_base)
+        result = signup.start_step(kind, {k: v for k, v in given.items() if v}, api_base=api_base)
     except SDKConnectionError as exc:
         return _exit_with(f"Could not reach AgentChat ({exc}). No code was sent.")
     if result.message:
@@ -622,75 +641,122 @@ def _start_step(kind: signup.Kind, given: dict[str, Any]) -> int:
         )
     if result.action == "wait_then_retry":
         return _exit_with("Then run the same command again.")
-    return _stopped(result)
+    return _stopped(result, "")
 
 
-def _stopped(result: Any) -> int:
+def _stopped(result: Any, after: str) -> int:
     """Exit 1 after an answer that ends the step: its message, printed
-    already, says why; a code is named only when no message came."""
-    if result.message:
+    already, says why (a code is named only when no message came); ``after``
+    is Hermes' line, when it has one."""
+    lines = [] if result.message else [f"AgentChat answered {result.code or 'without a message'}."]
+    if after:
+        lines.append(after)
+    if not lines:
         return _EXIT_API_ERR
-    return _exit_with(f"AgentChat answered {result.code or 'without a message'}.")
+    return _exit_with(" ".join(lines))
 
 
 def _finish_step(kind: signup.Kind, code: str, *, on_saved: Callable[..., None]) -> int:
     """``register --code C`` / ``recover --code C``: submit the code with the
     flow the start step kept; on ``done``, save and place. Every other answer
-    is the server's message plus the command that goes on from there."""
-    from agentchatme import ConnectionError as SDKConnectionError
-
+    is the server's message plus the command that goes on from there. One
+    such command at a time per profile (a lock beside the file)."""
+    from .leader_lock import held_lock
     from .profile_scope import resolve_hermes_home
 
     home = resolve_hermes_home()
     cmd = cli_prefix(home)
+    if not code.strip():
+        return _exit_usage(f"No code given: {cmd} {kind} --code <code>")
+    if signup_steps.read_pending(home) is None:
+        return _exit_usage(signup_steps.no_pending_line(kind, cmd))
+    with held_lock(signup_steps.lock_path(home), timeout_s=60.0) as lock:
+        if lock == "busy":
+            return _exit_with(
+                f"Another `{cmd} {kind} --code` is running in this profile: let it end, then check "
+                f"`{cmd} status`."
+            )
+        return _finish_step_held(kind, code, home=home, cmd=cmd, on_saved=on_saved)
+
+
+def _finish_step_held(
+    kind: signup.Kind, code: str, *, home: Path, cmd: str, on_saved: Callable[..., None]
+) -> int:
+    """:func:`_finish_step` under its lock: the file read again, then the call."""
+    from agentchatme import ConnectionError as SDKConnectionError
+
     pending = signup_steps.read_pending(home)
     if pending is None:
         return _exit_usage(signup_steps.no_pending_line(kind, cmd))
     if pending.kind != kind:
         return _exit_usage(signup_steps.other_kind_line(pending, cmd))
-    if not code.strip():
-        return _exit_usage(f"No code given: {cmd} {kind} --code <code>")
+    held = _set_up_already(home, cmd) if kind == "register" else None
+    if held is not None:
+        # Set up some other way since the code was sent (a login, the wizard):
+        # finishing would replace that agent.
+        signup_steps.drop_pending(home)
+        return _exit_with(f"{held} The sign-up waiting for its code was dropped; nothing was sent.")
     try:
-        result = signup_steps.submit(pending, code)
+        result = signup.submit_step(pending.flow, code, api_base=pending.api_base)
     except SDKConnectionError as exc:
         return _exit_with(
             f"Could not reach AgentChat ({exc}). Nothing was saved; run the same command again."
+        )
+    except (TypeError, ValueError) as exc:
+        signup_steps.drop_pending(home)
+        return _exit_with(
+            f"The sign-up waiting here cannot be finished ({exc}); start again: "
+            f"{signup_steps.start_line(kind, cmd, email=pending.email, handle=pending.handle)}"
         )
     if result.message:
         _printline(result.message)
     if result.action == "done" and result.api_key and result.handle:
         # The code is spent whatever the save does next: nothing waits any more.
-        signup_steps.clear_pending(home)
+        signup_steps.drop_pending(home)
         return _save_and_place(
             api_key=result.api_key, handle=result.handle, api_base=pending.api_base, on_saved=on_saved
         )
-    again = signup_steps.start_line(kind, cmd, email=pending.email, handle=pending.handle)
+    # A sign-up waits only while the server's answer names the verify step.
+    if signup_steps.waits(kind, result.flow):
+        _keep_waiting(home, pending, result)
+    else:
+        signup_steps.drop_pending(home)
     if result.action == "ask_code":
         # A wrong code: the server counted the try and keeps the code alive.
-        _keep_waiting(home, pending, result)
-        return _exit_with(f"Run it again with the right code: {cmd} {kind} --code <code>")
+        return _exit_usage(f"Run it again with the right code: {cmd} {kind} --code <code>")
     if result.action == "wait_then_retry":
-        _keep_waiting(home, pending, result)
         return _exit_with("Then run the same command again.")
     if result.action == "offer_new_code":
         # The code is gone (expired, or too many wrong tries): a new start sends another.
-        signup_steps.clear_pending(home)
+        again = signup_steps.start_line(kind, cmd, email=pending.email, handle=pending.handle)
         return _exit_with(f"For a new code: {again}")
     if result.action == "ask_param":
-        signup_steps.clear_pending(home)
         param = result.flow.get("param")
+        again = signup_steps.start_line(
+            kind,
+            cmd,
+            email=None if param == "email" else pending.email,
+            handle=None if param == "handle" else pending.handle,
+        )
         name = f"--{param}" if isinstance(param, str) else "the input named above"
         return _exit_usage(f"Start again with a different {name}: {again}")
-    # ``stop``: the server's message says it all (after a 5xx the account may
-    # exist: never steer to a second one). The flow stays for a retry.
-    return _stopped(result)
+    # ``stop``. After a 5xx the account may exist: never steer to a second
+    # one. A recovery sends a code only if it does, and gets its key back.
+    after = "Nothing was saved."
+    if result.http_status >= 500 and kind == "register":
+        after += (
+            " If the account was created anyway, get its key with: "
+            f"{signup_steps.start_line('recover', cmd, email=pending.email, handle=pending.handle)}"
+        )
+    return _stopped(result, after)
 
 
 def _keep_waiting(home: Path, pending: signup_steps.Pending, result: Any) -> None:
-    """Keep the sign-up waiting with the flow of ``result``; a file that cannot
-    be written keeps the earlier flow, which the server still answers."""
+    """Keep the sign-up waiting with the flow of ``result`` (a wrong code
+    counts a try; a wait names its seconds); a file that cannot be written
+    keeps the earlier flow, which the server still answers."""
     try:
-        signup_steps.save_pending(home, signup_steps.waiting(pending, result))
+        signup_steps.save_pending(home, dataclasses.replace(pending, flow=dict(result.flow)))
     except OSError:
         logger.debug("agentchat: the waiting sign-up was not updated", exc_info=True)
 
@@ -868,7 +934,7 @@ def _key_location_line(resolution: KeyResolution) -> str:
     """Where this profile's key is, in one line (never the key)."""
     key = resolution.api_key or ""
     if resolution.source == KEY_SOURCE_STORE:
-        return f"{_mask_key(key)} in {resolution.store.path} (readable by you only)"
+        return f"{_mask_key(key)} in {_key_file(resolution.store.path)} (readable by you only)"
     cmd = cli_prefix(resolution.store.path.parent.parent)
     return (
         f"{_mask_key(key)} from this profile's settings ({resolution.source}: the profile .env or "
@@ -1351,11 +1417,16 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             # The gateway runs; AgentChat's runtime in it does not hold this
             # account's socket (it retries while AgentChat cannot be reached,
             # or its start failed: the gateway log says which).
-            warn(
-                f"WS leader lock not held ({lock_path}) — the gateway runs, but AgentChat's runtime in it "
-                "has not started for this account: it retries on its own while AgentChat cannot be "
-                "reached (the gateway log says why); no wakes until it does"
-            )
+            from .placement import gateway_cannot_load
+
+            if gateway_cannot_load(hermes_home):
+                fail(credentials.LOAD_RESTART_LINE)
+            else:
+                warn(
+                    f"WS leader lock not held ({lock_path}) — the gateway runs, but AgentChat's runtime in it "
+                    "has not started for this account: it retries on its own while AgentChat cannot be "
+                    "reached (the gateway log says why); no wakes until it does"
+                )
         elif state == "free":
             warn(
                 f"WS leader lock file present but no holder ({lock_path}) — "
@@ -1632,9 +1703,10 @@ def _doctor_key_checks(
             "the key file decides which agent this profile is; an AGENTCHAT_API_KEY in the "
             "profile .env or the environment is not used"
         )
-        ok(f"key saved in {store.path} ({_mask_key(resolution.api_key)}, readable by you only) — {decides}"
+        where = _key_file(store.path)
+        ok(f"key saved in {where} ({_mask_key(resolution.api_key)}, readable by you only) — {decides}"
            if not store.loose_mode else
-           f"key saved in {store.path} ({_mask_key(resolution.api_key)}) — {decides}")
+           f"key saved in {where} ({_mask_key(resolution.api_key)}) — {decides}")
         if store.loose_mode:
             warn(f"{store.path} can be read by its group or others — `{cmd} doctor --fix` makes it "
                  "readable by you only")
@@ -1924,7 +1996,7 @@ def _dispatch_logout(_args: argparse.Namespace) -> int:
     # removes a line and clears the variable from this process together).
     in_settings = settings_key()
     # A sign-up still waiting for its code goes too: logout leaves nothing to finish.
-    if signup_steps.clear_pending(home):
+    if signup_steps.drop_pending(home):
         _printline("The sign-up waiting for its emailed code was dropped.")
     if not has_file and resolution.held_key is None and in_settings is None:
         _printline("No AgentChat key was configured. Nothing to clear.")
@@ -2618,8 +2690,8 @@ def _resolve_recovery_email(provided: str | None, *, ask: bool = True) -> str:
         return provided.strip()
     if not (ask and _stdin_is_tty()):
         raise _MissingFlag(
-            "No email given and stdin is not a terminal. Re-run with: "
-            "hermes agentchat recover --handle <handle> --email <email>"
+            f"No email given{'' if not ask else ' and stdin is not a terminal'}. Re-run with: "
+            f"{_profile_cmd()} recover --handle <handle> --email <email>"
         )
     return _ask_recovery_field("email")
 
@@ -2659,7 +2731,7 @@ def _resolve_recovery_handle(provided: str | None, *, ask: bool = True) -> str:
         raise _MissingFlag(
             "No @handle given and none is saved for this profile. Recovery "
             "needs the agent's handle as well as its email — re-run with: "
-            "hermes agentchat recover --handle <handle> --email <email>"
+            f"{_profile_cmd()} recover --handle <handle> --email <email>"
         )
     return _ask_recovery_field("handle")
 
@@ -2801,10 +2873,19 @@ def _persist_credentials(*, api_key: str, handle: str, api_base: str) -> bool:
     return True
 
 
+def _key_file(path: Path) -> str:
+    """The key file as output names it: its path for a person; in an agent's
+    terminal "this profile's key file". An agent repeats a path in its reply,
+    and Hermes' gateway attaches a file whose bare path a reply names (lab,
+    2026-11-27: it tried to send credentials.json); its delivery denylist
+    covers Hermes' own credential stores, not a plugin's."""
+    return "this profile's key file" if allow.in_agent_terminal() else str(path)
+
+
 def _saved_where() -> str:
     if _last_saved_path is None:
         return f"saved in the profile .env as {_ENV_API_KEY}"
-    return f"saved in {_last_saved_path}, readable by you only"
+    return f"saved in {_key_file(_last_saved_path)}, readable by you only"
 
 
 def _held_and_serving(api_base: str) -> tuple[str | None, bool, bool | None]:

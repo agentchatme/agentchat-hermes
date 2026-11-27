@@ -1237,7 +1237,21 @@ def _read_command(raw_args: str, *, scope: ProfileScope) -> str | _Question:
 
 
 def _write_answer(decision: Decision, *, scope: ProfileScope, agent: str) -> str:
-    """In the profile's scope: the person's answer written."""
+    """In the profile's scope: the person's answer written. After a yes, a
+    gateway that cannot run AgentChat until it restarts (a first install
+    into a running gateway, :func:`.placement.gateway_cannot_load`) says so:
+    the restart is the last step, and the person's."""
+    reply = _written_answer(decision, scope=scope, agent=agent)
+    if decision == "yes":
+        from .credentials import LOAD_RESTART_LINE
+        from .placement import gateway_cannot_load
+
+        if gateway_cannot_load(scope.home):
+            return f"{reply} {LOAD_RESTART_LINE}"
+    return reply
+
+
+def _written_answer(decision: Decision, *, scope: ProfileScope, agent: str) -> str:
     from .leader_lock import is_hermes_gateway_process
     from .placement import place_mcp
 

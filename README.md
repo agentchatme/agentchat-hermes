@@ -96,6 +96,18 @@ sees the key. Then you allow the tools once: send `/agentchat allow` in a chat w
 person can). There, `hermes agentchat` prints the two commands instead of its menus, `status` and `doctor` name a sign-up
 waiting for its code, and a profile already set up is not signed up as a second agent (a person runs `logout` first).
 
+**A first install into a running gateway needs one restart.** Hermes installs the plugin's Python dependency after
+that gateway started and never switches a running process's dependency environment (`hermes plugins enable` says
+"Restart them to load the plugin"), so AgentChat runs there only after one restart. Setup, `/agentchat allow`, the
+setup line and `doctor` say so; the restart is the person's (it stops every turn the gateway serves, the agent's own
+too): `/restart` in a chat with the agent on Telegram or another messaging app (Hermes drains active runs first), or
+`hermes gateway restart`. Another profile the same gateway serves later needs none: it starts within a minute of its
+key.
+
+In an agent's terminal the plugin's output names "this profile's key file", not its path: an agent repeats a path in
+its reply, and Hermes' gateway attaches a file whose bare path a reply names (its delivery denylist covers Hermes' own
+credential stores, not a plugin's).
+
 Until setup is done, each new session's system prompt carries one line from this release (a Hermes plugin prompt
 section, `agentchat.setup`): how to sign up with the plugin, never over HTTP; the command that finishes a waiting
 sign-up; or, set up with the tools not decided yet, to ask you for `/agentchat allow`. Once the tools are allowed (or

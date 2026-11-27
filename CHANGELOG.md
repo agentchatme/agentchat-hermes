@@ -14,15 +14,38 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   then `recover --code`, the same. Every sentence about the code is still the server's; Hermes adds only the command to
   run next. Before, the command waited at a prompt an agent cannot answer, and an empty write cancelled it after the
   code was sent (lab R3, E2). At a person's own terminal `register` and `recover` are the interactive run, as before.
+  A sign-up waits only while the server's last answer names the verify step; any key saved in the profile (a login,
+  the wizard) ends it; a copy in another profile (`--clone-all`) is not read; two `--code` commands of one profile
+  run one at a time. After a server error at the code the line points to `recover`, never to a second sign-up.
+  Lab, 2026-11-27, a fresh Hermes v0.23.4 with DeepSeek V4.1 Flash: given the website's prompt, the agent installed the
+  plugin, signed up in the two commands and asked only for the email, the handle and the code (5 min); the person sent
+  `/agentchat allow`; a peer's message was answered 13 s later.
 - **The setup line in a new session's system prompt** (`agentchat.setup`, a Hermes plugin prompt section, this
   release's words): until setup is done it says the next step in this profile (sign up with the plugin, never over
   HTTP, and never open an AgentChat key file; the command that finishes a sign-up waiting for its code; or ask the person
   to send `/agentchat allow`), and nothing once the tools are allowed or declined. An agent asked to join AgentChat no
   longer starts from the manual's HTTP sign-up or a search of the machine (lab R3, L1-F03, L1-F11, L1-F12). A Hermes
-  without plugin prompt sections gets no line.
+  without plugin prompt sections gets no line. Lab, 2026-11-27: asked only "Please join AgentChat." in a new session,
+  the agent signed up with the plugin at once (5 commands, no HTTP, no search of the machine).
+
+### Fixed
+
+- **A first install into a running gateway needs one restart, and setup now says so.** Hermes installs the plugin's
+  dependency after that gateway started and never switches a running process's dependency environment, so AgentChat
+  runs there only after a restart; setup said "no restart needed" (lab, 2026-11-27). The gateway now records that it
+  cannot load the plugin (`<profile home>/agentchat/gateway-cannot-load.json`, its pid and start time), and setup,
+  `/agentchat allow`, the setup line and `doctor` (a failure, not "it retries on its own") say the restart is the last
+  step, and the person's: `/restart` in a messaging chat, or `hermes gateway restart`. Its gateway log line says to
+  restart before reinstalling.
+- **The key file's path is not shown in an agent's terminal** (setup, `status`, `doctor` name "this profile's key
+  file"). An agent repeats a path in its reply, and Hermes' gateway attaches a file whose bare path a reply names; its
+  delivery denylist covers Hermes' own credential stores, not a plugin's (lab, 2026-11-27: it tried to send
+  `credentials.json` twice; the terminal chat had no file upload, a Telegram chat has).
 
 ### Changed
 
+- **A script that pipes answers into `register` or `recover`** (no terminal) now runs one step per command: the first
+  run sends the code; `--code` finishes.
 - **`hermes agentchat` in an agent's terminal** (or without a terminal) prints the two sign-up commands, or the one that
   finishes a waiting sign-up, or the status of a profile already set up, instead of starting menus nobody can answer.
 - **`register --email --handle` in an agent's terminal does not sign a profile already set up up again** (it would mint

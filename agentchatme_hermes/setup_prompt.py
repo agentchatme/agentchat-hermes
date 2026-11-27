@@ -13,7 +13,11 @@ in this profile, and nothing once there is none:
   in its own terminal, and that the person allows the tools once;
 * a sign-up waiting for its emailed code: the command that finishes it;
 * set up, tools not decided yet: ask the person to send ``/agentchat allow``;
-* anything else (allowed, declined, hand-managed, unreadable): no text.
+* and in each case, when the gateway started before the plugin was installed
+  (it cannot run AgentChat until it restarts,
+  :func:`.placement.gateway_cannot_load`): ask the person for that restart;
+* anything else (allowed, declined, hand-managed, a key file that cannot be
+  used): no text.
 
 The words are this release's, fixed (no served text). The section never
 raises: a state that cannot be read renders nothing, and Hermes then skips
@@ -54,6 +58,13 @@ NOT_ALLOWED_YET = (
     "allowed yet, so you cannot read or answer AgentChat messages: when you need them, ask your "
     "person to send /agentchat allow in a chat with you and tap Allow."
 )
+# A first install into a running gateway: AgentChat runs there only after one
+# restart, the person's (it stops this turn too). Said after the step above it.
+RESTART_TO_LOAD = (
+    "The gateway you run in started before the AgentChat plugin was installed, so AgentChat cannot run "
+    "until it restarts once: ask your person to send /restart in a chat with you on Telegram or another "
+    "messaging app, or to run `hermes gateway restart` (never restart it yourself: it stops this turn)."
+)
 
 
 def section_text(home: Path, *, api_base: str) -> str:
@@ -61,17 +72,27 @@ def section_text(home: Path, *, api_base: str) -> str:
     there is nothing to say."""
     from . import allow, signup_steps
     from .config import cli_prefix, profile_handles, resolve_key
+    from .placement import gateway_cannot_load
 
     cmd = cli_prefix(home)
-    if resolve_key(home).api_key is None:
+    restart = RESTART_TO_LOAD if gateway_cannot_load(home) else ""
+    resolution = resolve_key(home)
+    if resolution.store.status in ("unsafe", "unreadable"):
+        # A key file this profile cannot use still names its agent: no sign-up line.
+        return restart
+    if resolution.api_key is None:
         pending = signup_steps.read_pending(home)
         if pending is not None:
-            return WAITING.format(waiting=signup_steps.waiting_line(pending, cmd))
-        return NOT_SET_UP.format(cmd=cmd)
+            return _joined(WAITING.format(waiting=signup_steps.waiting_line(pending, cmd)), restart)
+        return _joined(NOT_SET_UP.format(cmd=cmd), restart)
     switch = allow.read_switch(home, api_base=api_base)
     if switch.state == "not_allowed_yet":
-        return NOT_ALLOWED_YET.format(who=allow.who(profile_handles(home).own))
-    return ""
+        return _joined(NOT_ALLOWED_YET.format(who=allow.who(profile_handles(home).own)), restart)
+    return restart
+
+
+def _joined(*parts: str) -> str:
+    return " ".join(part for part in parts if part)
 
 
 def register_setup_section(ctx: Any, scope: ProfileScope) -> bool:

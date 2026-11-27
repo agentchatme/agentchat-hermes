@@ -20,7 +20,7 @@ import pytest
 import signup_wire as sw
 from fake_keys import api_key
 from key_files import profile_home, save_key
-from sdk_wire import connect_error, serve
+from sdk_wire import api_error, connect_error, serve
 
 from agentchatme_hermes import allow, cli, signup_steps
 from agentchatme_hermes.cli import _EXIT_API_ERR, _EXIT_ARG_ERR, _EXIT_OK
@@ -71,6 +71,12 @@ class _Steps:
     def _place(self, handle: str, *, api_base: str, api_key: str, tools_decision: Any = None) -> list[Any]:
         self.placed.append(handle)
         return []
+
+
+def key_files_path() -> Path:
+    from agentchatme_hermes import key_store
+
+    return key_store.store_path(profile_home())
 
 
 def _waiting() -> dict[str, Any] | None:
@@ -223,7 +229,7 @@ class TestRegisterCode:
         run = _start(monkeypatch)
         capsys.readouterr()
         serve(monkeypatch, {sw.REGISTER_VERIFY: [sw.wrong_code(attempts=1), sw.registered("alice", _KEY)]})
-        assert cli._dispatch_register(_ns(code="111111")) == _EXIT_API_ERR
+        assert cli._dispatch_register(_ns(code="111111")) == _EXIT_ARG_ERR
         captured = capsys.readouterr()
         assert captured.out.splitlines() == [sw.WRONG_CODE]
         assert "Run it again with the right code: hermes agentchat register --code <code>" in captured.err
@@ -279,16 +285,119 @@ class TestRegisterCode:
         assert "finish with hermes agentchat recover --code <code>" in capsys.readouterr().err
         assert wire.requests == []
 
-    def test_a_file_that_is_not_a_sign_up_is_removed(
-        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    @pytest.mark.parametrize(
+        "record",
+        [
+            {"version": 1, "kind": "register"},
+            {"version": 2, "kind": "register", "flow": {"next_step": "verify", "pending_id": "p"}},
+            {"version": 1, "kind": "register", "api_base": "https://api.agentchat.me", "flow": {"next_step": "verify"}},
+            {"version": 1, "kind": "register", "api_base": "https://api.agentchat.me",
+             "flow": {"next_step": "register", "pending_id": "p"}},
+        ],
+    )
+    def test_a_file_that_is_not_a_waiting_sign_up_is_read_as_none_and_left(
+        self, monkeypatch: pytest.MonkeyPatch, record: dict[str, Any]
     ) -> None:
         _Steps(monkeypatch)
         path = signup_steps.pending_path(profile_home())
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text('{"version": 1, "kind": "register"}')
-        serve(monkeypatch, {})
+        path.write_text(json.dumps({**record, "profile_home": str(profile_home())}))
+        wire = serve(monkeypatch, {})
         assert cli._dispatch_register(_ns(code="123456")) == _EXIT_ARG_ERR
-        assert not path.exists()
+        assert path.exists(), "a file this release cannot finish from is not deleted (a later start replaces it)"
+        assert wire.requests == []
+
+    def test_a_server_error_ends_the_wait_and_points_to_recovery_never_a_second_account(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = _start(monkeypatch)
+        capsys.readouterr()
+        details = {"version": 1, "flow": "register", "next_step": "register"}
+        serve(monkeypatch, {sw.REGISTER_VERIFY: api_error(500, "INTERNAL_ERROR", "Something went wrong.", details)})
+        assert cli._dispatch_register(_ns(code="123456")) == _EXIT_API_ERR
+        captured = capsys.readouterr()
+        assert captured.out.splitlines() == ["Something went wrong."]
+        assert "Nothing was saved." in captured.err
+        assert "hermes agentchat recover --email a@b.co --handle alice" in captured.err
+        assert "register --email" not in captured.err and "different" not in captured.err
+        assert _waiting() is None and run.persisted == []
+
+    def test_a_refused_input_is_not_suggested_again(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _start(monkeypatch)
+        capsys.readouterr()
+        details = {"version": 1, "flow": "register", "next_step": "register", "param": "handle"}
+        serve(monkeypatch, {sw.REGISTER_VERIFY: api_error(409, "HANDLE_TAKEN", "The handle @alice is taken.", details)})
+        assert cli._dispatch_register(_ns(code="123456")) == _EXIT_ARG_ERR
+        err = capsys.readouterr().err
+        assert "Start again with a different --handle: hermes agentchat register --email a@b.co --handle <handle>" in err
+        assert _waiting() is None
+
+    def test_set_up_meanwhile_the_code_does_not_replace_that_agent(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        run = _start(monkeypatch)
+        capsys.readouterr()
+        # A person set the profile up some other way since the code was sent
+        # (written directly: save_credentials would end the wait itself).
+        save_key(api_key("meanwhile_000000000000"), handle="bob")
+        wire = serve(monkeypatch, {sw.REGISTER_VERIFY: sw.registered("alice", _KEY)})
+        assert cli._dispatch_register(_ns(code="123456")) == _EXIT_API_ERR
+        err = capsys.readouterr().err
+        assert "already set up as @bob" in err and "dropped" in err
+        assert wire.requests == [] and run.persisted == [] and _waiting() is None
+
+    def test_any_key_saved_in_the_profile_ends_the_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import credentials
+
+        _start(monkeypatch)
+        assert _waiting() is not None
+        credentials.save_credentials(api_key=_KEY, handle="alice", api_base="https://api.agentchat.me")
+        assert _waiting() is None
+
+    def test_a_copied_waiting_file_is_not_this_profiles_sign_up(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import shutil
+
+        _start(monkeypatch)
+        clone = tmp_path / "clone-all"
+        shutil.copytree(profile_home() / "agentchat", clone / "agentchat")
+        assert signup_steps.read_pending(clone) is None
+        assert signup_steps.read_pending(profile_home()) is not None
+
+    def test_a_second_code_command_waits_for_the_first(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import contextlib
+
+        from agentchatme_hermes import leader_lock
+
+        _start(monkeypatch)
+        capsys.readouterr()
+
+        @contextlib.contextmanager
+        def busy(path: Any, **kwargs: Any) -> Any:
+            yield "busy"
+
+        monkeypatch.setattr(leader_lock, "held_lock", busy)
+        wire = serve(monkeypatch, {})
+        assert cli._dispatch_register(_ns(code="123456")) == _EXIT_API_ERR
+        assert "is running in this profile" in capsys.readouterr().err
+        assert wire.requests == [] and _waiting() is not None
+
+    def test_the_key_files_path_is_never_shown_in_an_agents_terminal(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _start(monkeypatch)
+        capsys.readouterr()
+        monkeypatch.setattr(cli, "_last_saved_path", key_files_path())
+        serve(monkeypatch, {sw.REGISTER_VERIFY: sw.registered("alice", _KEY)})
+        assert cli._dispatch_register(_ns(code="123456")) == _EXIT_OK
+        out = capsys.readouterr().out
+        assert "credentials.json" not in out
+        assert "saved in this profile's key file, readable by you only" in out
 
 
 class TestRecoverSteps:
@@ -307,6 +416,18 @@ class TestRecoverSteps:
         assert wire.bodies() == [{"email": "a@b.co", "handle": "alice"}, {"pending_id": "pnd_1", "code": "123456"}]
         assert "Recovered @alice" in capsys.readouterr().out
         assert run.persisted[0]["handle"] == "alice" and _waiting() is None
+
+    @pytest.mark.skipif(os.name == "nt", reason="file modes mean nothing on Windows")
+    def test_a_refused_key_file_is_not_signed_up_over(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _Steps(monkeypatch)
+        path = save_key(api_key("loose_00000000000000000"), handle="bob")
+        os.chmod(path, 0o664)
+        wire = serve(monkeypatch, {})
+        assert cli._dispatch_register(_ns(email="a@b.co", handle="alice")) == _EXIT_API_ERR
+        assert "Nothing was sent." in capsys.readouterr().err
+        assert wire.requests == []
 
     def test_a_missing_handle_is_named_never_asked(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

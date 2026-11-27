@@ -8,25 +8,30 @@ stdin is not a terminal nobody can. There, sign-up runs one step per command,
 the shape the coding-agent integrations use:
 
 1. ``register --email E --handle H`` (``recover --email E --handle H``) makes
-   the start call. When the server answers that a code was sent, its flow
-   object is kept in this profile's ``agentchat/signup.json`` and the command
-   ends.
+   the start call (:func:`.signup.start_step`). When the server answers that a
+   code was sent, its flow object is kept in this profile's
+   ``agentchat/signup.json`` and the command ends.
 2. ``register --code C`` (``recover --code C``) submits the code with the
-   kept flow. On ``done`` the key is saved and placed exactly as the
-   interactive run does, and the file is removed.
+   kept flow (:func:`.signup.submit_step`). On ``done`` the key is saved and
+   placed exactly as the interactive run does, and the file is removed.
 
 The rules stay the server's (contract v1, "Sign-up flows"): every sentence
 about a code, a handle or an email is the server's ``message``, and what
 comes next is the SDK's ``action_of`` (``agentchatme.integration.account``,
 whose step functions are made for this: "save the returned flow between
-start and submit_code"). What is Hermes's, and lives here: when a command
-runs one step, where the flow waits between the two commands, and the line
-naming the command to run next.
+start and submit_code"). A sign-up waits only while the server's last answer
+names the verify step: any other answer ends the wait. What is Hermes's, and
+lives here: when a command runs one step, where the flow waits between the
+two commands, and the line naming the command to run next.
 
 The file holds the flow (its ``pending_id`` answers the emailed code once),
-the email and handle the sign-up was started with, and the API base. Owner
-only (``0600`` in the ``0700`` key directory), written atomically. It is not
-the key and never holds it.
+the email and handle the sign-up was started with, the API base, and the
+profile home it was saved for: a copy in another profile (``--clone-all``, a
+hand copy) is not that profile's sign-up (:func:`.key_store.same_home`).
+Owner only (``0600`` in the ``0700`` key directory), written atomically, read
+without side effects. It is not the key and never holds it. Any key saved in
+the profile ends the wait (:func:`drop_pending`, from
+:func:`.credentials.save_credentials`).
 """
 from __future__ import annotations
 
@@ -37,29 +42,28 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from . import allow
-from .client_identity import hermes_client_identity
-from .key_store import store_dir
+from .key_store import same_home, store_dir
 from .state import read_json, write_json_atomic
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-
-    from agentchatme.integration.account import StepResult
 
     from .signup import Kind
 
 logger = logging.getLogger(__name__)
 
 PENDING_FILENAME = "signup.json"
+LOCK_FILENAME = "signup.lock"
 PENDING_VERSION = 1
-_KINDS = ("register", "recover")
+# The step that submits the code, per flow: the only step a sign-up waits on.
+VERIFY_STEP: dict[str, str] = {"register": "verify", "recover": "recover_verify"}
 
 
 def one_step_per_run() -> bool:
-    """Does sign-up run one step per command here? In an agent's terminal
-    (Hermes stamps ``HERMES_SESSION_ID`` on every command its terminal tool
-    runs, a PTY included) and wherever stdin is not a terminal. A person at
-    their own terminal gets the interactive run."""
+    """Does sign-up run one step per command here? In a command Hermes'
+    terminal ran (Hermes stamps ``HERMES_SESSION_ID`` on what its terminal tool
+    runs, a PTY included, and on shells it starts) and wherever stdin is not a
+    terminal. A person at their own terminal gets the interactive run."""
     return allow.in_agent_terminal() or not allow.stdin_is_tty()
 
 
@@ -69,7 +73,7 @@ class Pending:
 
     kind: Kind
     flow: dict[str, Any]
-    """The server's flow object from the last answer (plain JSON)."""
+    """The server's flow object from the last answer (plain JSON), naming the verify step."""
     api_base: str
     email: str | None = None
     handle: str | None = None
@@ -77,32 +81,40 @@ class Pending:
     display_name: str | None = None
 
 
+def waits(kind: str, flow: Mapping[str, Any]) -> bool:
+    """Does ``flow`` leave a sign-up of ``kind`` waiting for its code? Only
+    when the server names the verify step and the pending code."""
+    pending_id = flow.get("pending_id")
+    return flow.get("next_step") == VERIFY_STEP.get(kind) and isinstance(pending_id, str) and bool(pending_id)
+
+
 def pending_path(home: Path) -> Path:
     """``<profile home>/agentchat/signup.json``, beside the key file."""
     return store_dir(home) / PENDING_FILENAME
 
 
+def lock_path(home: Path) -> Path:
+    """The lock that keeps two ``--code`` commands of one profile apart."""
+    return store_dir(home) / LOCK_FILENAME
+
+
 def read_pending(home: Path) -> Pending | None:
-    """The sign-up waiting in ``home``, or ``None`` (none, or a file that is
-    not one: it is removed, since nothing can finish from it)."""
-    path = pending_path(home)
-    record = read_json(path)
-    if record is None:
-        return None
-    pending = _parse(record)
-    if pending is None:
-        logger.warning("agentchat: %s is not a sign-up this release can finish; removed", path)
-        clear_pending(home)
-    return pending
+    """The sign-up waiting in ``home``, or ``None``: none, one saved for another
+    profile, or a file this release cannot finish from (left as it is: a later
+    start replaces it). No side effects."""
+    return _parse(read_json(pending_path(home)), home)
 
 
-def _parse(record: Any) -> Pending | None:
+def _parse(record: Any, home: Path) -> Pending | None:
     if not isinstance(record, dict) or record.get("version") != PENDING_VERSION:
         return None
     kind, flow, api_base = record.get("kind"), record.get("flow"), record.get("api_base")
-    if kind not in _KINDS or not isinstance(api_base, str) or not api_base:
+    if kind not in VERIFY_STEP or not isinstance(api_base, str) or not api_base:
         return None
-    if not isinstance(flow, dict) or not isinstance(flow.get("next_step"), str):
+    if not isinstance(flow, dict) or not waits(kind, flow):
+        return None
+    saved_for = record.get("profile_home")
+    if not isinstance(saved_for, str) or not same_home(Path(saved_for), Path(home)):
         return None
 
     def text(name: str) -> str | None:
@@ -136,8 +148,8 @@ def save_pending(home: Path, pending: Pending) -> None:
     write_json_atomic(pending_path(home), record)
 
 
-def clear_pending(home: Path) -> bool:
-    """Remove the waiting sign-up; ``True`` when there was one."""
+def drop_pending(home: Path) -> bool:
+    """End the waiting sign-up (its file removed); ``True`` when there was a file."""
     path = pending_path(home)
     try:
         path.unlink()
@@ -149,45 +161,6 @@ def clear_pending(home: Path) -> bool:
     with suppress(OSError):
         path.parent.rmdir()  # only when empty
     return True
-
-
-def start(kind: Kind, given: Mapping[str, Any], *, api_base: str) -> StepResult:
-    """One start call (sends a code). Raises ``agentchatme.ConnectionError``
-    when no answer came."""
-    from agentchatme.integration import account
-
-    return account.start(
-        kind,
-        cast("Any", dict(given)),
-        client_identity=hermes_client_identity(),
-        api_base=api_base,
-    )
-
-
-def submit(pending: Pending, code: str) -> StepResult:
-    """Submit ``code`` with the kept flow. Raises ``agentchatme.ConnectionError``
-    when no answer came."""
-    from agentchatme.integration import account
-
-    return account.submit_code(
-        cast("Any", pending.flow),
-        code.strip(),
-        client_identity=hermes_client_identity(),
-        api_base=pending.api_base,
-    )
-
-
-def waiting(pending: Pending, result: StepResult) -> Pending:
-    """``pending`` carrying the flow of the answer that keeps it waiting (a
-    wrong code counts a try; a wait names its seconds)."""
-    return Pending(
-        kind=pending.kind,
-        flow=dict(result.flow),
-        api_base=pending.api_base,
-        email=pending.email,
-        handle=pending.handle,
-        display_name=pending.display_name,
-    )
 
 
 # ─── the lines Hermes adds (the server's message is shown before them) ─────

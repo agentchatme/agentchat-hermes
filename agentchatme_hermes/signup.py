@@ -22,7 +22,7 @@ from __future__ import annotations
 import importlib
 import math
 import time
-from typing import TYPE_CHECKING, Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal, cast
 
 from .client_identity import hermes_client_identity
 
@@ -34,6 +34,7 @@ if TYPE_CHECKING:
         AccountQuestion,
         CheckKeyResult,
         RunResult,
+        StepResult,
     )
 
 Kind = Literal["register", "recover"]
@@ -166,6 +167,28 @@ def run(
         sleep=sleep,
         client_identity=hermes_client_identity(),
         api_base=api_base,
+    )
+
+
+def start_step(kind: Kind, given: Mapping[str, Any], *, api_base: str) -> StepResult:
+    """One start call alone (sends a code), for sign-up one step per command
+    (:mod:`.signup_steps`). Raises ``agentchatme.ConnectionError`` when no
+    answer came."""
+    from agentchatme.integration import account
+
+    return account.start(
+        kind, cast("Any", dict(given)), client_identity=hermes_client_identity(), api_base=api_base
+    )
+
+
+def submit_step(flow: Mapping[str, Any], code: str, *, api_base: str) -> StepResult:
+    """One verify call with a kept flow (:mod:`.signup_steps`). Raises
+    ``agentchatme.ConnectionError`` when no answer came, and ``ValueError`` /
+    ``TypeError`` for a flow that is not waiting for a code."""
+    from agentchatme.integration import account
+
+    return account.submit_code(
+        cast("Any", dict(flow)), code.strip(), client_identity=hermes_client_identity(), api_base=api_base
     )
 
 

@@ -40,6 +40,7 @@ key is removed; :func:`.soul_anchor.remove_soul_anchor` decides).
 """
 from __future__ import annotations
 
+import contextlib
 import logging
 import time
 from dataclasses import dataclass
@@ -476,6 +477,68 @@ def profile_identity(home: Path, *, api_base: str) -> ProfileIdentity:
 
 
 SERVING_GATEWAY_FILENAME = "serving-gateway.json"
+GATEWAY_CANNOT_LOAD_FILENAME = "gateway-cannot-load.json"
+
+
+def note_gateway_cannot_load(home: Path, problem: str) -> None:
+    """In a gateway whose plugin load found no usable SDK: record this process
+    (pid and start time) for the profile, so every other process tells this
+    gateway apart from the next one. A first install into a running gateway
+    lands here: Hermes installs the dependency after the gateway started and
+    never switches a running process's dependency environment. Never raises."""
+    import os
+
+    from .allow import process_start_time
+    from .key_store import store_dir
+    from .state import write_json_atomic
+
+    pid = os.getpid()
+    try:
+        write_json_atomic(
+            store_dir(home) / GATEWAY_CANNOT_LOAD_FILENAME,
+            {"pid": pid, "start_time": process_start_time(pid), "problem": problem},
+        )
+    except Exception:
+        logger.debug("placement: the gateway that cannot load the plugin was not recorded", exc_info=True)
+
+
+def clear_gateway_cannot_load(home: Path) -> None:
+    """A gateway that loaded the plugin: the record of an earlier one goes."""
+    from .key_store import store_dir
+
+    with contextlib.suppress(OSError):
+        (store_dir(home) / GATEWAY_CANNOT_LOAD_FILENAME).unlink(missing_ok=True)
+
+
+def gateway_cannot_load(home: Path) -> bool:
+    """Does the gateway serving ``home``'s profile run without the plugin's
+    SDK, so that AgentChat starts there only after its restart? In that
+    gateway itself: its own import says. Elsewhere: the record that gateway
+    left (:func:`note_gateway_cannot_load`), compared with the gateway Hermes
+    sees serving the profile (:func:`.allow.gateway_verdict`): forgotten once
+    that gateway is shown gone, kept while that cannot be told. Never raises."""
+    from .allow import gateway_seen, gateway_verdict
+    from .key_store import store_dir
+    from .kit import kit_problem
+    from .leader_lock import is_hermes_gateway_process
+    from .state import read_json
+
+    try:
+        if is_hermes_gateway_process():
+            return kit_problem() is not None
+        path = store_dir(home) / GATEWAY_CANNOT_LOAD_FILENAME
+        held = read_json(path)
+        pid = held.get("pid") if isinstance(held, dict) else None
+        start = held.get("start_time") if isinstance(held, dict) else None
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            return False
+        recorded = (pid, start if isinstance(start, int) and not isinstance(start, bool) else None)
+        if gateway_verdict(recorded, gateway_seen(home)) != "gone":
+            return True
+        path.unlink(missing_ok=True)  # that gateway is shown gone
+    except Exception:
+        logger.debug("placement: the gateway's plugin load was not read", exc_info=True)
+    return False
 
 
 def serving_gateway(home: Path, *, api_base: str) -> dict[str, Any] | None:
