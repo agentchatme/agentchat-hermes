@@ -301,7 +301,9 @@ def describe(switch: Switch, handle: str | None, *, cmd: str = "hermes agentchat
         if switch.hand_edited:
             return (
                 "allowed in config.yaml (trust changed by hand there): a running gateway uses it once it "
-                "connects the tools again — /reload-mcp in a chat it serves, or hermes gateway restart"
+                "connects the tools again — hermes gateway restart, or /reload-mcp in a messaging chat it serves "
+                "(Telegram, Discord, …; not Desktop or a terminal chat, whose /reload-mcp keeps a connected server "
+                "as it is)"
             )
         if allowance.via == "trust":
             if switch.carried:

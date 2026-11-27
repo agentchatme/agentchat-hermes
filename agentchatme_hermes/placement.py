@@ -309,8 +309,8 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
         return PlacementStep(
             "mcp",
             "changed",
-            f"set trust: full on mcp_servers.agentchat{named} (a running gateway uses it after /reload-mcp "
-            "in a chat it serves, or hermes gateway restart)",
+            f"set trust: full on mcp_servers.agentchat{named} (a running gateway uses it after hermes gateway "
+            "restart, or /reload-mcp in a messaging chat it serves; an open Hermes session after /reload-mcp)",
             outcome,
         )
     if outcome == "upgraded":
@@ -318,8 +318,8 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
             "mcp",
             "changed",
             "added the client header to mcp_servers.agentchat (X-AgentChat-Client: hermes), so "
-            "the hosted tools know this agent runs on Hermes (used after a gateway restart, or "
-            "/reload-mcp in a session)",
+            "the hosted tools know this agent runs on Hermes (used after hermes gateway restart, or "
+            "/reload-mcp in a messaging chat the gateway serves or in an open Hermes session)",
             outcome,
         )
     if outcome == "present":

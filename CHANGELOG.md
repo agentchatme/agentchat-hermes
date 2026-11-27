@@ -210,7 +210,9 @@ Found by the lab round on a real Hermes v0.23.2 box (R3):
 - **The parked-tools remedy is true.** `/reload-mcp` reconnects a parked hosted tools server only from a messaging chat
   the gateway serves; from Desktop or a terminal chat Hermes refuses it (`mcp_servers_unavailable`) and nothing
   reconnects. The remedy now names `hermes gateway restart` first and `/reload-mcp` only for a messaging chat
-  (contract-tested on both of Hermes' reload paths, v0.23.2 to `main`).
+  (contract-tested on both of Hermes' reload paths, v0.23.2 to `main`). The same holds for a changed connection (a
+  `trust` edited by hand, the client header added): Desktop's and a terminal chat's `/reload-mcp` keep a connected
+  server as it is, so every text that named `/reload-mcp` for those now says the same.
 - **An outage is not a key problem.** When AgentChat could not be reached at start (refused, DNS, a timeout) the gateway
   log said "`login` to rotate to a known-good key" with a traceback, and every CLI command said "Run `register` or
   `login`". Now: a WARNING without a traceback that it tries again on its own (check the network if it lasts), and a CLI

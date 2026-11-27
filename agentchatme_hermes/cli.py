@@ -982,8 +982,8 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         else:
             set_headers = (
                 "set this header under its `headers:` (replace any existing X-AgentChat-Client "
-                "line; a key may appear only once, in any casing), then restart the gateway or "
-                "/reload-mcp:\n" + client_header_lines("      ")
+                "line; a key may appear only once, in any casing), then restart the gateway (or /reload-mcp "
+                "in a messaging chat it serves):\n" + client_header_lines("      ")
             )
             if entry_state == "ours":
                 ok(

@@ -172,7 +172,7 @@ class TestMcpStep:
         monkeypatch.setattr(placement, "install_entry", _placed("upgraded"))
         detail = placement.place_mcp("https://api.example.test").detail
         assert "X-AgentChat-Client: hermes" in detail
-        assert "gateway restart" in detail and "/reload-mcp" in detail
+        assert "gateway restart" in detail and "/reload-mcp in a messaging chat the gateway serves" in detail
 
     def test_the_decision_reaches_the_writer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         seen: list[Any] = []
@@ -196,7 +196,7 @@ class TestMcpStep:
     def test_an_allowed_entry_says_how_to_apply_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(placement, "install_entry", _placed("allowed", "full", header_added=True))
         detail = placement.place_mcp("https://api.example.test", decision="yes").detail
-        assert "trust: full" in detail and "/reload-mcp" in detail and "hermes gateway restart" in detail
+        assert "trust: full" in detail and "/reload-mcp in a messaging chat it serves" in detail and "hermes gateway restart" in detail
         assert "X-AgentChat-Client: hermes" in detail
 
     def test_not_allowed_yet_names_the_slash_command(self, monkeypatch: pytest.MonkeyPatch) -> None:

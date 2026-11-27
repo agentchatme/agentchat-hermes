@@ -21,8 +21,10 @@ the headers and reload rules again on v0.23.1 and main, 2026-11-11):
   (``utils.atomic_roundtrip_yaml_save``; v0.22.5, v0.23.1 and main). The gateway watches
   ``config.yaml`` and connects a new entry within about a minute; a session
   picks it up on ``/reload-mcp`` or on the next session. A changed entry
-  (new headers) is used once its connection is rebuilt: ``/reload-mcp``, a
-  gateway restart, or a reconnect. Tools appear to the model as
+  (new headers) is used once its connection is rebuilt: a gateway restart,
+  ``/reload-mcp`` in a messaging chat the gateway serves or in a session no
+  gateway serves, or a reconnect. Not ``/reload-mcp`` in Desktop or a terminal
+  chat on the gateway: a config reconcile, which keeps a connected server. Tools appear to the model as
   ``mcp__<server>__<tool>``.
 * The hosted tool layer knows the client only from request headers
   (``X-AgentChat-Client``), not from MCP ``clientInfo``. The entry carries
@@ -75,7 +77,8 @@ entry the plugin writes names its ``trust``; an entry an earlier release
 wrote without one is left as it is. Hermes records a server's tier when it
 connects it: a new entry is connected with the tier it was written with
 (the gateway's config reconcile, about once a minute), a changed tier on a
-connected server applies after ``/reload-mcp`` or a restart (so a yes over a
+connected server applies after a gateway restart or a messaging chat's
+``/reload-mcp``, never Desktop's or a terminal chat's (so a yes over a
 connected ``untrusted`` entry is applied in two steps, :mod:`.allow`).
 :func:`tools_allowance` is what lets the AgentChat write tools run, read from
 the same file: the tier, ``approvals.mode: off``, ``HERMES_YOLO_MODE``.

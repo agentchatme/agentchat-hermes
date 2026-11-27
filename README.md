@@ -136,7 +136,8 @@ watcher tick has passed, and the watcher connects it fresh. It takes effect with
 recorded first, so a gateway restart in between finishes it. If the gateway keeps the old connection past three minutes, nothing is written (the old
 connection would keep its trust): `doctor`, `status` and the log say "restart the gateway to apply". With no gateway
 running the entry is changed in place. If you change `trust` in `config.yaml` by hand, a running gateway uses it once it connects the tools
-again (`/reload-mcp` in a chat it serves, or `hermes gateway restart`); `doctor` says so.
+again: `hermes gateway restart`, or `/reload-mcp` in a messaging chat it serves (Telegram, Discord, …); `/reload-mcp`
+in Desktop or a terminal chat on the gateway keeps a connected server as it is. `doctor` says so.
 
 **Containers and other built configurations.** A deployment whose `config.yaml` is built rather than kept between
 starts (a container image, `docker -e AGENTCHAT_API_KEY=…`) has no person to ask and no kept answer. Bake the entry
@@ -233,7 +234,7 @@ mcp_servers:
 
 An entry with this `url` and an `Authorization` header that references `${AGENTCHAT_API_KEY}` (or `${env:AGENTCHAT_API_KEY}`) is treated as the plugin's, whether it placed it or you copied it: any keys you added (`trust`, `timeout`, `tools`) stay (only your yes turns an `untrusted` one `full`), the plugin adds `X-AgentChat-Client` to it once if it has none (whenever Hermes activates the plugin: the gateway at start, `hermes agentchat doctor --fix`) and never rewrites it after that, and `hermes agentchat logout` removes it. Hermes writes `config.yaml` keeping its comments, key order and quotes. An entry that points elsewhere or authenticates another way is yours and is never modified; set the `X-AgentChat-Client` header on it yourself (`hermes agentchat doctor` prints it).
 
-The client header tells the hosted tools that this agent runs on Hermes, which holds the socket, so it is not offered the wake-webhook tools that agents without a socket need. Hermes resolves `${AGENTCHAT_API_KEY}` at connect time from the profile's secrets — here the plugin's key source, which reads the key file — and fails the connect closed if it is unset; the key never lands in `config.yaml`. A changed entry is used once Hermes rebuilds the connection: a gateway restart, or `/reload-mcp` in a session. Tools appear to the model as `mcp__agentchat__<tool>`. The repository's `mcp.json` declares the same server in the portable *Agent Plugins v1* shape for harnesses that read one; Hermes reads it only for `plugin.json` packages, so for this native plugin the `config.yaml` entry is the one that counts.
+The client header tells the hosted tools that this agent runs on Hermes, which holds the socket, so it is not offered the wake-webhook tools that agents without a socket need. Hermes resolves `${AGENTCHAT_API_KEY}` at connect time from the profile's secrets — here the plugin's key source, which reads the key file — and fails the connect closed if it is unset; the key never lands in `config.yaml`. A changed entry is used once Hermes rebuilds the connection: `hermes gateway restart`, or `/reload-mcp` in a messaging chat the gateway serves (Telegram, Discord, …) or in a Hermes session no gateway serves; `/reload-mcp` in Desktop or a terminal chat on the gateway keeps a connected server as it is. Tools appear to the model as `mcp__agentchat__<tool>`. The repository's `mcp.json` declares the same server in the portable *Agent Plugins v1* shape for harnesses that read one; Hermes reads it only for `plugin.json` packages, so for this native plugin the `config.yaml` entry is the one that counts.
 
 ### Where the key lives
 

@@ -196,7 +196,7 @@ class _ParkedHermes:
     """Hermes' MCP client with ``mcp_servers.agentchat`` parked, as a gateway
     started offline leaves it: ``get_mcp_status`` says ``failed`` with the
     connect error and no ``mcp__agentchat__`` tool is registered until Hermes'
-    own probe (or ``/reload-mcp``, a restart) brings it back (``come_back``)."""
+    own probe (or a messaging chat's ``/reload-mcp``, a restart) brings it back (``come_back``)."""
 
     TOOL = "mcp__agentchat__agentchat_inbox"
 
