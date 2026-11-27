@@ -19,7 +19,7 @@ from fake_keys import api_key
 from key_files import save_key
 from sdk_wire import Wire, answer, api_error, connect_error, serve
 
-from agentchatme_hermes import allow, cli, signup
+from agentchatme_hermes import allow, cli, credentials, signup
 from agentchatme_hermes.cli import _EXIT_API_ERR, _EXIT_ARG_ERR, _EXIT_OK, _EXIT_USER_CANCEL
 
 _KEY = api_key("cli_0000000000000000")
@@ -638,3 +638,100 @@ class TestToolsQuestion:
         run = _Cli(monkeypatch, [])
         assert cli._dispatch_login(_ns(api_key=_KEY)) == _EXIT_API_ERR
         assert run.events == []
+
+
+# ─── whether the key just saved needs a restart (lab R3, L1-F02 / L1-F04) ───
+
+
+class TestKeyInUse:
+    """A profile's first key needs no restart (a running gateway takes it up
+    by itself); a key that replaces another does, and in an agent's own
+    terminal that restart is the person's, never the agent's."""
+
+    def _register(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        serve(monkeypatch, {sw.REGISTER: sw.code_sent(), sw.REGISTER_VERIFY: sw.registered("alice", _KEY)})
+        _Cli(monkeypatch, ["123456"])
+        assert cli._dispatch_register(_ns(email="a@b.co", handle="alice", display_name=None)) == _EXIT_OK
+
+    def test_a_first_key_needs_no_restart(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        self._register(monkeypatch)
+        out = capsys.readouterr().out
+        assert credentials.NO_RESTART_LINE in out and "hermes gateway restart" not in out
+
+    def test_in_an_agents_terminal_a_first_key_names_no_restart_at_all(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("HERMES_SESSION_ID", "20261127_002100_r3c")
+        self._register(monkeypatch)
+        out = capsys.readouterr().out
+        assert credentials.NO_RESTART_LINE in out and "restart" not in out.replace("no restart", "")
+
+    def test_a_replaced_key_needs_the_restart_said_to_the_person(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        save_key(api_key("earlier_00000000000000"))
+        self._register(monkeypatch)
+        out = capsys.readouterr().out
+        assert credentials.RESTART_HINT in out and credentials.NO_RESTART_LINE not in out
+
+    def test_in_an_agents_terminal_the_restart_is_the_persons(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("HERMES_SESSION_ID", "20261127_002100_r3c")
+        save_key(api_key("earlier_00000000000000"))
+        self._register(monkeypatch)
+        out = capsys.readouterr().out
+        assert credentials.RESTART_HINT_AGENT in out and "Restart the gateway" not in out
+        assert "`hermes gateway restart`" not in out
+
+    @pytest.mark.parametrize(("held", "said"), [("same", "none"), ("other", "restart")])
+    def test_login(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], held: str, said: str) -> None:
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        save_key(_KEY if held == "same" else api_key("earlier_00000000000000"))
+        serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice", "status": "active"})})
+        _Cli(monkeypatch, [])
+        assert cli._dispatch_login(_ns(api_key=_KEY)) == _EXIT_OK
+        out = capsys.readouterr().out
+        assert (credentials.RESTART_HINT if said == "restart" else credentials.NO_RESTART_LINE) in out
+
+    def test_a_yes_the_gateway_takes_up_only_at_its_restart_is_not_called_allowed(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from agentchatme_hermes.placement import PlacementStep
+
+        serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice", "status": "active"})})
+        run = _Cli(monkeypatch, [])
+        monkeypatch.setattr(
+            cli,
+            "_install_placement",
+            lambda handle, **_kw: run.placed.append(handle) or [PlacementStep("mcp", "warned", "not in effect yet", "restart")],
+        )
+        assert cli._dispatch_login(_ns(api_key=_KEY)) == _EXIT_OK
+        assert allow.ALLOWED_LINE not in capsys.readouterr().out
+
+
+class TestKeyInUseLine:
+    @pytest.mark.parametrize(
+        ("before", "terminal", "line"),
+        [
+            (None, False, "NO_RESTART_LINE"),
+            (None, True, "NO_RESTART_LINE"),
+            ("k", False, "NO_RESTART_LINE"),
+            ("other", False, "RESTART_HINT"),
+            ("other", True, "RESTART_HINT_AGENT"),
+            ("", False, "RESTART_HINT"),  # a refused copy whose key is not known
+        ],
+    )
+    def test_the_line(self, monkeypatch: pytest.MonkeyPatch, before: str | None, terminal: bool, line: str) -> None:
+        if terminal:
+            monkeypatch.setenv("HERMES_SESSION_ID", "s")
+        else:
+            monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        assert credentials.key_in_use_line(before, "k") == getattr(credentials, line)
+
+    def test_what_the_profile_held(self) -> None:
+        assert credentials.key_held() is None
+        save_key(_KEY)
+        assert credentials.key_held() == _KEY

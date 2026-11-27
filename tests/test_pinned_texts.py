@@ -490,6 +490,26 @@ class TestGateway:
         _register._reconcile_soul_anchor(_runtime(home))
         assert soul.read_bytes() == before
 
+    def test_the_august_2026_block_is_brought_to_this_releases_line_without_a_warning(
+        self, home: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Lab R3 (L2-F01): a profile updated from the August 2026 build was warned
+        "edited by hand" at every gateway start and kept that build's text for good."""
+        from test_soul_anchor import AUGUST_BLOCK_ALICE
+
+        soul = home / "SOUL.md"
+        soul.write_text("# Persona\n\n" + AUGUST_BLOCK_ALICE.replace("@alice", "@ops") + "\n", encoding="utf-8")
+        with caplog.at_level(logging.INFO, logger="agentchatme_hermes"):
+            _register._reconcile_soul_anchor(_runtime(home))
+        text = soul.read_text(encoding="utf-8")
+        assert text.startswith("# Persona\n\n<!-- agentchat:start -->\n<!-- agentchat:handle ops -->\n")
+        assert _release_line("ops") in text and "## On AgentChat" not in text
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        assert "the block the August 2026 build wrote is replaced" in caplog.text
+        caplog.clear()
+        _register._reconcile_soul_anchor(_runtime(home))
+        assert soul.read_text(encoding="utf-8") == text and "August" not in caplog.text, "once"
+
     def test_a_broken_snapshot_places_nothing_and_says_so(
         self, home: Path, broken_snapshot: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -547,6 +567,16 @@ class TestDoctor:
         assert "this release's manual and SOUL.md identity line" in said
         assert "hermes config set plugins.entries.agentchat.settings.live_texts true" in said
 
+    def test_in_a_named_profile_the_command_names_the_profile(self, tmp_path: Path) -> None:
+        """Lab R3 (L1-F05): without ``-p`` the command sets the default profile's setting."""
+        named = tmp_path / ".hermes" / "profiles" / "t5tmp"
+        named.mkdir(parents=True)
+        (said,) = _Lines().texts(named).of("ok")
+        assert "`hermes -p t5tmp config set plugins.entries.agentchat.settings.live_texts true`" in said
+        record_mode(named, texts.read_mode(_Ctx({"live_texts": "yes"})))
+        (warned,) = _Lines().texts(named).of("warn")
+        assert "`hermes -p t5tmp config set plugins.entries.agentchat.settings.live_texts true`" in warned
+
     def test_on_says_kept_current(self, home: Path) -> None:
         record_mode(home, TextsMode(True, "live_texts on"))
         assert _Lines().texts(home).of("ok") == [
@@ -589,6 +619,7 @@ class TestDoctor:
         else:
             (said,) = lines.of("warn")
             assert warned in said and "hermes gateway restart" in said
+            assert lines.of("ok") == [], "one line for one cause (lab R3, L1-F06)"
 
     def test_the_manual_is_this_releases_copy(self, home: Path) -> None:
         register_skill(_Ctx(), hermes_home=home)

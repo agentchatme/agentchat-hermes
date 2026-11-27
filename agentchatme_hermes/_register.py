@@ -90,6 +90,11 @@ logger = logging.getLogger(__name__)
 ACTIVATION_RETRY_S = 30.0
 ACTIVATION_RETRY_MAX_S = 300.0
 
+# Why the runtime last failed to start, per profile home (:func:`_start_failure`):
+# ``register()`` says the matching remedy, never login for a network outage.
+StartFailure = Literal["unreachable", "key_refused", "other"]
+_last_start_failure: dict[str, StartFailure] = {}
+
 
 def register(ctx: Any) -> None:
     """Hermes plugin entry point. See module docstring."""
@@ -147,6 +152,19 @@ def register(ctx: Any) -> None:
     except Exception:
         logger.error("agentchat plugin: /agentchat could not be registered", exc_info=True)
 
+    # plugins.isolation: host runs this code outside the gateway: nothing can
+    # hold the socket, so the agent is never woken. Said once per process
+    # (Hermes calls register() once per profile and process); /agentchat says it too.
+    try:
+        from .allow import host_isolation_note, plugin_host_isolation
+
+        if scope.run(plugin_host_isolation):
+            logger.warning(
+                "agentchat plugin: profile=%s — %s", profile_label(hermes_home), host_isolation_note(hermes_home)
+            )
+    except Exception:
+        logger.debug("agentchat plugin: plugins.isolation not read", exc_info=True)
+
     gateway_mode = _is_gateway_context(ctx)
     problem = kit_problem()
     if problem is not None:
@@ -183,10 +201,11 @@ def register(ctx: Any) -> None:
     if outcome == "active":
         return
 
+    failure = _last_start_failure.get(hermes_home_key(hermes_home)) if outcome == "failed" else None
     reason = {
         "unconfigured": "no API key configured",
         "refused": "the key this profile holds is refused (the error above says why)",
-    }.get(outcome, "runtime did not start")
+    }.get(outcome, "AgentChat could not be reached" if failure == "unreachable" else "runtime did not start")
     if gateway_mode:
         # Long-lived process: keep trying. A gateway that boots before the
         # wizard has run, or before the network is up, activates by
@@ -202,7 +221,7 @@ def register(ctx: Any) -> None:
             hermes_home,
             watcher.retry_schedule(),
         )
-    else:
+    elif outcome == "unconfigured":
         from .config import cli_prefix
 
         cmd = cli_prefix(hermes_home)
@@ -215,6 +234,22 @@ def register(ctx: Any) -> None:
             hermes_home,
             cmd,
             cmd,
+        )
+    elif failure == "unreachable":
+        logger.info(
+            "agentchat plugin: %s for profile=%s (%s) — CLI-only in this process. Nothing to change "
+            "here: the gateway, which receives, tries again on its own; check this machine's network "
+            "if it lasts.",
+            reason,
+            profile,
+            hermes_home,
+        )
+    else:
+        logger.info(
+            "agentchat plugin: %s for profile=%s (%s) — CLI-only in this process; the line above says why.",
+            reason,
+            profile,
+            hermes_home,
         )
 
 
@@ -600,29 +635,73 @@ def _try_start_runtime(
     and restarts. None of them should kill the whole plugin load; we want
     the CLI subcommand to remain reachable so the user can diagnose.
     """
+    from pathlib import Path as _Path
+
+    home = getattr(config, "hermes_home", None)
     try:
         from .runtime import get_runtime
 
         runtime = get_runtime(config, gateway_mode=gateway_mode, host_llm=host_llm, scope=scope)
         runtime.start()
     except Exception as exc:
-        from pathlib import Path as _Path
-
         from .config import cli_prefix
 
-        home = getattr(config, "hermes_home", None)
         cmd = cli_prefix(_Path(home)) if home else "hermes agentchat"
-        logger.error(
-            "agentchat plugin: runtime startup failed — there is no live "
-            "inbound until it starts. Reason: %s. See the Hermes errors log for the full traceback. "
-            "Try `%s doctor` to diagnose, or `%s login` to rotate to a known-good key.",
-            exc,
-            cmd,
-            cmd,
-            exc_info=True,
-        )
+        label = profile_label(_Path(home)) if home else "?"
+        failure = _start_failure(exc)
+        if home:
+            _last_start_failure[hermes_home_key(_Path(home))] = failure
+        if failure == "unreachable":
+            # Not the key: no traceback, no login. The watcher retries with backoff.
+            logger.warning(
+                "agentchat plugin: AgentChat could not be reached for profile=%s (%s) — nothing is "
+                "received until it answers. %s; check this machine's network (DNS, a proxy, a "
+                "firewall) if it lasts.",
+                label,
+                exc,
+                "The gateway tries again on its own" if gateway_mode else "The gateway, which receives, tries again on its own",
+            )
+        elif failure == "key_refused":
+            logger.error(
+                "agentchat plugin: AgentChat refused this profile's key (profile=%s: %s) — nothing is "
+                "received until it holds a key AgentChat accepts: `%s login` with a current key, or "
+                "`%s recover` to issue a new one.",
+                label,
+                exc,
+                cmd,
+                cmd,
+            )
+        else:
+            logger.error(
+                "agentchat plugin: runtime startup failed — there is no live "
+                "inbound until it starts. Reason: %s. See the Hermes errors log for the full traceback. "
+                "Try `%s doctor` to diagnose.",
+                exc,
+                cmd,
+                exc_info=True,
+            )
         return None
+    if home:
+        _last_start_failure.pop(hermes_home_key(_Path(home)), None)
     return runtime
+
+
+def _start_failure(exc: BaseException) -> StartFailure:
+    """Why the runtime did not start: ``unreachable`` — no answer from
+    AgentChat (the SDK's transport error: refused, DNS, a timeout, a reset);
+    ``key_refused`` — AgentChat answered 401 for the key; ``other`` — anything
+    else (a server error, a local fault)."""
+    import socket
+
+    unreachable: tuple[type[BaseException], ...] = (ConnectionError, TimeoutError, socket.gaierror)
+    try:
+        from agentchatme import ConnectionError as SDKConnectionError
+        from agentchatme import UnauthorizedError
+    except ImportError:
+        return "unreachable" if isinstance(exc, unreachable) else "other"
+    if isinstance(exc, UnauthorizedError):
+        return "key_refused"
+    return "unreachable" if isinstance(exc, (*unreachable, SDKConnectionError)) else "other"
 
 
 def _reconcile_soul_anchor_when_texts_arrive(runtime: Any) -> None:

@@ -1598,7 +1598,8 @@ def test_hermes_mcp_status_surface_and_the_parked_remedy() -> None:
     Its remedy for a parked server is true of this Hermes: a parked server
     probes itself after 300 s — again every 300 s on v0.23.2, backing off to
     an hour since v0.23.3 — and ``/reload-mcp`` is a command a chat on the
-    gateway can send."""
+    gateway can send (which chats it reconnects a parked server from:
+    :func:`test_reload_mcp_reconnects_a_parked_server_only_from_a_messaging_chat`)."""
     from agentchatme_hermes import hosted_tools
 
     discovery = _import("tools.mcp_tool_discovery")
@@ -1606,7 +1607,8 @@ def test_hermes_mcp_status_surface_and_the_parked_remedy() -> None:
     mcp_tool = _import("tools.mcp_tool")
     assert mcp_tool._PARKED_RETRY_INTERVAL == 300
     remedy = hosted_tools.PARKED_REMEDY
-    assert "after 5 minutes" in remedy and "/reload-mcp" in remedy
+    assert "after 5 minutes" in remedy and "`hermes gateway restart`" in remedy
+    assert "/reload-mcp in a messaging chat" in remedy and "not in Desktop or a terminal chat" in remedy
     if hasattr(mcp_tool, "_PARKED_PROBE_BACKOFF_MAX"):
         assert mcp_tool._PARKED_PROBE_BACKOFF_MAX == 3600
         assert "up to an hour" in remedy
@@ -1736,6 +1738,93 @@ def test_a_parked_hosted_tools_server_is_held_and_named(_hermes_home: Path) -> N
     finally:
         lifecycle.shutdown_mcp_servers()
 
+
+
+def _park(home: Path, port: int) -> Any:
+    """``mcp_servers.agentchat`` on ``port``, where nothing listens: Hermes'
+    discovery tries three times and parks it. Its state."""
+    from agentchatme_hermes import hosted_tools
+
+    (home / "config.yaml").write_text(
+        f"mcp_servers:\n  agentchat:\n    url: http://127.0.0.1:{port}/mcp\n    connect_timeout: 30\n",
+        encoding="utf-8",
+    )
+    _import("tools.mcp_tool_discovery").discover_mcp_tools()
+    state = hosted_tools.hosted_server_state()
+    assert state is not None and state.parked, f"Hermes parked the server: {state}"
+    return state
+
+
+def test_reload_mcp_reconnects_a_parked_server_only_from_a_messaging_chat(_hermes_home: Path) -> None:
+    """Lab R3 (L1-F07): ``PARKED_REMEDY`` names ``/reload-mcp`` only for a
+    messaging chat. Both of the gateway's reload paths, run for real against a
+    parked server that answers again (the network is back):
+
+    * a messaging chat (``/reload-mcp`` in Telegram, Discord, …) runs
+      ``GatewayTurnMixin._execute_mcp_reload``: the profile's servers torn down
+      and discovered again — the parked server is connected;
+    * Desktop and a terminal chat on the gateway send the ``reload_mcp``
+      request (``gateway/session_ancillary.py``), a config reconcile
+      (``reconcile_mcp_servers_with_config``): the parked server stays parked,
+      so Hermes refuses the reload (``mcp_servers_unavailable``).
+
+    When either changes, ``PARKED_REMEDY`` and the README / RUNBOOK change."""
+    pytest.importorskip("mcp.client.streamable_http")
+    import asyncio
+    from types import SimpleNamespace
+
+    from agentchatme_hermes import hosted_tools
+
+    discovery = _import("tools.mcp_tool_discovery")
+    lifecycle = _import("tools.mcp_tool_lifecycle")
+    ancillary = _import("gateway.session_ancillary")
+    source = inspect.getsource(ancillary.reload_mcp)
+    assert "reconcile_mcp_servers_with_config()" in source and "mcp_servers_unavailable" in source
+    assert "discover_mcp_tools" not in source and "shutdown_mcp_servers" not in source
+
+    # Desktop / a terminal chat: the reconcile, with the server answering again.
+    port = _free_port()
+    try:
+        _park(_hermes_home, port)
+        with _McpStub(port):
+            result = discovery.reconcile_mcp_servers_with_config()
+            assert not result.get("added") and not result.get("removed"), result
+            time.sleep(1.0)
+            state = hosted_tools.hosted_server_state()
+            assert state is not None and state.parked, f"the reconcile left it parked: {state}"
+            assert "agentchat" in discovery.mcp_servers_not_connected(), "so the request is refused"
+            assert hosted_tools.hosted_tool_names() == []
+    finally:
+        lifecycle.shutdown_mcp_servers()
+
+    # A messaging chat: the gateway's own reload, the server answering again.
+    run_turn = _import("gateway.run_turn")
+
+    async def in_executor(fn: Any) -> Any:
+        return await asyncio.to_thread(fn)
+
+    class _Sessions:
+        async def get_or_create_session(self, _source: Any) -> Any:
+            raise RuntimeError("no session store here")  # the transcript note is best effort
+
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=False),
+        _run_in_executor_with_context=in_executor,
+        _mcp_reload_refresh_cached_agents=lambda *_a: None,
+        async_session_store=_Sessions(),
+    )
+    port = _free_port()
+    try:
+        _park(_hermes_home, port)
+        with _McpStub(port):
+            said = asyncio.run(
+                run_turn.GatewayTurnMixin._execute_mcp_reload(runner, SimpleNamespace(source=SimpleNamespace(profile=None)))
+            )
+            state = hosted_tools.hosted_server_state()
+            assert state is not None and state.status == "connected", f"{state}: {said}"
+            assert hosted_tools.hosted_tool_names() == ["mcp__agentchat__agentchat_inbox"]
+    finally:
+        lifecycle.shutdown_mcp_servers()
 
 
 # ─── the one switch on a real connection ───────────────────────────────────
@@ -1994,3 +2083,48 @@ def test_each_profile_waits_only_on_its_own_server(
             assert runtime(served) == "gone"
     finally:
         lifecycle.shutdown_mcp_servers()
+
+
+# ─── plugins.isolation: host (lab R3, L2-F05 / L2-F06) ──────────────────────
+
+
+@pytest.mark.parametrize(
+    ("written", "host"),
+    [(None, False), ("host", True), ("HOST", True), (" host ", True), ("in_process", False), ("in-process", False), ("sandbox", False)],
+)
+def test_plugins_isolation_is_read_as_hermes_reads_it(
+    _hermes_home: Path, monkeypatch: pytest.MonkeyPatch, written: str | None, host: bool
+) -> None:
+    """``allow.plugin_host_isolation`` reads ``plugins.isolation`` from the
+    profile's config.yaml the way Hermes' loader decides (``isolation_mode``),
+    and has to read it itself: inside the plugin host Hermes answers
+    ``in_process`` (its ``HERMES_PLUGIN_HOST_PROCESS`` marker). There Hermes
+    skips ``register_cli_command``, so no ``hermes agentchat`` command exists."""
+    from agentchatme_hermes import allow
+
+    isolation = _import("hermes_cli.plugin_isolation")
+    monkeypatch.delenv(isolation.HOST_PROCESS_ENV, raising=False)
+    config = {"plugins": {"isolation": written}} if written is not None else {}
+    (_hermes_home / "config.yaml").write_text(
+        "plugins:\n  isolation: '" + written + "'\n" if written is not None else "model: {}\n", encoding="utf-8"
+    )
+    assert (isolation.isolation_mode(config) == isolation.ISOLATION_HOST) is host
+    assert allow.plugin_host_isolation() is host
+    monkeypatch.setenv(isolation.HOST_PROCESS_ENV, "1")
+    assert isolation.isolation_mode(config) == isolation.ISOLATION_IN_PROCESS, "why the plugin reads the file"
+    assert allow.plugin_host_isolation() is host
+    assert "register_cli_command" in isolation.HOST_SKIPPED_CTX_METHODS
+
+
+def test_hermes_says_whether_a_gateway_serves_the_profile(_hermes_home: Path) -> None:
+    """``allow.hermes_gateway_pid`` asks Hermes' one liveness answer for a
+    profile (``gateway.status.resolve_gateway_liveness``: pid file and lock,
+    runtime status, a multiplexed gateway serving it) — no plugin code needs
+    to run in that gateway, as under ``plugins.isolation: host``."""
+    from agentchatme_hermes import allow
+
+    status = _import("gateway.status")
+    assert {"profile_dir", "use_cache"} <= _params(status.resolve_gateway_liveness)
+    liveness = status.resolve_gateway_liveness(profile_dir=_hermes_home, use_cache=False)
+    assert liveness.running is False and liveness.pid is None
+    assert allow.hermes_gateway_pid(_hermes_home) is None

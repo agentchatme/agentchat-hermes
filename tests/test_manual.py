@@ -819,6 +819,21 @@ class TestDoctor:
         lines.run(home, BUNDLE_ANNOUNCED, healthy)
         assert any(line.startswith("the gateway keeps the manual current") for line in lines.of("ok"))
 
+    def test_live_texts_on_before_the_gateway_restarts_is_one_line(self, home: Path) -> None:
+        """Lab R3 (L1-F06): live_texts turned on, the gateway still running with
+        it off — one cause, one line (the restart), not four: no "stale" with
+        its doctor --fix, no "Hermes serves …" about this process, no "the
+        gateway serves the bundled copy"."""
+        register_skill(_Ctx(), hermes_home=home)
+        worker = {"manual": {"registered": {"path": str(BUNDLED_MANUAL_PATH), "pinned": True, "kept_current": False}}}
+        lines = _Lines()
+        cli._doctor_texts_checks(home, served=None, worker=worker, ok=lines.ok, warn=lines.warn, fail=lines.fail)
+        lines.run(home, _announce(_body("9.9.9"), "9.9.9"), worker)
+        (warning,) = lines.of("warn")
+        assert warning.startswith("texts: live_texts is on, but the running gateway started with it off")
+        assert "hermes gateway restart" in warning
+        assert lines.of("ok") == [] and lines.of("fail") == []
+
     def test_unsafe(self, home: Path) -> None:
         register_skill(_Ctx(), hermes_home=home)
         manual_path(home).write_bytes(_body("9.9.9", "now: " + _shell("date")))

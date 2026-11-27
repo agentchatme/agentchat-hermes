@@ -278,7 +278,8 @@ class TestParked:
         (line,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
         assert "Cause: Hermes parked mcp_servers.agentchat after its connection failed (All connection attempts failed" in line
         assert "after 5 minutes, then at longer intervals up to an hour" in line
-        assert "/reload-mcp in a chat this gateway serves, or run `hermes gateway restart`" in line
+        assert "run `hermes gateway restart`, or send /reload-mcp in a messaging chat this gateway serves" in line
+        assert "not in Desktop or a terminal chat" in line
         assert "mcp SDK" not in line, "not the wrong cause"
 
     def test_the_plugin_has_no_reconnect_request(self) -> None:
@@ -321,7 +322,8 @@ class TestDoctorLines:
         assert "Hermes parked mcp_servers.agentchat after its connection failed (All connection attempts failed)" in line
         assert "the agent is woken but cannot answer" in line
         assert "Hermes probes it again on its own after 5 minutes" in line
-        assert line.endswith("send /reload-mcp in a chat this gateway serves, or run `hermes gateway restart`")
+        assert line.endswith(hosted_tools.PARKED_REMEDY[1:])
+        assert "run `hermes gateway restart`, or send /reload-mcp in a messaging chat" in line
 
     def test_a_record_from_an_older_release_still_reads(self) -> None:
         level, line = self._line({"status": "failed", "error": None, "reconnect": {"requests": 2, "asked_ago_s": 4.0}}) or ("", "")
@@ -350,9 +352,9 @@ class TestDoctorLines:
                  "at": "2026-11-22T14:52:08.624Z"}
         level, line = _describe_worker({"state": "idle", "loop": {"recent_cycles": [cycle]}}, now=1000.0) or ("", "")
         assert level == "warn" and "tools_unavailable" in line
-        assert "/reload-mcp in a chat this gateway serves, or `hermes gateway restart`, reconnects them" in line
+        assert "`hermes gateway restart`, or /reload-mcp in a messaging chat this gateway serves (not Desktop or a terminal chat), reconnects them" in line
         level, line = _describe_worker({"state": "idle", "loop": {"recent_cycles": [cycle] * 3}}, now=1000.0) or ("", "")
-        assert level == "fail" and "/reload-mcp in a chat this gateway serves" in line
+        assert level == "fail" and "/reload-mcp in a messaging chat this gateway serves" in line
 
     @pytest.mark.parametrize("state", ["not_allowed_yet", "not_allowed", "applying", "disabled"])
     def test_a_run_paused_by_the_switch_is_said_not_alarmed_on(self, state: str) -> None:

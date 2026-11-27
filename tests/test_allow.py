@@ -949,3 +949,159 @@ class TestSlashCommand:
         handler = chat.commands["agentchat"][0]
         assert list(inspect.signature(handler).parameters) == ["raw_args"]
         assert not inspect.iscoroutinefunction(handler)
+
+
+# ─── plugins.isolation: host, and a yes a running gateway takes up only at its restart (lab R3) ───
+
+
+class TestHostIsolation:
+    """L2-F05 / L2-F06: under plugins.isolation: host the plugin runs beside
+    the gateway, never in it: nothing wakes the agent, the `hermes agentchat`
+    commands do not exist, and a yes over the gateway's untrusted connection
+    is in effect only once that gateway restarts."""
+
+    @pytest.mark.parametrize(
+        ("config", "host"),
+        [
+            ({"plugins": {"isolation": "host"}}, True),
+            ({"plugins": {"isolation": "Host "}}, True),
+            ({"plugins": {"isolation": "in_process"}}, False),
+            ({"plugins": {"isolation": "in-process"}}, False),
+            ({"plugins": {}}, False),
+            ({}, False),
+            ({"plugins": "host"}, False),
+        ],
+    )
+    def test_the_setting_is_read_from_the_profiles_config(
+        self, monkeypatch: pytest.MonkeyPatch, config: dict[str, Any], host: bool
+    ) -> None:
+        monkeypatch.setattr(mcp_registration, "_hermes_raw_config", lambda: config)
+        assert allow.plugin_host_isolation() is host
+
+    def test_an_unreadable_config_is_not_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def unreadable() -> Any:
+            raise mcp_registration.McpRegistrationError("no hermes")
+
+        monkeypatch.setattr(mcp_registration, "_hermes_raw_config", unreadable)
+        assert allow.plugin_host_isolation() is False
+
+    def test_the_note_names_only_hermes_own_commands(self, tmp_path: Path) -> None:
+        note = allow.host_isolation_note(tmp_path / ".hermes")
+        assert "cannot wake this agent" in note and "plugins.isolation is host" in note
+        assert "`hermes config set plugins.isolation in_process`" in note and "`hermes gateway restart`" in note
+        assert "hermes agentchat" not in note
+        named = allow.host_isolation_note(tmp_path / ".hermes" / "profiles" / "growth")
+        assert "`hermes -p growth config set plugins.isolation in_process`" in named
+
+    def test_register_says_it_once_at_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from agentchatme_hermes import _register
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(allow, "plugin_host_isolation", lambda: True)
+        monkeypatch.setattr(_register, "kit_problem", lambda: "no kit in this test")
+        ctx = types.SimpleNamespace(register_command=lambda *a, **k: None, get_config=lambda key, default=None: default)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes"):
+            _register.register(ctx)
+        said = [r for r in caplog.records if "cannot wake this agent" in r.getMessage()]
+        assert len(said) == 1 and said[0].levelno == logging.WARNING
+        assert "hermes agentchat" not in said[0].getMessage()
+
+    def test_register_is_quiet_in_process(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from agentchatme_hermes import _register
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(allow, "plugin_host_isolation", lambda: False)
+        monkeypatch.setattr(_register, "kit_problem", lambda: "no kit in this test")
+        ctx = types.SimpleNamespace(register_command=lambda *a, **k: None, get_config=lambda key, default=None: default)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes"):
+            _register.register(ctx)
+        assert "cannot wake" not in caplog.text
+
+    def _record_yes_in_place(self, home: Path, pid: int) -> None:
+        assert allow.write_record(home, how="asked", trust="full", decision="yes", restart_pid=pid)
+
+    def test_a_yes_awaits_the_restart_of_the_gateway_that_held_the_connection(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _config_says(monkeypatch, _allowance("ours", "full", "trust"))
+        self._record_yes_in_place(tmp_path, 4242)
+        monkeypatch.setattr(allow, "hermes_gateway_pid", lambda home: 4242)
+        switch = allow.read_switch(tmp_path, api_base="https://api.agentchat.me")
+        assert (switch.state, switch.awaits_restart, switch.by_tier) == ("allowed", 4242, True)
+        text = allow.describe(switch, "alice")
+        assert text.startswith("allowed in config.yaml, not in effect yet") and allow.RESTART_TO_APPLY in text
+        assert "allowed (trust: full)" not in text
+        decided = allow.decide("alice", api_base="https://api.agentchat.me", tty=True, home=tmp_path, ask=lambda q: "yes")
+        assert decided.decision is None and decided.line != allow.ALREADY_ALLOWED_LINE and "not in effect yet" in decided.line
+
+    @pytest.mark.parametrize("now", [4343, None], ids=["restarted", "stopped"])
+    def test_once_that_gateway_is_gone_it_is_allowed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, now: int | None
+    ) -> None:
+        _config_says(monkeypatch, _allowance("ours", "full", "trust"))
+        self._record_yes_in_place(tmp_path, 4242)
+        monkeypatch.setattr(allow, "hermes_gateway_pid", lambda home: now)
+        switch = allow.read_switch(tmp_path, api_base="https://api.agentchat.me")
+        assert switch.awaits_restart is None and allow.describe(switch, "alice") == "allowed (trust: full)"
+
+    def test_no_recorded_gateway_reads_no_liveness(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        _config_says(monkeypatch, _allowance("ours", "full", "trust"))
+        allow.write_record(tmp_path, how="asked", trust="full", decision="yes")
+        monkeypatch.setattr(allow, "hermes_gateway_pid", lambda home: pytest.fail("not asked"))
+        assert allow.read_switch(tmp_path, api_base="https://api.agentchat.me").awaits_restart is None
+
+    def test_describe_without_the_cli_names_no_agentchat_command(self) -> None:
+        for switch in (allow.Switch("not_allowed_yet", _allowance("missing", None)), allow.Switch("not_allowed", _allowance())):
+            assert "hermes agentchat allow" in allow.describe(switch, "alice")
+            assert "hermes agentchat" not in allow.describe(switch, "alice", cli=False)
+            assert "/agentchat allow" in allow.describe(switch, "alice", cli=False)
+
+
+class TestSlashCommandUnderHost:
+    """``/agentchat`` is the one surface there: it says the agent is not woken."""
+
+    _wire = TestSlashCommand._wire
+    _run = TestSlashCommand._run
+
+    def test_status_says_it_is_never_woken(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        self._wire(monkeypatch, tmp_path, state="not_allowed", allowance=_allowance())
+        monkeypatch.setattr(allow, "plugin_host_isolation", lambda: True)
+        reply = self._run(tmp_path, _Chat(), args="")
+        assert "cannot wake this agent" in reply and "hermes agentchat" not in reply
+        assert "/agentchat allow in a chat with it" in reply
+
+    def test_a_yes_the_gateway_takes_up_at_its_restart_is_not_called_allowed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        placed = self._wire(monkeypatch, tmp_path, state="not_allowed", allowance=_allowance(), outcome="restart", gateway=False)
+        monkeypatch.setattr(allow, "plugin_host_isolation", lambda: True)
+        reply = self._run(tmp_path, _Chat("allow"))
+        assert placed == ["yes"]
+        assert reply.startswith("AgentChat tools for @alice: not in effect yet — trust: full is written")
+        assert allow.RESTART_TO_APPLY in reply and "cannot wake this agent" in reply
+        assert "AgentChat tools allowed" not in reply
+
+    def test_allow_again_while_it_awaits_the_restart(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        placed = self._wire(monkeypatch, tmp_path, state="allowed", allowance=_allowance("ours", "full", "trust"))
+        monkeypatch.setattr(
+            allow, "read_switch", lambda home, *, api_base: allow.Switch("allowed", _allowance("ours", "full", "trust"), None, 4242)
+        )
+        chat = _Chat("allow")
+        reply = self._run(tmp_path, chat)
+        assert chat.asked == [] and placed == [] and "not in effect yet" in reply
+
+    def test_not_set_up_names_no_agentchat_command(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        self._wire(monkeypatch, tmp_path, state="not_allowed_yet", allowance=_allowance("missing", None), key=False)
+        for name in ("AGENTCHAT_API_KEY", "AGENTCHATME_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(allow, "plugin_host_isolation", lambda: True)
+        reply = self._run(tmp_path, _Chat("allow"))
+        assert reply.startswith("AgentChat is not set up in this profile yet.") and "hermes agentchat" not in reply

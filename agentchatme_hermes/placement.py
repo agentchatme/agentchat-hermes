@@ -250,7 +250,11 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
     entry removed (Hermes' watcher drops the connected server), and the
     gateway writes it with ``trust: full`` once Hermes runs no AgentChat
     server for the profile any more (:func:`.allow.start_completion`). With no gateway running the
-    entry is changed in place (``allowed``). Never raises."""
+    entry is changed in place (``allowed``). Changed in place while Hermes says
+    a gateway serves the profile but no AgentChat runtime runs in it
+    (``plugins.isolation: host``), it is ``restart`` (warned): that gateway
+    keeps the earlier connection and its trust until it restarts, and the
+    record names its pid (:attr:`.allow.Switch.awaits_restart`). Never raises."""
     home = resolve_hermes_home()
     if decision == "yes":
         flip = _begin_two_step_yes(api_base, home)
@@ -263,6 +267,15 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
     except Exception as exc:  # Hermes' config layer raised something of its own
         return PlacementStep("mcp", "failed", f"Hermes refused the config.yaml write: {exc}")
     outcome = placed.outcome
+    # Changed in place with no AgentChat runtime in a gateway to take it up
+    # (_begin_two_step_yes did not apply), while Hermes says a gateway serves
+    # this profile: that gateway keeps the connection, and its trust, it made
+    # before (plugins.isolation: host runs no plugin code in it).
+    held_by: int | None = None
+    if outcome == "allowed":
+        from .allow import hermes_gateway_pid
+
+        held_by = hermes_gateway_pid(home)
     if outcome in ("added", "allowed"):
         from .allow import write_record
 
@@ -271,6 +284,7 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
             how="carried_over" if decision == "carried_over" else "asked",
             trust=placed.trust,
             decision=decision if decision in ("yes", "no") else None,
+            restart_pid=held_by,
         )
     if outcome == "added":
         return PlacementStep(
@@ -279,6 +293,16 @@ def place_mcp(api_base: str, *, decision: Decision | None = None) -> PlacementSt
             f"registered the hosted tools as mcp_servers.agentchat in config.yaml with trust: {placed.trust} "
             "(a running gateway connects them within about a minute; a session on /reload-mcp)",
             outcome,
+        )
+    if outcome == "allowed" and held_by is not None:
+        from .allow import AWAITS_RESTART_WORDS
+
+        named = "; this client is named too (X-AgentChat-Client: hermes)" if placed.header_added else ""
+        return PlacementStep(
+            "mcp",
+            "warned",
+            f"not in effect yet: {AWAITS_RESTART_WORDS} (gateway pid {held_by}){named}",
+            "restart",
         )
     if outcome == "allowed":
         named = " and named this client (X-AgentChat-Client: hermes)" if placed.header_added else ""

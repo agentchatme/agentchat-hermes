@@ -30,8 +30,13 @@ minutes on v0.23.2; ``tools/mcp_tool.py`` ``_PARKED_RETRY_INTERVAL`` /
 ``_PARKED_PROBE_BACKOFF_MAX``).
 Hermes has no public way for a plugin to ask for a reconnect, so this plugin
 does not: while the server is parked every wake ends ``tools_unavailable``,
-and the log line and ``doctor`` name the cause and the remedy — ``/reload-mcp``
-in a chat this gateway serves, or ``hermes gateway restart``. Once Hermes
+and the log line and ``doctor`` name the cause and the remedy — ``hermes
+gateway restart``, or ``/reload-mcp`` in a messaging chat this gateway serves
+(Telegram, Discord, Slack, …: Hermes tears the profile's servers down and
+connects them again). Not ``/reload-mcp`` in Desktop or a terminal chat on the
+gateway: there it is a config reconcile, which leaves a parked server parked
+and is refused (``mcp_servers_unavailable``; lab R3, contract-tested on
+v0.23.2 to ``main``). Once Hermes
 connects it again, the gateway's minute check
 (:meth:`.agent_invoker.AgentInvoker.check_tools`) wakes the receive loop for
 the cards that waited.
@@ -66,11 +71,13 @@ HOSTED_TOOLS_POLL_S = 0.5
 Probe = Callable[[], Optional[list[str]]]
 
 # What a parked server waits for on its own (Hermes' self-probe), and what
-# brings it back now: said in the log line and by ``doctor``.
+# brings it back now: said in the log line and by ``doctor``. /reload-mcp only
+# where Hermes' reload reconnects a parked server: a messaging chat.
 PARKED_REMEDY = (
     "Hermes probes it again on its own after 5 minutes, then at longer intervals up to an "
-    "hour (every 5 minutes on Hermes v0.23.2); to reconnect it now, send /reload-mcp in a "
-    "chat this gateway serves, or run `hermes gateway restart`"
+    "hour (every 5 minutes on Hermes v0.23.2); to reconnect it now, run `hermes gateway restart`, "
+    "or send /reload-mcp in a messaging chat this gateway serves (Telegram, Discord, Slack, …) — "
+    "not in Desktop or a terminal chat, where Hermes' /reload-mcp leaves a parked server parked"
 )
 
 
