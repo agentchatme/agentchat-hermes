@@ -498,31 +498,29 @@ def gateway_serves_profile(home: Path, *, api_base: str) -> bool:
     (:func:`serving_gateway`), or — after a logout, which keeps that gateway's
     socket open until it restarts — the gateway logout found serving it
     (:func:`gateway_still_serving` recorded it, by pid and process start time,
-    in ``<profile home>/agentchat/serving-gateway.json``; forgotten the first
-    time that gateway is seen gone). Such a gateway keeps the key it started
-    with, so a new key needs its restart. Never raises."""
+    in ``<profile home>/agentchat/serving-gateway.json``). It is compared with
+    the gateway Hermes sees serving the profile (:func:`.allow.gateway_verdict`):
+    forgotten only once that gateway is shown gone; while that cannot be told
+    it is kept, and counts as serving (a restart said when none was needed
+    costs less than a key that is silently not used). Such a gateway keeps the
+    key it started with, so a new key needs its restart. Never raises."""
     if serving_gateway(home, api_base=api_base) is not None:
         return True
-    from .allow import process_start_time, same_gateway
+    from .allow import gateway_seen, gateway_verdict
     from .key_store import store_dir
     from .state import read_json
-    from .ws_health import pid_alive
 
     path = store_dir(home) / SERVING_GATEWAY_FILENAME
     try:
         held = read_json(path)
         pid = held.get("pid") if isinstance(held, dict) else None
         start = held.get("start_time") if isinstance(held, dict) else None
-        recorded = (pid, start if isinstance(start, int) else None) if isinstance(pid, int) else None
-        if (
-            recorded is not None
-            and not isinstance(pid, bool)
-            and pid_alive(recorded[0]) is not False
-            and same_gateway(recorded, (recorded[0], process_start_time(recorded[0])))
-        ):
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            return False
+        recorded = (pid, start if isinstance(start, int) and not isinstance(start, bool) else None)
+        if gateway_verdict(recorded, gateway_seen(home)) != "gone":
             return True
-        if held is not None:
-            path.unlink(missing_ok=True)  # that gateway is gone
+        path.unlink(missing_ok=True)  # that gateway is shown gone
     except Exception:
         logger.debug("placement: the gateway logout left serving was not read", exc_info=True)
     return False

@@ -1029,14 +1029,35 @@ class TestHostIsolation:
     def _record_yes_in_place(self, home: Path, pid: int, start: int | None = 1000) -> None:
         assert allow.write_record(home, how="asked", trust="full", decision="yes", restart_gateway=(pid, start))
 
+    def _liveness(self, monkeypatch: pytest.MonkeyPatch, **reading: Any) -> None:
+        """Hermes' ``resolve_gateway_liveness`` as this process reads it
+        (``raises``: the read fails), under :func:`allow.gateway_seen`."""
+        status = types.ModuleType("gateway.status")
+
+        def resolve(*, profile_dir: Any, use_cache: bool) -> Any:
+            if reading.get("raises"):
+                raise OSError("permission denied")
+            return types.SimpleNamespace(
+                running=reading.get("running", True), pid=reading.get("pid"), probe_error=reading.get("probe_error", False)
+            )
+
+        status.resolve_gateway_liveness = resolve  # type: ignore[attr-defined]
+        status.get_process_start_time = lambda pid: reading.get("start")  # type: ignore[attr-defined]
+        status.start_time_fingerprints_match = lambda a, b: abs(int(a) - int(b)) <= 200  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
+        monkeypatch.setitem(sys.modules, "gateway.status", status)
+
+    def _switch(self, tmp_path: Path) -> allow.Switch:
+        return allow.read_switch(tmp_path, api_base="https://api.agentchat.me")
+
     def test_a_yes_awaits_the_restart_of_the_gateway_that_held_the_connection(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         _config_says(monkeypatch, _allowance("ours", "full", "trust"))
         self._record_yes_in_place(tmp_path, 4242)
-        monkeypatch.setattr(allow, "hermes_gateway", lambda home: (4242, 1000))
-        switch = allow.read_switch(tmp_path, api_base="https://api.agentchat.me")
-        assert (switch.state, switch.awaits_restart, switch.by_tier) == ("allowed", 4242, True)
+        self._liveness(monkeypatch, pid=4242, start=1000)
+        switch = self._switch(tmp_path)
+        assert (switch.state, switch.awaits_restart, switch.restart_unverified, switch.by_tier) == ("allowed", 4242, False, True)
         text = allow.describe(switch, "alice")
         assert text.startswith("allowed in config.yaml, not in effect yet") and allow.RESTART_TO_APPLY in text
         assert "allowed (trust: full)" not in text
@@ -1044,44 +1065,85 @@ class TestHostIsolation:
         assert decided.decision is None and decided.line != allow.ALREADY_ALLOWED_LINE and "not in effect yet" in decided.line
 
     @pytest.mark.parametrize(
-        "now",
-        [(4343, 5000), None, (4242, 9000), (4242, None)],
-        ids=["restarted", "stopped", "pid-reused-or-pid-1-again", "start-unreadable-now"],
+        "reading",
+        [
+            {"pid": 4343, "start": 5000},  # another pid
+            {"running": False, "probe_error": False},  # Hermes: none runs, no probe error
+            {"pid": 4242, "start": 9000},  # a reused pid, a container's PID 1 started again
+        ],
+        ids=["restarted", "stopped", "pid-reused-or-pid-1-again"],
     )
-    def test_once_that_gateway_is_gone_it_is_allowed_and_forgotten(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, now: Any
+    def test_on_positive_evidence_it_is_allowed_and_forgotten(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reading: dict[str, Any]
     ) -> None:
-        """Keyed on the pid AND the process start time: a container gateway
-        that is PID 1 on every start, or a reused pid, is another gateway. The
-        record forgets it the first time it is seen gone, so a later gateway
+        """Keyed on the pid and the process start time: another pid, another
+        start time (both readable), or Hermes saying no gateway runs is that
+        gateway gone. The record forgets it then, once, so a later gateway
         with that pid never brings "not in effect yet" back."""
         _config_says(monkeypatch, _allowance("ours", "full", "trust"))
         self._record_yes_in_place(tmp_path, 4242)
-        monkeypatch.setattr(allow, "hermes_gateway", lambda home: now)
-        switch = allow.read_switch(tmp_path, api_base="https://api.agentchat.me")
+        self._liveness(monkeypatch, **reading)
+        switch = self._switch(tmp_path)
         assert switch.awaits_restart is None and allow.describe(switch, "alice") == "allowed (trust: full)"
         record = allow.read_record(tmp_path)
         assert record is not None and "restart_gateway" not in record and record["trust"] == "full"
-        monkeypatch.setattr(allow, "hermes_gateway", lambda home: (4242, 1000))
-        assert allow.read_switch(tmp_path, api_base="https://api.agentchat.me").awaits_restart is None
+        self._liveness(monkeypatch, pid=4242, start=1000)
+        assert self._switch(tmp_path).awaits_restart is None
+
+    @pytest.mark.parametrize(
+        "reading",
+        [
+            {"raises": True},  # Hermes' liveness not readable here
+            {"running": False, "probe_error": True},  # a rung raised: "down" not told from "unknown"
+            {"running": True, "pid": None},  # running, no pid to compare
+        ],
+        ids=["exception", "probe-error", "running-without-a-pid"],
+    )
+    def test_when_it_cannot_be_told_the_record_is_kept_and_said_so(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reading: dict[str, Any]
+    ) -> None:
+        """Lead review: a read path never rewrites the record on uncertain
+        evidence (doctor on a host against a containerized gateway would have
+        cleared it for good, and the loop resumed on the untrusted connection)."""
+        _config_says(monkeypatch, _allowance("ours", "full", "trust"))
+        self._record_yes_in_place(tmp_path, 4242)
+        before = allow.record_path(tmp_path).read_bytes()
+        self._liveness(monkeypatch, **reading)
+        switch = self._switch(tmp_path)
+        assert (switch.awaits_restart, switch.restart_unverified) == (4242, True)
+        assert switch.in_effect_state == "applying", "the receive loop stays paused"
+        text = allow.describe(switch, "alice")
+        assert "not in effect yet as far as can be told" in text and "cannot be told" in text
+        assert allow.record_path(tmp_path).read_bytes() == before, "not rewritten"
+
+    def test_a_pid_whose_start_time_cannot_be_read_here_is_compared_by_pid(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A gateway in another pid namespace (a container sharing HERMES_HOME):
+        its start time is not readable from here. Only one side readable: the
+        pid alone decides, so the record is kept."""
+        _config_says(monkeypatch, _allowance("ours", "full", "trust"))
+        self._record_yes_in_place(tmp_path, 4242, 1000)
+        before = allow.record_path(tmp_path).read_bytes()
+        self._liveness(monkeypatch, pid=4242, start=None)
+        switch = self._switch(tmp_path)
+        assert (switch.awaits_restart, switch.restart_unverified) == (4242, False)
+        assert allow.record_path(tmp_path).read_bytes() == before
+        self._record_yes_in_place(tmp_path, 4242, None)  # unreadable when written, readable now
+        self._liveness(monkeypatch, pid=4242, start=1000)
+        assert self._switch(tmp_path).awaits_restart == 4242
 
     def test_start_times_within_hermes_drift_are_one_process(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         _config_says(monkeypatch, _allowance("ours", "full", "trust"))
         self._record_yes_in_place(tmp_path, 4242, 1000)
-        monkeypatch.setattr(allow, "hermes_gateway", lambda home: (4242, 1150))
-        assert allow.read_switch(tmp_path, api_base="https://api.agentchat.me").awaits_restart == 4242
-
-    def test_no_start_time_on_either_side_is_the_pid_alone(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-        _config_says(monkeypatch, _allowance("ours", "full", "trust"))
-        self._record_yes_in_place(tmp_path, 4242, None)
-        monkeypatch.setattr(allow, "hermes_gateway", lambda home: (4242, None))
-        assert allow.read_switch(tmp_path, api_base="https://api.agentchat.me").awaits_restart == 4242
+        self._liveness(monkeypatch, pid=4242, start=1150)
+        assert self._switch(tmp_path).awaits_restart == 4242
 
     def test_no_recorded_gateway_reads_no_liveness(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
         _config_says(monkeypatch, _allowance("ours", "full", "trust"))
         allow.write_record(tmp_path, how="asked", trust="full", decision="yes")
-        monkeypatch.setattr(allow, "hermes_gateway", lambda home: pytest.fail("not asked"))
-        assert allow.read_switch(tmp_path, api_base="https://api.agentchat.me").awaits_restart is None
+        monkeypatch.setattr(allow, "gateway_seen", lambda home: pytest.fail("not asked"))
+        assert self._switch(tmp_path).awaits_restart is None
 
     def test_the_receive_loop_pauses_while_a_yes_is_not_in_effect(self) -> None:
         switch = allow.Switch("allowed", _allowance("ours", "full", "trust"), {"how": "asked"}, 4242)

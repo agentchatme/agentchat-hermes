@@ -773,7 +773,7 @@ class TestReconcileMcpRegistration:
         allow.write_record(tmp_path, how="asked", trust="full", decision="yes", restart_gateway=holder)
         entry = {"state": Allowance("ours", "full", "trust")}
         monkeypatch.setattr(allow, "inspect_allowance", lambda *, api_base: entry["state"])
-        monkeypatch.setattr(allow, "hermes_gateway", lambda home: holder)
+        monkeypatch.setattr(allow, "gateway_seen", lambda home: holder)
         monkeypatch.setattr(allow, "process_start_time", lambda pid: 777)
         done: list[Any] = []
 

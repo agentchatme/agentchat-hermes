@@ -373,12 +373,26 @@ class AgentInvoker:
         applied that the gateway did not take up. When a pause ends the cards
         that waited are wanted: :meth:`check_tools` wakes the loop for them once
         the tools are registered."""
-        from .allow import PAUSED_STATES, Switch, describe, read_switch, start_completion
+        from .allow import (
+            PAUSED_STATES,
+            Switch,
+            describe,
+            held_by_this_process,
+            read_switch,
+            reapply_in_two_steps,
+            start_completion,
+        )
 
         home = self._home()
         api_base = str(getattr(self._config, "api_base", "") or DEFAULT_API_BASE)
         try:
             switch = read_switch(home, api_base=api_base)
+            if switch.awaits_restart is not None and not self._stopped.is_set() and held_by_this_process(switch):
+                # This gateway kept the earlier connection (its runtime was
+                # down, or its health record stale, when the yes was written
+                # in place): it applies the yes itself, in two steps.
+                reapply_in_two_steps(self._scope, api_base=api_base)
+                switch = read_switch(home, api_base=api_base)
         except Exception:
             logger.debug("AgentInvoker: the tools switch could not be read", exc_info=True)
             switch = Switch("unknown")

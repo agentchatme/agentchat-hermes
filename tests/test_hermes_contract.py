@@ -2134,6 +2134,9 @@ def test_hermes_says_whether_a_gateway_serves_the_profile(_hermes_home: Path) ->
     assert {"profile_dir", "use_cache"} <= _params(status.resolve_gateway_liveness)
     liveness = status.resolve_gateway_liveness(profile_dir=_hermes_home, use_cache=False)
     assert liveness.running is False and liveness.pid is None
+    # ``probe_error`` tells "down" from "cannot tell": only a clean "down" clears a record.
+    assert liveness.probe_error is False
+    assert allow.gateway_seen(_hermes_home) == "stopped"
     assert allow.hermes_gateway(_hermes_home) is None
     # The pid-reuse guard: Hermes' start-time fingerprint and its comparator.
     import os

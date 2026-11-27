@@ -192,9 +192,10 @@ Found by the lab round on a real Hermes v0.23.2 box (R3):
   asks Hermes whether a gateway serves the profile (`gateway.status.resolve_gateway_liveness`), writes `trust: full`,
   and says it is not in effect until that gateway restarts ("restart the gateway to apply"); `/agentchat`, `allow` and
   `doctor` say so, and the receive loop starts no turn, until that gateway is gone (recorded by pid and process start
-  time, so a reused pid or a container's PID 1 started again is another gateway; forgotten the first time it is seen
-  gone). Also when a gateway serves the profile with no AgentChat runtime in it; when that gateway is the process
-  itself, its activation applies the yes in two steps.
+  time, so a reused pid or a container's PID 1 started again is another gateway; forgotten only once that gateway is
+  shown gone, never on a liveness that cannot be read). Also when a gateway serves the profile with no AgentChat
+  runtime in it; when that gateway is the process itself, its activation or minute check applies the yes in two
+  steps.
 - **`plugins.isolation: host` is said.** One WARNING at `register()` and a sentence in every `/agentchat` reply: AgentChat
   cannot wake the agent there, the hosted tools still work in chats, and the trade-off: being woken needs the plugin
   inside the gateway (`in_process`), the person's choice, not advised for a pooled or multi-tenant deployment. It never

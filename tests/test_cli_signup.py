@@ -735,12 +735,18 @@ class TestKeyInUse:
         monkeypatch.setattr(allow, "process_start_time", lambda pid: 4242)
         assert "still holds @bob's AgentChat connection" in (placement.gateway_still_serving(home, api_base="x") or "")
         monkeypatch.setattr(placement, "serving_gateway", lambda h, *, api_base: None)  # the key is gone
+        marker = home / "agentchat" / placement.SERVING_GATEWAY_FILENAME
+        seen: dict[str, Any] = {"now": (os.getpid(), 4242)}
+        monkeypatch.setattr(allow, "gateway_seen", lambda h: seen["now"])
         assert placement.gateway_serves_profile(home, api_base="x") is True
         self._register(monkeypatch)
         assert credentials.RESTART_HINT in capsys.readouterr().out
-        monkeypatch.setattr(allow, "process_start_time", lambda pid: 99999)  # that gateway restarted
+        for unsure in ("unknown", (os.getpid(), None)):  # cannot be told / one start time readable: kept
+            seen["now"] = unsure
+            assert placement.gateway_serves_profile(home, api_base="x") is True and marker.exists()
+        seen["now"] = (os.getpid(), 99999)  # that gateway restarted: shown gone
         assert placement.gateway_serves_profile(home, api_base="x") is False
-        assert not (home / "agentchat" / placement.SERVING_GATEWAY_FILENAME).exists(), "forgotten once gone"
+        assert not marker.exists(), "forgotten once shown gone"
 
     def test_a_yes_the_gateway_takes_up_only_at_its_restart_is_not_called_allowed(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

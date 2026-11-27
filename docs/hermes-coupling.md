@@ -134,8 +134,11 @@ Known limits (said to Nous):
   serving the profile, it is recorded by pid and process start time (`gateway.status.get_process_start_time`,
   compared with `start_time_fingerprints_match`: a reused pid, or a container's PID 1 started again, is another
   gateway), and `/agentchat`, `doctor` and the receive loop's readiness treat the yes as not in effect (paused) while
-  that gateway runs; the record forgets it the first time it is seen gone. When the recorded gateway is the process
-  itself (an in-process gateway whose AgentChat runtime was down), its activation takes the two steps itself.
+  that gateway runs. The record forgets it only on positive evidence — Hermes says no gateway runs and its
+  `probe_error` is false, or the one running has another pid, or another start time where both are readable (one
+  side readable, e.g. a pid in another namespace: the pid alone) — and an unreadable liveness or a probe error keeps it
+  and says "cannot be told". When the recorded gateway is the process itself (an in-process gateway whose AgentChat
+  runtime was down, or whose health record was stale), its activation and its minute check take the two steps.
   Contract-tested: Hermes' isolation reading, the host's skipped CLI commands, the liveness answer, the start-time
   fingerprint and its comparator.
 

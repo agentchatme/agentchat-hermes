@@ -83,7 +83,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, Union
 
 from ._version import __version__
 from .mcp_registration import (
@@ -212,10 +212,14 @@ class Switch:
     allowance: Allowance | None = None
     record: dict[str, Any] | None = None
     # The pid of the running gateway that still holds the connection made
-    # before a yes was written in place (the record's ``restart_gateway``, the
-    # same pid and process start time as Hermes reports now), else ``None``:
-    # the yes is in config.yaml, not in effect until that gateway restarts.
+    # before a yes was written in place (the record's ``restart_gateway``, not
+    # shown to be gone: :func:`gateway_verdict`), else ``None``: the yes is in
+    # config.yaml, not in effect until that gateway restarts.
     awaits_restart: int | None = None
+    # ``awaits_restart`` because whether that gateway still runs cannot be
+    # told from here (Hermes' liveness not readable, a probe error), not
+    # because it was seen running.
+    restart_unverified: bool = False
 
     @property
     def in_effect_state(self) -> State:
@@ -288,18 +292,17 @@ def read_switch(home: Path, *, api_base: str) -> Switch:
     record = read_record(home)
     state = state_of(allowance, record)
     held = _restart_gateway(record)
-    awaits = None
-    if held is not None:
-        now = hermes_gateway(home) if state == "allowed" else None
-        if now is not None and same_gateway(held, now):
-            awaits = held[0]
-        else:
-            # That gateway is gone (stopped, restarted, its pid reused, a
-            # container's PID 1 started again): the yes is in effect. Said once.
-            assert record is not None
-            _rewrite(home, record, restart_gateway=None)
-            record = read_record(home)
-    return Switch(state, allowance, record, awaits)
+    if held is None or state != "allowed":
+        return Switch(state, allowance, record)
+    verdict = gateway_verdict(held, gateway_seen(home))
+    if verdict == "gone":
+        # Positive evidence only (Hermes says no gateway runs, or another pid,
+        # or another start time, both readable): the yes is in effect, and the
+        # record forgets that gateway, once.
+        assert record is not None
+        _rewrite(home, record, restart_gateway=None)
+        return Switch(state, allowance, read_record(home))
+    return Switch(state, allowance, record, held[0], restart_unverified=verdict == "unknown")
 
 
 GatewayId = tuple[int, Optional[int]]
@@ -319,16 +322,36 @@ def _restart_gateway(record: dict[str, Any] | None) -> GatewayId | None:
     return pid, start if isinstance(start, int) and not isinstance(start, bool) else None
 
 
+Seen = Union[GatewayId, Literal["stopped", "unknown"]]
+"""What Hermes says of the gateway serving a profile (:func:`gateway_seen`):
+the gateway running, ``stopped`` (no gateway, and Hermes' probe reported no
+error), or ``unknown`` (not readable, a probe error, running with no pid)."""
+
+
+def gateway_verdict(recorded: GatewayId, seen: Seen) -> Literal["same", "gone", "unknown"]:
+    """Whether the gateway ``recorded`` is the one Hermes sees now. ``gone``
+    only on positive evidence: Hermes says none runs (no probe error), or the
+    one running has another pid, or another start time where both are
+    readable. Where only one side's start time is readable (a pid in another
+    namespace, a process this one may not inspect) the pid alone decides; an
+    unreadable liveness is ``unknown``, never ``gone``."""
+    if seen == "unknown":
+        return "unknown"
+    if seen == "stopped":
+        return "gone"
+    return "same" if same_gateway(recorded, seen) else "gone"
+
+
 def same_gateway(recorded: GatewayId, current: GatewayId) -> bool:
-    """One process, not a pid reused: the same pid and start-time fingerprints
-    that agree (Hermes' ``start_time_fingerprints_match``, its 2 s drift
-    tolerance). Where neither side's start time could be read, the pid alone;
-    where only one side's, not the same (it cannot be shown to be)."""
+    """One process, not a pid reused: the same pid, and start-time
+    fingerprints that agree where both are readable (Hermes'
+    ``start_time_fingerprints_match``, its 2 s drift tolerance); where only one
+    side's, or neither, is readable, the pid alone."""
     if recorded[0] != current[0]:
         return False
     before, now = recorded[1], current[1]
     if before is None or now is None:
-        return before is None and now is None
+        return True
     try:
         from gateway.status import start_time_fingerprints_match  # type: ignore[import-not-found]
 
@@ -345,6 +368,12 @@ def describe(switch: Switch, handle: str | None, *, cmd: str = "hermes agentchat
     agent = who(handle)
     allowance = switch.allowance
     run_allow = f", or run {cmd} allow" if cli else ""
+    if switch.awaits_restart is not None and switch.restart_unverified:
+        return (
+            f"allowed in config.yaml, not in effect yet as far as can be told — the gateway that kept the earlier "
+            f"AgentChat connection (pid {switch.awaits_restart}) cannot be checked from here, so whether it "
+            f"restarted cannot be told; {RESTART_TO_APPLY}"
+        )
     if switch.awaits_restart is not None:
         return f"allowed in config.yaml, not in effect yet — {AWAITS_RESTART_WORDS} (gateway pid {switch.awaits_restart})"
     if switch.state == "allowed" and allowance is not None:
@@ -803,27 +832,41 @@ def gateway_lives(home: Path, *, api_base: str) -> bool:
         return False
 
 
-def hermes_gateway(home: Path) -> GatewayId | None:
-    """The gateway Hermes says serves ``home``'s profile — its pid and its
-    process start-time fingerprint — or ``None`` (none, or not readable):
+def gateway_seen(home: Path) -> Seen:
+    """What Hermes says of the gateway serving ``home``'s profile:
     ``gateway.status.resolve_gateway_liveness``, Hermes' one answer to "is the
     gateway up?" (the profile's pid file and lock, its runtime status, a
-    multiplexed gateway serving the profile), read-only and uncached, and
-    ``gateway.status.get_process_start_time``. Unlike :func:`gateway_lives`
-    it does not need the plugin to run in that gateway: under
-    ``plugins.isolation: host`` the gateway holds the hosted tools'
-    connection while no AgentChat runtime runs in it. Never raises."""
+    multiplexed gateway serving the profile), read-only and uncached, with
+    the process start-time fingerprint (``gateway.status
+    .get_process_start_time``) of the one running. ``stopped`` only when
+    Hermes says none runs and its probe reported no error (``probe_error``);
+    ``unknown`` when it cannot be read. Unlike :func:`gateway_lives` it does
+    not need the plugin to run in that gateway: under ``plugins.isolation:
+    host`` the gateway holds the hosted tools' connection while no AgentChat
+    runtime runs in it. Never raises."""
     try:
         from gateway.status import resolve_gateway_liveness
 
         liveness = resolve_gateway_liveness(profile_dir=home, use_cache=False)
     except Exception:
         logger.debug("allow: Hermes' gateway liveness not read", exc_info=True)
-        return None
+        return "unknown"
+    running = getattr(liveness, "running", None)
     pid = getattr(liveness, "pid", None)
-    if getattr(liveness, "running", False) is not True or not isinstance(pid, int) or isinstance(pid, bool):
-        return None
-    return pid, process_start_time(pid)
+    if running is True:
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            return "unknown"
+        return pid, process_start_time(pid)
+    if running is False and getattr(liveness, "probe_error", True) is False:
+        return "stopped"
+    return "unknown"
+
+
+def hermes_gateway(home: Path) -> GatewayId | None:
+    """The gateway Hermes says serves ``home``'s profile (:func:`gateway_seen`),
+    or ``None`` when none is seen running (stopped, or not readable)."""
+    seen = gateway_seen(home)
+    return None if isinstance(seen, str) else seen
 
 
 def process_start_time(pid: int) -> int | None:
