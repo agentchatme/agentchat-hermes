@@ -489,12 +489,14 @@ class TestCompletePending:
         import time as _time
 
         placed = self._placement(monkeypatch)
+        # Measured from the removal (decided_at), not from the call: a slow
+        # runner spends time in between, and the wait counts from the removal.
+        started = _time.monotonic()
         allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True, decided_at=_time.time())
         self._runtime(monkeypatch, reading)
         monkeypatch.setattr(allow, "TICK_WAIT_S", 0.3)
         monkeypatch.setattr(allow, "POLL_S", 0.01)
         monkeypatch.setattr(hosted_tools, "hosted_tool_names", lambda: ["mcp__agentchat__agentchat_inbox"])
-        started = _time.monotonic()
         assert allow.complete_pending(tmp_path, api_base="x", wait=True) is True
         assert _time.monotonic() - started >= 0.25 and placed == ["yes"]
 
