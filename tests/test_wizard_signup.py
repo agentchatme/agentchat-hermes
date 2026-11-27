@@ -12,8 +12,9 @@ wizard, although the server allows several tries on the same code.
 """
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
+import pytest
 import signup_wire as sw
 from fake_keys import api_key
 from key_files import saved
@@ -21,9 +22,6 @@ from sdk_wire import Wire, answer, api_error, connect_error, serve
 
 from agentchatme_hermes import allow, credentials, signup, wizard
 from agentchatme_hermes._version import __version__
-
-if TYPE_CHECKING:
-    import pytest
 
 _KEY = api_key("wizard_000000000000")
 _CODE_PROMPT = "Enter the 6-digit code (blank to cancel, new for a new code)"
@@ -623,6 +621,9 @@ class TestMenuRouting:
             "Skip for now",
         ]
         assert menus.person.said("success") == ["AgentChat ready"]
+        # A profile's first key, no gateway serving it: no restart line (lab R3, L1-F02).
+        assert menus.person.said("info") == [credentials.NO_RESTART_LINE]
+        assert not any("restart" in text.lower() and "no restart" not in text.lower() for _, text in menus.person.transcript)
 
     def test_fresh_menu_skip_runs_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         menus = _Menus(monkeypatch, pick=3)
@@ -639,7 +640,7 @@ class TestMenuRouting:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         menus = _Menus(monkeypatch, pick=2)
-        wizard._replace_key_branch(existing_handle="alice", **menus.kwargs())
+        wizard._replace_key_branch(existing_key=api_key("old"), existing_handle="alice", **menus.kwargs())
         name, kwargs = menus.ran[0]
         assert name == "recover"
         assert kwargs["existing_handle"] == "alice"
@@ -647,9 +648,24 @@ class TestMenuRouting:
 
     def test_replace_branch_cancel_is_last(self, monkeypatch: pytest.MonkeyPatch) -> None:
         menus = _Menus(monkeypatch, pick=3)
-        wizard._replace_key_branch(existing_handle="alice", **menus.kwargs())
+        wizard._replace_key_branch(existing_key=api_key("old"), existing_handle="alice", **menus.kwargs())
         assert menus.ran == []
         assert menus.choices[3].startswith("Cancel")
+        assert menus.person.said("info")[-1:] != [credentials.RESTART_HINT], "nothing replaced"
+
+    @pytest.mark.parametrize(("saved_key", "said"), [("new", "restart"), ("old", "none")], ids=["another-key", "the-same-key"])
+    def test_replace_branch_says_restart_only_for_another_key_while_a_gateway_serves(
+        self, monkeypatch: pytest.MonkeyPatch, saved_key: str, said: str
+    ) -> None:
+        from types import SimpleNamespace
+
+        menus = _Menus(monkeypatch, pick=0)
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        monkeypatch.setattr(wizard, "gateway_serves_profile", lambda home, *, api_base: True)
+        monkeypatch.setattr(wizard, "resolve_key", lambda: SimpleNamespace(api_key=api_key(saved_key)))
+        wizard._replace_key_branch(existing_key=api_key("old"), existing_handle="alice", **menus.kwargs())
+        expected = credentials.RESTART_HINT if said == "restart" else credentials.NO_RESTART_LINE
+        assert menus.person.said("info")[-1] == expected
 
 
 class TestToolsQuestion:

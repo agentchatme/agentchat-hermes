@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Literal, NamedTuple
 
 from . import manual as manual_module
 from .agent_invoker import AgentInvoker
@@ -57,6 +57,27 @@ if TYPE_CHECKING:
     from .config import Config
 
 logger = logging.getLogger(__name__)
+
+StartFailure = Literal["unreachable", "key_refused", "other"]
+
+
+def start_failure(exc: BaseException) -> StartFailure:
+    """Why the runtime did not start: ``unreachable`` — no answer from
+    AgentChat (the SDK's transport error: refused, DNS, a timeout, a reset);
+    ``key_refused`` — AgentChat answered 401 for the key; ``other`` — anything
+    else (a server error, a local fault)."""
+    import socket
+
+    unreachable: tuple[type[BaseException], ...] = (ConnectionError, TimeoutError, socket.gaierror)
+    try:
+        from agentchatme import ConnectionError as SDKConnectionError
+        from agentchatme import UnauthorizedError
+    except ImportError:
+        return "unreachable" if isinstance(exc, unreachable) else "other"
+    if isinstance(exc, UnauthorizedError):
+        return "key_refused"
+    return "unreachable" if isinstance(exc, (*unreachable, SDKConnectionError)) else "other"
+
 
 def keeps_placements_current(runtime: Any) -> bool:
     """The one rule for which Hermes processes keep placed files current by
@@ -345,8 +366,14 @@ class Runtime:
                         profile_label(self._hermes_home),
                         self._identity.handle,
                     )
-            except Exception:
-                logger.exception("agentchat runtime: start failed")
+            except Exception as exc:
+                if start_failure(exc) == "other":
+                    logger.exception("agentchat runtime: start failed")
+                else:
+                    # AgentChat not reached, or the key refused: the caller
+                    # (_register._try_start_runtime) says which, with its remedy,
+                    # once per attempt; no traceback for an outage.
+                    logger.debug("agentchat runtime: start failed (%s)", exc)
                 # Best-effort cleanup so subsequent get_runtime() calls
                 # don't see a half-initialized object.
                 self._teardown_partial()

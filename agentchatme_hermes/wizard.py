@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Literal
 from . import allow, credentials, key_store, signup
 from .config import ENV_HANDLE, cli_prefix, resolve_key
 from .placement import (
+    gateway_serves_profile,
     gateway_still_serving,
     place_identity_and_tools,
     profile_identity,
@@ -192,6 +193,7 @@ def _edit_menu(
         return
     if picked == replace:
         _replace_key_branch(
+            existing_key=existing_key,
             existing_handle=existing_handle,
             prompt=prompt,
             prompt_yes_no=prompt_yes_no,
@@ -244,6 +246,8 @@ def _fresh_setup_menu(
     if idx == 3:
         return
 
+    # Read before a key is saved: a gateway a logout left serving keeps its key.
+    serving = gateway_serves_profile(resolve_hermes_home(), api_base=_api_base())
     if idx == 0:
         ok = _register_new_agent_flow(
             prompt=prompt,
@@ -270,12 +274,13 @@ def _fresh_setup_menu(
     if not ok:
         return
 
-    _step("Restart the gateway: hermes gateway restart")
+    print_info(credentials.key_in_use_line(None, resolve_key().api_key or "", serving=serving))
     print_success("AgentChat ready")
 
 
 def _replace_key_branch(
     *,
+    existing_key: str,
     existing_handle: str,
     prompt: Any,
     prompt_yes_no: Any,
@@ -315,6 +320,7 @@ def _replace_key_branch(
     if idx == 3:
         return
 
+    serving = gateway_serves_profile(resolve_hermes_home(), api_base=_api_base())
     if idx == 0:
         ok = _paste_existing_key_flow(
             prompt, print_info, print_success, print_warning, save_env_value
@@ -340,7 +346,9 @@ def _replace_key_branch(
         )
 
     if ok:
-        _step("Restart the gateway: hermes gateway restart")
+        # A different key needs a restart (a running Hermes keeps the one it
+        # started with); the same key pasted again does not.
+        print_info(credentials.key_in_use_line(existing_key, resolve_key().api_key or "", serving=serving))
 
 
 def _logout_flow(
@@ -450,8 +458,8 @@ def _paste_existing_key_flow(
     if not _save_key(api_key, checked.handle, print_warning):
         return False
     _step(f"Key validated — you are @{checked.handle}")
-    _place_or_warn(checked.handle, api_key, print_warning, tools_decision=tools.decision)
-    _show_tools(tools, print_info)
+    placed = _place_or_warn(checked.handle, api_key, print_warning, tools_decision=tools.decision)
+    _show_tools(tools, print_info, placed)
     return True
 
 
@@ -497,8 +505,8 @@ def _register_new_agent_flow(
     if not _save_key(api_key, server_handle, print_warning):
         return False
     _step(f"Registered as @{server_handle} (key {_mask_key(api_key)})")
-    _place_or_warn(server_handle, api_key, print_warning, tools_decision=tools.decision)
-    _show_tools(tools, print_info)
+    placed = _place_or_warn(server_handle, api_key, print_warning, tools_decision=tools.decision)
+    _show_tools(tools, print_info, placed)
     return True
 
 
@@ -553,8 +561,8 @@ def _recover_lost_key_flow(
     if not _save_key(api_key, server_handle, print_warning):
         return False
     _step(f"Recovered @{server_handle} (new key {_mask_key(api_key)})")
-    _place_or_warn(server_handle, api_key, print_warning, tools_decision=tools.decision)
-    _show_tools(tools, print_info)
+    placed = _place_or_warn(server_handle, api_key, print_warning, tools_decision=tools.decision)
+    _show_tools(tools, print_info, placed)
     return True
 
 
@@ -684,8 +692,11 @@ def _save_key(api_key: str, handle: str, print_warning: Any) -> bool:
     return True
 
 
-def _show_tools(tools: allow.SetupDecision, print_info: Any) -> None:
-    """The answer's line: a check mark for a yes or tools already allowed."""
+def _show_tools(tools: allow.SetupDecision, print_info: Any, mcp_outcome: str | None = None) -> None:
+    """The answer's line: a check mark for a yes or tools already allowed;
+    nothing when the placement's warning said it (:func:`.allow.line_after`)."""
+    if allow.line_after(tools, mcp_outcome) is None:
+        return
     if tools.decision == "yes" or tools.line == allow.ALREADY_ALLOWED_LINE:
         _step(allow.ALLOWED_LINE)
     else:
@@ -712,6 +723,9 @@ def _allow_tools_flow(handle: str, *, print_info: Any, print_warning: Any) -> No
     if step.failed:
         print_warning(f"AgentChat tools: nothing changed — {step.detail}")
         return
+    if step.outcome == "restart":
+        print_warning(f"AgentChat tools: {step.detail}")
+        return
     _show_tools(tools, print_info)
     if step.outcome == "applying":
         _step(f"The running gateway applies it: {allow.APPLY_WORDS}")
@@ -723,7 +737,7 @@ def _allow_tools_flow(handle: str, *, print_info: Any, print_warning: Any) -> No
 
 def _place_or_warn(
     handle: str, api_key: str, print_warning: Any, *, tools_decision: Decision | None = None
-) -> None:
+) -> str | None:
     """Place the identity line and the manual, register the hosted tools.
 
     The texts are fetched from the server for this key (cached copy when the
@@ -733,16 +747,21 @@ def _place_or_warn(
     gateway places both later). Non-fatal — the credentials are persisted
     and the runtime will boot; each failed step is surfaced so the operator
     can repair it (``hermes agentchat doctor --fix`` re-runs the placement).
+    Returns what the tools' placement did (:attr:`.placement.PlacementStep.outcome`).
     """
     api_base = _api_base()
     texts = resolve_texts(api_key=api_key, api_base=api_base)
+    mcp_outcome: str | None = None
     for step in place_identity_and_tools(handle=handle, texts=texts, api_base=api_base, tools_decision=tools_decision):
+        if step.name == "mcp":
+            mcp_outcome = step.outcome
         if step.name == "mcp" and step.outcome == "missing":
             continue  # the AgentChat tools line says it
         if step.needs_attention:
             print_warning(f"{step.name}: {step.detail}")
         else:
             _step(step.detail)
+    return mcp_outcome
 
 
 def _api_base() -> str:

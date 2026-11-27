@@ -11,7 +11,7 @@ atomic; a file that is not UTF-8 is never written.
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from agentchatme.integration import anchor
@@ -1130,3 +1130,139 @@ class TestNoFinalLineBreak:
         assert soul.read_text(encoding="utf-8").endswith(ANCHOR_END)
         remove_soul_anchor(handle="alice", soul_path=soul)
         assert soul.read_text(encoding="utf-8") == self.TEMPLATE
+
+
+# ───────────────────────── the block the August 2026 build wrote (lab R3, L2-F01) ─────────────────────────
+
+# The August 2026 build (commit 8322d5c97fc81b1493c2ccfc83c19cee03173196, the plugin
+# catalog's earlier pin): ``render_anchor_block("alice")`` in its soul_anchor.py, word for
+# word, and what its ``write_soul_anchor`` left in Hermes' own SOUL.md template (the block
+# appended after one blank line, a line break after it).
+AUGUST_COMMIT = "8322d5c97fc81b1493c2ccfc83c19cee03173196"
+AUGUST_BLOCK_ALICE = (
+    "<!-- agentchat:start -->\n"
+    "## On AgentChat\n"
+    "\n"
+    "You are **@alice** on AgentChat — a peer-to-peer messaging network for AI agents. Your handle is your address "
+    "here, like a phone number, except the other end is always another agent.\n"
+    "\n"
+    "- Other agents can DM you. You can DM them — any time, for anything that fits your context.\n"
+    "- Share `@alice` freely. Whenever and wherever you think you should share. It's how peers reach you.\n"
+    "- When you need to send, search, or handle an error, run `skill_view agentchat:agentchat` for the full reference.\n"
+    "\n"
+    "This is an identity, not a tool you reach for occasionally.\n"
+    "<!-- agentchat:end -->"
+)
+AUGUST_FILE = "# Persona\n\nYou are a helpful assistant.\n\n" + AUGUST_BLOCK_ALICE + "\n"
+
+
+def test_the_august_text_is_that_builds_render() -> None:
+    """The literal above is what commit 8322d5c renders (when the history is in this checkout)."""
+    import subprocess
+    import types
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    try:
+        source = subprocess.run(
+            ["git", "show", f"{AUGUST_COMMIT}:agentchatme_hermes/soul_anchor.py"],
+            cwd=root, capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        pytest.skip("the August 2026 commit is not in this checkout (a shallow clone)")
+    august = types.ModuleType("august_soul_anchor")
+    exec(compile(source, "august_soul_anchor.py", "exec"), august.__dict__)
+    assert august.render_anchor_block("alice") == AUGUST_BLOCK_ALICE
+    assert august._upsert_anchor_block("# Persona\n\nYou are a helpful assistant.\n", AUGUST_BLOCK_ALICE) == AUGUST_FILE
+
+
+class TestAugustBlock:
+    """Every profile updated from the August 2026 build holds the block that build
+    wrote: no handle line and never a served text, so the kit reads it as edited by
+    hand. Exactly that text, for this profile's handle, is AgentChat's own block."""
+
+    def test_the_refresh_replaces_it_once(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(AUGUST_FILE, encoding="utf-8")
+        result = follow_soul(handle="alice", identity_line=_line(), soul_path=soul)
+        assert (result.outcome, result.claimed) == ("updated", "alice")
+        assert "August 2026" in result.detail
+        assert soul.read_text(encoding="utf-8") == (
+            "# Persona\n\nYou are a helpful assistant.\n\n" + render_anchor_block(_line(), handle="alice") + "\n"
+        )
+        assert follow_soul(handle="alice", identity_line=_line(), soul_path=soul).outcome == "unchanged"
+
+    @pytest.mark.parametrize("replace_other", [False, True], ids=["doctor-fix", "setup"])
+    def test_a_placement_replaces_it(self, tmp_path: Path, replace_other: bool) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(AUGUST_FILE, encoding="utf-8")
+        placement = place_soul_anchor(_line(), handle="alice", soul_path=soul, replace_other=replace_other)
+        assert (placement.outcome, placement.ok, placement.wrote) == ("updated", True, True)
+        assert "the block the August 2026 build wrote is replaced" in placement.detail
+        assert _owner_of(soul) == "alice" and "On AgentChat" not in soul.read_text(encoding="utf-8")
+
+    def test_crlf_and_no_final_line_break_are_kept(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_bytes(AUGUST_FILE.rstrip("\n").replace("\n", "\r\n").encode())
+        assert follow_soul(handle="alice", identity_line=_line(), soul_path=soul).outcome == "updated"
+        data = soul.read_bytes().decode("utf-8")
+        assert data.endswith(ANCHOR_END) and "\n" not in data.replace("\r\n", "")
+
+    def test_doctor_reads_it_as_a_line_to_refresh_not_edited_by_hand(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(AUGUST_FILE, encoding="utf-8")
+        state = inspect_soul(handle="alice", identity_line=_line(), soul_path=soul)
+        assert (state.outcome, state.claimed) == ("updated", "alice")
+        assert inspect_soul(handle="alice", identity_line=None, soul_path=soul).claimed == "alice"
+        ((level, line),) = _Lines().run(soul, monkeypatch, handle="alice", identity_line=_line(), template=None)
+        assert level == "warn" and "is not the served one" in line and "doctor --fix" in line
+        assert "edited by hand" not in line
+        assert soul.read_text(encoding="utf-8") == AUGUST_FILE, "doctor writes nothing"
+
+    def test_logout_removes_it(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        soul.write_text(AUGUST_FILE, encoding="utf-8")
+        assert _remove(soul).outcome == "removed"
+        assert soul.read_text(encoding="utf-8") == "# Persona\n\nYou are a helpful assistant.\n"
+
+    @pytest.mark.parametrize(
+        "edit",
+        [
+            lambda text: text.replace("occasionally.", "occasionally!"),
+            lambda text: text.replace("It's how", "It\u2019s how"),
+            lambda text: text.replace("- Other agents", "- Other  agents"),
+            lambda text: text.replace("## On AgentChat\n", "## On AgentChat\nMy own note.\n"),
+        ],
+        ids=["one-character", "a-curly-apostrophe", "a-doubled-space", "a-line-added"],
+    )
+    def test_a_block_that_differs_by_one_character_stays_the_persons(self, tmp_path: Path, edit: Any) -> None:
+        soul = tmp_path / "SOUL.md"
+        mine = edit(AUGUST_FILE)
+        assert mine != AUGUST_FILE
+        soul.write_text(mine, encoding="utf-8")
+        assert follow_soul(handle="alice", identity_line=_line(), soul_path=soul).outcome == "hand_edited"
+        assert place_soul_anchor(_line(), handle="alice", soul_path=soul, replace_other=True).outcome == "left"
+        assert inspect_soul(handle="alice", identity_line=_line(), soul_path=soul).outcome == "hand_edited"
+        assert _remove(soul).outcome == "hand_edited"
+        assert soul.read_text(encoding="utf-8") == mine
+
+    def test_another_handles_august_block_is_not_this_agents(self, tmp_path: Path) -> None:
+        """Only this profile's handle: the August block for @bob in @alice's profile stays as it was read before."""
+        soul = tmp_path / "SOUL.md"
+        bobs = AUGUST_FILE.replace("@alice", "@bob")
+        soul.write_text(bobs, encoding="utf-8")
+        assert follow_soul(handle="alice", identity_line=_line(), soul_path=soul).outcome == "hand_edited"
+        assert place_soul_anchor(_line(), handle="alice", soul_path=soul, replace_other=True).outcome == "left"
+        assert inspect_soul(handle="alice", identity_line=None, soul_path=soul).claimed is None
+        assert _remove(soul).outcome == "hand_edited"
+        assert soul.read_text(encoding="utf-8") == bobs
+
+    def test_beside_another_block_both_are_left(self, tmp_path: Path) -> None:
+        soul = tmp_path / "SOUL.md"
+        both = AUGUST_FILE + f"\n{ANCHOR_START}\nmy own notes\n{ANCHOR_END}\n"
+        soul.write_text(both, encoding="utf-8")
+        assert follow_soul(handle="alice", identity_line=_line(), soul_path=soul).outcome == "several_blocks"
+        assert place_soul_anchor(_line(), handle="alice", soul_path=soul).outcome == "left"
+        assert soul.read_text(encoding="utf-8") == both

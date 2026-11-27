@@ -813,6 +813,7 @@ class TestDoctorToolsSwitch:
         switch = allow.Switch("allowed", _allowance("ours", "full", "trust"), {"how": "asked", "trust": "untrusted"})
         [(level, line)] = self._lines(monkeypatch, switch)
         assert level == "warn" and "trust changed by hand" in line and "hermes gateway restart" in line
+        assert "/reload-mcp in a messaging chat it serves" in line and "not Desktop or a terminal chat" in line
 
     def test_disabled_is_said_once_above(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from agentchatme_hermes import allow

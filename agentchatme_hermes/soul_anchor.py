@@ -37,6 +37,15 @@ served line, the served template filled in, one of the lines served before):
 user's own words is not ours to rewrite. The loose reading (the template's
 words anywhere in the block) is for display only.
 
+One text more is this agent's, read here before the kit is asked: the block
+the August 2026 build of this plugin wrote (:data:`AUGUST_2026_BLOCK`, no
+handle line, never served, so the kit reads it as edited by hand), when the
+whole block is exactly that text for this profile's handle. Every path below
+treats it as this agent's own block: the refresh and a placement replace it
+with the line in use once, ``doctor`` reports it as a line to refresh, and
+``logout`` removes it. One character different is the person's, as for any
+other block.
+
 Lifecycle
 ─────────
 refresh — the activation path (once with this release's line; with
@@ -70,6 +79,7 @@ beside it, then a rename), and a file that is not UTF-8 is not written.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import os
 import secrets
@@ -144,6 +154,54 @@ def resolve_soul_path() -> Path:
 
     hermes_home: Path = get_hermes_home()
     return hermes_home / "SOUL.md"
+
+
+AUGUST_2026_BLOCK = "\n".join(
+    [
+        "## On AgentChat",
+        "",
+        "You are **@<handle>** on AgentChat — a peer-to-peer messaging network for AI agents. Your handle is your "
+        "address here, like a phone number, except the other end is always another agent.",
+        "",
+        "- Other agents can DM you. You can DM them — any time, for anything that fits your context.",
+        "- Share `@<handle>` freely. Whenever and wherever you think you should share. It's how peers reach you.",
+        "- When you need to send, search, or handle an error, run `skill_view agentchat:agentchat` for the full "
+        "reference.",
+        "",
+        "This is an identity, not a tool you reach for occasionally.",
+    ]
+)
+"""What the August 2026 build (commit 8322d5c, the plugin catalog's earlier
+pin) wrote between the fences, word for word: its ``render_anchor_block``,
+``<handle>`` for the handle. Frozen history: only ever compared, never
+written."""
+
+
+def _is_august_block(found: Any, handle: str | None) -> bool:
+    """``found`` (the kit's ``FoundBlock``) is, exactly, the block the August
+    2026 build wrote for ``handle``: no handle line, the current fences, and
+    its whole text that build's for this handle (line endings and the space
+    around it aside, as the kit compares a served text)."""
+    bare = normalize_handle(handle) if handle else ""
+    return (
+        bool(bare)
+        and not found.marked
+        and not found.legacy
+        and found.body == AUGUST_2026_BLOCK.replace("<handle>", bare)
+    )
+
+
+def _holds_august_block(text: str | None, handle: str) -> bool:
+    """``text`` (a file's text) holds one AgentChat block, and it is the
+    August 2026 build's for ``handle``."""
+    if text is None:
+        return False
+    anchor = _kit()
+    body = _without_bom(text)
+    found = anchor.find(body)
+    if found is None or anchor.find(body[: found.start] + body[found.end :]) is not None:
+        return False
+    return _is_august_block(found, handle)
 
 
 def _kit() -> Any:
@@ -250,10 +308,27 @@ def follow_soul(
     the served line, every other block left as it is, never a block created.
     Returns the kit's ``FollowResult`` (``outcome``: ``updated``, ``unchanged``,
     ``absent``, ``hand_edited``, ``other_agent``, ``several_blocks``,
-    ``edited_meanwhile``, ``failed``). Never raises but :class:`AnchorError`
-    for a kit without it."""
+    ``edited_meanwhile``, ``failed``). The block the August 2026 build wrote
+    for this agent, which the kit reads as ``hand_edited``, is replaced by
+    :func:`place_soul_anchor` (``updated``). Never raises but
+    :class:`AnchorError` for a kit without it."""
     target = soul_path if soul_path is not None else resolve_soul_path()
-    return _kit().follow(target, handle=handle, identity_line=identity_line, template=template)
+    result = _kit().follow(target, handle=handle, identity_line=identity_line, template=template)
+    if result.outcome != "hand_edited":
+        return result
+    try:
+        august = _holds_august_block(read_soul(target), handle)
+    except (AnchorError, OSError):
+        august = False
+    if not august:
+        return result
+    placement = place_soul_anchor(identity_line, handle=handle, soul_path=target, template=template)
+    if placement.ok:
+        outcome = "updated" if placement.wrote else "unchanged"
+        return dataclasses.replace(result, outcome=outcome, claimed=normalize_handle(handle), named=None, detail=placement.detail)
+    if placement.outcome == "failed":
+        return dataclasses.replace(result, outcome="failed", detail=placement.detail)
+    return result  # changed under it to a block that is not this agent's: as the kit found it
 
 
 # ─── state (doctor) ─────────────────────────────────────────────────────────
@@ -307,6 +382,11 @@ def inspect_soul(
     body = _without_bom(text)
     if handle and identity_line:
         decision = anchor.decide(body, handle=handle, identity_line=identity_line, template=template)
+        if decision.outcome == "hand_edited" and _holds_august_block(body, handle):
+            bare = normalize_handle(handle)
+            return SoulState(
+                "updated", target, bare, None, f"the block the August 2026 build wrote for @{bare} in {target}"
+            )
         return SoulState(
             decision.outcome, target, decision.claimed, decision.named, decision.detail.replace("the file", str(target))
         )
@@ -314,6 +394,8 @@ def inspect_soul(
     if found is None:
         return SoulState("absent", target, None, None, f"no AgentChat block in {target}")
     claimed = anchor.owner(found, handle=handle, identity_line=identity_line, template=template)
+    if claimed is None and _is_august_block(found, handle):
+        claimed = normalize_handle(handle or "")
     return SoulState("unverified", target, claimed, found.handle, f"the AgentChat block in {target}")
 
 
@@ -364,8 +446,10 @@ def place_soul_anchor(
     """Place the served identity line for ``handle`` in SOUL.md, on request.
 
     This agent's own block is brought to the served line (``anchor.follow``);
-    no block (or no file) gets one. A block edited by hand is the user's: left
-    as it is, with the remedy (delete that block, then ``doctor --fix``).
+    no block (or no file) gets one; the block the August 2026 build wrote for
+    this agent (:data:`AUGUST_2026_BLOCK`) is replaced (``updated``). A block
+    edited by hand is the user's: left as it is, with the remedy (delete that
+    block, then ``doctor --fix``).
     Several blocks are left (one write would remove the others). Another
     agent's block is replaced only with ``replace_other`` (``login`` and the
     wizard: this profile becomes this agent), else refused (``doctor --fix``).
@@ -392,10 +476,6 @@ def place_soul_anchor(
             return AnchorPlacement("unchanged", target, f"identity line for @{bare} in {target} (the served text)")
         if result.outcome in ("failed", "edited_meanwhile"):
             return AnchorPlacement("failed", target, result.detail)
-        if result.outcome == "hand_edited":
-            return AnchorPlacement(
-                "left", target, f"the AgentChat block in {target} was edited by hand, so it is left; {hand_edited_remedy(target)}"
-            )
         if result.outcome == "several_blocks":
             return AnchorPlacement(
                 "left",
@@ -410,10 +490,11 @@ def place_soul_anchor(
                 f"the AgentChat block in {target} is @{result.claimed}'s, not @{bare}'s — not replaced: fix the key "
                 f"(`{cmd} login`) or remove that block",
             )
-        if result.outcome not in ("absent", "other_agent"):
+        if result.outcome not in ("absent", "other_agent", "hand_edited"):
             return AnchorPlacement("failed", target, result.detail)
 
-        # No block, or (setup) another agent's: write this agent's, decided on the text it replaces.
+        # No block, (setup) another agent's, or the August 2026 build's for this
+        # agent: write this agent's, decided on the text it replaces.
         try:
             text = read_soul(target)
         except AnchorError as exc:
@@ -423,6 +504,10 @@ def place_soul_anchor(
         now = anchor.decide(_without_bom(text or ""), handle=bare, identity_line=identity_line, template=template)
         if now.outcome != result.outcome or now.claimed != result.claimed:
             continue  # changed since it was read: decide again
+        if result.outcome == "hand_edited" and not _holds_august_block(text, bare):
+            return AnchorPlacement(
+                "left", target, f"the AgentChat block in {target} was edited by hand, so it is left; {hand_edited_remedy(target)}"
+            )
         placed = anchor.replace(text or "", block)
         if result.outcome == "absent":
             placed = _keep_missing_final_break(text, placed)
@@ -451,6 +536,13 @@ def place_soul_anchor(
                 "replaced_other",
                 target,
                 f"the AgentChat block in {target} was @{result.claimed}'s; it now is @{bare}'s (this profile is @{bare})",
+            )
+        if result.outcome == "hand_edited":
+            return AnchorPlacement(
+                "updated",
+                target,
+                f"identity line for @{bare} in {target}: the block the August 2026 build wrote is replaced by the "
+                "served text",
             )
         return AnchorPlacement("placed", target, f"identity line for @{bare} placed in {target}")
     return AnchorPlacement(
@@ -538,7 +630,8 @@ def remove_soul_anchor(
 
     The block goes only when it is this agent's by the kit's strict reading
     (``anchor.owner`` is ``handle``: its handle line, or, without one, its
-    whole text is exactly a text AgentChat served). A block edited by hand,
+    whole text is exactly a text AgentChat served), or it is the block the
+    August 2026 build wrote for ``handle``. A block edited by hand,
     another agent's block, several blocks, or any block while ``handle`` is
     not known are left as they are, and :attr:`AnchorRemoval.detail` says so.
     ``identity_line`` and ``template`` are the served texts as Hermes places
@@ -593,6 +686,8 @@ def remove_soul_anchor(
                     "no longer want them",
                 )
             claimed = anchor.owner(found, handle=bare or None, identity_line=identity_line, template=template)
+            if claimed is None and _is_august_block(found, bare):
+                claimed = bare
             if claimed is None:
                 return result("hand_edited", f"left your edited AgentChat block in {target}; {by_hand}")
             if not bare:

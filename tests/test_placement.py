@@ -172,7 +172,7 @@ class TestMcpStep:
         monkeypatch.setattr(placement, "install_entry", _placed("upgraded"))
         detail = placement.place_mcp("https://api.example.test").detail
         assert "X-AgentChat-Client: hermes" in detail
-        assert "gateway restart" in detail and "/reload-mcp" in detail
+        assert "gateway restart" in detail and "/reload-mcp in a messaging chat the gateway serves" in detail
 
     def test_the_decision_reaches_the_writer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         seen: list[Any] = []
@@ -196,7 +196,7 @@ class TestMcpStep:
     def test_an_allowed_entry_says_how_to_apply_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(placement, "install_entry", _placed("allowed", "full", header_added=True))
         detail = placement.place_mcp("https://api.example.test", decision="yes").detail
-        assert "trust: full" in detail and "/reload-mcp" in detail and "hermes gateway restart" in detail
+        assert "trust: full" in detail and "/reload-mcp in a messaging chat it serves" in detail and "hermes gateway restart" in detail
         assert "X-AgentChat-Client: hermes" in detail
 
     def test_not_allowed_yet_names_the_slash_command(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -270,6 +270,26 @@ class TestMcpStep:
         assert step.outcome == "allowed" and log == ["install yes"]
         record = allow.read_record(tmp_path)
         assert record is not None and record["pending"] is False and record["decision"] == "yes"
+
+    def test_a_gateway_without_the_plugin_in_it_is_told_to_restart(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Lab R3 (L2-F05): under plugins.isolation: host no AgentChat runtime
+        runs in the gateway (no health record), so the yes is written in place,
+        while Hermes' gateway keeps the untrusted connection it made: the step
+        says "not in effect yet", never "allowed", and records that gateway."""
+        from agentchatme_hermes import allow
+
+        log = self._connected_untrusted(monkeypatch, tmp_path, gateway=False)
+        monkeypatch.setattr(allow, "hermes_gateway", lambda home: (4242, 31337))
+        step = placement.place_mcp("https://api.example.test", decision="yes")
+        assert (step.status, step.outcome) == ("warned", "restart") and step.needs_attention
+        assert "not in effect yet" in step.detail and allow.RESTART_TO_APPLY in step.detail
+        assert "pid 4242" in step.detail and log == ["install yes"]
+        record = allow.read_record(tmp_path)
+        assert record is not None and record["trust"] == "full"
+        assert record["restart_gateway"] == {"pid": 4242, "start_time": 31337}
+        assert allow.line_after(allow.SetupDecision("yes", allow.ALLOWED_LINE), step.outcome) is None
 
     def test_a_removal_that_fails_leaves_the_entry_and_no_pending_yes(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

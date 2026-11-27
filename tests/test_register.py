@@ -15,6 +15,7 @@ The load-bearing logic that needs coverage:
 from __future__ import annotations
 
 import logging
+import socket
 import sys
 from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
@@ -761,6 +762,76 @@ class TestReconcileMcpRegistration:
         _register._reconcile_mcp_registration(self._runtime(tmp_path, gateway=False))
         assert done == [("inline", False)]
 
+    def _written_in_place(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, holder: tuple[int, int | None]
+    ) -> list[Any]:
+        """A yes written in place while ``holder`` (pid, start time), a gateway
+        with no AgentChat runtime in it, kept the untrusted connection."""
+        from agentchatme_hermes import allow, mcp_registration
+        from agentchatme_hermes.mcp_registration import Allowance
+
+        allow.write_record(tmp_path, how="asked", trust="full", decision="yes", restart_gateway=holder)
+        entry = {"state": Allowance("ours", "full", "trust")}
+        monkeypatch.setattr(allow, "inspect_allowance", lambda *, api_base: entry["state"])
+        monkeypatch.setattr(allow, "gateway_seen", lambda home: holder)
+        monkeypatch.setattr(allow, "process_start_time", lambda pid: 777)
+        done: list[Any] = []
+
+        def removed(*, api_base: str) -> bool:
+            entry["state"] = Allowance("missing", None, None)
+            done.append("removed")
+            return True
+
+        monkeypatch.setattr(mcp_registration, "uninstall_entry", removed)
+        monkeypatch.setattr(allow, "start_completion", lambda scope, *, api_base: done.append(("completion", scope.home)))
+        return done
+
+    def test_outage_then_activate_this_gateway_applies_the_yes_itself(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Review: an in-process gateway whose AgentChat runtime was down (an
+        outage) when the yes was written in place is the gateway that keeps
+        the untrusted connection. Readiness pauses meanwhile; once its runtime
+        activates, it takes the two steps itself instead of waiting for a
+        restart."""
+        import os
+
+        from agentchatme_hermes import _register, allow
+
+        calls = self._wire(monkeypatch, tmp_path, entry="ours", legacy=False)
+        done = self._written_in_place(monkeypatch, tmp_path, holder=(os.getpid(), 777))
+        before = allow.read_switch(tmp_path, api_base="https://api.example.test")
+        assert before.awaits_restart == os.getpid() and before.in_effect_state == "applying", "paused meanwhile"
+        _register._reconcile_mcp_registration(self._runtime(tmp_path, gateway=True))
+        assert done == ["removed", ("completion", tmp_path)] and calls == []
+        record = allow.read_record(tmp_path)
+        assert record is not None and record["pending"] is True and record["decision"] == "yes"
+        after = allow.read_switch(tmp_path, api_base="https://api.example.test")
+        assert (after.state, after.awaits_restart) == ("applying", None), "now the two steps, as any yes"
+
+    def test_another_gateway_holding_it_is_left_to_its_restart(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        import os
+
+        from agentchatme_hermes import _register, allow
+
+        self._wire(monkeypatch, tmp_path, entry="ours", legacy=False)
+        done = self._written_in_place(monkeypatch, tmp_path, holder=(os.getpid() + 1, 777))
+        _register._reconcile_mcp_registration(self._runtime(tmp_path, gateway=True))
+        assert done == []
+        assert allow.read_switch(tmp_path, api_base="https://api.example.test").awaits_restart == os.getpid() + 1
+
+    def test_a_cli_process_never_applies_it(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        import os
+
+        from agentchatme_hermes import _register
+
+        self._wire(monkeypatch, tmp_path, entry="ours", legacy=False)
+        done = self._written_in_place(monkeypatch, tmp_path, holder=(os.getpid(), 777))
+        _register._reconcile_mcp_registration(self._runtime(tmp_path, gateway=False))
+        assert done == []
+
     def test_failure_is_logged_not_raised(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -1462,3 +1533,113 @@ class TestGatewayOnlyReconcile:
         assert keeps_placements_current(SimpleNamespace()) is False
         assert "keeps_placements_current(self)" in _inspect.getsource(runtime.Runtime.start)
         assert "keeps_placements_current(runtime)" in _inspect.getsource(_register.ActivationWatcher.try_activate)
+
+
+# ─── a runtime that does not start: the remedy that matches (lab R3, L1-F08) ───
+
+
+class TestStartFailureRemedy:
+    """A network outage is not a key problem: "could not be reached" with no
+    login or register in it, at WARNING and without a traceback; a 401 is the
+    key's (login, recover); anything else names doctor only."""
+
+    def _fail(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, exc: BaseException) -> Any:
+        from types import SimpleNamespace
+
+        from agentchatme_hermes import _register, runtime
+
+        class _Runtime:
+            def start(self) -> None:
+                raise exc
+
+        monkeypatch.setattr(runtime, "get_runtime", lambda config, **_kw: _Runtime())
+        config = SimpleNamespace(hermes_home=tmp_path / ".hermes" / "profiles" / "ops")
+        return _register._try_start_runtime(config, gateway_mode=True)
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            "sdk",
+            ConnectionRefusedError(111, "Connection refused"),
+            TimeoutError("timed out"),
+            socket.gaierror(-2, "Name or service not known"),
+        ],
+        ids=["sdk-transport", "refused", "timeout", "dns"],
+    )
+    def test_unreachable_says_wait_and_check_the_network(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture, exc: Any
+    ) -> None:
+        import agentchatme
+
+
+        if exc == "sdk":
+            exc = agentchatme.ConnectionError("[Errno 111] Connection refused")
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes"):
+            assert self._fail(monkeypatch, tmp_path, exc) is None
+        (record,) = caplog.records
+        message = record.getMessage()
+        assert record.levelno == logging.WARNING and record.exc_info is None
+        assert "AgentChat could not be reached for profile=ops" in message and "tries again on its own" in message
+        assert "login" not in message and "register" not in message and "key" not in message
+        from agentchatme_hermes.runtime import start_failure
+
+        assert start_failure(exc) == "unreachable"
+
+    def test_a_refused_key_says_login_or_recover(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agentchatme import UnauthorizedError
+
+        exc = UnauthorizedError({"code": "UNAUTHORIZED", "message": "Invalid API key"}, 401)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes"):
+            assert self._fail(monkeypatch, tmp_path, exc) is None
+        (record,) = caplog.records
+        message = record.getMessage()
+        assert record.levelno == logging.ERROR and "refused this profile's key" in message
+        assert "`hermes -p ops agentchat login`" in message and "`hermes -p ops agentchat recover`" in message
+        assert "could not be reached" not in message
+
+    def test_anything_else_names_doctor_only(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes"):
+            assert self._fail(monkeypatch, tmp_path, RuntimeError("schema changed")) is None
+        (record,) = caplog.records
+        message = record.getMessage()
+        assert record.levelno == logging.ERROR and record.exc_info is not None
+        assert "`hermes -p ops agentchat doctor`" in message and "login" not in message
+
+    def test_a_cli_process_during_an_outage_does_not_send_the_person_to_login(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``register()`` in a CLI process (not the gateway) after a start that
+        could not reach AgentChat: nothing to change here, the gateway retries."""
+        from types import SimpleNamespace
+
+        import agentchatme
+
+        from agentchatme_hermes import _register, runtime
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        class _Runtime:
+            def start(self) -> None:
+                raise agentchatme.ConnectionError("[Errno 111] Connection refused")
+
+        monkeypatch.setattr(runtime, "get_runtime", lambda config, **_kw: _Runtime())
+        monkeypatch.setattr(_register, "kit_problem", lambda: None)
+        monkeypatch.setattr(_register, "_is_gateway_context", lambda ctx: False)
+        monkeypatch.setattr(_register, "_register_surface", lambda *a, **k: None)
+        monkeypatch.setattr(
+            _register, "load_config", lambda *, hermes_home=None: SimpleNamespace(api_base="https://api.example.test", hermes_home=home)
+        )
+        monkeypatch.setattr(_register, "_split_identity", lambda config: None)
+        ctx = SimpleNamespace(register_command=lambda *a, **k: None, get_config=lambda key, default=None: default)
+        with caplog.at_level(logging.INFO, logger="agentchatme_hermes"):
+            _register.register(ctx)
+        cli_only = [r.getMessage() for r in caplog.records if "CLI-only in this process" in r.getMessage()]
+        assert len(cli_only) == 1
+        assert "AgentChat could not be reached" in cli_only[0] and "Nothing to change here" in cli_only[0]
+        assert "register" not in cli_only[0].split("—", 1)[1] and "login" not in cli_only[0]

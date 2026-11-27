@@ -130,6 +130,20 @@ class TestRegister:
         assert BUNDLE_VERSION is not None and BUNDLE_VERSION not in SKILL_DESCRIPTION
         assert "verbatim" in SKILL_DESCRIPTION
 
+    def test_the_description_opens_with_how_to_join_on_this_hermes(self) -> None:
+        """Lab R3 (L1-F03): an agent told only "join AgentChat following
+        agentchat.me/skill.md" signed up by HTTP (its key in the model's
+        context, nothing placed). The skills list Hermes shows every session
+        says first, within Hermes' default 60-character index width, to join
+        with the plugin's commands."""
+        from agentchatme_hermes.skills import SKILL_JOIN_LINE
+
+        assert SKILL_DESCRIPTION.startswith(SKILL_JOIN_LINE + " ")
+        assert len(SKILL_JOIN_LINE) <= 57, "Hermes clips the row at 60 characters, '...' included"
+        assert "`hermes agentchat register`" in SKILL_DESCRIPTION and "`hermes agentchat login`" in SKILL_DESCRIPTION
+        assert "not HTTP" in SKILL_JOIN_LINE
+        assert "\n" not in SKILL_DESCRIPTION
+
     def test_an_existing_file_is_registered_as_it_is(self, home: Path) -> None:
         target = manual_path(home)
         target.parent.mkdir(parents=True)
@@ -818,6 +832,21 @@ class TestDoctor:
         lines = _Lines()
         lines.run(home, BUNDLE_ANNOUNCED, healthy)
         assert any(line.startswith("the gateway keeps the manual current") for line in lines.of("ok"))
+
+    def test_live_texts_on_before_the_gateway_restarts_is_one_line(self, home: Path) -> None:
+        """Lab R3 (L1-F06): live_texts turned on, the gateway still running with
+        it off — one cause, one line (the restart), not four: no "stale" with
+        its doctor --fix, no "Hermes serves …" about this process, no "the
+        gateway serves the bundled copy"."""
+        register_skill(_Ctx(), hermes_home=home)
+        worker = {"manual": {"registered": {"path": str(BUNDLED_MANUAL_PATH), "pinned": True, "kept_current": False}}}
+        lines = _Lines()
+        cli._doctor_texts_checks(home, served=None, worker=worker, ok=lines.ok, warn=lines.warn, fail=lines.fail)
+        lines.run(home, _announce(_body("9.9.9"), "9.9.9"), worker)
+        (warning,) = lines.of("warn")
+        assert warning.startswith("texts: live_texts is on, but the running gateway started with it off")
+        assert "hermes gateway restart" in warning
+        assert lines.of("ok") == [] and lines.of("fail") == []
 
     def test_unsafe(self, home: Path) -> None:
         register_skill(_Ctx(), hermes_home=home)

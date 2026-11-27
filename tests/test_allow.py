@@ -489,12 +489,14 @@ class TestCompletePending:
         import time as _time
 
         placed = self._placement(monkeypatch)
+        # Measured from the removal (decided_at), not from the call: a slow
+        # runner spends time in between, and the wait counts from the removal.
+        started = _time.monotonic()
         allow.write_record(tmp_path, how="asked", trust="full", decision="yes", pending=True, decided_at=_time.time())
         self._runtime(monkeypatch, reading)
         monkeypatch.setattr(allow, "TICK_WAIT_S", 0.3)
         monkeypatch.setattr(allow, "POLL_S", 0.01)
         monkeypatch.setattr(hosted_tools, "hosted_tool_names", lambda: ["mcp__agentchat__agentchat_inbox"])
-        started = _time.monotonic()
         assert allow.complete_pending(tmp_path, api_base="x", wait=True) is True
         assert _time.monotonic() - started >= 0.25 and placed == ["yes"]
 
@@ -949,3 +951,260 @@ class TestSlashCommand:
         handler = chat.commands["agentchat"][0]
         assert list(inspect.signature(handler).parameters) == ["raw_args"]
         assert not inspect.iscoroutinefunction(handler)
+
+
+# ─── plugins.isolation: host, and a yes a running gateway takes up only at its restart (lab R3) ───
+
+
+class TestHostIsolation:
+    """L2-F05 / L2-F06: under plugins.isolation: host the plugin runs beside
+    the gateway, never in it: nothing wakes the agent, the `hermes agentchat`
+    commands do not exist, and a yes over the gateway's untrusted connection
+    is in effect only once that gateway restarts."""
+
+    @pytest.mark.parametrize(
+        ("config", "host"),
+        [
+            ({"plugins": {"isolation": "host"}}, True),
+            ({"plugins": {"isolation": "Host "}}, True),
+            ({"plugins": {"isolation": "in_process"}}, False),
+            ({"plugins": {"isolation": "in-process"}}, False),
+            ({"plugins": {}}, False),
+            ({}, False),
+            ({"plugins": "host"}, False),
+        ],
+    )
+    def test_the_setting_is_read_from_the_profiles_config(
+        self, monkeypatch: pytest.MonkeyPatch, config: dict[str, Any], host: bool
+    ) -> None:
+        monkeypatch.setattr(mcp_registration, "_hermes_raw_config", lambda: config)
+        assert allow.plugin_host_isolation() is host
+
+    def test_an_unreadable_config_is_not_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def unreadable() -> Any:
+            raise mcp_registration.McpRegistrationError("no hermes")
+
+        monkeypatch.setattr(mcp_registration, "_hermes_raw_config", unreadable)
+        assert allow.plugin_host_isolation() is False
+
+    def test_the_note_states_the_trade_off_and_prescribes_nothing(self) -> None:
+        """Rule 12: the fact and the trade-off, the choice left to the person;
+        never an instruction to turn a guard off, no plugin command."""
+        note = allow.host_isolation_note()
+        assert "cannot wake this agent" in note and "plugins.isolation: host" in note
+        assert "needs the plugin inside the gateway (plugins.isolation: in_process)" in note
+        assert "the person's choice" in note and "not advised for a pooled or multi-tenant deployment" in note
+        assert "config set" not in note and "hermes agentchat" not in note and "`" not in note
+
+    def test_register_says_it_once_at_warning(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from agentchatme_hermes import _register
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(allow, "plugin_host_isolation", lambda: True)
+        monkeypatch.setattr(_register, "kit_problem", lambda: "no kit in this test")
+        ctx = types.SimpleNamespace(register_command=lambda *a, **k: None, get_config=lambda key, default=None: default)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes"):
+            _register.register(ctx)
+        said = [r for r in caplog.records if "cannot wake this agent" in r.getMessage()]
+        assert len(said) == 1 and said[0].levelno == logging.WARNING
+        assert "hermes agentchat" not in said[0].getMessage()
+
+    def test_register_is_quiet_in_process(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from agentchatme_hermes import _register
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(allow, "plugin_host_isolation", lambda: False)
+        monkeypatch.setattr(_register, "kit_problem", lambda: "no kit in this test")
+        ctx = types.SimpleNamespace(register_command=lambda *a, **k: None, get_config=lambda key, default=None: default)
+        with caplog.at_level(logging.WARNING, logger="agentchatme_hermes"):
+            _register.register(ctx)
+        assert "cannot wake" not in caplog.text
+
+    def _record_yes_in_place(self, home: Path, pid: int, start: int | None = 1000) -> None:
+        assert allow.write_record(home, how="asked", trust="full", decision="yes", restart_gateway=(pid, start))
+
+    def _liveness(self, monkeypatch: pytest.MonkeyPatch, **reading: Any) -> None:
+        """Hermes' ``resolve_gateway_liveness`` as this process reads it
+        (``raises``: the read fails), under :func:`allow.gateway_seen`."""
+        status = types.ModuleType("gateway.status")
+
+        def resolve(*, profile_dir: Any, use_cache: bool) -> Any:
+            if reading.get("raises"):
+                raise OSError("permission denied")
+            return types.SimpleNamespace(
+                running=reading.get("running", True), pid=reading.get("pid"), probe_error=reading.get("probe_error", False)
+            )
+
+        status.resolve_gateway_liveness = resolve  # type: ignore[attr-defined]
+        status.get_process_start_time = lambda pid: reading.get("start")  # type: ignore[attr-defined]
+        status.start_time_fingerprints_match = lambda a, b: abs(int(a) - int(b)) <= 200  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
+        monkeypatch.setitem(sys.modules, "gateway.status", status)
+
+    def _switch(self, tmp_path: Path) -> allow.Switch:
+        return allow.read_switch(tmp_path, api_base="https://api.agentchat.me")
+
+    def test_a_yes_awaits_the_restart_of_the_gateway_that_held_the_connection(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _config_says(monkeypatch, _allowance("ours", "full", "trust"))
+        self._record_yes_in_place(tmp_path, 4242)
+        self._liveness(monkeypatch, pid=4242, start=1000)
+        switch = self._switch(tmp_path)
+        assert (switch.state, switch.awaits_restart, switch.restart_unverified, switch.by_tier) == ("allowed", 4242, False, True)
+        text = allow.describe(switch, "alice")
+        assert text.startswith("allowed in config.yaml, not in effect yet") and allow.RESTART_TO_APPLY in text
+        assert "allowed (trust: full)" not in text
+        decided = allow.decide("alice", api_base="https://api.agentchat.me", tty=True, home=tmp_path, ask=lambda q: "yes")
+        assert decided.decision is None and decided.line != allow.ALREADY_ALLOWED_LINE and "not in effect yet" in decided.line
+
+    @pytest.mark.parametrize(
+        "reading",
+        [
+            {"pid": 4343, "start": 5000},  # another pid
+            {"running": False, "probe_error": False},  # Hermes: none runs, no probe error
+            {"pid": 4242, "start": 9000},  # a reused pid, a container's PID 1 started again
+        ],
+        ids=["restarted", "stopped", "pid-reused-or-pid-1-again"],
+    )
+    def test_on_positive_evidence_it_is_allowed_and_forgotten(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reading: dict[str, Any]
+    ) -> None:
+        """Keyed on the pid and the process start time: another pid, another
+        start time (both readable), or Hermes saying no gateway runs is that
+        gateway gone. The record forgets it then, once, so a later gateway
+        with that pid never brings "not in effect yet" back."""
+        _config_says(monkeypatch, _allowance("ours", "full", "trust"))
+        self._record_yes_in_place(tmp_path, 4242)
+        self._liveness(monkeypatch, **reading)
+        switch = self._switch(tmp_path)
+        assert switch.awaits_restart is None and allow.describe(switch, "alice") == "allowed (trust: full)"
+        record = allow.read_record(tmp_path)
+        assert record is not None and "restart_gateway" not in record and record["trust"] == "full"
+        self._liveness(monkeypatch, pid=4242, start=1000)
+        assert self._switch(tmp_path).awaits_restart is None
+
+    @pytest.mark.parametrize(
+        "reading",
+        [
+            {"raises": True},  # Hermes' liveness not readable here
+            {"running": False, "probe_error": True},  # a rung raised: "down" not told from "unknown"
+            {"running": True, "pid": None},  # running, no pid to compare
+        ],
+        ids=["exception", "probe-error", "running-without-a-pid"],
+    )
+    def test_when_it_cannot_be_told_the_record_is_kept_and_said_so(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, reading: dict[str, Any]
+    ) -> None:
+        """Lead review: a read path never rewrites the record on uncertain
+        evidence (doctor on a host against a containerized gateway would have
+        cleared it for good, and the loop resumed on the untrusted connection)."""
+        _config_says(monkeypatch, _allowance("ours", "full", "trust"))
+        self._record_yes_in_place(tmp_path, 4242)
+        before = allow.record_path(tmp_path).read_bytes()
+        self._liveness(monkeypatch, **reading)
+        switch = self._switch(tmp_path)
+        assert (switch.awaits_restart, switch.restart_unverified) == (4242, True)
+        assert switch.in_effect_state == "applying", "the receive loop stays paused"
+        text = allow.describe(switch, "alice")
+        assert "not in effect yet as far as can be told" in text and "cannot be told" in text
+        assert allow.record_path(tmp_path).read_bytes() == before, "not rewritten"
+
+    def test_a_pid_whose_start_time_cannot_be_read_here_is_compared_by_pid(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A gateway in another pid namespace (a container sharing HERMES_HOME):
+        its start time is not readable from here. Only one side readable: the
+        pid alone decides, so the record is kept."""
+        _config_says(monkeypatch, _allowance("ours", "full", "trust"))
+        self._record_yes_in_place(tmp_path, 4242, 1000)
+        before = allow.record_path(tmp_path).read_bytes()
+        self._liveness(monkeypatch, pid=4242, start=None)
+        switch = self._switch(tmp_path)
+        assert (switch.awaits_restart, switch.restart_unverified) == (4242, False)
+        assert allow.record_path(tmp_path).read_bytes() == before
+        self._record_yes_in_place(tmp_path, 4242, None)  # unreadable when written, readable now
+        self._liveness(monkeypatch, pid=4242, start=1000)
+        assert self._switch(tmp_path).awaits_restart == 4242
+
+    def test_start_times_within_hermes_drift_are_one_process(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        _config_says(monkeypatch, _allowance("ours", "full", "trust"))
+        self._record_yes_in_place(tmp_path, 4242, 1000)
+        self._liveness(monkeypatch, pid=4242, start=1150)
+        assert self._switch(tmp_path).awaits_restart == 4242
+
+    def test_no_recorded_gateway_reads_no_liveness(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        _config_says(monkeypatch, _allowance("ours", "full", "trust"))
+        allow.write_record(tmp_path, how="asked", trust="full", decision="yes")
+        monkeypatch.setattr(allow, "gateway_seen", lambda home: pytest.fail("not asked"))
+        assert self._switch(tmp_path).awaits_restart is None
+
+    def test_the_receive_loop_pauses_while_a_yes_is_not_in_effect(self) -> None:
+        switch = allow.Switch("allowed", _allowance("ours", "full", "trust"), {"how": "asked"}, 4242)
+        assert switch.in_effect_state == "applying" and switch.in_effect_state in allow.PAUSED_STATES
+        assert allow.Switch("allowed", _allowance("ours", "full", "trust")).in_effect_state == "allowed"
+
+    def test_this_process_is_told_apart_from_another_gateway(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import os
+
+        monkeypatch.setattr(allow, "process_start_time", lambda pid: 777)
+        mine = allow.Switch("allowed", None, {"restart_gateway": {"pid": os.getpid(), "start_time": 777}}, os.getpid())
+        other = allow.Switch("allowed", None, {"restart_gateway": {"pid": os.getpid(), "start_time": 1}}, os.getpid())
+        assert allow.held_by_this_process(mine) is True and allow.held_by_this_process(other) is False
+
+
+    def test_describe_without_the_cli_names_no_agentchat_command(self) -> None:
+        for switch in (allow.Switch("not_allowed_yet", _allowance("missing", None)), allow.Switch("not_allowed", _allowance())):
+            assert "hermes agentchat allow" in allow.describe(switch, "alice")
+            assert "hermes agentchat" not in allow.describe(switch, "alice", cli=False)
+            assert "/agentchat allow" in allow.describe(switch, "alice", cli=False)
+
+
+class TestSlashCommandUnderHost:
+    """``/agentchat`` is the one surface there: it says the agent is not woken."""
+
+    _wire = TestSlashCommand._wire
+    _run = TestSlashCommand._run
+
+    def test_status_says_it_is_never_woken(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        self._wire(monkeypatch, tmp_path, state="not_allowed", allowance=_allowance())
+        monkeypatch.setattr(allow, "plugin_host_isolation", lambda: True)
+        reply = self._run(tmp_path, _Chat(), args="")
+        assert "cannot wake this agent" in reply and "hermes agentchat" not in reply
+        assert "/agentchat allow in a chat with it" in reply
+
+    def test_a_yes_the_gateway_takes_up_at_its_restart_is_not_called_allowed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        placed = self._wire(monkeypatch, tmp_path, state="not_allowed", allowance=_allowance(), outcome="restart", gateway=False)
+        monkeypatch.setattr(allow, "plugin_host_isolation", lambda: True)
+        reply = self._run(tmp_path, _Chat("allow"))
+        assert placed == ["yes"]
+        assert reply.startswith("AgentChat tools for @alice: not in effect yet — trust: full is written")
+        assert allow.RESTART_TO_APPLY in reply and "cannot wake this agent" in reply
+        assert "AgentChat tools allowed" not in reply
+
+    def test_allow_again_while_it_awaits_the_restart(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        placed = self._wire(monkeypatch, tmp_path, state="allowed", allowance=_allowance("ours", "full", "trust"))
+        monkeypatch.setattr(
+            allow, "read_switch", lambda home, *, api_base: allow.Switch("allowed", _allowance("ours", "full", "trust"), None, 4242)
+        )
+        chat = _Chat("allow")
+        reply = self._run(tmp_path, chat)
+        assert chat.asked == [] and placed == [] and "not in effect yet" in reply
+
+    def test_not_set_up_names_no_agentchat_command(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        self._wire(monkeypatch, tmp_path, state="not_allowed_yet", allowance=_allowance("missing", None), key=False)
+        for name in ("AGENTCHAT_API_KEY", "AGENTCHATME_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setattr(allow, "plugin_host_isolation", lambda: True)
+        reply = self._run(tmp_path, _Chat("allow"))
+        assert reply.startswith("AgentChat is not set up in this profile yet.") and "hermes agentchat" not in reply

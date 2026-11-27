@@ -928,3 +928,33 @@ class TestStopRecordsBeforeLettingGo:
             interrupted.set()
             rt.stop()
             api.close()
+
+
+class TestStartFailureLogging:
+    """Review (lab R3, L1-F08): an outage is not logged as an ERROR with a
+    traceback on every retry; the caller says what happened, once per attempt."""
+
+    @pytest.mark.parametrize("kind", ["unreachable", "key_refused", "other"])
+    def test_the_start_failure_is_logged_by_its_kind(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture, kind: str
+    ) -> None:
+        import agentchatme
+
+        from agentchatme_hermes.runtime import Runtime, start_failure
+
+        exc: Exception = {
+            "unreachable": agentchatme.ConnectionError("[Errno 111] Connection refused"),
+            "key_refused": agentchatme.UnauthorizedError({"code": "UNAUTHORIZED", "message": "Invalid API key"}, 401),
+            "other": RuntimeError("schema changed"),
+        }[kind]
+        assert start_failure(exc) == kind
+        with _patched_runtime() as (_ws, _inv, fake_client, _acq, _rel):
+            fake_client.get_me.side_effect = exc
+            runtime = Runtime(_config(hermes_home=tmp_path), gateway_mode=True)  # type: ignore[arg-type]
+            with caplog.at_level(logging.DEBUG, logger="agentchatme_hermes"), pytest.raises(type(exc)):
+                runtime.start()
+        loud = [r for r in caplog.records if r.levelno >= logging.WARNING]
+        if kind == "other":
+            assert len(loud) == 1 and loud[0].levelno == logging.ERROR and loud[0].exc_info is not None
+        else:
+            assert loud == [], "the caller (_try_start_runtime) says it, without a traceback"

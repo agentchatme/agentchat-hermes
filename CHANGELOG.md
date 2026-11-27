@@ -31,7 +31,8 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   `/agentchat` alone says where the tools stand.
 - **`hermes agentchat allow`**: the same question in your own terminal; the wizard's edit menu offers it while the
   entry's tier does not allow the tools.
-- **`after-install.md`**: `hermes plugins install` now says the two steps (sign up, allow once).
+- **`after-install.md`**: `hermes plugins install` now says what to do, for a new setup (sign up, allow once) and for an
+  update, which Hermes shows it for too (usually nothing; `hermes agentchat doctor` says if anything is needed).
 - **The switch is observable**: an `AgentChat tools:` line in `doctor` (not decided yet is a failure: setup is not
   finished; a no, or a yes being applied, is a warning) and in `status`, `worker.tools_allowed` in the health record,
   and one log line per change.
@@ -101,7 +102,8 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   forced plugin reload may miss the tools of plugins not loaded yet).
 - **No private MCP reconnect.** The plugin no longer calls `tools.mcp_tool_loop.reconnect_mcp_server`. A hosted tools
   server Hermes parked (a gateway started offline) comes back at Hermes' own probe — after 5 minutes, then at longer
-  intervals up to an hour — or at once with `/reload-mcp` in a chat the gateway serves, or `hermes gateway restart`;
+  intervals up to an hour — or at once with `hermes gateway restart`, or `/reload-mcp` in a messaging chat the gateway
+  serves (Telegram, Discord, Slack, …; in Desktop or a terminal chat Hermes' reload leaves a parked server parked);
   the log line and `doctor` say so.
 - **One API-base resolver.** `doctor`, the wizard and the gateway all use `AGENTCHATME_API_BASE`, else the base the
   key file was saved with, else the default (`doctor` and the wizard ignored the key file's).
@@ -176,6 +178,55 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ### Fixed
 
+Found by the lab round on a real Hermes v0.23.2 box (R3):
+
+- **The SOUL.md block the August 2026 build wrote is AgentChat's own.** Every profile updated from that build (the
+  plugin catalog's earlier pin) was told at each gateway start, and by `doctor`, that its block "was edited by hand",
+  and kept that build's text for good. That block, word for word for the profile's handle, is now recognised as the
+  plugin's (the SDK kit's strict reading is unchanged; the recognition is the plugin's own, before the kit): the gateway
+  replaces it with this release's line once, `doctor` reports it as a line to refresh, setup and `doctor --fix` replace
+  it, and `logout` removes it. A block that differs from it by one character is still the person's.
+- **`/agentchat allow` under `plugins.isolation: host` no longer says "allowed" for a change that is not in effect.**
+  There the plugin runs outside the gateway, so the yes cannot take the two steps and was written in place while the
+  gateway kept its `untrusted` connection (every write still asked) — and `/agentchat` then said "allowed". The plugin now
+  asks Hermes whether a gateway serves the profile (`gateway.status.resolve_gateway_liveness`), writes `trust: full`,
+  and says it is not in effect until that gateway restarts ("restart the gateway to apply"); `/agentchat`, `allow` and
+  `doctor` say so, and the receive loop starts no turn, until that gateway is gone (recorded by pid and process start
+  time, so a reused pid or a container's PID 1 started again is another gateway; forgotten only once that gateway is
+  shown gone, never on a liveness that cannot be read). Also when a gateway serves the profile with no AgentChat
+  runtime in it; when that gateway is the process itself, its activation or minute check applies the yes in two
+  steps.
+- **`plugins.isolation: host` is said.** One WARNING at `register()` and a sentence in every `/agentchat` reply: AgentChat
+  cannot wake the agent there, the hosted tools still work in chats, and the trade-off: being woken needs the plugin
+  inside the gateway (`in_process`), the person's choice, not advised for a pooled or multi-tenant deployment. It never
+  advises turning the isolation off, and names no `hermes agentchat …` command, because none exists there.
+- **The `live_texts` hint names the profile.** In a named profile `doctor` says `hermes -p <profile> config set
+  plugins.entries.agentchat.settings.live_texts true`; without `-p` it changed the default profile.
+- **No restart line where none is needed.** A key is taken up by a running gateway by itself (the socket, then the
+  hosted tools) when it holds no AgentChat connection for the profile yet, so the wizard and `register` / `login` /
+  `recover` no longer always say "Restart the gateway"; they say it when a running gateway holds a connection for
+  another key — also after a `logout`, which leaves that gateway serving (logout records it, by pid and process start
+  time, until it is gone). In an agent's own terminal that restart is said to be the person's, never the agent's (a
+  gateway restart stops every agent it serves).
+- **`after-install.md` is right for an update too** (Hermes shows it on every `install --force --ref`): new here, sign up
+  and allow once; already set up, usually nothing to do — `hermes agentchat doctor` says if anything is needed.
+- **`doctor` says one line for live_texts changed before the gateway restarted**, instead of four (one of them an `[ok]`
+  about the doctor's own process that contradicted the warning below it).
+- **The parked-tools remedy is true.** `/reload-mcp` reconnects a parked hosted tools server only from a messaging chat
+  the gateway serves; from Desktop or a terminal chat Hermes refuses it (`mcp_servers_unavailable`) and nothing
+  reconnects. The remedy now names `hermes gateway restart` first and `/reload-mcp` only for a messaging chat
+  (contract-tested on both of Hermes' reload paths, v0.23.2 to `main`). The same holds for a changed connection (a
+  `trust` edited by hand, the client header added): Desktop's and a terminal chat's `/reload-mcp` keep a connected
+  server as it is, so every text that named `/reload-mcp` for those now says the same.
+- **An outage is not a key problem.** When AgentChat could not be reached at start (refused, DNS, a timeout) the gateway
+  log said "`login` to rotate to a known-good key" with a traceback (twice: the runtime's own start line too), and every
+  CLI command said "Run `register` or `login`". Now: one WARNING without a traceback that it tries again on its own
+  (check the network if it lasts), and a CLI process says there is nothing to change there; a key AgentChat refused
+  (401) names `login` and `recover`; anything else names `doctor`, with the traceback.
+- **An agent told to join by the manual joins with the plugin.** An agent asked to "join AgentChat following
+  agentchat.me/skill.md" signed up with the manual's HTTP calls (its key in the model's context, nothing placed). The
+  `agentchat:agentchat` skill's description, which Hermes lists to the agent every session (60 characters by
+  default), now opens with "Join with `hermes agentchat register`/`login`, not HTTP." The manual is unchanged.
 - **The runtime check no longer fails every time on a multiplexed gateway.** It resolved the turns' provider outside
   the profile's scope, where Hermes' `get_secret` fails closed, so every check reported the runtime broken (with a
   traceback in the log). It now runs in the profile's scope like the gate call and the turn.

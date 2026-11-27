@@ -112,9 +112,18 @@ _ENV_API_BASE = ENV_API_BASE
 
 _DEFAULT_API_BASE = "https://api.agentchat.me"
 
-# Turns the plugin setting on in any install (a pip install has no settings
-# form: Hermes reads ``config_schema`` only from a plugin directory).
-_LIVE_TEXTS_ON = "hermes config set plugins.entries.agentchat.settings.live_texts true"
+
+def _live_texts_on(home: Path) -> str:
+    """Turns the plugin setting on in any install (a pip install has no
+    settings form: Hermes reads ``config_schema`` only from a plugin
+    directory), for ``home``'s profile: ``hermes -p NAME config set …`` in a
+    named profile (without ``-p`` it would set the default profile's)."""
+    from .profile_scope import profile_label
+
+    label = profile_label(home)
+    flag = "" if label == "default" else f"-p {label} "
+    return f"hermes {flag}config set plugins.entries.agentchat.settings.live_texts true"
+
 
 _EXIT_OK = 0
 _EXIT_ARG_ERR = 2
@@ -328,12 +337,13 @@ def _dispatch_login(args: argparse.Namespace) -> int:
         )
 
     tools = allow.decide_for(checked.handle)
+    before, serving = _held_and_serving(api_base)
     if not _persist_credentials(api_key=api_key, handle=checked.handle, api_base=api_base):
         return _EXIT_API_ERR
-    _install_placement(checked.handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
+    steps = _install_placement(checked.handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
     _printline(f"Saved AgentChat key for @{checked.handle}.")
-    _printline(tools.line)
-    _printline(_RESTART_HINT)
+    _print_tools_line(tools, steps)
+    _printline(credentials.key_in_use_line(before, api_key, serving=serving))
     return _EXIT_OK
 
 
@@ -457,11 +467,12 @@ def _run_signup(
         return _exit_with(f"{reason}Nothing was saved.")
     api_key, handle = saved
     tools = allow.decide_for(handle)
+    before, serving = _held_and_serving(api_base)
     if not _persist_credentials(api_key=api_key, handle=handle, api_base=api_base):
         return _EXIT_API_ERR
-    _install_placement(handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
-    _printline(tools.line)
-    on_saved(handle=handle, api_key=api_key)
+    steps = _install_placement(handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
+    _print_tools_line(tools, steps)
+    on_saved(handle=handle, api_key=api_key, before=before, serving=serving)
     return _EXIT_OK
 
 
@@ -489,6 +500,8 @@ def _dispatch_allow(_args: argparse.Namespace) -> int:
         return _exit_with(f"AgentChat tools: nothing changed — {step.detail}")
     if step.outcome == "applying":
         _printline(allow.APPLYING_LINE + ".")
+    elif step.outcome == "restart":
+        _printline(f"AgentChat tools: {step.detail}.")
     else:
         _printline(tools.line + ("." if tools.decision == "yes" else ""))
     if step.status == "changed":
@@ -901,6 +914,7 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                 resolution, handle=authenticated_handle, api_base=api_base, home=hermes_home
             ):
                 {"ok": ok, "warn": warn, "fail": fail}[level](line)
+        mcp_outcome: str | None = None
         for step in place_identity_and_tools(
             handle=authenticated_handle,
             texts=served_texts,
@@ -911,12 +925,15 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             replace_other_agent=False,
             tools_decision=tools.decision if tools.decision in ("yes", "no") else None,
         ):
+            if step.name == "mcp":
+                mcp_outcome = step.outcome
             if step.name == "mcp" and step.outcome == "missing":
                 continue  # the AgentChat tools line below says it
             report = fail if step.failed else warn if step.status == "warned" else ok
             report(f"fix: {step.name} {step.status} — {step.detail}")
-        if tools.decision in ("yes", "no"):
-            ok(f"fix: {tools.line}")
+        tools_line = allow.line_after(tools, mcp_outcome)
+        if tools.decision in ("yes", "no") and tools_line is not None:
+            ok(f"fix: {tools_line}")
 
     # Offline, the block is read against the line in use for the handle this
     # profile saved (as `status` does), not left "not verified": this
@@ -965,8 +982,8 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         else:
             set_headers = (
                 "set this header under its `headers:` (replace any existing X-AgentChat-Client "
-                "line; a key may appear only once, in any casing), then restart the gateway or "
-                "/reload-mcp:\n" + client_header_lines("      ")
+                "line; a key may appear only once, in any casing), then restart the gateway (or /reload-mcp "
+                "in a messaging chat it serves):\n" + client_header_lines("      ")
             )
             if entry_state == "ours":
                 ok(
@@ -1142,8 +1159,8 @@ _WORKER_BAD_CYCLES = 3
 # What to do about a cycle that did not get through, by its outcome.
 _CYCLE_REMEDIES = {
     "tools_unavailable": (
-        "; the hosted tools line below says why — /reload-mcp in a chat this gateway serves, or "
-        "`hermes gateway restart`, reconnects them"
+        "; the hosted tools line below says why — `hermes gateway restart`, or /reload-mcp in a messaging "
+        "chat this gateway serves (not Desktop or a terminal chat), reconnects them"
     ),
 }
 
@@ -1159,9 +1176,10 @@ def _doctor_tools_switch(
     fail: Callable[[str], None],
 ) -> None:
     """The one switch (:func:`.allow.read_switch`): not decided yet, or a yes
-    the running gateway did not take up (restart to apply), is a failure — the
-    agent answers nothing on AgentChat; a no, a yes being applied, or a trust
-    changed by hand is a warning."""
+    the running gateway did not take up (restart to apply: stalled, or written
+    in place while that gateway keeps the earlier connection), is a failure —
+    the agent answers nothing on AgentChat; a no, a yes being applied, or a
+    trust changed by hand is a warning."""
     switch = allow.read_switch(hermes_home, api_base=api_base)
     if switch.state == "disabled":
         return  # said above
@@ -1169,7 +1187,7 @@ def _doctor_tools_switch(
         warn("AgentChat tools: not checked — this Hermes' config.yaml could not be read here")
         return
     text = f"AgentChat tools: {allow.describe(switch, handle, cmd=cmd)}"
-    if switch.state == "not_allowed_yet" or switch.stalled:
+    if switch.state == "not_allowed_yet" or switch.stalled or switch.awaits_restart is not None:
         fail(text)
     elif switch.state == "allowed" and not switch.hand_edited:
         ok(text)
@@ -1733,17 +1751,34 @@ def _doctor_texts_checks(
     from .turn import identity_line_template
 
     mode = mode_for(hermes_home)
+    on = _live_texts_on(hermes_home)
+    other = _gateway_on_other_setting(worker, live=mode.live)
     if mode.problem is not None:
         warn(
             f"texts: {mode.problem} — this release's manual and identity line are used; set it with "
-            f"`{_LIVE_TEXTS_ON}` (or `false`), then `hermes gateway restart`"
+            f"`{on}` (or `false`), then `hermes gateway restart`"
         )
+    if other and mode.live:
+        # One cause, one line: the manual lines below say nothing more about the gateway.
+        warn(
+            "texts: live_texts is on, but the running gateway started with it off, so it still uses this "
+            "release's manual and identity line — restart it (`hermes gateway restart`) to keep them current "
+            "from agentchat.me"
+        )
+    elif other:
+        warn(
+            "texts: live_texts is off, but the running gateway started with it on (or runs a release before "
+            "0.7.0), so it still uses the served manual and identity line — restart it (`hermes gateway "
+            "restart`) to use this release's"
+        )
+    elif mode.problem is not None:
+        pass  # said above
     elif mode.live:
         ok("texts: the manual and the SOUL.md identity line are kept current from agentchat.me (live_texts on)")
     else:
         ok(
             f"texts: this release's manual and SOUL.md identity line ({mode.detail}): they change only with a "
-            f"plugin update — to keep them current from agentchat.me: `{_LIVE_TEXTS_ON}`, then "
+            f"plugin update — to keep them current from agentchat.me: `{on}`, then "
             "`hermes gateway restart`"
         )
     if not mode.live:
@@ -1755,22 +1790,20 @@ def _doctor_texts_checks(
                 f"AgentChat now serves a different identity line from this release's (taken {snapshot.fetched_at}): "
                 "a plugin update brings it, or live_texts on"
             )
+
+
+def _gateway_on_other_setting(worker: Any, *, live: bool) -> bool:
+    """Whether the running gateway (its health record, ``worker``) started with
+    the other ``live_texts`` setting than this profile's (``live``): it reads
+    the setting when it starts, so it keeps the other texts until it restarts.
+    A record from before 0.7.0 has no ``pinned``: that gateway keeps the texts
+    current."""
     section = worker.get("manual") if isinstance(worker, dict) else None
     registered = section.get("registered") if isinstance(section, dict) else None
     if not isinstance(registered, dict):
-        return
-    # A record from before 0.7.0 has no "pinned": that gateway keeps the texts current.
+        return False
     gateway_live = registered.get("pinned") is not True
-    if gateway_live and not mode.live:
-        warn(
-            "the running gateway uses the served manual and identity line (it started with live_texts on, or "
-            "runs a release before 0.7.0): restart it (`hermes gateway restart`) to use this release's"
-        )
-    elif mode.live and not gateway_live:
-        warn(
-            "the running gateway uses this release's manual and identity line (it started with live_texts off): "
-            "restart it (`hermes gateway restart`) to keep them current from agentchat.me"
-        )
+    return gateway_live != live
 
 
 def _doctor_soul_checks(
@@ -2058,8 +2091,14 @@ def _doctor_manual_checks(
         return
     bundled = bundled_version() or "?"
     state = check(target, served)
+    # The running gateway started with live_texts off: the texts line said it,
+    # and its restart is the one step. What it would place, and what this
+    # process (not the gateway) registered, are not said again.
+    restart_first = _gateway_on_other_setting(worker, live=True)
     if state.state == "current":
         ok(f"manual {state.detail} (kept current from {MANUAL_URL})")
+    elif state.state in ("missing", "stale") and restart_first:
+        pass
     elif state.state == "missing" and _routine_registration(hermes_home):
         fail(
             f"manual {state.summary} at {target} — not placed yet: Hermes sessions read the bundled "
@@ -2091,7 +2130,7 @@ def _doctor_manual_checks(
         warn(f"manual {state.detail} — it cannot be compared until /v1/texts answers")
 
     held, reason = _registered_manual(hermes_home)
-    if held is not None and not _routine_registration(hermes_home):
+    if held is not None and not _routine_registration(hermes_home) and not restart_first:
         if held == target:
             ok(f"Hermes serves agentchat:agentchat from {target}")
         else:
@@ -2103,7 +2142,7 @@ def _doctor_manual_checks(
     section = worker.get("manual") if isinstance(worker, dict) else None
     if isinstance(section, dict):
         registered = section.get("registered")
-        if isinstance(registered, dict) and registered.get("kept_current") is False:
+        if isinstance(registered, dict) and registered.get("kept_current") is False and not restart_first:
             why = registered.get("reason")
             warn(
                 f"the gateway serves the bundled copy {registered.get('path')}, frozen at {bundled}"
@@ -2407,10 +2446,13 @@ def _api_base() -> str:
     return resolve_api_base(stored_api_base(), strict=False)
 
 
-_RESTART_HINT = (
-    "Restart the gateway (`hermes gateway restart`) and any open Hermes session so they use the "
-    "key: a running Hermes keeps the key it started with for the AgentChat tools."
-)
+def _print_tools_line(tools: allow.SetupDecision, steps: list[PlacementStep]) -> None:
+    """The answer's line after the placement (:func:`.allow.line_after`)."""
+    outcome = next((step.outcome for step in steps if step.name == "mcp"), None)
+    line = allow.line_after(tools, outcome)
+    if line is not None:
+        _printline(line)
+
 
 # Where the last successful save put the key, for the success lines.
 _last_saved_path: Path | None = None
@@ -2475,22 +2517,31 @@ def _saved_where() -> str:
     return f"saved in {_last_saved_path}, readable by you only"
 
 
-def _print_registration_success(*, handle: str, api_key: str) -> None:
+def _held_and_serving(api_base: str) -> tuple[str | None, bool]:
+    """Before a save: the key this profile holds, and whether a running gateway
+    holds an AgentChat connection for it (:func:`.credentials.key_in_use_line`)."""
+    from .placement import gateway_serves_profile
+    from .profile_scope import resolve_hermes_home
+
+    return credentials.key_held(), gateway_serves_profile(resolve_hermes_home(), api_base=api_base)
+
+
+def _print_registration_success(*, handle: str, api_key: str, before: str | None, serving: bool) -> None:
     masked = _mask_key(api_key)
     _printline("")
     _printline(f"  Registered @{handle}")
     _printline(f"  Key:   {masked}   ({_saved_where()})")
     _printline("")
-    _printline(f"{_RESTART_HINT} Then your agent is on the network.")
+    _printline(credentials.key_in_use_line(before, api_key, serving=serving))
 
 
-def _print_recovery_success(*, handle: str, api_key: str) -> None:
+def _print_recovery_success(*, handle: str, api_key: str, before: str | None, serving: bool) -> None:
     masked = _mask_key(api_key)
     _printline("")
     _printline(f"  Recovered @{handle}")
     _printline(f"  New key:   {masked}   ({_saved_where()})")
     _printline("")
-    _printline(_RESTART_HINT)
+    _printline(credentials.key_in_use_line(before, api_key, serving=serving))
 
 
 def _could_not_process_section(worker: Any) -> dict[str, Any] | None:

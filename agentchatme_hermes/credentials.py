@@ -13,6 +13,9 @@
   has accepted it (the hosted tools read ``AGENTCHAT_API_KEY``); the ``.env``
   line stays for ``doctor --fix``.
 * :func:`clear_credentials` — logout: the key file and the key settings.
+* :func:`key_in_use_line` — after a save: whether a restart is needed for the
+  key to be used (only when a running gateway held another key for the
+  profile), said to the person.
 
 This module never opens a ``.env`` file. The key is read from the profile's
 settings as Hermes resolves them (:func:`.config.settings_key`); lines are
@@ -63,6 +66,54 @@ class SaveOutcome:
     # The key is in the key file, but ``secrets.agentchat`` must be added (by
     # hand: a managed config) before the hosted tools can read it.
     tools_need_block: bool = False
+
+
+RESTART_HINT = (
+    "Restart the gateway (`hermes gateway restart`) and any open Hermes session so they use the "
+    "key: a running Hermes keeps the key it started with for the AgentChat tools."
+)
+# In an agent's own terminal the restart is the person's: a gateway restart
+# stops the live turns of every agent that gateway serves.
+RESTART_HINT_AGENT = (
+    "A running gateway and any open Hermes session keep the earlier key for the AgentChat tools until they "
+    "restart. That restart is for the person who runs them, not for an agent: a gateway restart stops every "
+    "agent the gateway serves."
+)
+NO_RESTART_LINE = (
+    "A running gateway that serves this profile starts AgentChat for it by itself within about a minute: "
+    "no restart needed."
+)
+
+
+def key_held(home: Path | None = None) -> str | None:
+    """The key this profile holds before a save, refused or not (``""`` for a
+    refused copy whose key is not known), or ``None`` when it holds none."""
+    from .config import resolve_key
+
+    resolution = resolve_key(home)
+    held = resolution.api_key or resolution.held_key
+    if held is None and resolution.refusal is not None:
+        return ""
+    return held
+
+
+def key_in_use_line(before: str | None, api_key: str, *, serving: bool) -> str:
+    """How a key just saved comes into use. ``serving``: a running gateway held
+    an AgentChat connection for this profile before the save
+    (:func:`.placement.gateway_serves_profile`: for the key it held, or the
+    gateway a logout left serving); ``before``: :func:`key_held` before the
+    save. Such a gateway keeps the key it started with (the socket, and Hermes
+    the hosted tools' key), so a different key needs its restart — the same
+    line logout says. With none, or the same key again, no restart: a running
+    gateway activates a profile's first key by itself (its activation
+    re-checks every 30 s) and connects the hosted tools with it. In an agent's
+    own terminal (:func:`.allow.in_agent_terminal`) the restart is said to be
+    the person's, never the agent's."""
+    from .allow import in_agent_terminal
+
+    if not serving or before == api_key:
+        return NO_RESTART_LINE
+    return RESTART_HINT_AGENT if in_agent_terminal() else RESTART_HINT
 
 
 def key_bridge() -> tuple[bool, str]:
