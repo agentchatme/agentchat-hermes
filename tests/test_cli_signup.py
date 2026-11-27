@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 import signup_wire as sw
@@ -21,6 +21,9 @@ from sdk_wire import Wire, answer, api_error, connect_error, serve
 
 from agentchatme_hermes import allow, cli, credentials, signup
 from agentchatme_hermes.cli import _EXIT_API_ERR, _EXIT_ARG_ERR, _EXIT_OK, _EXIT_USER_CANCEL
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 _KEY = api_key("cli_0000000000000000")
 _CODE_PROMPT = "Enter the 6-digit code (blank to cancel, new for a new code): "
@@ -685,6 +688,16 @@ class TestKeyInUse:
         out = capsys.readouterr().out
         assert credentials.RESTART_HINT in out and credentials.NO_RESTART_LINE not in out
 
+    def test_register_with_no_gateway_running(self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+        from agentchatme_hermes import placement
+
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        monkeypatch.setattr(placement, "gateway_runs_for", lambda home: False)
+        self._register(monkeypatch)
+        out = capsys.readouterr().out
+        assert "AgentChat reaches this agent once one runs (`hermes gateway run`" in out
+        assert credentials.NO_RESTART_LINE not in out
+
     def test_another_key_with_no_gateway_serving_needs_none(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -786,6 +799,23 @@ class TestKeyInUseLine:
         else:
             monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
         assert credentials.key_in_use_line(before, "k", serving=serving) == getattr(credentials, line)
+
+    @pytest.mark.parametrize(("runs", "start"), [(False, True), (None, False), (True, False)])
+    def test_with_no_gateway_running_it_says_the_agent_is_reached_once_one_runs(
+        self, tmp_path: Path, runs: bool | None, start: bool
+    ) -> None:
+        """Lab R3 (L2-F09): "no restart needed" was said with no gateway
+        running at all; nothing said the agent waits for one."""
+        line = credentials.key_in_use_line(None, "k", serving=False, runs=runs, home=tmp_path / ".hermes")
+        if start:
+            assert line.startswith("No gateway runs for this profile now: AgentChat reaches this agent once one runs")
+            assert "`hermes gateway run`" in line and "restart" not in line
+        else:
+            assert line == credentials.NO_RESTART_LINE
+
+    def test_a_named_profile_names_its_own_gateway(self, tmp_path: Path) -> None:
+        line = credentials.start_gateway_line(tmp_path / ".hermes" / "profiles" / "r3x")
+        assert "`hermes -p r3x gateway run`" in line
 
     def test_what_the_profile_held(self) -> None:
         assert credentials.key_held() is None

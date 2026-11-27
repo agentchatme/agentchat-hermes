@@ -2147,3 +2147,32 @@ def test_hermes_says_whether_a_gateway_serves_the_profile(_hermes_home: Path) ->
     assert status.start_time_fingerprints_match(start, start) is True
     assert status.start_time_fingerprints_match(start, start + 10_000) is False
     assert allow.same_gateway((os.getpid(), start), (os.getpid(), allow.process_start_time(os.getpid())))
+
+
+# ─── pre-0.7.0 lab fixes ────────────────────────────────────────────────────
+
+
+def test_a_replacement_install_loads_nothing_into_a_running_gateway() -> None:
+    """Lab R3 (L1-F10): ``hermes plugins install --force`` over an enabled
+    plugin changes no selection and activates nothing, so a running gateway
+    keeps the code it imported: after-install.md says to restart it, and
+    doctor compares the build the gateway's health record names."""
+    install = _import("hermes_cli.plugins_cmd_install")
+    source = inspect.getsource(install)
+    assert "Replacement installed; plugin selection was not changed." in source
+    assert "if activate and not is_memory_provider:" in source and "report_activation(" in source
+
+
+def test_config_unset_removes_a_leftover_handle_from_this_profiles_env(
+    _hermes_home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The cleanup doctor names for a copied AGENTCHATME_HANDLE (R2-F04):
+    ``hermes config unset AGENTCHATME_HANDLE`` removes it from the profile's
+    own ``.env`` (any UPPER_SNAKE name is an env setting there)."""
+    routing = _import("hermes_cli.config_env_routing")
+    assert routing.is_env_setting_key("AGENTCHATME_HANDLE") is True
+    env = _hermes_home / ".env"
+    env.write_text("AGENTCHATME_HANDLE=fixtest-lab-he-1\nOTHER=keep\n", encoding="utf-8")
+    _import("hermes_cli.config").unset_config_value("AGENTCHATME_HANDLE")
+    text = env.read_text(encoding="utf-8")
+    assert "AGENTCHATME_HANDLE" not in text and "OTHER=keep" in text

@@ -5,11 +5,14 @@ and its sentence is shown (``test_cli_signup.py``).
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from fake_keys import api_key
 from key_files import save_key
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class TestArgparseWiring:
@@ -966,3 +969,42 @@ class TestDoctorFixCarryOver:
         order = self._doctor(monkeypatch, landed=False)
         assert order == ["place carried_over", "places None"], "the key's old .env line is not removed"
         assert "the key's old .env line is kept" in capsys.readouterr().out
+
+
+# ─── a handle the settings name for a profile with no key (lab R2-F04 / R3 L1-F11) ───
+
+
+class TestHandleHint:
+    """`hermes profile create` copies another profile's .env, its
+    AGENTCHATME_HANDLE included: with no key in this profile, doctor does not
+    present that handle as this profile's."""
+
+    def _resolution(self, *, key: str | None) -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(api_key=key, held_key=key)
+
+    def test_with_a_key_it_is_the_local_hint(self, tmp_path: Path) -> None:
+        from agentchatme_hermes import cli
+
+        assert cli._handle_hint_line(self._resolution(key="k"), "alice", tmp_path / ".hermes") == (
+            "ok",
+            "Local handle hint: @alice",
+        )
+
+    @pytest.mark.parametrize(("home", "command"), [(".hermes", "hermes config unset"), (".hermes/profiles/r3a", "hermes -p r3a config unset")])
+    def test_with_no_key_it_is_a_leftover_with_this_profiles_cleanup(
+        self, tmp_path: Path, home: str, command: str
+    ) -> None:
+        from agentchatme_hermes import cli
+
+        level, line = cli._handle_hint_line(self._resolution(key=None), "fixtest-lab-he-1", tmp_path / home) or ("", "")
+        assert level == "warn" and line.startswith("this profile holds no AgentChat key")
+        assert "a leftover setting" in line and "may be another profile's agent, not this profile's" in line
+        assert line.endswith(f"`{command} AGENTCHATME_HANDLE`")
+        assert "Local handle hint" not in line
+
+    def test_no_handle_no_line(self, tmp_path: Path) -> None:
+        from agentchatme_hermes import cli
+
+        assert cli._handle_hint_line(self._resolution(key=None), None, tmp_path) is None

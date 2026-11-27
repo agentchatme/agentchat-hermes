@@ -97,7 +97,22 @@ def key_held(home: Path | None = None) -> str | None:
     return held
 
 
-def key_in_use_line(before: str | None, api_key: str, *, serving: bool) -> str:
+def start_gateway_line(home: Path) -> str:
+    """No gateway runs for the profile: what reaches the agent."""
+    label = profile_scope.profile_label(home)
+    if label == "default":
+        how = "`hermes gateway run`, or the service it usually runs as"
+    else:
+        how = (
+            f"`hermes -p {label} gateway run`, the default profile's gateway where it serves every profile, or the "
+            "service it usually runs as"
+        )
+    return f"No gateway runs for this profile now: AgentChat reaches this agent once one runs ({how})."
+
+
+def key_in_use_line(
+    before: str | None, api_key: str, *, serving: bool, runs: bool | None = None, home: Path | None = None
+) -> str:
     """How a key just saved comes into use. ``serving``: a running gateway held
     an AgentChat connection for this profile before the save
     (:func:`.placement.gateway_serves_profile`: for the key it held, or the
@@ -106,11 +121,16 @@ def key_in_use_line(before: str | None, api_key: str, *, serving: bool) -> str:
     the hosted tools' key), so a different key needs its restart — the same
     line logout says. With none, or the same key again, no restart: a running
     gateway activates a profile's first key by itself (its activation
-    re-checks every 30 s) and connects the hosted tools with it. In an agent's
-    own terminal (:func:`.allow.in_agent_terminal`) the restart is said to be
-    the person's, never the agent's."""
+    re-checks every 30 s) and connects the hosted tools with it — when one
+    runs: ``runs`` False (Hermes says no gateway serves the profile,
+    :func:`.placement.gateway_runs_for`) says the agent is reached once one
+    runs instead (``home``: the profile, for its command). In an agent's own
+    terminal (:func:`.allow.in_agent_terminal`) the restart is said to be the
+    person's, never the agent's."""
     from .allow import in_agent_terminal
 
+    if not serving and runs is False:
+        return start_gateway_line(home if home is not None else profile_scope.resolve_hermes_home())
     if not serving or before == api_key:
         return NO_RESTART_LINE
     return RESTART_HINT_AGENT if in_agent_terminal() else RESTART_HINT

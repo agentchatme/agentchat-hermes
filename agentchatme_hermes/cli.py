@@ -337,13 +337,13 @@ def _dispatch_login(args: argparse.Namespace) -> int:
         )
 
     tools = allow.decide_for(checked.handle)
-    before, serving = _held_and_serving(api_base)
+    before, serving, runs = _held_and_serving(api_base)
     if not _persist_credentials(api_key=api_key, handle=checked.handle, api_base=api_base):
         return _EXIT_API_ERR
     steps = _install_placement(checked.handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
     _printline(f"Saved AgentChat key for @{checked.handle}.")
     _print_tools_line(tools, steps)
-    _printline(credentials.key_in_use_line(before, api_key, serving=serving))
+    _printline(credentials.key_in_use_line(before, api_key, serving=serving, runs=runs))
     return _EXIT_OK
 
 
@@ -467,12 +467,12 @@ def _run_signup(
         return _exit_with(f"{reason}Nothing was saved.")
     api_key, handle = saved
     tools = allow.decide_for(handle)
-    before, serving = _held_and_serving(api_base)
+    before, serving, runs = _held_and_serving(api_base)
     if not _persist_credentials(api_key=api_key, handle=handle, api_base=api_base):
         return _EXIT_API_ERR
     steps = _install_placement(handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
     _print_tools_line(tools, steps)
-    on_saved(handle=handle, api_key=api_key, before=before, serving=serving)
+    on_saved(handle=handle, api_key=api_key, before=before, serving=serving, runs=runs)
     return _EXIT_OK
 
 
@@ -768,8 +768,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         ok(f"API base: {api_base} (from AGENTCHATME_API_BASE, or the base the key was saved with)")
 
     saved_handle = _read_saved_handle()
-    if saved_handle:
-        ok(f"Local handle hint: @{saved_handle}")
+    hint = _handle_hint_line(resolution, saved_handle, hermes_home)
+    if hint is not None:
+        {"ok": ok, "warn": warn}[hint[0]](hint[1])
 
     try:
         from agentchatme import AgentChatClient, AgentChatError, UnauthorizedError
@@ -1118,6 +1119,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                 scope_line = _describe_scope(health.get("worker"))
                 if scope_line is not None:
                     warn(scope_line)
+                build_line = _describe_running_build(health, hermes_home)
+                if build_line is not None:
+                    warn(build_line)
                 for level, text in _describe_could_not_process(health.get("worker"), now=time.time()):
                     {"ok": ok, "warn": warn, "fail": fail}[level](text)
         elif state in ("free", "not present") and gateway is not None:
@@ -1213,6 +1217,34 @@ def _doctor_tools_decision(handle: str, *, api_base: str, home: Path) -> allow.S
             "carried_over", "AgentChat tools allowed: carried over from your setup under an earlier release"
         )
     return allow.decide_for(handle)
+
+
+def _describe_running_build(health: Any, hermes_home: Path) -> str | None:
+    """The warn line when the running gateway (its health record) runs other
+    plugin code than the installed package: an update replaces the files, but
+    Hermes keeps imported code until the process restarts. A record with no
+    ``plugin`` was written by a release before 0.7.0."""
+    from .placement import _gateway_restart_command
+    from .profile_scope import profile_label
+    from .ws_health import plugin_build
+
+    installed = plugin_build()
+    running = health.get("plugin") if isinstance(health, dict) else None
+    restart = _gateway_restart_command(hermes_home, profile_label(hermes_home), health.get("pid"))
+    if not isinstance(running, dict):
+        return (
+            f"the gateway still runs a release before 0.7.0 (pid {health.get('pid')}) — restart it to load "
+            f"{installed['version']}: {restart}"
+        )
+    if running.get("build") == installed["build"] or installed["build"] == "unknown":
+        return None
+    same_version = running.get("version") == installed["version"]
+
+    def label(build: Any) -> str:
+        version = build.get("version") or "?"
+        return f"{version} (build {build.get('build') or '?'})" if same_version else str(version)
+
+    return f"the gateway still runs {label(running)} — restart it to load {label(installed)}: {restart}"
 
 
 def _describe_scope(worker: Any) -> str | None:
@@ -2398,6 +2430,31 @@ def _prompt_api_key() -> str:
 # ───────────────────────── helpers ─────────────────────────
 
 
+def _handle_hint_line(
+    resolution: KeyResolution, saved_handle: str | None, hermes_home: Path
+) -> tuple[Literal["ok", "warn"], str] | None:
+    """doctor's handle line. A profile with no AgentChat key whose settings
+    still name a handle (``AGENTCHATME_HANDLE``) is not shown that handle as
+    its own: ``hermes profile create`` copies another profile's ``.env``, so
+    it is labelled a leftover that may be another profile's agent, with the
+    cleanup for this profile only (Hermes' ``config unset``)."""
+    if not saved_handle:
+        return None
+    holds_key = bool(resolution.api_key or resolution.held_key)
+    if holds_key:
+        return "ok", f"Local handle hint: @{saved_handle}"
+    from .profile_scope import profile_label
+
+    label = profile_label(hermes_home)
+    flag = "" if label == "default" else f"-p {label} "
+    return "warn", (
+        f"this profile holds no AgentChat key, but its settings still name a handle ({_ENV_HANDLE}=@{saved_handle}): "
+        "a leftover setting — `hermes profile create` copies another profile's .env — and it may be another "
+        f"profile's agent, not this profile's. Remove it for this profile only: `hermes {flag}config unset "
+        f"{_ENV_HANDLE}`"
+    )
+
+
 def _read_saved_handle() -> str | None:
     """The handle this profile is configured as, or ``None``.
 
@@ -2517,31 +2574,37 @@ def _saved_where() -> str:
     return f"saved in {_last_saved_path}, readable by you only"
 
 
-def _held_and_serving(api_base: str) -> tuple[str | None, bool]:
-    """Before a save: the key this profile holds, and whether a running gateway
-    holds an AgentChat connection for it (:func:`.credentials.key_in_use_line`)."""
-    from .placement import gateway_serves_profile
+def _held_and_serving(api_base: str) -> tuple[str | None, bool, bool | None]:
+    """Before a save: the key this profile holds, whether a running gateway
+    holds an AgentChat connection for it, and whether a gateway serves it at
+    all (:func:`.credentials.key_in_use_line`)."""
+    from .placement import gateway_runs_for, gateway_serves_profile
     from .profile_scope import resolve_hermes_home
 
-    return credentials.key_held(), gateway_serves_profile(resolve_hermes_home(), api_base=api_base)
+    home = resolve_hermes_home()
+    return credentials.key_held(), gateway_serves_profile(home, api_base=api_base), gateway_runs_for(home)
 
 
-def _print_registration_success(*, handle: str, api_key: str, before: str | None, serving: bool) -> None:
+def _print_registration_success(
+    *, handle: str, api_key: str, before: str | None, serving: bool, runs: bool | None = None
+) -> None:
     masked = _mask_key(api_key)
     _printline("")
     _printline(f"  Registered @{handle}")
     _printline(f"  Key:   {masked}   ({_saved_where()})")
     _printline("")
-    _printline(credentials.key_in_use_line(before, api_key, serving=serving))
+    _printline(credentials.key_in_use_line(before, api_key, serving=serving, runs=runs))
 
 
-def _print_recovery_success(*, handle: str, api_key: str, before: str | None, serving: bool) -> None:
+def _print_recovery_success(
+    *, handle: str, api_key: str, before: str | None, serving: bool, runs: bool | None = None
+) -> None:
     masked = _mask_key(api_key)
     _printline("")
     _printline(f"  Recovered @{handle}")
     _printline(f"  New key:   {masked}   ({_saved_where()})")
     _printline("")
-    _printline(credentials.key_in_use_line(before, api_key, serving=serving))
+    _printline(credentials.key_in_use_line(before, api_key, serving=serving, runs=runs))
 
 
 def _could_not_process_section(worker: Any) -> dict[str, Any] | None:

@@ -32,7 +32,7 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 - **`hermes agentchat allow`**: the same question in your own terminal; the wizard's edit menu offers it while the
   entry's tier does not allow the tools.
 - **`after-install.md`**: `hermes plugins install` now says what to do, for a new setup (sign up, allow once) and for an
-  update, which Hermes shows it for too (usually nothing; `hermes agentchat doctor` says if anything is needed).
+  update, which Hermes shows it for too (restart the gateway to load the update, then `hermes agentchat doctor`).
 - **The switch is observable**: an `AgentChat tools:` line in `doctor` (not decided yet is a failure: setup is not
   finished; a no, or a yes being applied, is a warning) and in `status`, `worker.tools_allowed` in the health record,
   and one log line per change.
@@ -180,6 +180,22 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 Found by the lab round on a real Hermes v0.23.2 box (R3):
 
+- **An update is loaded only at the gateway's restart, and doctor says so.** Hermes keeps the plugin code a running
+  gateway imported, so an update (a reinstall at a new commit) is not in effect until it restarts, while
+  `after-install.md` said "usually nothing to do" and `doctor` "All checks passed". The health record now names the
+  build the gateway runs (`plugin`: the version and a fingerprint of the package's code, taken at `register()`);
+  `doctor` warns "the gateway still runs <that> — restart it to load <the installed one>" (a record from a release
+  before 0.7.0 names none, and says so). `after-install.md`: restart the gateway to load the update, then `doctor`.
+- **No "no restart needed" when no gateway runs.** With no gateway serving the profile, setup says AgentChat reaches the
+  agent once one runs (`hermes gateway run`, or the service it usually runs as), and nothing else.
+- **The SOUL.md lines name the text placed**: "this release's text" with `live_texts` off, "the served text" with it on
+  (the log said "the served text" for this release's line).
+- **A copied handle is not shown as this profile's.** `hermes profile create` copies another profile's `.env`,
+  `AGENTCHATME_HANDLE` included; with no key in the profile `doctor` showed "[ok] Local handle hint: @<the other
+  agent>", which sent an agent looking through every profile's files. With no key it is now a warning that labels it a
+  leftover setting that may be another profile's agent, with the cleanup for this profile only (`hermes [-p <profile>]
+  config unset AGENTCHATME_HANDLE`).
+
 - **The SOUL.md block the August 2026 build wrote is AgentChat's own.** Every profile updated from that build (the
   plugin catalog's earlier pin) was told at each gateway start, and by `doctor`, that its block "was edited by hand",
   and kept that build's text for good. That block, word for word for the profile's handle, is now recognised as the
@@ -209,7 +225,8 @@ Found by the lab round on a real Hermes v0.23.2 box (R3):
   time, until it is gone). In an agent's own terminal that restart is said to be the person's, never the agent's (a
   gateway restart stops every agent it serves).
 - **`after-install.md` is right for an update too** (Hermes shows it on every `install --force --ref`): new here, sign up
-  and allow once; already set up, usually nothing to do — `hermes agentchat doctor` says if anything is needed.
+  and allow once; already set up, restart the gateway to load the update (a running Hermes keeps the code it
+  imported), then `hermes agentchat doctor`, which now says when the gateway still runs an earlier build.
 - **`doctor` says one line for live_texts changed before the gateway restarted**, instead of four (one of them an `[ok]`
   about the doctor's own process that contradicted the warning below it).
 - **The parked-tools remedy is true.** `/reload-mcp` reconnects a parked hosted tools server only from a messaging chat

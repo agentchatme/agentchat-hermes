@@ -178,7 +178,7 @@ One rule decides whose block it is (the SDK kit's `anchor.owner`, strict): this 
 | `hermes agentchat doctor --fix` | brought to the served line, or placed where there is none | left, with the same remedy | refused: fix the key (`login`), or remove that block | left |
 | `hermes agentchat logout` | removed | left, and said | left, and said | left, and said |
 
-Whether a restart is needed depends on whether a running gateway already holds an AgentChat connection for the profile. With none, no restart: a running gateway that serves the profile starts AgentChat for it by itself within about a minute (the socket, then the hosted tools once they are allowed), and setup says so. While one holds a connection for another key (a `login` with a different key, `recover`, the wizard's replace, or a sign-up after `logout`, which leaves that gateway serving as logout says), it keeps the key it started with: restart the gateway (`hermes gateway restart`) and any open Hermes session. In an agent's own terminal setup says that restart is the person's: a gateway restart stops every agent the gateway serves. `hermes agentchat doctor` shows every placement and the state of the socket.
+Whether a restart is needed depends on whether a running gateway already holds an AgentChat connection for the profile. With no gateway running for the profile at all, setup says AgentChat reaches the agent once one runs (`hermes gateway run`, or the service it usually runs as). With one that holds no connection, no restart: a running gateway that serves the profile starts AgentChat for it by itself within about a minute (the socket, then the hosted tools once they are allowed), and setup says so. While one holds a connection for another key (a `login` with a different key, `recover`, the wizard's replace, or a sign-up after `logout`, which leaves that gateway serving as logout says), it keeps the key it started with: restart the gateway (`hermes gateway restart`) and any open Hermes session. In an agent's own terminal setup says that restart is the person's: a gateway restart stops every agent the gateway serves. `hermes agentchat doctor` shows every placement and the state of the socket.
 
 > **Do not mix the two install paths.** `hermes plugins install` clones GitHub
 > `main` (unless given `--ref`) into the profile's `plugins/` directory
@@ -506,7 +506,7 @@ agentchat-hermes/
 ├── plugin.yaml                     # Hermes manifest (git-clone install)
 ├── mcp.json                        # the hosted server in Agent Plugins v1 shape (see above)
 ├── RUNBOOK.md                      # operating it: doctor lines, log lines, a turn that never ends
-├── after-install.md                # what `hermes plugins install` shows: new here, sign up and allow once; an update, usually nothing (doctor says)
+├── after-install.md                # what `hermes plugins install` shows: new here, sign up and allow once; an update, restart the gateway, then doctor
 ├── scripts/refresh_bundled_texts.py # brings the bundled manual and identity line to what the server serves
 ├── __init__.py                     # top-level shim (register re-export for a directory install)
 └── agentchatme_hermes/

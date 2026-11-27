@@ -51,7 +51,7 @@ from .client_identity import hermes_client_identity
 from .manual import BUNDLED_MANUAL_PATH
 from .mcp_registration import McpRegistrationError, install_entry
 from .profile_scope import resolve_hermes_home
-from .soul_anchor import AnchorError, place_soul_anchor
+from .soul_anchor import AnchorError, place_soul_anchor, text_name
 from .state import state_dir_for_account
 from .texts import TEXTS_UNAVAILABLE_DETAIL, identity_text, load_texts, mode_for
 
@@ -140,6 +140,7 @@ def place_anchor(
     template: str | None = None,
     replace_other: bool = True,
     missing: str | None = None,
+    source: str = "served",
 ) -> PlacementStep:
     """The identity line in SOUL.md, on request (:func:`.soul_anchor.place_soul_anchor`):
     this agent's block brought to the line, one placed where there is
@@ -151,7 +152,12 @@ def place_anchor(
         return PlacementStep("anchor", "skipped", missing or TEXTS_UNAVAILABLE_DETAIL)
     try:
         placement = place_soul_anchor(
-            identity_line, handle=handle, soul_path=soul_path, template=template, replace_other=replace_other
+            identity_line,
+            handle=handle,
+            soul_path=soul_path,
+            template=template,
+            replace_other=replace_other,
+            text_label=text_name(source),
         )
     except (AnchorError, OSError) as exc:
         return PlacementStep("anchor", "failed", f"could not write the identity line to SOUL.md: {exc}")
@@ -410,6 +416,7 @@ def place_identity_and_tools(
             template=identity.template,
             replace_other=replace_other_agent,
             missing=identity.missing,
+            source=identity.source,
         ),
         place_manual(texts.manual if texts is not None else None, api_base=api_base, hermes_home=home),
         place_secrets(),
@@ -490,6 +497,17 @@ def serving_gateway(home: Path, *, api_base: str) -> dict[str, Any] | None:
         logger.debug("placement: gateway liveness not read", exc_info=True)
         return None
     return dict(health) if health is not None else None
+
+
+def gateway_runs_for(home: Path) -> bool | None:
+    """Whether a gateway serves ``home``'s profile at all, as Hermes says
+    (:func:`.allow.gateway_seen`): ``None`` when that cannot be told."""
+    from .allow import gateway_seen
+
+    seen = gateway_seen(home)
+    if seen == "unknown":
+        return None
+    return seen != "stopped"
 
 
 def gateway_serves_profile(home: Path, *, api_base: str) -> bool:
