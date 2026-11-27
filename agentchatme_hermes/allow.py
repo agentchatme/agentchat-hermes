@@ -1268,6 +1268,13 @@ def _written_answer(decision: Decision, *, scope: ProfileScope, agent: str, rest
     if restart is not None:
         if step.outcome == "applying" and is_hermes_gateway_process():
             start_completion(scope, api_base=api_base)
+        # PROTOTYPE (lab only, never merged): ask Hermes for its own graceful
+        # restart with the public CLI, detached so it outlives this gateway.
+        if _proto_request_restart(scope.home):
+            return (
+                f"AgentChat tools allowed for {agent}. Hermes restarts its gateway as soon as it is idle "
+                f"to load the plugin; AgentChat starts by itself after it.{note}"
+            )
         return f"AgentChat tools allowed for {agent}. {restart}{note}"
     if step.outcome == "applying":
         if is_hermes_gateway_process():
@@ -1278,3 +1285,29 @@ def _written_answer(decision: Decision, *, scope: ProfileScope, agent: str, rest
     if step.outcome == "allowed":
         return f"AgentChat tools allowed for {agent}. This chat uses them after /reload-mcp.{note}"
     return f"AgentChat tools allowed for {agent}. The gateway connects them within about a minute.{note}"
+
+
+def _proto_request_restart(home: "Path") -> bool:
+    """PROTOTYPE: run `hermes gateway restart --detach` in its own session (POSIX only)."""
+    import os
+    import subprocess
+    import time as _time
+    from pathlib import Path
+
+    from .leader_lock import is_hermes_gateway_process
+
+    if os.name == "nt" or not is_hermes_gateway_process():
+        return False
+    log = Path(home) / "agentchat" / "proto-restart.log"
+    try:
+        out = open(log, "a", encoding="utf-8")  # noqa: SIM115
+        out.write(f"--- {_time.strftime('%Y-%m-%dT%H:%M:%SZ', _time.gmtime())} pid={os.getpid()}\n")
+        out.flush()
+        subprocess.Popen(
+            [sys.executable, "-m", "hermes_cli.main", "gateway", "restart", "--detach"],
+            stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, close_fds=True,
+        )
+        return True
+    except Exception:
+        logger.warning("agentchat prototype: restart request failed", exc_info=True)
+        return False
