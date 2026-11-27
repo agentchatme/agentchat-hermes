@@ -483,6 +483,18 @@ class TestGateway:
         text = (home / "SOUL.md").read_text(encoding="utf-8")
         assert _release_line("ops") in text and _served().identity_line not in text
 
+    def test_a_refresh_names_this_releases_text(self, home: Path, caplog: pytest.LogCaptureFixture) -> None:
+        """Lab R3 (L2-F11): the log and the setup lines say which line was
+        placed — this release's, not "the served text"."""
+        soul_anchor.place_soul_anchor(_served().identity_line, handle="ops", template=SERVED_TEMPLATE)
+        with caplog.at_level(logging.INFO, logger="agentchatme_hermes"):
+            _register._reconcile_soul_anchor(_runtime(home))
+        assert "now is this release's text" in caplog.text and "served" not in caplog.text
+        step = placement.place_anchor(
+            handle="ops", identity_line=_release_line("ops"), template=None, source="release"
+        )
+        assert step.detail.endswith("(this release's text)")
+
     def test_a_block_edited_by_hand_is_left_alone(self, home: Path) -> None:
         soul = home / "SOUL.md"
         soul.write_text("<!-- agentchat:start -->\nI am @ops here, my own words.\n<!-- agentchat:end -->\n", encoding="utf-8")
@@ -505,7 +517,8 @@ class TestGateway:
         assert text.startswith("# Persona\n\n<!-- agentchat:start -->\n<!-- agentchat:handle ops -->\n")
         assert _release_line("ops") in text and "## On AgentChat" not in text
         assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
-        assert "the block the August 2026 build wrote is replaced" in caplog.text
+        assert "the block the August 2026 build wrote is replaced by this release's text" in caplog.text
+        assert "served text" not in caplog.text, "lab R3 (L2-F11): named by the line's source"
         caplog.clear()
         _register._reconcile_soul_anchor(_runtime(home))
         assert soul.read_text(encoding="utf-8") == text and "August" not in caplog.text, "once"

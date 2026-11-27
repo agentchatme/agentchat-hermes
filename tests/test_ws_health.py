@@ -222,3 +222,113 @@ def test_status_shows_could_not_process_from_this_accounts_health_record(capsys:
     assert "Could not process" not in capsys.readouterr().out, "a record from an older release"
     write_ws_health(handle="me", state="connected", path=health_path_for(lock), worker=worker, now=time.time() - 3600)
     assert cli._health_worker(base, key) is None, "a stale record is not this gateway's word"
+
+
+# ─── the build the gateway runs (lab R3, L1-F10) ─────────────────────────────
+
+
+def test_the_record_names_the_build_this_process_loaded(tmp_path: Path) -> None:
+    from agentchatme_hermes._version import __version__
+    from agentchatme_hermes.ws_health import plugin_build
+
+    written = write_ws_health(handle="alice", state="connected", path=tmp_path / "h.json", now=1.0)
+    assert written["plugin"] == plugin_build()
+    assert plugin_build()["version"] == __version__
+    build = plugin_build()["build"]
+    assert len(build) == 12 and all(c in "0123456789abcdef" for c in build)
+    assert read_ws_health(tmp_path / "h.json") == written
+
+
+def test_the_fingerprint_follows_the_code_and_nothing_else(tmp_path: Path) -> None:
+    from agentchatme_hermes.ws_health import code_fingerprint
+
+    (tmp_path / "pkg" / "sub").mkdir(parents=True)
+    (tmp_path / "pkg" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (tmp_path / "pkg" / "sub" / "b.py").write_text("y = 2\n", encoding="utf-8")
+    first = code_fingerprint(tmp_path / "pkg")
+    assert code_fingerprint(tmp_path / "pkg") == first, "stable"
+    (tmp_path / "pkg" / "SKILL.md").write_text("a manual\n", encoding="utf-8")
+    (tmp_path / "pkg" / "__pycache__").mkdir()
+    (tmp_path / "pkg" / "__pycache__" / "a.py").write_text("cache\n", encoding="utf-8")
+    assert code_fingerprint(tmp_path / "pkg") == first, "only the code it imports"
+    (tmp_path / "pkg" / "sub" / "b.py").write_text("y = 3\n", encoding="utf-8")
+    assert code_fingerprint(tmp_path / "pkg") != first, "a changed file is another build"
+
+
+class TestRunningBuild:
+    """doctor: the running gateway's health record against the installed package."""
+
+    def _line(self, tmp_path: Path, plugin: object) -> str | None:
+        from agentchatme_hermes.cli import _describe_running_build
+
+        record: dict[str, object] = {"pid": 4242, "handle": "alice"}
+        if plugin is not None:
+            record["plugin"] = plugin
+        return _describe_running_build(record, tmp_path / ".hermes")
+
+    def test_the_same_build_says_nothing(self, tmp_path: Path) -> None:
+        from agentchatme_hermes.ws_health import plugin_build
+
+        assert self._line(tmp_path, dict(plugin_build())) is None
+
+    def test_a_build_the_gateway_could_not_read_says_nothing(self, tmp_path: Path) -> None:
+        """Review: a gateway running as a service user that cannot read a file
+        records ``unknown``: no "restart" for ever."""
+        from agentchatme_hermes.ws_health import plugin_build
+
+        assert self._line(tmp_path, {"version": plugin_build()["version"], "build": "unknown"}) is None
+
+    def test_a_build_this_process_could_not_read_says_nothing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agentchatme_hermes import ws_health
+
+        monkeypatch.setattr(ws_health, "plugin_build", lambda: {"version": "0.6.5", "build": "unknown"})
+        assert self._line(tmp_path, {"version": "0.6.5", "build": "0123456789ab"}) is None
+
+    def test_a_record_from_before_0_7_0(self, tmp_path: Path) -> None:
+        from agentchatme_hermes._version import __version__
+
+        line = self._line(tmp_path, None) or ""
+        assert line.startswith("the gateway still runs a release before 0.7.0 (pid 4242)")
+        assert f"restart it to load {__version__}" in line and "hermes gateway restart" in line
+
+    def test_another_version(self, tmp_path: Path) -> None:
+        from agentchatme_hermes._version import __version__
+
+        line = self._line(tmp_path, {"version": "0.5.9", "build": "0123456789ab"}) or ""
+        assert line.startswith(f"the gateway still runs 0.5.9 — restart it to load {__version__}:")
+
+    def test_the_same_version_another_commit(self, tmp_path: Path) -> None:
+        from agentchatme_hermes.ws_health import plugin_build
+
+        installed = plugin_build()
+        line = self._line(tmp_path, {"version": installed["version"], "build": "0123456789ab"}) or ""
+        assert f"still runs {installed['version']} (build 0123456789ab)" in line
+        assert f"restart it to load {installed['version']} (build {installed['build']})" in line
+
+
+@pytest.mark.parametrize("name", ["plugin.yaml", "skills/agentchat/SKILL.md", "texts_snapshot.json"])
+def test_the_fingerprint_follows_the_package_data_that_changes_behaviour(tmp_path: Path, name: str) -> None:
+    """Review: a same-version update that changes only the manifest, the
+    bundled manual or the pinned texts is another build too."""
+    from agentchatme_hermes.ws_health import BUILD_DATA_FILES, code_fingerprint
+
+    root = tmp_path / "pkg"
+    (root / "skills" / "agentchat").mkdir(parents=True)
+    (root / "a.py").write_text("x = 1\n", encoding="utf-8")
+    for data in BUILD_DATA_FILES:
+        (root / data).write_text("v1\n", encoding="utf-8")
+    first = code_fingerprint(root)
+    (root / name).write_text("v2\n", encoding="utf-8")
+    assert code_fingerprint(root) != first
+
+
+def test_the_installed_package_fingerprints_its_data() -> None:
+    from pathlib import Path as _Path
+
+    import agentchatme_hermes
+    from agentchatme_hermes.ws_health import BUILD_DATA_FILES
+
+    root = _Path(agentchatme_hermes.__file__).resolve().parent
+    assert all((root / name).is_file() for name in BUILD_DATA_FILES), "the names the build covers exist"

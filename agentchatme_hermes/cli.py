@@ -209,8 +209,8 @@ def setup_argparse(parser: argparse.ArgumentParser) -> None:
         "--handle",
         help=(
             "@handle of the agent to recover. Required because an email can back "
-            "several agents. Defaults to the locally configured AGENTCHATME_HANDLE; "
-            "otherwise prompts if stdin is a TTY."
+            "several agents. Defaults to the handle this profile is configured as (never a "
+            "leftover AGENTCHATME_HANDLE in a profile with no key); otherwise prompts if stdin is a TTY."
         ),
     )
     p_recover.set_defaults(func=_dispatch_recover)
@@ -337,13 +337,13 @@ def _dispatch_login(args: argparse.Namespace) -> int:
         )
 
     tools = allow.decide_for(checked.handle)
-    before, serving = _held_and_serving(api_base)
+    before, serving, runs = _held_and_serving(api_base)
     if not _persist_credentials(api_key=api_key, handle=checked.handle, api_base=api_base):
         return _EXIT_API_ERR
     steps = _install_placement(checked.handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
     _printline(f"Saved AgentChat key for @{checked.handle}.")
     _print_tools_line(tools, steps)
-    _printline(credentials.key_in_use_line(before, api_key, serving=serving))
+    _printline(credentials.key_in_use_line(before, api_key, serving=serving, runs=runs))
     return _EXIT_OK
 
 
@@ -412,8 +412,9 @@ def _dispatch_recover(args: argparse.Namespace) -> int:
 
     Recovery sends the @handle with the email because an email can back
     several agents. When ``--handle`` is omitted the handle comes from, in
-    order: the locally configured ``AGENTCHATME_HANDLE`` (the "rotate my own
-    key" case, by far the most common), a prompt when stdin is a TTY,
+    order: the handle this profile is configured as (the "rotate my own key"
+    case, by far the most common; never a leftover ``AGENTCHATME_HANDLE`` in a
+    profile with no key), a prompt when stdin is a TTY,
     otherwise a hard failure that names the flag — a script must fail fast,
     not hang on a prompt nobody will answer. ``--email`` follows the same
     TTY rule (there is no stored email to default to). Then the server's
@@ -467,12 +468,12 @@ def _run_signup(
         return _exit_with(f"{reason}Nothing was saved.")
     api_key, handle = saved
     tools = allow.decide_for(handle)
-    before, serving = _held_and_serving(api_base)
+    before, serving, runs = _held_and_serving(api_base)
     if not _persist_credentials(api_key=api_key, handle=handle, api_base=api_base):
         return _EXIT_API_ERR
     steps = _install_placement(handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
     _print_tools_line(tools, steps)
-    on_saved(handle=handle, api_key=api_key, before=before, serving=serving)
+    on_saved(handle=handle, api_key=api_key, before=before, serving=serving, runs=runs)
     return _EXIT_OK
 
 
@@ -768,8 +769,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
         ok(f"API base: {api_base} (from AGENTCHATME_API_BASE, or the base the key was saved with)")
 
     saved_handle = _read_saved_handle()
-    if saved_handle:
-        ok(f"Local handle hint: @{saved_handle}")
+    hint = _handle_hint_line(hermes_home)
+    if hint is not None:
+        {"ok": ok, "warn": warn}[hint[0]](hint[1])
 
     try:
         from agentchatme import AgentChatClient, AgentChatError, UnauthorizedError
@@ -1118,6 +1120,9 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
                 scope_line = _describe_scope(health.get("worker"))
                 if scope_line is not None:
                     warn(scope_line)
+                build_line = _describe_running_build(health, hermes_home)
+                if build_line is not None:
+                    warn(build_line)
                 for level, text in _describe_could_not_process(health.get("worker"), now=time.time()):
                     {"ok": ok, "warn": warn, "fail": fail}[level](text)
         elif state in ("free", "not present") and gateway is not None:
@@ -1213,6 +1218,34 @@ def _doctor_tools_decision(handle: str, *, api_base: str, home: Path) -> allow.S
             "carried_over", "AgentChat tools allowed: carried over from your setup under an earlier release"
         )
     return allow.decide_for(handle)
+
+
+def _describe_running_build(health: Any, hermes_home: Path) -> str | None:
+    """The warn line when the running gateway (its health record) runs other
+    plugin code than the installed package: an update replaces the files, but
+    Hermes keeps imported code until the process restarts. A record with no
+    ``plugin`` was written by a release before 0.7.0."""
+    from .placement import _gateway_restart_command
+    from .profile_scope import profile_label
+    from .ws_health import plugin_build
+
+    installed = plugin_build()
+    running = health.get("plugin") if isinstance(health, dict) else None
+    restart = _gateway_restart_command(hermes_home, profile_label(hermes_home), health.get("pid"))
+    if not isinstance(running, dict):
+        return (
+            f"the gateway still runs a release before 0.7.0 (pid {health.get('pid')}) — restart it to load "
+            f"{installed['version']}: {restart}"
+        )
+    if running.get("build") == installed["build"] or "unknown" in (running.get("build"), installed["build"]):
+        return None  # the same build, or one side could not read its files: nothing to tell
+    same_version = running.get("version") == installed["version"]
+
+    def label(build: Any) -> str:
+        version = build.get("version") or "?"
+        return f"{version} (build {build.get('build') or '?'})" if same_version else str(version)
+
+    return f"the gateway still runs {label(running)} — restart it to load {label(installed)}: {restart}"
 
 
 def _describe_scope(worker: Any) -> str | None:
@@ -2366,22 +2399,32 @@ def _resolve_recovery_handle(provided: str | None) -> str:
     """Which agent to recover.
 
     ``--handle`` wins (``@`` prefix and case are forgiven, people type
-    handles the way they see them). Otherwise the locally configured
-    ``AGENTCHATME_HANDLE`` — the operator is told which one and how to
-    override it. Otherwise prompt on a TTY. Otherwise fail naming the
+    handles the way they see them). Otherwise the handle this profile is
+    configured as (its key file's, or ``AGENTCHATME_HANDLE`` while it holds a
+    key) — the operator is told which one and how to override it; a settings
+    handle in a profile with no key is said to be a leftover and never used.
+    Otherwise prompt on a TTY. Otherwise fail naming the
     flag: an email can back several agents, so the server cannot pick
     one for us, and a script must not hang on a prompt.
     """
     handle = signup.typed_value("handle", provided or "")
     if handle:
         return handle
-    saved = _read_saved_handle()
-    if saved:
+    from .config import leftover_handle_line, profile_handles
+    from .profile_scope import resolve_hermes_home
+
+    handles = profile_handles()
+    if handles.own:
         _printline(
-            f"Recovering the locally configured agent @{saved} "
+            f"Recovering the locally configured agent @{handles.own} "
             "(pass --handle to recover a different one)."
         )
-        return saved
+        return handles.own
+    if handles.leftover is not None:
+        # Said, never used: it may be (a refused copy: is) another profile's
+        # agent, whose key a recovery here would rotate. The person types it.
+        sys.stderr.write(f"Note: {leftover_handle_line(handles, resolve_hermes_home())}.\n")
+        sys.stderr.flush()
     if not _stdin_is_tty():
         raise _MissingFlag(
             "No @handle given and none is saved for this profile. Recovery "
@@ -2398,19 +2441,36 @@ def _prompt_api_key() -> str:
 # ───────────────────────── helpers ─────────────────────────
 
 
+def _handle_hint_line(hermes_home: Path) -> tuple[Literal["ok", "warn"], str] | None:
+    """doctor's handle line (:func:`.config.profile_handles`): this profile's
+    own handle as the local hint; a handle the settings name while the profile
+    holds no key is a leftover that may be another profile's agent, with the
+    cleanup for this profile only (:func:`.config.leftover_handle_line`)."""
+    from .config import leftover_handle_line, profile_handles
+
+    handles = profile_handles(hermes_home)
+    if handles.own is not None:
+        return "ok", f"Local handle hint: @{handles.own}"
+    if handles.leftover is not None:
+        return "warn", leftover_handle_line(handles, hermes_home)
+    return None
+
+
 def _read_saved_handle() -> str | None:
-    """The handle this profile is configured as, or ``None``.
+    """The handle this profile is configured as, or ``None``
+    (:func:`.config.profile_handles`).
 
     The key file holds the handle the server returned at register / login /
-    recover; a profile set up before 0.6 has it as ``AGENTCHATME_HANDLE``.
-    Its form is the server's to judge: a hand-edited value it does not accept
-    is answered with the server's message, and the handle is asked for again.
+    recover; a profile set up before 0.6 has it as ``AGENTCHATME_HANDLE``,
+    taken only while the profile holds a key: with none, a settings handle is
+    a leftover (a ``.env`` copied by ``hermes profile create``), never this
+    profile's. Its form is the server's to judge: a hand-edited value it does
+    not accept is answered with the server's message, and the handle is asked
+    for again.
     """
-    from .profile_scope import resolve_hermes_home, resolve_setting
+    from .config import profile_handles
 
-    read = key_store.read_store(resolve_hermes_home())
-    stored = read.key.handle if read.usable and read.key is not None else ""
-    return signup.typed_value("handle", stored or resolve_setting(_ENV_HANDLE) or "") or None
+    return profile_handles().own
 
 
 def _stdin_is_tty() -> bool:
@@ -2517,31 +2577,37 @@ def _saved_where() -> str:
     return f"saved in {_last_saved_path}, readable by you only"
 
 
-def _held_and_serving(api_base: str) -> tuple[str | None, bool]:
-    """Before a save: the key this profile holds, and whether a running gateway
-    holds an AgentChat connection for it (:func:`.credentials.key_in_use_line`)."""
-    from .placement import gateway_serves_profile
+def _held_and_serving(api_base: str) -> tuple[str | None, bool, bool | None]:
+    """Before a save: the key this profile holds, whether a running gateway
+    holds an AgentChat connection for it, and whether a gateway serves it at
+    all (:func:`.credentials.key_in_use_line`)."""
+    from .placement import gateway_runs_for, gateway_serves_profile
     from .profile_scope import resolve_hermes_home
 
-    return credentials.key_held(), gateway_serves_profile(resolve_hermes_home(), api_base=api_base)
+    home = resolve_hermes_home()
+    return credentials.key_held(), gateway_serves_profile(home, api_base=api_base), gateway_runs_for(home)
 
 
-def _print_registration_success(*, handle: str, api_key: str, before: str | None, serving: bool) -> None:
+def _print_registration_success(
+    *, handle: str, api_key: str, before: str | None, serving: bool, runs: bool | None = None
+) -> None:
     masked = _mask_key(api_key)
     _printline("")
     _printline(f"  Registered @{handle}")
     _printline(f"  Key:   {masked}   ({_saved_where()})")
     _printline("")
-    _printline(credentials.key_in_use_line(before, api_key, serving=serving))
+    _printline(credentials.key_in_use_line(before, api_key, serving=serving, runs=runs))
 
 
-def _print_recovery_success(*, handle: str, api_key: str, before: str | None, serving: bool) -> None:
+def _print_recovery_success(
+    *, handle: str, api_key: str, before: str | None, serving: bool, runs: bool | None = None
+) -> None:
     masked = _mask_key(api_key)
     _printline("")
     _printline(f"  Recovered @{handle}")
     _printline(f"  New key:   {masked}   ({_saved_where()})")
     _printline("")
-    _printline(credentials.key_in_use_line(before, api_key, serving=serving))
+    _printline(credentials.key_in_use_line(before, api_key, serving=serving, runs=runs))
 
 
 def _could_not_process_section(worker: Any) -> dict[str, Any] | None:

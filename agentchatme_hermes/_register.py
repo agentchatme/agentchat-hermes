@@ -97,6 +97,15 @@ _last_start_failure: dict[str, StartFailure] = {}
 
 def register(ctx: Any) -> None:
     """Hermes plugin entry point. See module docstring."""
+    # The code this process loaded, taken now (before an update can replace
+    # the files): the health record names it, so doctor can tell a gateway
+    # still running an earlier build (ws_health.plugin_build).
+    try:
+        from .ws_health import plugin_build
+
+        plugin_build()
+    except Exception:
+        logger.debug("agentchat plugin: the plugin build was not read", exc_info=True)
     # CLI subcommand is registered first and unconditionally so the
     # wizard remains reachable even when API key configuration is
     # missing or broken.
@@ -757,7 +766,7 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
     raised.
     """
     try:
-        from .soul_anchor import AnchorError, follow_soul, place_soul_anchor
+        from .soul_anchor import AnchorError, follow_soul, place_soul_anchor, text_name
     except ImportError:
         logger.debug("agentchatme_hermes.soul_anchor not importable; skipping backfill")
         return
@@ -781,7 +790,9 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
     actual = runtime.identity.handle
 
     try:
-        result = follow_soul(handle=actual, identity_line=identity_line, template=template)
+        result = follow_soul(
+            handle=actual, identity_line=identity_line, template=template, text_label=text_name(identity.source)
+        )
     except AnchorError as exc:
         _say_once("", "kit", str(exc), "agentchat plugin: SOUL.md identity line not followed for profile=%s — %s", label, exc)
         return
@@ -793,7 +804,7 @@ def _reconcile_soul_anchor(runtime: Any) -> None:
         logger.debug("agentchat plugin: SOUL.md — %s", result.detail)
     elif outcome == "absent":
         try:
-            placement = place_soul_anchor(identity_line, handle=actual, template=template)
+            placement = place_soul_anchor(identity_line, handle=actual, template=template, text_label=text_name(identity.source))
         except AnchorError as exc:
             logger.warning("agentchat plugin: SOUL.md identity line not placed for profile=%s — %s", label, exc)
             return

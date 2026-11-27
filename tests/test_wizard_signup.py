@@ -590,6 +590,8 @@ class _Menus:
         monkeypatch.setattr(wizard, "_recover_lost_key_flow", recover)
         monkeypatch.setattr(wizard, "_register_new_agent_flow", register)
         monkeypatch.setattr(wizard, "_paste_existing_key_flow", paste)
+        # A gateway serves the profile (Hermes, where installed, reads this test home's as stopped).
+        monkeypatch.setattr(wizard, "gateway_runs_for", lambda home: True)
 
     def prompt_choice(self, question: str, choices: list[str], default: int = 0, **_: Any) -> int:
         self.choices = list(choices)
@@ -624,6 +626,13 @@ class TestMenuRouting:
         # A profile's first key, no gateway serving it: no restart line (lab R3, L1-F02).
         assert menus.person.said("info") == [credentials.NO_RESTART_LINE]
         assert not any("restart" in text.lower() and "no restart" not in text.lower() for _, text in menus.person.transcript)
+
+    def test_fresh_menu_with_no_gateway_running_says_it_waits_for_one(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        menus = _Menus(monkeypatch, pick=0)
+        monkeypatch.setattr(wizard, "gateway_runs_for", lambda home: False)
+        wizard._fresh_setup_menu(**menus.kwargs())
+        (said,) = menus.person.said("info")
+        assert said.startswith("No gateway runs for this profile now") and "`hermes gateway run`" in said
 
     def test_fresh_menu_skip_runs_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         menus = _Menus(monkeypatch, pick=3)
@@ -700,3 +709,93 @@ class TestToolsQuestion:
         assert run.asked_with_key_saved == [False]
         assert run.tools_decisions == [None]
         assert "/agentchat allow" in person.said("info")[-1]
+
+
+# ─── a settings handle in a profile with no key (lab R2-F04 / R3 L1-F11) ───
+
+
+class TestLeftoverHandle:
+    """The wizard never pre-fills, or shows as this profile's, a handle the
+    settings name while the profile holds no key (another profile's .env,
+    copied by `hermes profile create`): it says it is a leftover, and the
+    person types the handle."""
+
+    def _hermes_cli(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
+        import sys
+        import types
+
+        said: list[tuple[str, str]] = []
+        cli_output = types.ModuleType("hermes_cli.cli_output")
+        cli_output.prompt = lambda *a, **k: ""  # type: ignore[attr-defined]
+        cli_output.prompt_yes_no = lambda *a, **k: False  # type: ignore[attr-defined]
+        setup = types.ModuleType("hermes_cli.setup")
+        for name in ("print_header", "print_info", "print_success", "print_warning"):
+            setattr(setup, name, lambda text, _name=name: said.append((_name, str(text))))
+        setup.prompt_choice = lambda *a, **k: 0  # type: ignore[attr-defined]
+        setup.save_env_value = lambda *a: None  # type: ignore[attr-defined]
+        setup.get_env_value = lambda name: None  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "hermes_cli", types.ModuleType("hermes_cli"))
+        monkeypatch.setitem(sys.modules, "hermes_cli.cli_output", cli_output)
+        monkeypatch.setitem(sys.modules, "hermes_cli.setup", setup)
+        return said
+
+    def test_no_key_says_it_is_a_leftover_and_pre_fills_nothing(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for name in ("AGENTCHAT_API_KEY", "AGENTCHATME_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("AGENTCHATME_HANDLE", "fixtest-lab-he-1")
+        said = self._hermes_cli(monkeypatch)
+        menus: list[dict[str, Any]] = []
+        monkeypatch.setattr(wizard, "_fresh_setup_menu", lambda **kw: menus.append(kw))
+        monkeypatch.setattr(wizard, "_edit_menu", lambda **kw: pytest.fail("no key: not the edit menu"))
+        wizard._interactive_setup_body()
+        warnings = [text for kind, text in said if kind == "print_warning"]
+        assert len(warnings) == 1 and "a leftover setting" in warnings[0]
+        assert "`hermes config unset AGENTCHATME_HANDLE`" in warnings[0]
+        assert len(menus) == 1 and "existing_handle" not in menus[0], "the fresh menu is given no handle"
+
+    def test_recover_from_the_fresh_menu_asks_the_handle_with_no_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AGENTCHATME_HANDLE", "fixtest-lab-he-1")
+        asked: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            wizard,
+            "_ask_field",
+            lambda prompt, kind, field, *, default="": asked.append((field, default)) or ("a@b.co" if field == "email" else None),
+        )
+        person = _Person([])
+        wizard._recover_lost_key_flow(
+            prompt=person.prompt, prompt_yes_no=person.prompt_yes_no, print_info=person.info,
+            print_success=person.success, print_warning=person.warning, save_env_value=lambda _k, _v: None,
+        )
+        assert asked == [("email", ""), ("handle", "")], "the handle is asked with no default"
+
+    def test_a_profile_with_a_key_keeps_its_settings_handle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Before 0.6 a profile kept its key and its handle in the settings: unchanged."""
+        monkeypatch.setenv("AGENTCHAT_API_KEY", api_key("pre06_00000000000000"))
+        monkeypatch.setenv("AGENTCHATME_HANDLE", "@Alice")
+        said = self._hermes_cli(monkeypatch)
+        menus: list[dict[str, Any]] = []
+        monkeypatch.setattr(wizard, "_edit_menu", lambda **kw: menus.append(kw))
+        wizard._interactive_setup_body()
+        assert menus and menus[0]["existing_handle"] == "alice"
+        assert not [text for kind, text in said if kind == "print_warning" and "leftover" in text]
+
+    def test_a_refused_copy_gives_the_edit_menu_no_handle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Review: a `--clone-all` copy of another profile's key file names that
+        profile's agent; the replace branch's recover must not default to it."""
+        import shutil
+
+        from key_files import profile_home, save_key
+
+        for name in ("AGENTCHAT_API_KEY", "AGENTCHATME_API_KEY", "AGENTCHATME_HANDLE"):
+            monkeypatch.delenv(name, raising=False)
+        root = profile_home()
+        save_key(api_key("cloned_0000000000000"), handle="alice", home=root)
+        clone = root / "profiles" / "ops"
+        shutil.copytree(root, clone, ignore=shutil.ignore_patterns("profiles"))
+        monkeypatch.setenv("HERMES_HOME", str(clone))
+        said = self._hermes_cli(monkeypatch)
+        menus: list[dict[str, Any]] = []
+        monkeypatch.setattr(wizard, "_edit_menu", lambda **kw: menus.append(kw))
+        wizard._interactive_setup_body()
+        assert menus and menus[0]["existing_handle"] == ""
+        assert any("copy" in text for kind, text in said if kind == "print_warning"), "the refusal is said"

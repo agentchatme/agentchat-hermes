@@ -5,11 +5,14 @@ and its sentence is shown (``test_cli_signup.py``).
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
 from fake_keys import api_key
 from key_files import save_key
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 class TestArgparseWiring:
@@ -966,3 +969,42 @@ class TestDoctorFixCarryOver:
         order = self._doctor(monkeypatch, landed=False)
         assert order == ["place carried_over", "places None"], "the key's old .env line is not removed"
         assert "the key's old .env line is kept" in capsys.readouterr().out
+
+
+# ─── a handle the settings name for a profile with no key (lab R2-F04 / R3 L1-F11) ───
+
+
+class TestHandleHint:
+    """`hermes profile create` copies another profile's .env, its
+    AGENTCHATME_HANDLE included: with no key in this profile, doctor does not
+    present that handle as this profile's."""
+
+    def test_with_a_key_it_is_the_local_hint(self, tmp_path: Path) -> None:
+        from agentchatme_hermes import cli
+
+        home = tmp_path / ".hermes"
+        save_key(api_key("hint_0000000000000000"), handle="alice", home=home)
+        assert cli._handle_hint_line(home) == ("ok", "Local handle hint: @alice")
+
+    @pytest.mark.parametrize(
+        ("home", "command"), [(".hermes", "hermes config unset"), (".hermes/profiles/r3a", "hermes -p r3a config unset")]
+    )
+    def test_with_no_key_it_is_a_leftover_with_this_profiles_cleanup(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, home: str, command: str
+    ) -> None:
+        from agentchatme_hermes import cli
+
+        for name in ("AGENTCHAT_API_KEY", "AGENTCHATME_API_KEY"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("AGENTCHATME_HANDLE", "fixtest-lab-he-1")
+        level, line = cli._handle_hint_line(tmp_path / home) or ("", "")
+        assert level == "warn" and line.startswith("this profile holds no AgentChat key")
+        assert "a leftover setting" in line and "may be another profile's agent, not this profile's" in line
+        assert line.endswith(f"`{command} AGENTCHATME_HANDLE`")
+        assert "Local handle hint" not in line
+
+    def test_no_handle_no_line(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import cli
+
+        monkeypatch.delenv("AGENTCHATME_HANDLE", raising=False)
+        assert cli._handle_hint_line(tmp_path) is None

@@ -49,6 +49,7 @@ import logging
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import urlparse, urlunparse
 
 from . import key_store, profile_scope
@@ -249,6 +250,73 @@ def shared_note(holder: key_store.Holder) -> str:
         f"profile {profile_label(holder.home)} ({holder.home}) also holds this key in its "
         f"{holder.where}: the two profiles are one AgentChat agent. Run `{cli_prefix(holder.home)} "
         "logout` in the one that should not be this agent, then `register` it as its own"
+    )
+
+
+class ProfileHandles(NamedTuple):
+    """:func:`profile_handles`: ``own`` is the handle this profile is
+    configured as; ``leftover`` a handle that is not this profile's, never
+    presented or pre-filled as its own; ``copy_of`` the profile whose key this
+    one holds a refused copy of, when that is why; ``in_settings`` whether the
+    leftover comes from the settings (``AGENTCHATME_HANDLE``) rather than a
+    copied key file."""
+
+    own: str | None
+    leftover: str | None = None
+    copy_of: Path | None = None
+    in_settings: bool = True
+
+
+def profile_handles(home: Path | None = None) -> ProfileHandles:
+    """The handle this profile is configured as — its key file's, else
+    ``AGENTCHATME_HANDLE`` when the profile holds a key of its own (a profile
+    set up before 0.6) — and a leftover one: a handle the settings name while
+    the profile holds no key, or the handle a refused copy of another
+    profile's key names (a ``--clone-all`` key file, a copied ``.env``). A
+    leftover is never presented or pre-filled as this profile's: it may be,
+    or is, another profile's agent (recovering it here would rotate that
+    profile's key) (:func:`leftover_handle_line`). Handles as typed: without
+    ``@``, lower case."""
+    target = home if home is not None else resolve_hermes_home()
+
+    def typed(raw: str | None) -> str | None:
+        return (raw or "").strip().lstrip("@").lower() or None
+
+    read = key_store.read_store(target)
+    in_file = typed(read.key.handle if read.key is not None else "")
+    if read.usable and in_file is not None:
+        return ProfileHandles(in_file)
+    setting = typed(resolve_setting(ENV_HANDLE))
+    resolution = resolve_key(target)
+    if resolution.copy_of is not None:
+        copied = in_file or setting
+        return ProfileHandles(None, copied, resolution.copy_of, in_file is None) if copied else ProfileHandles(None)
+    if setting is None:
+        return ProfileHandles(None)
+    if resolution.api_key or resolution.held_key:
+        return ProfileHandles(setting)
+    return ProfileHandles(None, setting)
+
+
+def leftover_handle_line(handles: ProfileHandles, home: Path) -> str:
+    """What is said of a leftover handle (:func:`profile_handles`), with the
+    cleanup for this profile only."""
+    label = profile_label(home)
+    flag = "" if label == "default" else f"-p {label} "
+    unset = f"`hermes {flag}config unset {ENV_HANDLE}`"
+    if handles.copy_of is not None:
+        where = f"its settings ({ENV_HANDLE})" if handles.in_settings else "the copied key file"
+        return (
+            f"this profile holds a refused copy of profile {profile_label(handles.copy_of)}'s AgentChat key, so the "
+            f"handle {where} name (@{handles.leftover}) is that profile's agent, not this profile's: never recover "
+            f"or log in as it here (that would act on that profile's agent). `{cli_prefix(home)} logout` removes "
+            f"the copy{f', and {unset} the handle' if handles.in_settings else ''}; then `{cli_prefix(home)} register` "
+            "makes this profile its own agent"
+        )
+    return (
+        f"this profile holds no AgentChat key, but its settings still name a handle ({ENV_HANDLE}=@{handles.leftover}): "
+        "a leftover setting — `hermes profile create` copies another profile's .env — and it may be another "
+        f"profile's agent, not this profile's. Remove it for this profile only: {unset}"
     )
 
 

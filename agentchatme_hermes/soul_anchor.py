@@ -301,8 +301,22 @@ def write_text_atomic(path: Path, text: str, *, unless_changed_from: str | None 
 # ─── refresh (the activation path) ──────────────────────────────────────────
 
 
+SERVED_TEXT = "the served text"
+RELEASE_TEXT = "this release's text"
+
+
+def text_name(source: str) -> str:
+    """How a detail names the line placed (:class:`.texts.IdentityText` ``source``)."""
+    return RELEASE_TEXT if source == "release" else SERVED_TEXT
+
+
 def follow_soul(
-    *, handle: str, identity_line: str, template: str | None = None, soul_path: Path | None = None
+    *,
+    handle: str,
+    identity_line: str,
+    template: str | None = None,
+    soul_path: Path | None = None,
+    text_label: str = SERVED_TEXT,
 ) -> Any:
     """The kit's ``anchor.follow`` on SOUL.md: this agent's own block brought to
     the served line, every other block left as it is, never a block created.
@@ -310,10 +324,14 @@ def follow_soul(
     ``absent``, ``hand_edited``, ``other_agent``, ``several_blocks``,
     ``edited_meanwhile``, ``failed``). The block the August 2026 build wrote
     for this agent, which the kit reads as ``hand_edited``, is replaced by
-    :func:`place_soul_anchor` (``updated``). Never raises but
-    :class:`AnchorError` for a kit without it."""
+    :func:`place_soul_anchor` (``updated``). ``text_label``: how the details
+    name the line (:func:`text_name`). Never raises but :class:`AnchorError` for a
+    kit without it."""
     target = soul_path if soul_path is not None else resolve_soul_path()
     result = _kit().follow(target, handle=handle, identity_line=identity_line, template=template)
+    if result.outcome == "updated":
+        bare = normalize_handle(handle)
+        return dataclasses.replace(result, detail=f"the identity line for @{bare} in {target} now is {text_label}")
     if result.outcome != "hand_edited":
         return result
     try:
@@ -322,7 +340,7 @@ def follow_soul(
         august = False
     if not august:
         return result
-    placement = place_soul_anchor(identity_line, handle=handle, soul_path=target, template=template)
+    placement = place_soul_anchor(identity_line, handle=handle, soul_path=target, template=template, text_label=text_label)
     if placement.ok:
         outcome = "updated" if placement.wrote else "unchanged"
         return dataclasses.replace(result, outcome=outcome, claimed=normalize_handle(handle), named=None, detail=placement.detail)
@@ -442,6 +460,7 @@ def place_soul_anchor(
     soul_path: Path | None = None,
     template: str | None = None,
     replace_other: bool = False,
+    text_label: str = SERVED_TEXT,
 ) -> AnchorPlacement:
     """Place the served identity line for ``handle`` in SOUL.md, on request.
 
@@ -471,9 +490,9 @@ def place_soul_anchor(
     for _ in range(PLACE_ATTEMPTS):
         result = anchor.follow(target, handle=bare, identity_line=identity_line, template=template)
         if result.outcome == "updated":
-            return AnchorPlacement("updated", target, f"identity line for @{bare} refreshed to the served text in {target}")
+            return AnchorPlacement("updated", target, f"identity line for @{bare} refreshed to {text_label} in {target}")
         if result.outcome == "unchanged":
-            return AnchorPlacement("unchanged", target, f"identity line for @{bare} in {target} (the served text)")
+            return AnchorPlacement("unchanged", target, f"identity line for @{bare} in {target} ({text_label})")
         if result.outcome in ("failed", "edited_meanwhile"):
             return AnchorPlacement("failed", target, result.detail)
         if result.outcome == "several_blocks":
@@ -541,8 +560,7 @@ def place_soul_anchor(
             return AnchorPlacement(
                 "updated",
                 target,
-                f"identity line for @{bare} in {target}: the block the August 2026 build wrote is replaced by the "
-                "served text",
+                f"identity line for @{bare} in {target}: the block the August 2026 build wrote is replaced by {text_label}",
             )
         return AnchorPlacement("placed", target, f"identity line for @{bare} placed in {target}")
     return AnchorPlacement(
