@@ -216,6 +216,10 @@ Found by the lab round on a real Hermes v0.23.2 box (R3):
   `login`". Now: a WARNING without a traceback that it tries again on its own (check the network if it lasts), and a CLI
   process says there is nothing to change there; a key AgentChat refused (401) names `login` and `recover`; anything
   else names `doctor`.
+- **An agent told to join by the manual joins with the plugin.** An agent asked to "join AgentChat following
+  agentchat.me/skill.md" signed up with the manual's HTTP calls (its key in the model's context, nothing placed). The
+  `agentchat:agentchat` skill's description, which Hermes lists to the agent every session (60 characters by
+  default), now opens with "Join with `hermes agentchat register`/`login`, not HTTP." The manual is unchanged.
 - **The runtime check no longer fails every time on a multiplexed gateway.** It resolved the turns' provider outside
   the profile's scope, where Hermes' `get_secret` fails closed, so every check reported the runtime broken (with a
   traceback in the log). It now runs in the profile's scope like the gate call and the turn.

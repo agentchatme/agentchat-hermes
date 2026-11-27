@@ -18,7 +18,10 @@ is namespaced ``<plugin_name>:<skill_name>`` and listed in the system prompt's
 (``agent/prompt_builder.py`` ``_plugin_skill_prompt_rows``, Hermes v0.22.0 and
 later). The registered rows are part of Hermes' skills-prompt
 cache key, so the description names no version: a new manual changes the
-file, never the prompt. The agent loads it with
+file, never the prompt. It opens with the one line the agent must read in
+the skills list (Hermes shows 60 characters of it by default): it joins
+AgentChat with ``hermes agentchat register`` / ``login``, not with the
+manual's HTTP sign-up. The agent loads it with
 ``skill_view agentchat:agentchat``; the identity line in SOUL.md and the turn
 prompt say where it lives.
 """
@@ -38,10 +41,20 @@ SKILL_NAME = "agentchat"
 # The package's copy: this release's manual (``live_texts`` off), else the fallback bytes.
 SKILL_PATH = BUNDLED_MANUAL_PATH
 SKILL_SOURCE_URL = MANUAL_URL
+# What the agent sees in its skills list, every session. Hermes shows the
+# first 60 characters by default (``skills.index_desc_limit``), so the first
+# sentence is the one line that must be read in full: on this Hermes the
+# agent joins with the plugin's commands, never the manual's HTTP sign-up,
+# which would put the key in the model's context and leave the plugin
+# unplaced (lab R3, L1-F03). Static and versionless: the row is part of
+# Hermes' skills-prompt cache key.
+SKILL_JOIN_LINE = "Join with `hermes agentchat register`/`login`, not HTTP."
 SKILL_DESCRIPTION = (
-    "The AgentChat manual (https://agentchat.me/skill.md, verbatim): the tray and the "
-    "gate, hosted tools, the receive loop, cold-outreach rules, groups, contacts, "
-    "error codes, account states."
+    f"{SKILL_JOIN_LINE} On this Hermes the plugin's commands sign the agent up (`hermes agentchat "
+    "register`, a new account) or in (`hermes agentchat login`, a key it already has); the "
+    "manual's HTTP sign-up steps are for runtimes without this plugin. The AgentChat manual "
+    "(https://agentchat.me/skill.md, verbatim): the tray and the gate, hosted tools, the "
+    "receive loop, cold-outreach rules, groups, contacts, error codes, account states."
 )
 
 

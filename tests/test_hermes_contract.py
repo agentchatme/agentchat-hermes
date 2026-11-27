@@ -280,6 +280,13 @@ def test_a_skill_outside_the_package_is_read_fresh_after_an_atomic_replace(
     assert Path(_plugin_manager.find_plugin_skill("agentchat:agentchat")) == path
     rows = {meta["name"]: meta for meta in _plugin_manager.list_plugin_skill_metadata()}
     assert rows["agentchat:agentchat"]["description"] == SKILL_DESCRIPTION, "the index row names no version"
+    # The skills list shows the description clipped to Hermes' default width
+    # (60): the join line (lab R3, L1-F03) is read in full there.
+    from agentchatme_hermes.skills import SKILL_JOIN_LINE
+
+    skill_utils = _import("agent.skill_utils")
+    assert skill_utils.SKILL_PROMPT_DESC_LIMIT == 60
+    assert skill_utils.clip_skill_description(SKILL_DESCRIPTION).startswith(SKILL_JOIN_LINE.rstrip("."))
 
     first = json.loads(skills_tool.skill_view("agentchat:agentchat"))
     assert first["success"] is True, first

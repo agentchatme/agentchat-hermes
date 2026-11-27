@@ -130,6 +130,20 @@ class TestRegister:
         assert BUNDLE_VERSION is not None and BUNDLE_VERSION not in SKILL_DESCRIPTION
         assert "verbatim" in SKILL_DESCRIPTION
 
+    def test_the_description_opens_with_how_to_join_on_this_hermes(self) -> None:
+        """Lab R3 (L1-F03): an agent told only "join AgentChat following
+        agentchat.me/skill.md" signed up by HTTP (its key in the model's
+        context, nothing placed). The skills list Hermes shows every session
+        says first, within Hermes' default 60-character index width, to join
+        with the plugin's commands."""
+        from agentchatme_hermes.skills import SKILL_JOIN_LINE
+
+        assert SKILL_DESCRIPTION.startswith(SKILL_JOIN_LINE + " ")
+        assert len(SKILL_JOIN_LINE) <= 57, "Hermes clips the row at 60 characters, '...' included"
+        assert "`hermes agentchat register`" in SKILL_DESCRIPTION and "`hermes agentchat login`" in SKILL_DESCRIPTION
+        assert "not HTTP" in SKILL_JOIN_LINE
+        assert "\n" not in SKILL_DESCRIPTION
+
     def test_an_existing_file_is_registered_as_it_is(self, home: Path) -> None:
         target = manual_path(home)
         target.parent.mkdir(parents=True)
