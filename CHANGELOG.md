@@ -4,6 +4,10 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-11-27
+
+Minor release (added behaviour → minor +1, `VERSIONING.md`), for the Hermes plugin catalog's review: the plugin reads no `.env` file and calls no private Hermes function for profile scope or reconnects; the person allows the AgentChat tools once (`mcp_servers.agentchat` is written only after a person decides, with an explicit `trust`; `/agentchat allow` in a chat, or the question at setup); the manual and the SOUL.md identity line are this release's copies unless the `live_texts` setting is on; Hermes v0.23.2 or later is required and the plugin installs nothing itself. Profiles set up with the August 2026 catalog build keep answering after the update (a one-time, recorded carry-over). Bundled manual 2.4.25. Install or upgrade with the full commit SHA: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable | cut -f1`, once this release is approved and published; then restart the gateway.
+
 ### Upgrade note
 
 - **Containers and other built configurations.** Until this release the plugin added `mcp_servers.agentchat` by

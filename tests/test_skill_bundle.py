@@ -22,10 +22,10 @@ from agentchatme_hermes.skills import SKILL_NAME, SKILL_PATH, SKILL_SOURCE_URL
 
 # The published manual this release bundles, byte for byte: the server pins the
 # same pair and announces it in the served texts. A new manual changes both here.
-MANUAL_VERSION = "2.4.23"
-MANUAL_SHA256 = "adf13e4fa20af2997a5bfb122a1e2a29f9afe3f7c52740631940471b47c41bd2"
+MANUAL_VERSION = "2.4.25"
+MANUAL_SHA256 = "f31264d5aee6914069a0e3caa59d21faf6f2c57c1d60ba121edd9f036dba1862"
 # texts_snapshot.json, byte for byte.
-TEXTS_SNAPSHOT_SHA256 = "862ec76b5bbe6720f7f19025976658f03a5e44ccf86ba70c3c6f23ef97b8f7a7"
+TEXTS_SNAPSHOT_SHA256 = "92b2c2010c2130e100439f9cf746d5a677d4c73cecf97396310ba13c04b2ea7a"
 
 
 class TestBundle:
