@@ -45,6 +45,8 @@ name: windows-native
 # first and last characters), and GitHub masks the secret in the step log.
 
 on:
+  push:
+    branches: [feat/windows-native]
   workflow_dispatch:
     inputs:
       hermes_channel:
