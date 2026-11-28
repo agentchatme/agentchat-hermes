@@ -230,24 +230,34 @@ The same gateway, the same doctor lines. What is different:
   handle closes or the process ends, killed included (Task Manager, `Stop-Process -Force`). A gateway that lost the
   election retries every 15 s, which also covers the moment Windows may take to release a killed holder's lock.
 - **The key file's access list.** `icacls "%LOCALAPPDATA%\hermes\agentchat"` shows only you, `NT AUTHORITY\SYSTEM` and
-  `BUILTIN\Administrators`, with no inherited entries, and you as the owner; the file inside inherits them. `doctor`
-  says `readable by you only` when that holds, and warns when another account can read the file (`doctor --fix` sets the
-  list again).
-- **"… can be changed by other accounts on this computer (…)".** A key file an earlier release wrote in a Hermes home
-  outside your profile (`HERMES_HOME=C:\hermes`, which commonly inherits `Authenticated Users: Modify` from the drive).
-  It is refused until it is yours only. When the file is yours (you own it), `hermes agentchat doctor --fix` sets the
-  list and the owner on the directory and the files in it and keeps the key; it then says which agent the key is for.
-  If you did not save that key yourself, run `hermes agentchat recover` for a new one instead.
-- **Refused and never repaired:** a key file or key directory another account owns ("owned by …, another account"), a
-  key file with more than one name ("… names (a hard link)"), a key directory that is a junction or symbolic link, or
-  one reached through one ("resolves to …"), and a key file whose access list cannot be read. Remove what is there (or
-  ask the account that owns it to) and run `hermes agentchat login` or `recover`.
-- **"cannot read …\credentials.json: Access is denied".** The key directory was made from an elevated ("Run as
-  administrator") prompt by a release before this one on Python 3.13 or later, which closed it to you unelevated: run
-  `hermes agentchat doctor --fix` once from an elevated prompt of the same account, then `hermes gateway restart`.
-- **A volume without access lists** (FAT32, exFAT: a USB stick) stores no owner or list at all: the key file there is
-  judged by its contents only, as nothing can be private on it.
+  `BUILTIN\Administrators`, with no inherited entries, and you as the owner; the key file has the same list of its own.
+  `doctor` says `readable by you only` only when that holds and the Hermes home is yours too, and warns when another
+  account can read the file (`doctor --fix` sets the list again).
+- **"the Hermes home … can be changed by other accounts on this computer (…)"** (doctor fails). A `HERMES_HOME` outside
+  your profile, like `C:\hermes`, commonly inherits `Authenticated Users: Modify` from the drive: other accounts can then
+  change the plugin's code and `config.yaml`, so no key in that home can be kept from them, whatever its own list says.
+  Move the Hermes home under your user profile (the default `%LOCALAPPDATA%\hermes`), or remove their access to it (the
+  folder's Properties → Security, or `icacls`), then run `doctor` again.
+- **"… can be changed by other accounts on this computer (…)"** on the key file itself. A key file an earlier release
+  wrote in such a home. It is refused until it is yours only. Once the Hermes home is yours, and when you own the file,
+  `hermes agentchat doctor --fix` sets the list and the owner on the key folder and the files in it and keeps the key; it
+  then says which agent the key is for. While the home is not yours it refuses ("left as it is until then"). If you did
+  not save that key yourself, run `hermes agentchat recover` for a new one instead.
+- **Refused and never repaired:** a key file or key directory another account owns ("owned by …, another account"; on
+  a network share files belong to the server's accounts: keep the Hermes home on a local disk), a key file with more
+  than one name ("… names (a hard link)"), a key directory that is a junction or symbolic link, or one reached through
+  one ("resolves to …"), and a key file whose access list cannot be read. Remove what is there (or ask the account that
+  owns it to) and run `hermes agentchat login` or `recover`.
+- **"cannot read …\credentials.json: Access is denied. Windows refuses this account its own key folder …".** The key
+  folder was made from an elevated ("Run as administrator") prompt by a release before this one on Python 3.13 or later,
+  which closed it to you unelevated; you cannot remove it, and `login` fails the same way. Run `hermes agentchat doctor
+  --fix` once from an elevated (Run as administrator) prompt of the same account, then `hermes gateway restart`. An
+  account with no administrator rights of its own is told the two `icacls` commands an administrator runs instead.
+- **"… is on a volume that keeps no access lists (FAT or exFAT)".** A Hermes home on a FAT32 or exFAT drive (a USB stick):
+  nothing there can be private, so the key is neither saved nor used, as POSIX refuses a file others can write. Move
+  the Hermes home to an NTFS drive.
 - **A real check.** Actions → `windows-native` → Run workflow installs Hermes with `install.ps1` on `windows-latest`,
   installs the plugin from the chosen branch, and checks the leader lock from a second process (stand-in API, no key),
-  once as the runner's administrator account and once as a standard account it makes. With the repository secret
-  `AGENTCHAT_WINDOWS_CHECK_KEY` (a dedicated test agent's key) it also connects to api.agentchat.me.
+  once as the runner's administrator account and once as a standard account it makes. With `connect` ticked it also
+  connects to api.agentchat.me with the test agent key in the `windows-check` environment (secret
+  `AGENTCHAT_WINDOWS_CHECK_KEY`; the environment's required reviewers approve the run first).

@@ -80,10 +80,10 @@ hermes agentchat login --api-key-file ~/ac.key  # or read it from a file
 
 ### Native Windows
 
-The plugin runs in a Hermes installed natively on Windows (the Microsoft Store / MSIX app, or `install.ps1`; see
-Hermes' [Windows (Native) Guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/windows-native.md)):
-the gateway holds AgentChat's socket and wakes the agent, as on Linux and macOS. The commands above are the same; the
-first line, in PowerShell:
+The plugin runs in a Hermes installed natively on Windows with `install.ps1` (see Hermes' [Windows (Native)
+Guide](https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/windows-native.md)): the gateway
+holds AgentChat's socket and wakes the agent, as on Linux and macOS. The Microsoft Store / MSIX app runs the same
+gateway, but it is not tested with this plugin yet. The commands above are the same; the first line, in PowerShell:
 
 ```powershell
 $sha = (git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable).Split("`t")[0]
@@ -102,21 +102,28 @@ What differs on Windows:
   `gateway run` process is a candidate: a chat session and the `hermes agentchat` commands never hold it.
 - **Who can read the key.** A file mode means nothing on Windows. The key's directory is created owned by you with an
   access list naming only you, SYSTEM and Administrators (the accounts POSIX root stands for), protected from its
-  parent's, in the one call that creates it; the key file inherits it as it is written. So the key stays yours even when
-  the Hermes home sits on a drive every local user can read. It names your account, not "the owner", so a `register` or
-  `login` run from an elevated ("Run as administrator") prompt leaves a key the gateway, which runs unelevated, can still
-  read. What POSIX refuses is refused here, read from the list: a key file or directory another account owns, a key
-  file another account can change, a key file with a second name (a hard link), a key directory that is (or is reached
-  through) a junction or symbolic link, and a list that cannot be read. One case is repaired: a key file that is yours
-  but that other accounts can change (an earlier release in a home like `C:\hermes`) — `hermes agentchat doctor --fix`
-  makes it yours only and keeps the key. A key directory an earlier release created from an elevated prompt on Python
-  3.13 or later may be closed to you unelevated (`doctor` then says the key file cannot be read, "Access is denied"):
-  run `hermes agentchat doctor --fix` once from an elevated prompt of the same account. See RUNBOOK.md for each message.
+  parent's, in the one call that creates it, and the key file is created with its own such list. It names your account,
+  not "the owner", so a `register` or `login` run from an elevated ("Run as administrator") prompt leaves a key the
+  gateway, which runs unelevated, can still read. What POSIX refuses is refused here, read from the list: a key file or
+  directory another account owns, a key file another account can change, a key file with a second name (a hard link),
+  a key directory that is (or is reached through) a junction or symbolic link, a list that cannot be read, and a volume
+  that keeps no lists at all (FAT, exFAT: move the Hermes home to an NTFS drive).
+- **The Hermes home must be yours too.** A key file's list cannot help in a Hermes home other accounts can change (a
+  `HERMES_HOME` like `C:\hermes`, which commonly inherits `Authenticated Users: Modify` from the drive): they can change
+  the plugin's code and `config.yaml` there. `hermes agentchat doctor` fails on such a home; keep the Hermes home under
+  your user profile (the default), or remove the other accounts' access to it. A key file that is yours but that other
+  accounts can change is refused until `hermes agentchat doctor --fix` makes it yours only, keeping the key — which it
+  does only once the home is yours.
+- **A key folder an elevated run made.** On Python 3.13 or later an earlier release run from an elevated prompt could
+  leave the key folder closed to you unelevated: the key is refused with "Access is denied" and the fix: run
+  `hermes agentchat doctor --fix` once from an elevated (Run as administrator) prompt of the same account. See
+  RUNBOOK.md for each message.
 - **Checked on a real gateway.** `.github/workflows/windows-native.yml` installs Hermes with `install.ps1` on a
   `windows-latest` runner, installs the plugin from a commit, starts the gateway (`hermes gateway start`, then the
   logon task) and checks from a second process that the plugin holds the leader lock and that the lock is free after
-  a stop and after a kill; a second runner does the same as a standard (non-admin) account, with the test suite. With a test agent's key as the repository secret `AGENTCHAT_WINDOWS_CHECK_KEY` it also
-  checks the connect to api.agentchat.me.
+  a stop and after a kill; a second runner does the same as a standard (non-admin) account, with the test suite. Run
+  with `connect` and a test agent's key in the `windows-check` environment, it also checks the connect to
+  api.agentchat.me.
 
 ### Let your agent set it up
 
@@ -342,9 +349,9 @@ profile — `hermes profile create` copies `.env`, so the new profile silently b
 - **One file per profile, read only by this plugin.** `<profile home>/agentchat/credentials.json`, `0600`, written
   atomically. On native Windows, where a mode means nothing, its directory has an access list that names only you (your
   account's SID, the same whether or not the command ran elevated), SYSTEM and Administrators, protected from the
-  parent's, and the file inherits it as it is created; a key file another account can change is refused until
-  `doctor --fix` makes it yours only (when you own it), and one another account can read is tightened (see
-  [Native Windows](#native-windows)). It records the profile it belongs to: a copy made by `hermes profile create --clone-all` (or by hand) is
+  parent's, and the file is created with its own such list; a key file another account can change is refused until
+  `doctor --fix` makes it yours only (when you own it and the Hermes home is yours), and one another account can read is
+  tightened (see [Native Windows](#native-windows)). It records the profile it belongs to: a copy made by `hermes profile create --clone-all` (or by hand) is
   refused, with the fix (`hermes -p <name> agentchat logout` removes only the copy); a profile that was renamed or moved
   keeps working and `doctor --fix` records the new home. Plain `profile create` and `--clone` copy nothing of it.
 - **Hermes' MCP client gets it through a secret source.** The plugin registers the `agentchat` secret source

@@ -29,9 +29,10 @@ Hermes' own: the probes are a second process beside the gateway, as
         Saving a made-up key into ``<home>`` must be refused with an error
         that contains ``<text>`` (a key directory of another account).
 
-    windows-check.py read-detail <home> <text>
-        Reading ``<home>``'s key file must not be usable, and what it says
-        must contain ``<text>`` (the message a person sees).
+    windows-check.py refusal <home> <text>
+        ``<home>``'s key must be refused, and the refusal ``hermes agentchat``
+        prints must contain ``<text>`` (the message a person sees, with its
+        remedy).
 
 Exit 0 when the check holds, 1 when it does not.
 """
@@ -158,13 +159,13 @@ def _write_refused(home: Path, text: str) -> int:
     return 1
 
 
-def _read_detail(home: Path, text: str) -> int:
-    from agentchatme_hermes import key_store
+def _refusal(home: Path, text: str) -> int:
+    from agentchatme_hermes import config
 
-    read = key_store.read_store(home)
-    print(f"status={read.status} detail={read.detail}")
-    if read.usable or text not in read.detail:
-        print(f"::error::expected an unusable key file saying {text!r}")
+    resolution = config.resolve_key(home)
+    print(f"status={resolution.store.status} refusal={resolution.refusal}")
+    if resolution.api_key is not None or text not in (resolution.refusal or ""):
+        print(f"::error::expected the key refused with {text!r}")
         return 1
     return 0
 
@@ -178,8 +179,8 @@ def main(argv: list[str]) -> int:
         return _free(Path(argv[2]), float(argv[3]))
     if len(argv) == 4 and argv[1] == "write-refused":
         return _write_refused(Path(argv[2]), argv[3])
-    if len(argv) == 4 and argv[1] == "read-detail":
-        return _read_detail(Path(argv[2]), argv[3])
+    if len(argv) == 4 and argv[1] == "refusal":
+        return _refusal(Path(argv[2]), argv[3])
     print(__doc__, file=sys.stderr)
     return 2
 

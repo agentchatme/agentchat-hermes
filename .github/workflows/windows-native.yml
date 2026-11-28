@@ -25,10 +25,20 @@ name: windows-native
 # same through the logon Scheduled Task `hermes gateway install` registers. A
 # connect is not proven here.
 #
-# With a key (only when the repository secret AGENTCHAT_WINDOWS_CHECK_KEY is
-# set): the same gateway signs in to api.agentchat.me with that key and must
-# reach `connected`. Use a dedicated test agent nobody messages: the runner
-# has no model, so a message arriving during the run is left unread.
+# With a key (job `connect`, only when the run is started with `connect`
+# ticked): a gateway signs in to api.agentchat.me with the key of a dedicated
+# test agent and must reach `connected`. Use an agent nobody messages: the
+# runner has no model, so a message arriving during the run is left unread.
+# The job runs in the `windows-check` environment, so the key is that
+# environment's secret and the environment's protection rules (required
+# reviewers) apply before the key reaches a runner. Its Hermes is the latest
+# release, the one hermes-main's "latest release" leg tests, installed from
+# install.ps1 at that release's commit (never Nous' moving main).
+#
+# The founder's one-time setup for that job: Settings → Environments → New
+# environment `windows-check`; add the secret AGENTCHAT_WINDOWS_CHECK_KEY (the
+# test agent's API key) there, and, as for the publish environments, add
+# yourself as a required reviewer. Then Run workflow with `connect` ticked.
 #
 # As a standard user (job `standard-user`, in parallel): GitHub's Windows
 # runners are administrators with UAC off, so the job above runs elevated. A
@@ -38,11 +48,13 @@ name: windows-native
 # it also checks that a key directory another account owns is not written
 # into, and what a key file the account cannot read says.
 #
-# Nothing is published. The keyless legs' logs and records are uploaded as
-# artifacts (no real key is in them). The key secret is in the keyed step's
-# environment only (not install.ps1's, the pip installs' or an earlier
-# gateway's); that step uploads nothing and runs no doctor (it prints a key's
-# first and last characters), and GitHub masks the secret in the step log.
+# Nothing is published. The keyless jobs' logs and records are uploaded as
+# artifacts (no real key is in them). In `connect` the key is in one step's
+# environment only (not install.ps1's or the pip installs'), goes to `login`
+# on stdin and is gone from the environment before the gateway starts; that
+# job uploads nothing and runs no doctor (it prints a key's first and last
+# characters), and GitHub masks the secret in the step log. No checkout keeps
+# the repository token (persist-credentials: false).
 
 on:
   workflow_dispatch:
@@ -52,6 +64,10 @@ on:
         type: choice
         options: [stable, main]
         default: stable
+      connect:
+        description: "Also connect to api.agentchat.me with the windows-check environment's test-agent key"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -77,10 +93,10 @@ jobs:
       PYTHONUTF8: "1"
       STUB_PORT: "18787"
       HERMES_CHANNEL: ${{ inputs.hermes_channel || 'stable' }}
-      # Whether the key is set, never the key: only the keyed step sees it.
-      HAS_CHECK_KEY: ${{ secrets.AGENTCHAT_WINDOWS_CHECK_KEY != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # The probes' own Python, beside Hermes': a second process, as doctor is.
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -231,38 +247,6 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # The key is in this step's environment only: not in install.ps1's, the
-      # pip installs', the earlier gateways' or any uploaded file. It goes to
-      # login on stdin and is gone from the environment before the gateway
-      # starts (the gateway reads the key file).
-      - name: "With a key: connect to api.agentchat.me"
-        if: env.HAS_CHECK_KEY == 'true'
-        env:
-          CHECK_KEY: ${{ secrets.AGENTCHAT_WINDOWS_CHECK_KEY }}
-        run: |
-          try {
-            hermes agentchat logout
-            $env:CHECK_KEY | hermes agentchat login --api-key -
-            if ($LASTEXITCODE -ne 0) { throw "login exited $LASTEXITCODE" }
-            Remove-Item Env:CHECK_KEY
-            hermes gateway start
-            # No doctor here: it prints the key's first and last characters,
-            # and this log is public.
-            python .github/scripts/windows-check.py leader $env:HERMES_HOME_DIR 300 connected
-            if ($LASTEXITCODE -ne 0) { throw "the gateway's plugin did not connect" }
-            hermes gateway stop
-            python .github/scripts/windows-check.py free $env:HERMES_HOME_DIR 60
-            if ($LASTEXITCODE -ne 0) { throw "the lock outlived a stopped gateway" }
-          } finally {
-            try { hermes gateway stop *> $null } catch { }
-            try { hermes agentchat logout *> $null } catch { }
-          }
-          exit 0
-
-      - name: "Without a key: the connect leg did not run"
-        if: env.HAS_CHECK_KEY != 'true'
-        run: Write-Output "::notice::AGENTCHAT_WINDOWS_CHECK_KEY is not set, so the connect to api.agentchat.me was not checked."
-
   standard-user:
     name: Hermes ${{ inputs.hermes_channel || 'stable' }} as a standard (non-admin) account
     runs-on: windows-latest
@@ -276,6 +260,8 @@ jobs:
       HERMES_CHANNEL: ${{ inputs.hermes_channel || 'stable' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
@@ -396,3 +382,83 @@ jobs:
           path: ${{ runner.temp }}/windows-native-standard-user
           if-no-files-found: warn
           retention-days: 14
+
+  connect:
+    name: Hermes (latest release) connects to api.agentchat.me with a test agent's key
+    if: inputs.connect
+    runs-on: windows-latest
+    environment: windows-check
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      HERMES_NONINTERACTIVE: "1"
+      HERMES_GATEWAY_INSTALL_START_ON_LOGIN: "0"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the probes (this package, in the runner's Python)
+        run: python -m pip install .
+
+      - name: The latest Hermes release and its commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw "no latest hermes-agent release (got '$tag')" }
+          $sha = gh api "repos/NousResearch/hermes-agent/commits/$tag" --jq .sha
+          if ($sha -notmatch '^[0-9a-f]{40}$') { throw "no commit for $tag (got '$sha')" }
+          Write-Output "hermes-agent $tag at $sha"
+          "HERMES_RELEASE=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "HERMES_RELEASE_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Hermes at that release (install.ps1 from the same commit)
+        run: |
+          $url = "https://raw.githubusercontent.com/NousResearch/hermes-agent/$env:HERMES_RELEASE_SHA/scripts/install.ps1"
+          $script = (Invoke-RestMethod $url).TrimStart([char]0xFEFF)
+          & ([scriptblock]::Create($script)) -NonInteractive -Commit $env:HERMES_RELEASE_SHA
+          $bin = Join-Path $env:LOCALAPPDATA 'hermes\bin'
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "HERMES_HOME_DIR=$(Join-Path $env:LOCALAPPDATA 'hermes')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install the plugin from this commit (README)
+        run: |
+          hermes --version
+          hermes plugins install "https://github.com/${{ github.repository }}.git" --ref '${{ github.sha }}' --force --yes-deps
+          if ($LASTEXITCODE -ne 0) { throw "plugins install exited $LASTEXITCODE" }
+          hermes plugins enable agentchat
+          if ($LASTEXITCODE -ne 0) { throw "plugins enable exited $LASTEXITCODE" }
+
+      # The key is in this step's environment only. It goes to login on stdin
+      # and is gone from the environment before the gateway starts (the
+      # gateway reads the key file).
+      - name: "Connect to api.agentchat.me"
+        env:
+          CHECK_KEY: ${{ secrets.AGENTCHAT_WINDOWS_CHECK_KEY }}
+        run: |
+          if (-not $env:CHECK_KEY) { throw "the windows-check environment has no AGENTCHAT_WINDOWS_CHECK_KEY secret" }
+          try {
+            $env:CHECK_KEY | hermes agentchat login --api-key -
+            if ($LASTEXITCODE -ne 0) { throw "login exited $LASTEXITCODE" }
+            Remove-Item Env:CHECK_KEY
+            hermes gateway start
+            # No doctor here: it prints the key's first and last characters,
+            # and this log is public.
+            python .github/scripts/windows-check.py leader $env:HERMES_HOME_DIR 300 connected
+            if ($LASTEXITCODE -ne 0) { throw "the gateway's plugin did not connect" }
+            hermes gateway stop
+            python .github/scripts/windows-check.py free $env:HERMES_HOME_DIR 60
+            if ($LASTEXITCODE -ne 0) { throw "the lock outlived a stopped gateway" }
+          } finally {
+            try { hermes gateway stop *> $null } catch { }
+            try { hermes agentchat logout *> $null } catch { }
+          }
+          exit 0

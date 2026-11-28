@@ -11,7 +11,7 @@
 #                       -Port, the gateway's leader lock held, then free after
 #                       a stop and after a kill
 #   -Step refused       a key directory another account owns is not written into
-#   -Step denied        what a key file this account cannot read says
+#   -Step denied        what a key file this account cannot read says, and its remedy
 #
 # The probes (windows-check.py) run with -Python, the runner's interpreter
 # with this package installed. Exit 0 when the step holds.
@@ -115,8 +115,10 @@ switch ($Step) {
         Assert-Exit 'the refused write'
     }
     'denied' {
-        & $Python $check read-detail $KeyHome 'Access is denied'
+        & $Python $check refusal $KeyHome 'Access is denied'
         Assert-Exit 'the denied read'
+        & $Python $check refusal $KeyHome 'doctor --fix` from an elevated (Run as administrator) prompt'
+        Assert-Exit 'the elevated remedy'
     }
     default { throw "unknown step $Step" }
 }
