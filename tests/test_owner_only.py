@@ -161,7 +161,9 @@ class TestWindowsAccessList:
     def test_a_list_without_the_user_is_not_private(self, tmp_path: Path) -> None:
         """What Python 3.13's ``mkdir(0o700)`` leaves when run elevated (SYSTEM,
         Administrators, OWNER RIGHTS = Administrators): no entry for the user.
-        Not private; set again with the user's own entry and ownership."""
+        An administrator's full token still reads it: not private, and set
+        again with the user's own entry and ownership (the elevated remedy).
+        A standard account cannot even open it: an error, never "private"."""
         target = tmp_path / "d"
         target.mkdir()
         user = owner_only.current_user_sid()
@@ -170,9 +172,14 @@ class TestWindowsAccessList:
         # it owns the folder; a fresh profile's Temp leaves one): what
         # remains names only SYSTEM and Administrators.
         icacls(str(target), "/remove", f"*{user}", f"*{owner_only.OWNER_RIGHTS_SID}")
+        if not elevated():
+            with pytest.raises(PermissionError):
+                owner_only.inspect(target)
+            with pytest.raises(PermissionError):
+                owner_only.make_private_dir(target, enforce=True, strict=True)
+            return
         access = owner_only.inspect(target)
-        listing = subprocess.run(["icacls", str(target)], capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
-        assert access is not None and not access.user_granted and not access.private, (access, listing)
+        assert access is not None and not access.user_granted and not access.private, access
         owner_only.make_private_dir(target, enforce=True)
         access = owner_only.inspect(target)
         assert access is not None and access.settled
