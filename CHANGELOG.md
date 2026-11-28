@@ -37,6 +37,36 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   `recover --code`. Before, those routes named only sign-up, and the server lets one email back several agents, so a
   returning agent could make a second account. `hermes agentchat login` with no key source in an agent's terminal no
   longer waits at a hidden prompt nobody answers: it says the file way and exits.
+- **Native Windows: the gateway now receives.** Hermes runs natively on Windows (the MSIX desktop app, `install.ps1`,
+  the gateway as a Scheduled Task or `hermes gateway start`), but the leader lock that elects the process holding
+  AgentChat's socket was `fcntl.flock`, which Windows does not have: the plugin logged "running in follower mode … must
+  run on POSIX" and no gateway ever held the socket, so sign-up and the hosted tools worked and no message ever woke
+  the agent. The lock is now `msvcrt.locking` on Windows (`LockFile` on byte 0 of the lock file's handle) and `flock`
+  elsewhere, with the same properties on both: an attempt never waits, the lock belongs to the open file (two
+  profiles of one multiplexed gateway on one key still exclude each other), the system releases it when the handle
+  closes or the process ends however it ends, and no child process inherits it. No new dependency. Checked on a real
+  Hermes gateway on `windows-latest` (`.github/workflows/windows-native.yml`, by hand): the plugin runs in gateway
+  mode, holds the lock against another process, starts its receive loop, and the lock is free again after a stop and
+  after the gateway is killed.
+- **Native Windows: the key file is private to you.** A file mode means nothing on Windows (`0600` is ignored), and
+  Python 3.13's `mkdir(0o700)` there makes a directory that an elevated ("Run as administrator") run closes to the same
+  user unelevated. The key's directory (`<profile home>\agentchat`) now gets an explicit access list, protected from its
+  parent's: full control for you (your account's SID, elevated or not), SYSTEM and Administrators, the principals
+  POSIX root stands for. The key file inherits it as it is created, so it is private from its first byte, wherever the
+  Hermes home is (a `HERMES_HOME` on another drive inherits that drive's list, which commonly lets every local user
+  read). The list is written on the directory's own handle, never through a junction, a symbolic link or a hard link.
+  The checks POSIX makes on the mode are made on the list: a key file of another owner, or one another account can
+  change, is refused; one another account can read, or one with no entry for you, is used and tightened at the
+  gateway's start and by `doctor --fix`. The lock, state and health directories get the same list when created.
+- **Native Windows, the rest of the gateway path.** A rename onto a file another process has open fails on Windows;
+  the key file, the health record, the state files and `SOUL.md` are now replaced with the SDK kit's retrying rename,
+  as the kit's own files are. Whether the gateway behind a health record still runs is asked with `OpenProcess` where
+  `psutil` is missing, never with `os.kill(pid, 0)` (a CTRL+C to the target's console on Windows). Outside Hermes the
+  default home is `%LOCALAPPDATA%\hermes` on Windows, as Hermes computes it. `doctor`'s note about old terminal
+  snapshots gives a PowerShell `Remove-Item` there. JSON the plugin reads back accepts a byte-order mark. Checked and
+  unchanged: the gateway is recognised by its command line on Windows too (the Scheduled Task's launcher and `hermes
+  gateway start` both run `python.exe -m hermes_cli.main [--profile X] gateway run`); the plugin starts no
+  subprocess, sends no signal and reads no `/proc`; process start times come from Hermes (`psutil` on Windows).
 
 ## [0.8.0] — 2026-11-27
 

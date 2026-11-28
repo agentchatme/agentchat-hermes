@@ -216,3 +216,27 @@ gives a plugin no way to kill a turn's thread, and releasing the lock early coul
 - Two gateways for the same account (two profiles with the same key, or two machines): one receives, the other logs
   `mode=follower-gateway` and takes over within 15 s of the first one stopping. A profile whose key is a *copy* of another
   profile's (a cloned profile) does not start at all: see the doctor lines above.
+
+## Native Windows
+
+The same gateway, the same doctor lines. What is different:
+
+- **Paths.** The Hermes home is `%LOCALAPPDATA%\hermes` (or `HERMES_HOME`): the locks and health records are in
+  `%LOCALAPPDATA%\hermes\agentchat-locks\`, the key file in `<profile home>\agentchat\credentials.json`, the logs in
+  `%LOCALAPPDATA%\hermes\logs\` (`agent.log`, `gateway.log`).
+- **The receiving process.** `hermes gateway install` (the Scheduled Task) and `hermes gateway start` both run
+  `python.exe -m hermes_cli.main gateway run`; its log line `agentchat runtime started: … mode=leader` says it holds the
+  account's lock. The lock is `LockFile` on byte 0 of `ws-<fingerprint>.lock`: Windows releases it when the gateway's
+  handle closes or the process ends, killed included (Task Manager, `Stop-Process -Force`). A gateway that lost the
+  election retries every 15 s, which also covers the moment Windows may take to release a killed holder's lock.
+- **The key file's access list.** `icacls "%LOCALAPPDATA%\hermes\agentchat"` shows only you, `NT AUTHORITY\SYSTEM` and
+  `BUILTIN\Administrators`, with no inherited entries; the file inside inherits them. `doctor` says `readable by you only`
+  when that holds, warns when another account can read the file (`doctor --fix` sets the list again), and refuses a key
+  file another account can change or that another account owns.
+- **"cannot read …\credentials.json: Permission denied".** The key directory was made from an elevated ("Run as
+  administrator") prompt by a release before this one on Python 3.13 or later, which closed it to you unelevated: run
+  `hermes agentchat doctor --fix` once from an elevated prompt, then `hermes gateway restart`.
+- **A real check.** Actions → `windows-native` → Run workflow installs Hermes with `install.ps1` on `windows-latest`,
+  installs the plugin from the chosen branch, and checks the leader lock from a second process (stand-in API, no key).
+  With the repository secret `AGENTCHAT_WINDOWS_CHECK_KEY` (a dedicated test agent's key) it also connects to
+  api.agentchat.me.
