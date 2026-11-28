@@ -164,7 +164,9 @@ class TestWindowsAccessList:
         Not private; set again with the user's own entry and ownership."""
         target = tmp_path / "d"
         target.mkdir()
+        user = owner_only.current_user_sid()
         icacls(str(target), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F")
+        icacls(str(target), "/remove:g", f"*{user}")  # an entry a parent's CREATOR OWNER left (C:\\Windows\\Temp)
         access = owner_only.inspect(target)
         assert access is not None and not access.user_granted and not access.private
         owner_only.make_private_dir(target, enforce=True)

@@ -227,8 +227,12 @@ class TestWindowsAccessList:
     def test_a_key_directory_closed_to_the_user_is_given_back(self, tmp_path: Path) -> None:
         """What an elevated run of an earlier release could leave on Python 3.13+
         (SYSTEM and Administrators only): loose, and tightening names the user."""
+        import ctypes
+
         from agentchatme_hermes import owner_only
 
+        if not ctypes.windll.shell32.IsUserAnAdmin():  # type: ignore[attr-defined, unused-ignore]
+            pytest.skip("the remedy is an elevated run; unelevated the file cannot be opened (refused)")
         home = _home(tmp_path)
         path = key_store.write_store(home, api_key=api_key("k"), handle="a", api_base="https://a.test")
         for target, inherit in ((path.parent, "(OI)(CI)"), (path, "")):
@@ -237,8 +241,6 @@ class TestWindowsAccessList:
                 f"*S-1-5-18:{inherit}F", f"*S-1-5-32-544:{inherit}F",
             )
         read = key_store.read_store(home)
-        if read.status == "unreadable":
-            pytest.skip("only an administrator reads it now (the elevated remedy); this account cannot")
         assert read.loose_mode
         assert key_store.tighten(home) is True
         after = owner_only.inspect(path, root=home)

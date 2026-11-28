@@ -315,6 +315,7 @@ jobs:
           $py = Join-Path $env:pythonLocation 'python.exe'
           $repo = Join-Path $env:AC_WORK 'repo'
           $script = Join-Path $repo '.github\scripts\windows-standard-user.ps1'
+          $failed = [System.Collections.Generic.List[string]]::new()
           function Invoke-AsStandardUser([string] $Step, [string[]] $More = @(), [int] $Minutes = 30) {
             $out = Join-Path $env:AC_WORK "$Step.out"
             $err = Join-Path $env:AC_WORK "$Step.err"
@@ -324,9 +325,12 @@ jobs:
                    -WorkingDirectory $env:AC_WORK -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
             $null = $p.Handle  # keeps the exit code readable
             if (-not $p.WaitForExit($Minutes * 60000)) { $p.Kill(); throw "$Step did not end in $Minutes min" }
-            Write-Host "=== $Step, as $env:AC_USER: exit $($p.ExitCode)"
+            Write-Host "=== $Step, as $($env:AC_USER): exit $($p.ExitCode)"
             Get-Content $out, $err -ErrorAction SilentlyContinue | Out-Host
-            if ($p.ExitCode -ne 0) { throw "$Step failed as the standard account" }
+            if ($p.ExitCode -ne 0) {
+              Write-Host "::error::$Step failed as the standard account"
+              $null = $failed.Add($Step)
+            }
           }
 
           Invoke-AsStandardUser 'whoami'
@@ -358,13 +362,15 @@ jobs:
           try {
             Invoke-AsStandardUser 'gateway' -More @('-Sha', '${{ github.sha }}', '-Source', "https://github.com/${{ github.repository }}.git", '-Port', $env:STUB_PORT)
             Write-Host "--- requests the stand-in API saw"
-            Get-Content $log | Out-Host
-            if (-not (Select-String -Path $log -Pattern '^GET /v1/ws' -Quiet)) {
-              throw "the standard account's receive loop never tried the socket"
+            Get-Content $log -ErrorAction SilentlyContinue | Out-Host
+            if (-not (Select-String -Path $log -Pattern '^GET /v1/ws' -Quiet -ErrorAction SilentlyContinue)) {
+              Write-Host "::error::the standard account's receive loop never tried the socket"
+              $null = $failed.Add('socket')
             }
           } finally {
             Stop-Process -Id $stub.Id -Force -ErrorAction SilentlyContinue
           }
+          if ($failed.Count -gt 0) { throw "failed as the standard account: $($failed -join ', ')" }
           exit 0
 
       - name: Collect the standard account's logs and records

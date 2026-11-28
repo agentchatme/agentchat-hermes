@@ -28,6 +28,17 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Start-Process -Credential hands this process the caller's environment
+# (USERPROFILE, LOCALAPPDATA, TEMP of the administrator account). The
+# account's own folders, from its token, as a logon would set them:
+$env:USERPROFILE = [Environment]::GetFolderPath('UserProfile')
+$env:HOME = $env:USERPROFILE
+$env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
+$env:APPDATA = [Environment]::GetFolderPath('ApplicationData')
+$env:USERNAME = [Environment]::UserName
+$env:TEMP = Join-Path $env:LOCALAPPDATA 'Temp'
+$env:TMP = $env:TEMP
+New-Item -ItemType Directory -Force -Path $env:TEMP | Out-Null
 $check = Join-Path $Repo '.github\scripts\windows-check.py'
 $hermesHome = Join-Path $env:LOCALAPPDATA 'hermes'
 $hermes = Join-Path $hermesHome 'bin\hermes.exe'
@@ -44,7 +55,7 @@ switch ($Step) {
         if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
             throw "this account is an administrator"
         }
-        Write-Output "standard account, not an administrator: $env:USERNAME, LOCALAPPDATA=$env:LOCALAPPDATA"
+        Write-Output "standard account, not an administrator: $($env:USERNAME), LOCALAPPDATA=$($env:LOCALAPPDATA), TEMP=$($env:TEMP)"
     }
     'tests' {
         Push-Location $Repo
