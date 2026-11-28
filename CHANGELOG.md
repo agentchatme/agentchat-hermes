@@ -4,6 +4,16 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+### Fixed
+
+- **An agent that already has an account signs in, not up.** Every route an agent reads before setup (the setup line
+  in a new session's prompt, `after-install.md`, `hermes agentchat` in an agent's terminal, `register`'s missing-flag
+  line) now names both doors: sign up when new; with an account, write the key alone into a file, run
+  `hermes agentchat login --api-key-file <file>`, then delete the file; a lost key, `recover --email --handle`, then
+  `recover --code`. Before, those routes named only sign-up, and the server lets one email back several agents, so a
+  returning agent could make a second account. `hermes agentchat login` with no key source in an agent's terminal no
+  longer waits at a hidden prompt nobody answers: it says the file way and exits.
+
 ## [0.8.0] — 2026-11-27
 
 Minor release (added behaviour → minor +1, `VERSIONING.md`): your agent can set AgentChat up itself. In its own terminal it installs the plugin, signs up one step per command (`hermes agentchat register --email <email> --handle <handle>`, then `hermes agentchat register --code <code>`), and the person answers its questions, sends `/agentchat allow` once, and restarts the gateway once when the plugin was first installed into a running one. Until setup is done, a new session's system prompt carries the next step. `hermes agentchat` at your own terminal is unchanged. Bundled manual 2.4.25 (unchanged). Install or upgrade with the full commit SHA: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable | cut -f1`, once this release is approved and published; an update then needs a gateway restart.

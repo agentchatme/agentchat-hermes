@@ -324,7 +324,8 @@ def _wizard_without_a_person() -> int:
     _printline(f"  2. {cmd} register --code <code>")
     _printline(
         f"Then the person allows the AgentChat tools once by sending /agentchat allow in a chat with "
-        f"the agent. With a key already: {cmd} login --api-key-file <path>."
+        f"the agent. Already have an account: {cmd} login --api-key-file <file with the key>; lost its key: "
+        f"{signup_steps.start_line('recover', cmd)}, then {cmd} recover --code <code>."
     )
     return _EXIT_OK if resolution.refusal is None else _EXIT_API_ERR
 
@@ -365,10 +366,12 @@ def _dispatch_login(args: argparse.Namespace) -> int:
     stdin otherwise (``… | hermes agentchat login``). ``--api-key <key>``
     still works and says why it should not be used.
     """
+    key_file, flag = getattr(args, "api_key_file", None), getattr(args, "api_key", None)
+    if key_file is None and flag is None and allow.in_agent_terminal():
+        # A hidden prompt nobody answers: an agent's terminal gives the key from a file.
+        return _exit_usage(LOGIN_IN_AGENT_TERMINAL.format(cmd=_profile_cmd()))
     try:
-        raw_key = _login_key_input(
-            key_file=getattr(args, "api_key_file", None), flag=getattr(args, "api_key", None)
-        )
+        raw_key = _login_key_input(key_file=key_file, flag=flag)
     except (KeyboardInterrupt, EOFError):
         return _exit_cancel()
     except _KeyInputError as exc:
@@ -376,7 +379,7 @@ def _dispatch_login(args: argparse.Namespace) -> int:
 
     api_key = raw_key.strip()
     if not api_key:
-        return _exit_with("No API key provided.")
+        return _exit_with(f"No API key provided. Give it from a file: {_profile_cmd()} login --api-key-file <file>")
 
     problem = _signup_problem()
     if problem is not None:
@@ -403,6 +406,15 @@ def _dispatch_login(args: argparse.Namespace) -> int:
     _printline(credentials.key_in_use_line(before, api_key, serving=serving, runs=runs))
     return _EXIT_OK
 
+
+
+# ``login`` with no key source in an agent's terminal: the masked prompt would
+# wait for a person. The key goes through a file the agent writes and deletes.
+LOGIN_IN_AGENT_TERMINAL = (
+    "In an agent's terminal the key is not typed at a prompt: write the key alone into a file with your "
+    "file tool, run `{cmd} login --api-key-file <file>`, then delete the file. Lost the key: "
+    "`{cmd} recover --email <email> --handle <handle>`, then `{cmd} recover --code <code>`."
+)
 
 
 class _KeyInputError(Exception):
@@ -569,7 +581,8 @@ def _start_register_step(given: dict[str, Any]) -> int:
         return _exit_usage(
             f"Missing {' and '.join(missing)}. Sign-up here runs one step per command: "
             f"{signup_steps.start_line('register', cmd)} sends the code, then "
-            f"{cmd} register --code <code> finishes."
+            f"{cmd} register --code <code> finishes. Already have an account? Don't sign up again: "
+            f"{cmd} login --api-key-file <file with the key>."
         )
     return _start_step("register", given)
 
