@@ -728,6 +728,11 @@ def _allow_tools_flow(handle: str, *, print_info: Any, print_warning: Any) -> No
     if step.failed:
         print_warning(f"AgentChat tools: nothing changed — {step.detail}")
         return
+    restart = allow.restart_after_yes(resolve_hermes_home(), outcome=step.outcome) if tools.decision == "yes" else None
+    if restart is not None:
+        _show_tools(tools, print_info)
+        _step(restart)
+        return
     if step.outcome == "restart":
         print_warning(f"AgentChat tools: {step.detail}")
         return
@@ -766,6 +771,10 @@ def _place_or_warn(
             print_warning(f"{step.name}: {step.detail}")
         else:
             _step(step.detail)
+    if tools_decision == "yes":
+        # The person's yes at their own terminal starts the restart a first install needs;
+        # the key-in-use line after setup says it is under way.
+        allow.restart_after_yes(resolve_hermes_home(), outcome=mcp_outcome)
     return mcp_outcome
 
 

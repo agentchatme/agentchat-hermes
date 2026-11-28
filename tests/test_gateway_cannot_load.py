@@ -114,27 +114,82 @@ class TestWhatIsSaid:
         assert line == credentials.LOAD_RESTART_LINE
         assert "/restart" in line and "hermes gateway restart" in line
 
-    def test_in_an_agents_terminal_the_restart_is_the_persons(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("supported", [True, False])
+    def test_in_an_agents_terminal_the_persons_allow_restarts_it_where_it_can(
+        self, monkeypatch: pytest.MonkeyPatch, supported: bool
+    ) -> None:
+        from agentchatme_hermes import gateway_restart
+
         monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
+        monkeypatch.setattr(allow, "read_switch", lambda home, *, api_base: allow.Switch("not_allowed_yet"))
+        monkeypatch.setattr(gateway_restart, "supported", lambda: supported)
+        monkeypatch.setenv("HERMES_SESSION_ID", "s")
+        line = credentials.key_in_use_line(None, "ac_x", serving=False, runs=True, home=profile_home())
+        assert line == (credentials.LOAD_ON_ALLOW_LINE_AGENT if supported else credentials.LOAD_RESTART_LINE_AGENT)
+        assert ("Never restart it yourself" if supported else "the person's, not yours") in line
+
+    def test_in_an_agents_terminal_allowed_already_the_restart_is_the_persons(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
+        allowed = MagicMock(by_tier=True)
+        monkeypatch.setattr(allow, "read_switch", lambda home, *, api_base: allowed)
+        monkeypatch.setattr(allow, "restart_after_yes", lambda home: pytest.fail("an agent's command restarted it"))
         monkeypatch.setenv("HERMES_SESSION_ID", "s")
         line = credentials.key_in_use_line(None, "ac_x", serving=False, runs=True, home=profile_home())
         assert line == credentials.LOAD_RESTART_LINE_AGENT
-        assert "the person's, not yours" in line
+
+    def test_a_restart_under_way_is_said(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import gateway_restart
+
+        monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
+        monkeypatch.setattr(gateway_restart, "restart_state", lambda home: "under_way")
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        line = credentials.key_in_use_line(None, "ac_x", serving=False, runs=True, home=profile_home())
+        assert line == credentials.LOAD_RESTARTING_LINE
+
+    def test_the_line_never_starts_a_restart(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import gateway_restart
+
+        monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
+        monkeypatch.setattr(allow, "read_switch", lambda home, *, api_base: MagicMock(by_tier=True))
+        monkeypatch.setattr(gateway_restart, "restart_state", lambda home: None)
+        monkeypatch.setattr(gateway_restart, "request_load_restart", lambda home: pytest.fail("a line restarted it"))
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        line = credentials.key_in_use_line(None, "ac_x", serving=False, runs=True, home=profile_home())
+        assert line == credentials.LOAD_RESTART_LINE
 
     @pytest.mark.parametrize("outcome", ["changed", "allowed", "applying"])
-    def test_allow_says_the_restart_instead_of_how_the_tools_connect(
-        self, monkeypatch: pytest.MonkeyPatch, outcome: str
+    @pytest.mark.parametrize("started", [True, False])
+    def test_allow_starts_the_restart_and_says_so_instead_of_how_the_tools_connect(
+        self, monkeypatch: pytest.MonkeyPatch, outcome: str, started: bool
     ) -> None:
+        from agentchatme_hermes import gateway_restart
         from agentchatme_hermes.profile_scope import ProfileScope
 
         step = MagicMock(failed=False, outcome=outcome)
         monkeypatch.setattr(placement, "place_mcp", lambda api_base, *, decision: step)
         monkeypatch.setattr(allow, "read_switch", lambda home, *, api_base: allow.Switch("not_allowed_yet"))
+        monkeypatch.setattr(allow, "start_completion", lambda scope, *, api_base: None)
         monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
+        monkeypatch.setattr(gateway_restart, "request_load_restart", lambda home: started)
         scope = ProfileScope.capture(profile_home())
         reply = allow._write_answer("yes", scope=scope, agent="@a")
-        assert reply == f"AgentChat tools allowed for @a. {credentials.LOAD_RESTART_LINE}"
+        line = credentials.LOAD_RESTARTING_LINE if started else credentials.LOAD_RESTART_LINE
+        assert reply == f"AgentChat tools allowed for @a. {line}"
         assert "within about a minute" not in reply
+
+    def test_no_restart_needed_leaves_the_reply_as_it_was(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import gateway_restart
+        from agentchatme_hermes.profile_scope import ProfileScope
+
+        step = MagicMock(failed=False, outcome="changed")
+        monkeypatch.setattr(placement, "place_mcp", lambda api_base, *, decision: step)
+        monkeypatch.setattr(allow, "read_switch", lambda home, *, api_base: allow.Switch("not_allowed_yet"))
+        monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: False)
+        monkeypatch.setattr(gateway_restart, "request_load_restart", lambda home: pytest.fail("restarted for nothing"))
+        scope = ProfileScope.capture(profile_home())
+        assert "within about a minute" in allow._write_answer("yes", scope=scope, agent="@a")
 
     def test_a_no_says_no_restart(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from agentchatme_hermes.profile_scope import ProfileScope
@@ -145,8 +200,19 @@ class TestWhatIsSaid:
         scope = ProfileScope.capture(profile_home())
         assert allow._write_answer("no", scope=scope, agent="@a") == allow.NOT_ALLOWED_LINE.format(who="@a")
 
-    def test_the_setup_line_asks_for_the_restart_last(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_the_setup_line_asks_for_no_restart_the_allow_will_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import gateway_restart
+
         monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
+        monkeypatch.setattr(gateway_restart, "supported", lambda: True)  # POSIX; Windows: the test below
+        text = setup_prompt.section_text(profile_home(), api_base="https://api.agentchat.me")
+        assert text == setup_prompt.NOT_SET_UP.format(cmd="hermes agentchat")
+
+    def test_where_the_plugin_cannot_restart_the_setup_line_asks_for_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import gateway_restart
+
+        monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
+        monkeypatch.setattr(gateway_restart, "supported", lambda: False)
         text = setup_prompt.section_text(profile_home(), api_base="https://api.agentchat.me")
         assert text.startswith(setup_prompt.NOT_SET_UP.format(cmd="hermes agentchat"))
         assert text.endswith(setup_prompt.RESTART_TO_LOAD)

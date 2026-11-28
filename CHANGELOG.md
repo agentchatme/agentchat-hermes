@@ -4,6 +4,30 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- **The person's Allow also restarts the gateway, when a first install needs it.** Hermes never switches a running
+  process's dependency environment, so a gateway that was running when the plugin was first installed (always the case
+  when an agent installs it, since every Hermes chat runs in the gateway) runs AgentChat only after a restart. Now the
+  person's Allow (`/agentchat allow`, `hermes agentchat allow`, the wizard, or setup at their own terminal) starts
+  Hermes' own graceful restart: SIGUSR1, what `systemctl reload hermes-gateway` and `hermes gateway restart` send. The
+  gateway waits until no work is in flight, exits, and its supervisor relaunches it; where nothing supervises it (the
+  desktop app's gateway, a hand-started `gateway run`), a detached helper runs `hermes gateway ensure`, what the desktop
+  app runs; a gateway a chat started is left to that chat, which starts the next one with its next message. The helper
+  waits as long as the gateway finishes its work, records each step (`hermes agentchat doctor` says whether the restart
+  is under way or why it failed), and one request per gateway process covers every profile it serves. Never started
+  from an agent's terminal or as root. POSIX only: on Windows the person still restarts. Lab, Hermes v0.23.4,
+  2026-11-28: under a systemd user service AgentChat was live 22 s after the Allow; a desktop-style gateway about 40 s;
+  a chat-started gateway with the chat's next message; in each the chat stayed the same session with its history.
+- **A reminder until the person decides.** Once a day at most, in a turn the person started on a chat platform (an
+  allowlist: never a cron job, a subagent, the curator, the API server, a webhook or AgentChat's own turns), the agent
+  is asked to tell its person in one line that it cannot use AgentChat until they send `/agentchat allow` and tap
+  Allow; Don't allow stops it. Allowed, but the gateway still needs its restart and none is under way, the reminder asks
+  the person for it; it never starts one, and it is not given where the person cannot act (a package-managed config, a
+  hand-written tools entry). A Hermes `pre_llm_call` hook; the day is counted per profile in
+  `<profile home>/agentchat/reminder.json`, checked before anything else is read. Nobody writes to an agent that has
+  never written, so a reminder tied to incoming messages would never fire.
+
 ### Fixed
 
 - **An agent that already has an account signs in, not up.** Every route an agent reads before setup (the setup line

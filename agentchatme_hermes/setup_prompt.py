@@ -28,6 +28,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from .credentials import RESTART_HOW_FOR_AGENT
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from pathlib import Path
@@ -61,12 +63,13 @@ NOT_ALLOWED_YET = (
     "allowed yet, so you cannot read or answer AgentChat messages: when you need them, ask your "
     "person to send /agentchat allow in a chat with you and tap Allow."
 )
-# A first install into a running gateway: AgentChat runs there only after one
-# restart, the person's (it stops this turn too). Said after the step above it.
+# A first install into a running gateway: AgentChat runs there only after one restart. The
+# person's Allow starts it where the plugin can (gateway_restart); this asks for it only where it
+# cannot, or where it failed.
 RESTART_TO_LOAD = (
     "The gateway you run in started before the AgentChat plugin was installed, so AgentChat cannot run "
-    "until it restarts once: ask your person to send /restart in a chat with you on Telegram or another "
-    "messaging app, or to run `hermes gateway restart` (never restart it yourself: it stops this turn)."
+    "until it restarts once: ask your person to " + RESTART_HOW_FOR_AGENT + " (never restart it yourself: "
+    "it stops this turn)."
 )
 
 
@@ -75,11 +78,11 @@ def section_text(home: Path, *, api_base: str) -> str:
     there is nothing to say."""
     from . import allow, signup_steps
     from .config import cli_prefix, profile_handles, resolve_key
-    from .placement import gateway_cannot_load
 
     cmd = cli_prefix(home)
-    restart = RESTART_TO_LOAD if gateway_cannot_load(home) else ""
     resolution = resolve_key(home)
+    switch_state = allow.read_switch(home, api_base=api_base).state if resolution.api_key is not None else None
+    restart = RESTART_TO_LOAD if _restart_is_asked(home, switch_state) else ""
     if resolution.store.status in ("unsafe", "unreadable"):
         # A key file this profile cannot use still names its agent: no sign-up line.
         return restart
@@ -88,10 +91,26 @@ def section_text(home: Path, *, api_base: str) -> str:
         if pending is not None:
             return _joined(WAITING.format(waiting=signup_steps.waiting_line(pending, cmd)), restart)
         return _joined(NOT_SET_UP.format(cmd=cmd), restart)
-    switch = allow.read_switch(home, api_base=api_base)
-    if switch.state == "not_allowed_yet":
+    if switch_state == "not_allowed_yet":
         return _joined(NOT_ALLOWED_YET.format(who=allow.who(profile_handles(home).own)), restart)
     return restart
+
+
+def _restart_is_asked(home: Path, switch_state: str | None) -> bool:
+    """The gateway cannot load the plugin, and the restart is the person's to start: none is
+    under way (a person's yes starts one where the plugin can), and either the plugin cannot start
+    it here, an earlier one failed, or the person decided already (so no Allow will start it)."""
+    from . import gateway_restart
+    from .placement import gateway_cannot_load
+
+    if not gateway_cannot_load(home):
+        return False
+    state = gateway_restart.restart_state(home)
+    if state == "under_way":
+        return False
+    if state == "failed" or not gateway_restart.supported():
+        return True
+    return switch_state not in (None, "not_allowed_yet")
 
 
 def _joined(*parts: str) -> str:
