@@ -48,21 +48,30 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   Hermes v0.23.4 gateway on `windows-latest`, installed with `install.ps1` (`.github/workflows/windows-native.yml`, by
   hand): started by `hermes gateway start` and by the `Hermes_Gateway` logon task, the plugin runs in gateway mode,
   holds the lock against another process, starts its receive loop and tries the socket, and the lock is free again
-  after a stop and after the gateway is killed. The connect to api.agentchat.me from Windows is not checked yet (it
+  after a stop and after the gateway is killed; on a second runner the same, with the test suite, as a standard
+  (non-admin) account, since GitHub's runners are administrators. The connect to api.agentchat.me from Windows is not checked yet (it
   needs a test agent's key as the repository secret `AGENTCHAT_WINDOWS_CHECK_KEY`).
 - **Native Windows: the key file is private to you.** A file mode means nothing on Windows (`0600` is ignored), and
   Python 3.13's `mkdir(0o700)` there makes a directory that an elevated ("Run as administrator") run closes to the same
-  user unelevated. The key's directory (`<profile home>\agentchat`) now gets an explicit access list, protected from its
-  parent's: full control for you (your account's SID, elevated or not), SYSTEM and Administrators, the principals
-  POSIX root stands for. The key file inherits it as it is created, so it is private from its first byte, wherever the
-  Hermes home is (a `HERMES_HOME` on another drive inherits that drive's list, which commonly lets every local user
-  read). The list is written on the directory's own handle, never through a junction, a symbolic link or a hard link.
-  The checks POSIX makes on the mode are made on the list: a key file of another owner, or one another account can
-  change, is refused; one another account can read, or one with no entry for you, is used and tightened at the
-  gateway's start and by `doctor --fix`. The lock, state and health directories get the same list when created.
+  user unelevated. The key's directory (`<profile home>\agentchat`) is now created owned by you with an explicit access
+  list, protected from its parent's, in the one call that creates it (`CreateDirectoryW` with the descriptor): full
+  control for you (your account's SID, elevated or not), SYSTEM and Administrators, the principals POSIX root stands
+  for. The key file inherits it as it is written, so it is private from its first byte, wherever the Hermes home is (a
+  `HERMES_HOME` on another drive inherits that drive's list, which commonly lets every local user read). Every list and
+  owner is read and written through a handle on the object itself, never through a junction, a symbolic link or a hard
+  link. The checks POSIX makes on the mode are made on the list, and fail closed: a key file or directory another
+  account owns, one another account can change, a key file with a second name (a hard link), a key directory that is
+  or is reached through a junction (`GetFinalPathNameByHandleW` against the profile home), and a list that cannot be
+  read are all refused; only a volume that stores no lists (FAT, exFAT) is judged by the contents alone. Inherit-only
+  entries count (they are what a new file gets). A key file that is yours but that other accounts can change (written
+  by an earlier release in a home like `C:\hermes`) is refused with the repair named: `doctor --fix` makes it yours
+  only and keeps the key. One another account can read, or with no entry for you, is used and tightened at the
+  gateway's start and by `doctor --fix`. The lock, state and health directories get the same list when created, and an
+  existing one another account owns is never written into.
 - **Native Windows, the rest of the gateway path.** A rename onto a file another process has open fails on Windows;
   the key file, the health record, the state files and `SOUL.md` are now replaced with the SDK kit's retrying rename,
-  as the kit's own files are. Whether the gateway behind a health record still runs is asked with `OpenProcess` where
+  as the kit's own files are, and a removal (`logout`'s key file, a finished sign-up, the plugin's records) is retried
+  the same way. A gateway that lost the election logs its lock lines once, not on every 15 s retry. Whether the gateway behind a health record still runs is asked with `OpenProcess` where
   `psutil` is missing, never with `os.kill(pid, 0)` (a CTRL+C to the target's console on Windows). Outside Hermes the
   default home is `%LOCALAPPDATA%\hermes` on Windows, as Hermes computes it. `doctor`'s note about old terminal
   snapshots gives a PowerShell `Remove-Item` there. JSON the plugin reads back accepts a byte-order mark. Checked and
