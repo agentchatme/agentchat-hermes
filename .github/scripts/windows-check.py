@@ -25,6 +25,14 @@ Hermes' own: the probes are a second process beside the gateway, as
         After the gateway stopped or was killed: the lock is free again (the
         OS released it with the process), taken and given back from here.
 
+    windows-check.py write-refused <home> <text>
+        Saving a made-up key into ``<home>`` must be refused with an error
+        that contains ``<text>`` (a key directory of another account).
+
+    windows-check.py read-detail <home> <text>
+        Reading ``<home>``'s key file must not be usable, and what it says
+        must contain ``<text>`` (the message a person sees).
+
 Exit 0 when the check holds, 1 when it does not.
 """
 
@@ -133,6 +141,34 @@ def _free(home: Path, timeout_s: float) -> int:
     return 0
 
 
+def _write_refused(home: Path, text: str) -> int:
+    import secrets
+
+    from agentchatme_hermes import key_store
+
+    try:
+        key_store.write_store(home, api_key="ac_" + secrets.token_urlsafe(32), handle="windows-check", api_base="http://127.0.0.1")
+    except key_store.KeyStoreError as exc:
+        print(f"refused: {exc}")
+        if text in str(exc):
+            return 0
+        print(f"::error::refused, but not with {text!r}")
+        return 1
+    print(f"::error::a key was saved into {home}")
+    return 1
+
+
+def _read_detail(home: Path, text: str) -> int:
+    from agentchatme_hermes import key_store
+
+    read = key_store.read_store(home)
+    print(f"status={read.status} detail={read.detail}")
+    if read.usable or text not in read.detail:
+        print(f"::error::expected an unusable key file saying {text!r}")
+        return 1
+    return 0
+
+
 def main(argv: list[str]) -> int:
     if len(argv) >= 4 and argv[1] == "stub":
         return _stub(int(argv[2]), Path(argv[3]))
@@ -140,6 +176,10 @@ def main(argv: list[str]) -> int:
         return _leader(Path(argv[2]), float(argv[3]), want_connected=argv[4:] == ["connected"])
     if len(argv) == 4 and argv[1] == "free":
         return _free(Path(argv[2]), float(argv[3]))
+    if len(argv) == 4 and argv[1] == "write-refused":
+        return _write_refused(Path(argv[2]), argv[3])
+    if len(argv) == 4 and argv[1] == "read-detail":
+        return _read_detail(Path(argv[2]), argv[3])
     print(__doc__, file=sys.stderr)
     return 2
 
