@@ -1288,25 +1288,61 @@ def _written_answer(decision: Decision, *, scope: ProfileScope, agent: str, rest
 
 
 def _proto_request_restart(home: "Path") -> bool:
-    """PROTOTYPE: run `hermes gateway restart --detach` in its own session (POSIX only)."""
+    """PROTOTYPE v2 (POSIX only): Hermes' own drain-first restart, then make sure a gateway comes back.
+
+    1. A detached helper (its own session, so it outlives this gateway) waits for this gateway's pid
+       to exit, then gives a supervisor 20 s to relaunch one; if none is up by then it runs the public
+       `hermes gateway ensure` (what the desktop app runs) to start one.
+    2. SIGUSR1 to this gateway: Hermes' documented graceful restart (`systemctl reload` maps to it):
+       it waits until no work is in flight, then exits for the supervisor to relaunch.
+    """
     import os
+    import signal
     import subprocess
     import time as _time
     from pathlib import Path
 
     from .leader_lock import is_hermes_gateway_process
 
-    if os.name == "nt" or not is_hermes_gateway_process():
+    if os.name == "nt" or not hasattr(signal, "SIGUSR1") or not is_hermes_gateway_process():
         return False
     log = Path(home) / "agentchat" / "proto-restart.log"
+    pid = os.getpid()
+    hermes = [sys.executable, "-m", "hermes_cli.main"]
+    script = (
+        "import os, subprocess, sys, time\n"
+        f"pid = {pid}\n"
+        "def alive(p):\n"
+        "    try:\n"
+        "        os.kill(p, 0)\n"
+        "        return True\n"
+        "    except OSError:\n"
+        "        return False\n"
+        "t0 = time.time()\n"
+        "while alive(pid) and time.time() - t0 < 3600:\n"
+        "    time.sleep(0.5)\n"
+        "print('gateway', pid, 'exited after', round(time.time() - t0, 1), 's', flush=True)\n"
+        "deadline = time.time() + 20\n"
+        f"status = {hermes!r} + ['gateway', 'status']\n"
+        "while time.time() < deadline:\n"
+        "    out = subprocess.run(status, capture_output=True, text=True).stdout\n"
+        "    if 'is running' in out.lower():\n"
+        "        print('a supervisor relaunched it:', out.strip().splitlines()[0] if out.strip() else '', flush=True)\n"
+        "        sys.exit(0)\n"
+        "    time.sleep(2)\n"
+        f"print('no gateway after 20 s: hermes gateway ensure', flush=True)\n"
+        f"r = subprocess.run({hermes!r} + ['gateway', 'ensure'], capture_output=True, text=True)\n"
+        "print(r.returncode, r.stdout.strip()[-400:], r.stderr.strip()[-400:], flush=True)\n"
+    )
     try:
         out = open(log, "a", encoding="utf-8")  # noqa: SIM115
-        out.write(f"--- {_time.strftime('%Y-%m-%dT%H:%M:%SZ', _time.gmtime())} pid={os.getpid()}\n")
+        out.write(f"--- v2 {_time.strftime('%Y-%m-%dT%H:%M:%SZ', _time.gmtime())} pid={pid}\n")
         out.flush()
         subprocess.Popen(
-            [sys.executable, "-m", "hermes_cli.main", "gateway", "restart", "--detach"],
+            [sys.executable, "-c", script],
             stdin=subprocess.DEVNULL, stdout=out, stderr=out, start_new_session=True, close_fds=True,
         )
+        os.kill(pid, signal.SIGUSR1)
         return True
     except Exception:
         logger.warning("agentchat prototype: restart request failed", exc_info=True)
