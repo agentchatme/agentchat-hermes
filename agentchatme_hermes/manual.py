@@ -330,9 +330,11 @@ def _prepare(
     sync_manual: Callable[..., ManualSyncResult],
     frozen: Callable[[str], ManualRegistration | None],
 ) -> ManualRegistration | None:
+    from .state import remove_file
+
     for leftover in stray_writes(target.parent):
         try:
-            leftover.unlink()
+            remove_file(leftover)
             logger.info("agentchat: removed %s, left by a manual write that never finished", leftover)
         except OSError:
             logger.debug("agentchat: could not remove %s", leftover, exc_info=True)

@@ -17,8 +17,9 @@ reached places it never should (found testing on a real Hermes box, 2026-11-17):
 
 The key is the agent's password on AgentChat. It now lives in
 ``<profile home>/agentchat/credentials.json``: one file per profile, mode
-``0600`` in a ``0700`` directory, written atomically, read only by this
-plugin — the socket, the CLI, and the secret source that hands it to Hermes'
+``0600`` in a ``0700`` directory (on Windows, a directory whose access list
+names only the user, SYSTEM and Administrators — :mod:`.owner_only`),
+written atomically, read only by this plugin — the socket, the CLI, and the secret source that hands it to Hermes'
 MCP client for the hosted tools (:mod:`.key_source`). Hermes copies no part
 of it on ``profile create`` / ``--clone``.
 
@@ -53,17 +54,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from . import owner_only
+from .state import remove_file, replace_file
+
 logger = logging.getLogger(__name__)
 
 STORE_DIRNAME = "agentchat"
 STORE_FILENAME = "credentials.json"
 STORE_VERSION = 1
 
-_FILE_MODE = 0o600
-_DIR_MODE = 0o700
 # POSIX file modes and owners mean something; on Windows they do not (every
-# file reads 0o666 whatever was asked). A constant rather than a platform
-# check inline, so the type checker on each platform sees both branches.
+# file reads 0o666 whatever was asked): there the access list says who may
+# use the file (:mod:`.owner_only`, which also holds the two modes). A
+# constant rather than a platform check inline, so the type checker on each
+# platform sees both branches.
 _POSIX = os.name != "nt"
 
 StoreStatus = Literal["missing", "ok", "moved", "copied", "unsafe", "unreadable"]
@@ -92,8 +96,18 @@ class StoreRead:
     detail: str = ""
     # ``copied`` / ``moved``: the profile home the file names.
     origin_home: Path | None = None
-    # Readable by the group or others (POSIX): still used, tightened on the next write.
+    # Readable by the group or others (POSIX; on Windows by any account but the
+    # user, SYSTEM and Administrators, or not granted to the user itself):
+    # still used, tightened at activation and by ``doctor --fix``.
     loose_mode: bool = False
+    # ``unsafe`` only because other accounts can change it, while it is yours
+    # (Windows: a file an earlier release wrote where their list reached it):
+    # ``doctor --fix`` makes it yours only and keeps the key (:func:`make_yours`),
+    # once the Hermes home is yours too (:func:`home_problem`).
+    repairable: bool = False
+    # Windows: this account was refused access to the file or its folder (a
+    # folder an elevated run made): the remedy is an elevated ``doctor --fix``.
+    denied: bool = False
 
     @property
     def usable(self) -> bool:
@@ -135,14 +149,18 @@ def read_store(home: Path) -> StoreRead:
     except FileNotFoundError:
         return StoreRead("missing", path)
     except OSError as exc:
-        return StoreRead("unreadable", path, detail=f"cannot read {path}: {exc.strerror or exc}")
-    problem = _ownership_problem(path, st)
-    if problem is not None:
-        return StoreRead("unsafe", path, detail=problem)
+        return StoreRead(
+            "unreadable", path, detail=f"cannot read {path}: {exc.strerror or exc}", denied=_denied(exc)
+        )
+    judged = _judge(path, st, home)
+    if judged.problem is not None:
+        return StoreRead(
+            "unsafe", path, detail=judged.problem, repairable=judged.repairable, denied=judged.denied
+        )
     record = _parse(path)
     if isinstance(record, str):
-        return StoreRead("unreadable", path, detail=record)
-    loose = _is_loose(st)
+        return StoreRead("unreadable", path, detail=record, denied=not _POSIX and "Access is denied" in record)
+    loose = judged.loose
     recorded = Path(record.profile_home) if record.profile_home else None
     if recorded is None or same_home(recorded, home):
         return StoreRead("ok", path, key=record, loose_mode=loose)
@@ -158,34 +176,77 @@ def read_store(home: Path) -> StoreRead:
     return StoreRead("moved", path, key=record, origin_home=recorded, loose_mode=loose)
 
 
-def _ownership_problem(path: Path, st: os.stat_result) -> str | None:
-    """Why the file must not be trusted as this user's own; ``None`` when it may.
+@dataclass(frozen=True)
+class _Judged:
+    # Why the file must not be trusted as this user's own; ``None`` when it may.
+    problem: str | None
+    # Others may read it (or, Windows, the user has no entry of its own).
+    loose: bool = False
+    # The problem is only that others can change a file that is yours.
+    repairable: bool = False
+    # Windows refused this account access to it.
+    denied: bool = False
+
+
+def _denied(exc: OSError) -> bool:
+    """Windows refused this account (``ERROR_ACCESS_DENIED``)."""
+    return not _POSIX and (getattr(exc, "winerror", None) == 5 or isinstance(exc, PermissionError))
+
+
+def _judge(path: Path, st: os.stat_result, home: Path) -> _Judged:
+    """Whether the key file at ``path`` (in profile ``home``) is this user's own.
 
     A symlink, a non-regular file, another owner, or a file the group or
     others can write: any of them lets someone else choose which agent this
-    profile is.
+    profile is. On Windows the same, read from the access list, and also a
+    file with more than one name (a hard link), a path that resolves outside
+    the profile home (a junction on the way) or a list that cannot be read:
+    the check fails closed. Only a volume that stores no access lists (FAT,
+    exFAT) is judged by its contents alone, as a POSIX file system without
+    modes would be.
     """
     if stat.S_ISLNK(st.st_mode):
-        return f"{path} is a symbolic link; the key file must be a regular file"
+        return _Judged(f"{path} is a symbolic link; the key file must be a regular file")
     if not stat.S_ISREG(st.st_mode):
-        return f"{path} is not a regular file"
+        return _Judged(f"{path} is not a regular file")
     if not _POSIX:
-        return None
+        return _judge_windows(path, home)
     getuid = getattr(os, "getuid", None)
     if callable(getuid) and st.st_uid != getuid():
-        return f"{path} is owned by uid {st.st_uid}, not by you (uid {getuid()})"
+        return _Judged(f"{path} is owned by uid {st.st_uid}, not by you (uid {getuid()})")
     if st.st_mode & 0o022:
-        return f"{path} can be written by its group or by others (mode {stat.S_IMODE(st.st_mode):o})"
-    return None
+        return _Judged(f"{path} can be written by its group or by others (mode {stat.S_IMODE(st.st_mode):o})")
+    return _Judged(None, loose=bool(st.st_mode & 0o044))
 
 
-def _is_loose(st: os.stat_result) -> bool:
-    return _POSIX and bool(st.st_mode & 0o044)
+def _judge_windows(path: Path, home: Path) -> _Judged:
+    try:
+        access = owner_only.inspect(path, root=home)
+    except owner_only.OwnerOnlyError as exc:
+        return _Judged(str(exc.strerror or exc))
+    except OSError as exc:
+        return _Judged(
+            f"{path}: its access list cannot be read ({exc.strerror or exc}), so it is not trusted",
+            denied=_denied(exc),
+        )
+    if access is None:
+        # FAT / exFAT: nothing on it can be private; as POSIX refuses a file
+        # others can write, the key is not used there.
+        return _Judged(owner_only.no_access_lists_message(path))
+    if not access.owner_trusted:
+        return _Judged(owner_only.foreign_owner_message(path, access.owner, "its key is not used"))
+    if access.null_dacl:
+        return _Judged(f"{path} has no access list: every account on this computer can change it", repairable=True)
+    if access.others_write:
+        names = ", ".join(owner_only.describe_sid(sid) for sid in access.others_write)
+        return _Judged(f"{path} can be changed by other accounts on this computer ({names})", repairable=True)
+    return _Judged(None, loose=not access.private)
 
 
 def _parse(path: Path) -> StoredKey | str:
     try:
-        raw = path.read_text(encoding="utf-8")
+        # utf-8-sig: a byte-order mark from a Windows editor is not a broken file.
+        raw = path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         return f"cannot read {path}: {exc.strerror or exc}"
     try:
@@ -215,7 +276,7 @@ def _holds_same_key(home: Path, api_key: str) -> bool:
         st = os.lstat(path)
     except OSError:
         return False
-    if _ownership_problem(path, st) is not None:
+    if _judge(path, st, home).problem is not None:
         return False
     record = _parse(path)
     return isinstance(record, StoredKey) and record.api_key == api_key
@@ -228,10 +289,13 @@ def write_store(home: Path, *, api_key: str, handle: str, api_base: str) -> Path
     """Save the key for ``home``; return the file's path.
 
     The directory is ``0700`` and the file ``0600`` from its first byte (it
-    is created with that mode, never chmod'ed after the key is in it). The
-    write goes to a temporary file in the same directory, is flushed to disk,
-    then renamed over the old one, so a crash leaves the old file or the new
-    one, never half of either. The file is read back before this returns.
+    is created with that mode, never chmod'ed after the key is in it); on
+    Windows the directory gets the owner-only access list and the file
+    inherits it as it is created. The write goes to a temporary file in the
+    same directory, is flushed to disk, then renamed over the old one (on
+    Windows retried for a moment while another process has the file open),
+    so a crash leaves the old file or the new one, never half of either. The
+    file is read back before this returns.
 
     Raises:
         KeyStoreError: the key was not saved; whatever file was there is
@@ -243,9 +307,7 @@ def write_store(home: Path, *, api_key: str, handle: str, api_base: str) -> Path
     directory = store_dir(home)
     path = store_path(home)
     try:
-        directory.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        if _POSIX:
-            os.chmod(directory, _DIR_MODE)
+        owner_only.make_private_dir(directory, root=Path(home), enforce=True, strict=True)
     except OSError as exc:
         raise KeyStoreError(f"cannot create {directory}: {exc.strerror or exc}") from exc
     record = {
@@ -258,15 +320,16 @@ def write_store(home: Path, *, api_key: str, handle: str, api_base: str) -> Path
     }
     payload = (json.dumps(record, indent=2) + "\n").encode("utf-8")
     tmp = directory / f".{STORE_FILENAME}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     try:
-        fd = os.open(tmp, flags, _FILE_MODE)
+        # Private from its first byte by its own descriptor, whatever list the
+        # folder its name resolves to has (Windows); 0600 and O_EXCL (POSIX).
+        fd = owner_only.create_private_file(tmp)
         try:
             os.write(fd, payload)
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.replace(tmp, path)
+        replace_file(tmp, path)
     except OSError as exc:
         with contextlib.suppress(OSError):
             tmp.unlink()
@@ -294,32 +357,85 @@ def _fsync_dir(directory: Path) -> None:
 
 
 def tighten(home: Path) -> bool:
-    """Make an existing key file ``0600`` and its directory ``0700``. ``True`` when changed."""
-    if not _POSIX:
-        return False
-    path = store_path(home)
+    """Make an existing key file ``0600`` and its directory ``0700`` (on Windows:
+    the owner-only list and owner on the directory and on every file in it,
+    :func:`.owner_only.ensure_private`). ``True`` when changed. Never raises:
+    a file it may not change is logged and left (the read says what is wrong)."""
+    directory, path = store_dir(home), store_path(home)
     changed = False
-    for target, mode in ((store_dir(home), _DIR_MODE), (path, _FILE_MODE)):
+    for target in (directory, path):
+        if not os.path.lexists(target):
+            continue
         try:
-            st = os.lstat(target)
+            changed = owner_only.ensure_private(target, root=Path(home)) or changed
         except OSError:
-            continue
-        if stat.S_ISLNK(st.st_mode):
-            continue
-        if stat.S_IMODE(st.st_mode) != mode:
-            try:
-                os.chmod(target, mode)
-                changed = True
-            except OSError:
-                logger.debug("key_store: chmod of %s failed", target, exc_info=True)
+            logger.debug("key_store: %s was not made private", target, exc_info=True)
+    if directory.is_dir():
+        changed = owner_only.restrict_children(directory, root=Path(home)) > 0 or changed
     return changed
+
+
+def home_problem(home: Path) -> str | None:
+    """Windows: why the Hermes home (the profile's, and the root that holds
+    every profile) cannot keep a key from other accounts, or ``None``. Another
+    account that can change the home can change the plugin's code and the
+    profile's ``config.yaml``, whatever the key file's own list says. A home
+    reached through a link is judged where it is. ``None`` on POSIX (its modes
+    are the person's choice there, as before)."""
+    if _POSIX:
+        return None
+    from .profile_scope import hermes_root_of
+
+    for target in dict.fromkeys(Path(os.path.realpath(h)) for h in (home, hermes_root_of(Path(home)))):
+        if not target.is_dir():
+            continue  # nothing there yet to protect, or to change
+        try:
+            access = owner_only.inspect(target, root=target)
+        except OSError as exc:
+            return f"who can change the Hermes home {target} cannot be read ({exc.strerror or exc})"
+        if access is None:
+            return owner_only.no_access_lists_message(target)
+        if not access.owner_trusted:
+            return owner_only.foreign_owner_message(target, access.owner, "the plugin's code and settings there are theirs")
+        if access.null_dacl or access.others_write:
+            names = ", ".join(owner_only.describe_sid(sid) for sid in access.others_write) or "everyone"
+            return (
+                f"the Hermes home {target} can be changed by other accounts on this computer ({names}): they can "
+                "change the plugin's code and config.yaml there, so no key in it can be kept from them — move the "
+                "Hermes home under your user profile (HERMES_HOME), or remove their access to it"
+            )
+    return None
+
+
+def make_yours(home: Path) -> StoreRead | None:
+    """``doctor --fix`` for a key file that is ``repairable`` (yours, but other
+    accounts can change it): its directory and the files in it made yours only,
+    the key kept. Returns the read before the repair when one was made, ``None``
+    when there was nothing to repair. Raises :class:`KeyStoreError` when the
+    file is still not usable afterwards (the read's detail says why)."""
+    before = read_store(home)
+    if before.status != "unsafe" or not before.repairable:
+        return None
+    problem = home_problem(home)
+    if problem is not None:
+        raise KeyStoreError(f"{problem}; the key file is left as it is until then")
+    try:
+        owner_only.make_private_dir(store_dir(home), root=Path(home), enforce=True, strict=True)
+        owner_only.ensure_private(store_path(home), root=Path(home))
+    except OSError as exc:
+        raise KeyStoreError(f"{store_path(home)} was not made yours: {exc.strerror or exc}") from exc
+    owner_only.restrict_children(store_dir(home), root=Path(home))
+    after = read_store(home)
+    if not after.usable:
+        raise KeyStoreError(f"{after.path} is still not usable: {after.detail or after.status}")
+    return before
 
 
 def delete_store(home: Path) -> bool:
     """Remove ``home``'s key file (a link is removed, never followed). ``True`` when one was there."""
     path = store_path(home)
     try:
-        path.unlink()
+        remove_file(path)
     except FileNotFoundError:
         return False
     except OSError as exc:
@@ -371,7 +487,7 @@ def holds_fingerprint(home: Path, key_fingerprint: str) -> bool:
         st = os.lstat(path)
     except OSError:
         return False
-    if _ownership_problem(path, st) is not None:
+    if _judge(path, st, home).problem is not None:
         return False
     record = _parse(path)
     return isinstance(record, StoredKey) and fingerprint(record.api_key) == key_fingerprint

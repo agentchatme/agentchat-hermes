@@ -14,6 +14,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -146,7 +147,10 @@ def write_ws_health(
         record["worker"] = dict(worker)
     record["plugin"] = dict(plugin_build())
 
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    from .owner_only import make_private_dir
+    from .state import replace_file
+
+    make_private_dir(target.parent)
     temp: Path | None = None
     try:
         # NamedTemporaryFile uses exclusive creation, avoiding both stale-temp
@@ -165,7 +169,7 @@ def write_ws_health(
             file.write("\n")
             file.flush()
             os.fsync(file.fileno())
-        os.replace(temp, target)
+        replace_file(temp, target)
         os.chmod(target, 0o600)
     finally:
         if temp is not None:
@@ -177,7 +181,7 @@ def write_ws_health(
 def read_ws_health(path: Path | None = None) -> WSHealth | None:
     target = path or default_health_path()
     try:
-        raw: Any = json.loads(target.read_text(encoding="utf-8"))
+        raw: Any = json.loads(target.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError):
         return None
 
@@ -357,7 +361,10 @@ def live_health(api_base: str, api_key: str, hermes_home: Path | None = None) ->
 
 def pid_alive(pid: int) -> bool | None:
     """Whether a process with ``pid`` exists here; ``None`` when that cannot be
-    told (Windows without ``psutil``: ``os.kill`` there would end the process)."""
+    told. ``psutil`` when installed (Hermes depends on it); else on Windows
+    ``OpenProcess`` + a zero wait — never ``os.kill(pid, 0)``, which there
+    sends CTRL+C to the target's console group (bpo-14484) — and on POSIX
+    ``os.kill(pid, 0)``."""
     try:
         import importlib
 
@@ -365,14 +372,20 @@ def pid_alive(pid: int) -> bool | None:
         return bool(psutil.pid_exists(pid))
     except ImportError:
         pass
-    if os.name == "nt":
-        return None
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # it exists, owned by another user
-    except OSError:
-        return None
-    return True
+    if sys.platform == "win32":
+        from .win32 import pid_alive as windows_pid_alive
+
+        try:
+            return windows_pid_alive(pid)
+        except OSError:
+            return None
+    else:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # it exists, owned by another user
+        except OSError:
+            return None
+        return True

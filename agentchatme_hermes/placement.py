@@ -53,7 +53,7 @@ from .manual import BUNDLED_MANUAL_PATH
 from .mcp_registration import McpRegistrationError, install_entry
 from .profile_scope import resolve_hermes_home
 from .soul_anchor import AnchorError, place_soul_anchor, text_name
-from .state import state_dir_for_account
+from .state import remove_file, state_dir_for_account
 from .texts import TEXTS_UNAVAILABLE_DETAIL, identity_text, load_texts, mode_for
 
 if TYPE_CHECKING:
@@ -507,7 +507,7 @@ def clear_gateway_cannot_load(home: Path) -> None:
     from .key_store import store_dir
 
     with contextlib.suppress(OSError):
-        (store_dir(home) / GATEWAY_CANNOT_LOAD_FILENAME).unlink(missing_ok=True)
+        remove_file(store_dir(home) / GATEWAY_CANNOT_LOAD_FILENAME)
 
 
 def gateway_cannot_load(home: Path) -> bool:
@@ -535,7 +535,8 @@ def gateway_cannot_load(home: Path) -> bool:
         recorded = (pid, start if isinstance(start, int) and not isinstance(start, bool) else None)
         if gateway_verdict(recorded, gateway_seen(home)) != "gone":
             return True
-        path.unlink(missing_ok=True)  # that gateway is shown gone
+        with contextlib.suppress(FileNotFoundError):
+            remove_file(path)  # that gateway is shown gone
     except Exception:
         logger.debug("placement: the gateway's plugin load was not read", exc_info=True)
     return False
@@ -601,7 +602,8 @@ def gateway_serves_profile(home: Path, *, api_base: str) -> bool:
         recorded = (pid, start if isinstance(start, int) and not isinstance(start, bool) else None)
         if gateway_verdict(recorded, gateway_seen(home)) != "gone":
             return True
-        path.unlink(missing_ok=True)  # that gateway is shown gone
+        with contextlib.suppress(FileNotFoundError):
+            remove_file(path)  # that gateway is shown gone
     except Exception:
         logger.debug("placement: the gateway logout left serving was not read", exc_info=True)
     return False

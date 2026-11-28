@@ -1,0 +1,464 @@
+name: windows-native
+
+# The plugin in a real Hermes gateway on native Windows, by hand
+# (Actions → windows-native → Run workflow, or
+# `gh workflow run windows-native.yml --ref <branch>`).
+#
+# The CI gate (ci.yml) runs the unit tests on windows-latest with Hermes
+# stubbed: the lock, the access lists and the rest proven in isolation. This
+# installs Hermes the way Nous documents for native Windows (install.ps1,
+# website/docs/user-guide/windows-native.md), installs this commit of the
+# plugin the way the README says (`hermes plugins install … --ref <sha>`),
+# starts the gateway the way `hermes gateway start` does on Windows (a
+# detached `python.exe -m hermes_cli.main gateway run`, the same command the
+# Scheduled Task's launcher runs), and checks from a second process what the
+# plugin did in it.
+#
+# Without a key (always): the plugin signs in to a stand-in for the AgentChat
+# API on 127.0.0.1 (.github/scripts/windows-check.py stub; a made-up key,
+# generated here, never stored). The gateway's plugin must run in gateway
+# mode (its `mode=leader` log line), take this account's leader lock (held
+# against another process; the health record beside it written by the
+# gateway's pid), start its receive loop and try the socket (the stand-in
+# logs `GET /v1/ws` and answers 404); after `hermes gateway stop`, and again
+# after the gateway is killed, the lock must be free. Then, best effort, the
+# same through the logon Scheduled Task `hermes gateway install` registers. A
+# connect is not proven here.
+#
+# With a key (job `connect`, only when the run is started with `connect`
+# ticked): a gateway signs in to api.agentchat.me with the key of a dedicated
+# test agent and must reach `connected`. Use an agent nobody messages: the
+# runner has no model, so a message arriving during the run is left unread.
+# The job runs in the `windows-check` environment, so the key is that
+# environment's secret and the environment's protection rules (required
+# reviewers) apply before the key reaches a runner. Its Hermes is the latest
+# release, the one hermes-main's "latest release" leg tests, installed from
+# install.ps1 at that release's commit (never Nous' moving main).
+#
+# The founder's one-time setup for that job: Settings → Environments → New
+# environment `windows-check`; add the secret AGENTCHAT_WINDOWS_CHECK_KEY (the
+# test agent's API key) there, and, as for the publish environments, add
+# yourself as a required reviewer. Then Run workflow with `connect` ticked.
+#
+# As a standard user (job `standard-user`, in parallel): GitHub's Windows
+# runners are administrators with UAC off, so the job above runs elevated. A
+# second runner makes a standard local account and, as that account
+# (Start-Process -Credential), runs the plugin's test suite, installs Hermes,
+# signs in to the stand-in API, and checks the gateway's leader lock as above;
+# it also checks that a key directory another account owns is not written
+# into, and what a key file the account cannot read says.
+#
+# Nothing is published. The keyless jobs' logs and records are uploaded as
+# artifacts (no real key is in them). In `connect` the key is in one step's
+# environment only (not install.ps1's or the pip installs'), goes to `login`
+# on stdin and is gone from the environment before the gateway starts; that
+# job uploads nothing and runs no doctor (it prints a key's first and last
+# characters), and GitHub masks the secret in the step log. No checkout keeps
+# the repository token (persist-credentials: false).
+
+on:
+  workflow_dispatch:
+    inputs:
+      hermes_channel:
+        description: "Hermes install channel: stable (the latest release) or main"
+        type: choice
+        options: [stable, main]
+        default: stable
+      connect:
+        description: "Also connect to api.agentchat.me with the windows-check environment's test-agent key"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gateway:
+    name: Hermes ${{ inputs.hermes_channel || 'stable' }} gateway on windows-latest
+    runs-on: windows-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      # Scripted: nothing asks, and `hermes gateway start` installs no
+      # Scheduled Task (windows-native.md: login auto-start only on an
+      # explicit answer).
+      HERMES_NONINTERACTIVE: "1"
+      HERMES_GATEWAY_INSTALL_START_ON_LOGIN: "0"
+      PYTHONUTF8: "1"
+      STUB_PORT: "18787"
+      HERMES_CHANNEL: ${{ inputs.hermes_channel || 'stable' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The probes' own Python, beside Hermes': a second process, as doctor is.
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the probes (this package, in the runner's Python)
+        run: python -m pip install .
+
+      - name: Install Hermes (install.ps1, as Nous documents for native Windows)
+        run: |
+          $script = (Invoke-RestMethod https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1).TrimStart([char]0xFEFF)
+          & ([scriptblock]::Create($script)) -NonInteractive -Channel $env:HERMES_CHANNEL
+          $bin = Join-Path $env:LOCALAPPDATA 'hermes\bin'
+          if (-not (Test-Path (Join-Path $bin 'hermes.exe')) -and -not (Test-Path (Join-Path $bin 'hermes.cmd'))) {
+            Get-ChildItem $bin -ErrorAction SilentlyContinue | Format-Table Name
+            throw "no hermes launcher in $bin"
+          }
+          # The installer adds it to the User PATH, which a later step's
+          # process does not re-read.
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Hermes version and home
+        run: |
+          hermes --version
+          $home_dir = Join-Path $env:LOCALAPPDATA 'hermes'
+          "HERMES_HOME_DIR=$home_dir" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Get-ChildItem $home_dir | Format-Table Name
+
+      - name: Install the plugin from this commit (README)
+        run: |
+          hermes plugins install "https://github.com/${{ github.repository }}.git" --ref '${{ github.sha }}' --force --yes-deps
+          if ($LASTEXITCODE -ne 0) { throw "plugins install exited $LASTEXITCODE" }
+          hermes plugins enable agentchat
+          if ($LASTEXITCODE -ne 0) { throw "plugins enable exited $LASTEXITCODE" }
+          hermes plugins list
+
+      # One step: the stand-in API must outlive the gateway's starts.
+      - name: "Keyless: the gateway's plugin takes the leader lock, and the OS frees it"
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP 'stub-requests.log'
+          "STUB_LOG=$log" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $stub = Start-Process python -ArgumentList '.github/scripts/windows-check.py', 'stub', $env:STUB_PORT, $log -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          try {
+            $env:AGENTCHATME_API_BASE = "http://127.0.0.1:$env:STUB_PORT"
+            # A made-up key of the real shape, made here and never stored.
+            python -c "import secrets; print('ac_' + secrets.token_urlsafe(32))" | hermes agentchat login --api-key -
+            if ($LASTEXITCODE -ne 0) { throw "login exited $LASTEXITCODE" }
+            Remove-Item Env:AGENTCHATME_API_BASE  # the key file records the base
+
+            Write-Output "=== start: the plugin runs in gateway mode and takes the lock"
+            hermes gateway start
+            python .github/scripts/windows-check.py leader $env:HERMES_HOME_DIR 300
+            if ($LASTEXITCODE -ne 0) { throw "the leader check failed" }
+            $record = Get-ChildItem (Join-Path $env:HERMES_HOME_DIR 'agentchat-locks') -Filter 'ws-*.health.json' | Select-Object -First 1
+            $holder = (Get-Content $record.FullName | ConvertFrom-Json).pid
+            Write-Output "--- the process holding the lock"
+            Get-CimInstance Win32_Process -Filter "ProcessId = $holder" | Select-Object ProcessId, ParentProcessId, CommandLine | Format-List
+            $logs = Join-Path $env:HERMES_HOME_DIR 'logs'
+            Write-Output "--- the plugin's lines in the gateway's logs"
+            Get-ChildItem $logs -Filter *.log | ForEach-Object {
+              Select-String -Path $_.FullName -Pattern 'agentchat' | Select-Object -Last 30
+            }
+            if (-not (Get-ChildItem $logs -Filter *.log | Select-String -Pattern 'mode=leader' -Quiet)) {
+              throw "no 'mode=leader' line from the plugin in the gateway's logs"
+            }
+            Start-Sleep -Seconds 10
+            Write-Output "--- requests the stand-in API saw"
+            Get-Content $log
+            if (-not (Select-String -Path $log -Pattern '^GET /v1/ws' -Quiet)) {
+              throw "the receive loop never tried the socket (no GET /v1/ws at the stand-in)"
+            }
+            Write-Output "--- doctor, from another process"
+            hermes agentchat doctor
+
+            Write-Output "=== stop: the lock is free again"
+            hermes gateway stop
+            python .github/scripts/windows-check.py free $env:HERMES_HOME_DIR 60
+            if ($LASTEXITCODE -ne 0) { throw "the lock outlived a stopped gateway" }
+
+            Write-Output "=== kill: no cleanup runs, the OS frees the lock"
+            hermes gateway start
+            python .github/scripts/windows-check.py leader $env:HERMES_HOME_DIR 300
+            if ($LASTEXITCODE -ne 0) { throw "the leader check failed" }
+            $record = Get-ChildItem (Join-Path $env:HERMES_HOME_DIR 'agentchat-locks') -Filter 'ws-*.health.json' | Select-Object -First 1
+            $gateway = (Get-Content $record.FullName | ConvertFrom-Json).pid
+            Write-Output "killing the gateway, pid $gateway (TerminateProcess)"
+            Stop-Process -Id $gateway -Force
+            python .github/scripts/windows-check.py free $env:HERMES_HOME_DIR 60
+            if ($LASTEXITCODE -ne 0) { throw "the lock outlived a killed gateway" }
+          } finally {
+            try { hermes gateway stop *> $null } catch { }
+            Stop-Process -Id $stub.Id -Force -ErrorAction SilentlyContinue
+          }
+          exit 0
+
+      # The logon task `hermes gateway install` registers runs the same command
+      # through wscript.exe and gateway.vbs. A hosted runner may not let a
+      # logon task run (InteractiveToken), so this leg reports, never fails.
+      - name: "Keyless, best effort: the Scheduled Task's gateway takes the leader lock"
+        continue-on-error: true
+        run: |
+          $stub = Start-Process python -ArgumentList '.github/scripts/windows-check.py', 'stub', $env:STUB_PORT, $env:STUB_LOG -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          try {
+            $env:HERMES_GATEWAY_INSTALL_START_ON_LOGIN = '1'
+            $env:HERMES_GATEWAY_INSTALL_START_NOW = '0'
+            hermes gateway install
+            schtasks /Query /TN Hermes_Gateway /V /FO LIST
+            if ($LASTEXITCODE -ne 0) { throw "no Hermes_Gateway task was registered" }
+            schtasks /Run /TN Hermes_Gateway
+            python .github/scripts/windows-check.py leader $env:HERMES_HOME_DIR 180
+            if ($LASTEXITCODE -ne 0) { throw "the task's gateway did not take the leader lock" }
+            $record = Get-ChildItem (Join-Path $env:HERMES_HOME_DIR 'agentchat-locks') -Filter 'ws-*.health.json' | Select-Object -First 1
+            $gateway = (Get-Content $record.FullName | ConvertFrom-Json).pid
+            Write-Output "--- the process holding the lock"
+            Get-CimInstance Win32_Process -Filter "ProcessId = $gateway" | Select-Object ProcessId, ParentProcessId, CommandLine | Format-List
+            hermes gateway stop
+            python .github/scripts/windows-check.py free $env:HERMES_HOME_DIR 60
+            if ($LASTEXITCODE -ne 0) { throw "the lock outlived the task's gateway" }
+            Write-Output "::notice::the Scheduled Task's gateway took the leader lock and freed it on stop"
+          } finally {
+            try { hermes gateway stop *> $null } catch { }
+            try { hermes gateway uninstall *> $null } catch { }
+            Stop-Process -Id $stub.Id -Force -ErrorAction SilentlyContinue
+          }
+          exit 0
+
+      # Before the keyed leg: nothing it writes is ever uploaded.
+      - name: Collect the keyless leg's logs and records
+        if: always()
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'windows-native'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          if ($env:HERMES_HOME_DIR) {
+            Copy-Item (Join-Path $env:HERMES_HOME_DIR 'logs') (Join-Path $out 'logs') -Recurse -ErrorAction SilentlyContinue
+            Copy-Item (Join-Path $env:HERMES_HOME_DIR 'agentchat-locks') (Join-Path $out 'agentchat-locks') -Recurse -ErrorAction SilentlyContinue
+          }
+          if ($env:STUB_LOG) { Copy-Item $env:STUB_LOG $out -ErrorAction SilentlyContinue }
+          exit 0
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: windows-native-${{ inputs.hermes_channel || 'stable' }}
+          path: ${{ runner.temp }}/windows-native
+          if-no-files-found: warn
+          retention-days: 14
+
+  standard-user:
+    name: Hermes ${{ inputs.hermes_channel || 'stable' }} as a standard (non-admin) account
+    runs-on: windows-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      PYTHONUTF8: "1"
+      STUB_PORT: "18788"
+      HERMES_CHANNEL: ${{ inputs.hermes_channel || 'stable' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install this package and its test tools (the runner's Python)
+        run: python -m pip install ".[dev]"
+
+      - name: Make a standard local account
+        run: |
+          $user = 'acstd'
+          # A throwaway password for a throwaway account on a throwaway runner, never printed.
+          $plain = 'Ac1!' + [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(18))
+          $secure = ConvertTo-SecureString $plain -AsPlainText -Force
+          New-LocalUser -Name $user -Password $secure -PasswordNeverExpires -AccountNeverExpires -Description 'agentchat windows-native check' | Out-Null
+          Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $user -ErrorAction SilentlyContinue
+          $secure | ConvertFrom-SecureString | Out-File (Join-Path $env:RUNNER_TEMP 'acstd.secure') -Encoding ascii
+          # Start-Process -Credential needs the Secondary Logon service.
+          Set-Service seclogon -StartupType Manual
+          Start-Service seclogon
+          $work = 'C:\acstd'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          icacls $work /grant "${user}:(OI)(CI)F" | Out-Null
+          Copy-Item -Recurse $env:GITHUB_WORKSPACE (Join-Path $work 'repo')
+          # The runner's Python and this package, readable by the account.
+          icacls $env:pythonLocation /grant "${user}:(OI)(CI)RX" /Q | Out-Null
+          "AC_USER=$user" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "AC_WORK=$work" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: "Standard account: the steps"
+        run: |
+          $secure = Get-Content (Join-Path $env:RUNNER_TEMP 'acstd.secure') | ConvertTo-SecureString
+          $cred = [pscredential]::new("$env:COMPUTERNAME\$env:AC_USER", $secure)
+          $pwsh = (Get-Command pwsh).Source
+          $py = Join-Path $env:pythonLocation 'python.exe'
+          $repo = Join-Path $env:AC_WORK 'repo'
+          $script = Join-Path $repo '.github\scripts\windows-standard-user.ps1'
+          $failed = [System.Collections.Generic.List[string]]::new()
+          function Invoke-AsStandardUser([string] $Step, [string[]] $More = @(), [int] $Minutes = 30) {
+            $out = Join-Path $env:AC_WORK "$Step.out"
+            $err = Join-Path $env:AC_WORK "$Step.err"
+            $arguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $script,
+                           '-Step', $Step, '-Python', $py, '-Repo', $repo) + $More
+            $p = Start-Process -FilePath $pwsh -ArgumentList $arguments -Credential $cred -LoadUserProfile `
+                   -WorkingDirectory $env:AC_WORK -PassThru -RedirectStandardOutput $out -RedirectStandardError $err
+            $null = $p.Handle  # keeps the exit code readable
+            if (-not $p.WaitForExit($Minutes * 60000)) { $p.Kill(); throw "$Step did not end in $Minutes min" }
+            Write-Host "=== $Step, as $($env:AC_USER): exit $($p.ExitCode)"
+            Get-Content $out, $err -ErrorAction SilentlyContinue | Out-Host
+            if ($p.ExitCode -ne 0) {
+              Write-Host "::error::$Step failed as the standard account"
+              $null = $failed.Add($Step)
+            }
+          }
+
+          Invoke-AsStandardUser 'whoami'
+          Invoke-AsStandardUser 'tests' -Minutes 20
+
+          # A key directory another account owns (here the runner's own
+          # account, not Administrators), opened to this one: never written into.
+          $shared = 'C:\acshared'
+          New-Item -ItemType Directory -Force -Path (Join-Path $shared 'agentchat') | Out-Null
+          icacls $shared /grant "${env:AC_USER}:(OI)(CI)F" | Out-Null
+          icacls (Join-Path $shared 'agentchat') /setowner $env:USERNAME | Out-Null
+          icacls (Join-Path $shared 'agentchat') | Out-Host
+          Invoke-AsStandardUser 'refused' -More @('-KeyHome', $shared)
+
+          # A key file only SYSTEM and Administrators can open (what an
+          # elevated run of an earlier release could leave): the message.
+          # Python 3.13's mkdir(0o700) run elevated: SYSTEM, Administrators,
+          # OWNER RIGHTS, owned by Administrators; the file written inside.
+          $denied = 'C:\acdenied'
+          $deniedDir = Join-Path $denied 'agentchat'
+          New-Item -ItemType Directory -Force -Path $deniedDir | Out-Null
+          icacls $denied /grant "${env:AC_USER}:(OI)(CI)RX" | Out-Null
+          icacls $deniedDir /setowner '*S-1-5-32-544' | Out-Null
+          icacls $deniedDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-3-4:(OI)(CI)F' | Out-Null
+          '{"api_key": "not a key"}' | Out-File (Join-Path $deniedDir 'credentials.json') -Encoding ascii
+          icacls $deniedDir /T | Out-Host
+          Invoke-AsStandardUser 'denied' -More @('-KeyHome', $denied)
+
+          Invoke-AsStandardUser 'hermes' -More @('-Channel', $env:HERMES_CHANNEL)
+
+          $log = Join-Path $env:AC_WORK 'stub-requests.log'
+          $stub = Start-Process python -ArgumentList '.github/scripts/windows-check.py', 'stub', $env:STUB_PORT, $log -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          try {
+            Invoke-AsStandardUser 'gateway' -More @('-Sha', '${{ github.sha }}', '-Source', "https://github.com/${{ github.repository }}.git", '-Port', $env:STUB_PORT)
+            Write-Host "--- requests the stand-in API saw"
+            Get-Content $log -ErrorAction SilentlyContinue | Out-Host
+            if (-not ((Test-Path $log) -and (Select-String -Path $log -Pattern '^GET /v1/ws' -Quiet))) {
+              Write-Host "::error::the standard account's receive loop never tried the socket"
+              $null = $failed.Add('socket')
+            }
+          } finally {
+            Stop-Process -Id $stub.Id -Force -ErrorAction SilentlyContinue
+          }
+          if ($failed.Count -gt 0) { throw "failed as the standard account: $($failed -join ', ')" }
+          exit 0
+
+      - name: Collect the standard account's logs and records
+        if: always()
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'windows-native-standard-user'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          if ($env:AC_USER) {
+            $home_dir = "C:\Users\$env:AC_USER\AppData\Local\hermes"
+            Copy-Item (Join-Path $home_dir 'logs') (Join-Path $out 'logs') -Recurse -ErrorAction SilentlyContinue
+            Copy-Item (Join-Path $home_dir 'agentchat-locks') (Join-Path $out 'agentchat-locks') -Recurse -ErrorAction SilentlyContinue
+            Copy-Item (Join-Path $env:AC_WORK '*.out'), (Join-Path $env:AC_WORK '*.err'), (Join-Path $env:AC_WORK '*.log') $out -ErrorAction SilentlyContinue
+          }
+          exit 0
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: windows-native-standard-user-${{ inputs.hermes_channel || 'stable' }}
+          path: ${{ runner.temp }}/windows-native-standard-user
+          if-no-files-found: warn
+          retention-days: 14
+
+  connect:
+    name: Hermes (latest release) connects to api.agentchat.me with a test agent's key
+    if: inputs.connect
+    runs-on: windows-latest
+    environment: windows-check
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      HERMES_NONINTERACTIVE: "1"
+      HERMES_GATEWAY_INSTALL_START_ON_LOGIN: "0"
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install the probes (this package, in the runner's Python)
+        run: python -m pip install .
+
+      - name: The latest Hermes release and its commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = gh api repos/NousResearch/hermes-agent/releases/latest --jq .tag_name
+          if ($tag -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+$') { throw "no latest hermes-agent release (got '$tag')" }
+          $sha = gh api "repos/NousResearch/hermes-agent/commits/$tag" --jq .sha
+          if ($sha -notmatch '^[0-9a-f]{40}$') { throw "no commit for $tag (got '$sha')" }
+          Write-Output "hermes-agent $tag at $sha"
+          "HERMES_RELEASE=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "HERMES_RELEASE_SHA=$sha" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install Hermes at that release (install.ps1 from the same commit)
+        run: |
+          $url = "https://raw.githubusercontent.com/NousResearch/hermes-agent/$env:HERMES_RELEASE_SHA/scripts/install.ps1"
+          $script = (Invoke-RestMethod $url).TrimStart([char]0xFEFF)
+          & ([scriptblock]::Create($script)) -NonInteractive -Commit $env:HERMES_RELEASE_SHA
+          $bin = Join-Path $env:LOCALAPPDATA 'hermes\bin'
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "HERMES_HOME_DIR=$(Join-Path $env:LOCALAPPDATA 'hermes')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Install the plugin from this commit (README)
+        run: |
+          hermes --version
+          hermes plugins install "https://github.com/${{ github.repository }}.git" --ref '${{ github.sha }}' --force --yes-deps
+          if ($LASTEXITCODE -ne 0) { throw "plugins install exited $LASTEXITCODE" }
+          hermes plugins enable agentchat
+          if ($LASTEXITCODE -ne 0) { throw "plugins enable exited $LASTEXITCODE" }
+
+      # The key is in this step's environment only. It goes to login on stdin
+      # and is gone from the environment before the gateway starts (the
+      # gateway reads the key file).
+      - name: "Connect to api.agentchat.me"
+        env:
+          CHECK_KEY: ${{ secrets.AGENTCHAT_WINDOWS_CHECK_KEY }}
+        run: |
+          if (-not $env:CHECK_KEY) { throw "the windows-check environment has no AGENTCHAT_WINDOWS_CHECK_KEY secret" }
+          try {
+            $env:CHECK_KEY | hermes agentchat login --api-key -
+            if ($LASTEXITCODE -ne 0) { throw "login exited $LASTEXITCODE" }
+            Remove-Item Env:CHECK_KEY
+            hermes gateway start
+            # No doctor here: it prints the key's first and last characters,
+            # and this log is public.
+            python .github/scripts/windows-check.py leader $env:HERMES_HOME_DIR 300 connected
+            if ($LASTEXITCODE -ne 0) { throw "the gateway's plugin did not connect" }
+            hermes gateway stop
+            python .github/scripts/windows-check.py free $env:HERMES_HOME_DIR 60
+            if ($LASTEXITCODE -ne 0) { throw "the lock outlived a stopped gateway" }
+          } finally {
+            try { hermes gateway stop *> $null } catch { }
+            try { hermes agentchat logout *> $null } catch { }
+          }
+          exit 0

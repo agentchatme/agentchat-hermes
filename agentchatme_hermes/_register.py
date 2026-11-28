@@ -13,7 +13,7 @@ process is loading us:
 
 * **CLI mode** (every other Hermes process — TUI/REPL, named subcommands,
   one-shot agents, Hermes-spawned child Python that inherits
-  ``_HERMES_GATEWAY=1`` from its parent, or a second gateway whose flock
+  ``_HERMES_GATEWAY=1`` from its parent, or a second gateway whose lock
   acquisition lost the race): light runtime — identity only, no WS, no
   invoker. The skill is still registered — as the manual is found; only the
   gateway writes it (a gateway that lost the race syncs it once) — and the
@@ -25,7 +25,8 @@ Mode selection has two layered signals (see :mod:`.leader_lock`):
 
 1. argv says ``hermes gateway run`` (the ``_HERMES_GATEWAY=1`` marker alone
    is no longer enough — every child the gateway spawns inherits it).
-2. ``fcntl.flock(LOCK_EX | LOCK_NB)`` on the per-account lock file under
+2. An exclusive, non-blocking OS file lock (``flock`` on POSIX,
+   ``msvcrt.locking`` on Windows) on the per-account lock file under
    ``<hermes root>/agentchat-locks/``. Even with the argv signal, only one
    process can hold this OS-level lock for a given account at a time.
    Losers fall back to CLI mode and retry the election.

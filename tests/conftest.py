@@ -386,15 +386,18 @@ def _thread_guard() -> Iterator[None]:
 def assert_private_file() -> Callable[[Path], None]:
     """Assert a file the plugin wrote is owner-only (``0600``).
 
-    POSIX only: Windows reports ``0o666`` for every file whatever ``chmod``
-    asked for, so the mode bits say nothing there. The production code
-    still opens and ``chmod``s with ``0o600`` on every platform; only the
-    assertion is conditional (the pattern ``test_ws_health`` uses inline).
+    Windows reports ``0o666`` for every file whatever ``chmod`` asked for, so
+    there the access list says it (``owner_only.inspect``): only the user,
+    SYSTEM and Administrators, and the user itself.
     """
 
     def check(path: Path) -> None:
         assert path.exists(), f"{path} was not written"
         if os.name == "nt":
+            from agentchatme_hermes import owner_only
+
+            access = owner_only.inspect(path)
+            assert access is not None and access.private, f"{path}: {access}"
             return
         mode = stat.S_IMODE(path.stat().st_mode)
         assert mode == 0o600, f"{path}: expected 0600, got {oct(mode)}"

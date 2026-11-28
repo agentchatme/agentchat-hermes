@@ -45,7 +45,7 @@ from .profile_scope import (
     resolve_hermes_home,
 )
 from .receiver import Receiver
-from .state import LEGACY_INVITES_FILENAME, state_dir_for
+from .state import LEGACY_INVITES_FILENAME, remove_file, state_dir_for
 from .texts import IdentityText, identity_text, load_texts, remove_legacy_cache, texts_cache
 from .types import AgentIdentity
 from .ws_health import HealthBoard, health_path_for
@@ -121,10 +121,10 @@ class Runtime:
       lost the leader-lock race. The agent's tools are the hosted MCP
       server in every mode; only the wake is leader-only.
 
-    The two-gate design (env var + flock) eliminates every flavor
-    of multi-WS-per-account: the gateway env var blocks TUI/CLI/
-    oneshot, and the flock blocks concurrent gateways for one account
-    while letting sibling profiles with their own accounts receive.
+    The two-gate design (argv + the OS file lock) eliminates every flavor
+    of multi-WS-per-account: the argv check blocks TUI/CLI/oneshot, and
+    the lock blocks concurrent gateways for one account while letting
+    sibling profiles with their own accounts receive.
     """
 
     def __init__(
@@ -183,8 +183,9 @@ class Runtime:
 
         # File-descriptor for the leader lock when held. ``None`` when
         # not the leader (or before :meth:`start`). Held open for the
-        # process lifetime — POSIX flock auto-releases on close, so we
-        # explicitly close in :meth:`stop`/:meth:`_teardown_partial`.
+        # process lifetime — the OS lock (flock / LockFile) is released
+        # when it closes, so we explicitly close in
+        # :meth:`stop`/:meth:`_teardown_partial`.
         self._leader_lock_fd: int | None = None
 
         # Follower-gateway takeover: retries the leader election until
@@ -305,7 +306,7 @@ class Runtime:
                 # Leader election. Only attempt when the caller asked for
                 # gateway mode (a real ``hermes gateway run``) and the
                 # integration is on. The follower path covers TUI/CLI/oneshot
-                # AND gateway-class processes that lost the flock race.
+                # AND gateway-class processes that lost the lock race.
                 self._is_leader = (
                     self._gateway_mode_requested
                     and self.integration_enabled
@@ -667,7 +668,7 @@ def _notify(callback: Callable[[Texts], None], texts: Texts) -> None:
 
 def _remove_quietly(path: Path) -> None:
     try:
-        path.unlink()
+        remove_file(path)
     except FileNotFoundError:
         return
     except OSError as exc:

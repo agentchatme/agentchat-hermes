@@ -263,7 +263,9 @@ class TestRegister:
         run = _Wizard(monkeypatch, person)
         assert run.register() is True
         assert len(run.waits) == 1
-        assert 29 < run.waits[0] <= 30
+        # What is left of the server's 30 s; on Windows' coarse monotonic clock
+        # nothing may have passed, and 30 - 0 can round to 30.00000000000006.
+        assert 29 < run.waits[0] <= 30 + 1e-6
         assert ("info", "Waiting 30 seconds…") in person.transcript
 
     def test_blank_at_the_code_prompt_cancels(self, monkeypatch: pytest.MonkeyPatch) -> None:

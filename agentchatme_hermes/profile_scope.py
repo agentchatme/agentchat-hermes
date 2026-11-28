@@ -4,7 +4,8 @@ Why this module exists
 ──────────────────────
 Hermes runs several *profiles* on one machine, each with its own home
 (``~/.hermes`` for the default profile, ``~/.hermes/profiles/<name>`` for
-every other one), its own settings and its own ``SOUL.md``. Since Hermes
+every other one; ``%LOCALAPPDATA%\\hermes`` on native Windows), its own
+settings and its own ``SOUL.md``. Since Hermes
 0.22 a single gateway process can serve every profile at once
 ("multiplexing"): Hermes keeps one plugin manager per profile home and
 calls our ``register(ctx)`` once per profile, in a context that points
@@ -51,6 +52,7 @@ import contextvars
 import hashlib
 import logging
 import os
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -78,9 +80,10 @@ def resolve_hermes_home() -> Path:
 
     Order: Hermes' own ``get_hermes_home()`` (context-local override →
     ``HERMES_HOME`` → platform default) when Hermes is importable; else
-    ``HERMES_HOME``; else ``~/.hermes``. Inside a Hermes process the first
-    branch always wins, and under multiplexing it is the *only* correct
-    answer — the process environment may name a different profile.
+    ``HERMES_HOME``; else the platform default (:func:`platform_default_home`).
+    Inside a Hermes process the first branch always wins, and under
+    multiplexing it is the *only* correct answer — the process environment
+    may name a different profile.
     """
     try:
         from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
@@ -88,9 +91,25 @@ def resolve_hermes_home() -> Path:
         raw = os.environ.get("HERMES_HOME", "").strip()
         if raw:
             return Path(raw).expanduser()
-        return Path.home() / DEFAULT_HOME_DIRNAME
+        return platform_default_home()
     home: Path = get_hermes_home()
     return Path(home).expanduser()
+
+
+def platform_default_home() -> Path:
+    """Hermes' default home when nothing names one, as Hermes computes it
+    (``hermes_constants._platform_default_hermes_home``): ``~/.hermes`` on
+    POSIX; on native Windows ``%LOCALAPPDATA%\\hermes`` (``~\\AppData\\Local``
+    when ``LOCALAPPDATA`` is unset). ``HERMES_DATA_DIR_SUFFIX`` is appended as
+    Hermes appends it. Used only where Hermes cannot be imported."""
+    suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA", "").strip()
+        base = Path(local) if local else Path.home() / "AppData" / "Local"
+        home = base / ("hermes" + suffix)
+    else:
+        home = Path.home() / (DEFAULT_HOME_DIRNAME + suffix)
+    return home
 
 
 class ProfileScopeError(RuntimeError):

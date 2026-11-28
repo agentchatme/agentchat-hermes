@@ -1249,7 +1249,6 @@ class TestGatewayDetection:
         monkeypatch.setitem(sys.modules, "gateway.status", status)
         monkeypatch.setattr(cli, "_other_gateway_running", lambda: False)
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="the leader lock is fcntl, POSIX-only")
     def test_a_health_record_counts_only_while_its_gateway_lives(self, home: Path, _nothing_else: None) -> None:
         """A gateway stopped or killed leaves a fresh record saying "connected"
         (Hermes never stops the receiver): the record counts only with its pid

@@ -216,7 +216,6 @@ class TestAdoptLegacyKey:
         assert second.status == "copy" and second.owner == root
         assert key_store.read_store(named).status == "missing"
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="the per-account lock is fcntl, POSIX-only (as the leader lock)")
     def test_two_profiles_adopting_at_once_cannot_both_take_it(self, tmp_path: Path) -> None:
         """At one multiplexed boot: the per-account lock makes check-and-write
         one step, so exactly one adopts and the other is refused as its copy."""
@@ -241,7 +240,6 @@ class TestAdoptLegacyKey:
         assert sorted(outcomes.values()) == ["adopted"] + ["copy"] * (len(homes) - 1)
         assert sum(key_store.read_store(h).status != "missing" for h in homes) == 1
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="the per-account lock is fcntl, POSIX-only (as the leader lock)")
     def test_the_lock_beside_the_leader_lock(self, tmp_path: Path) -> None:
         from agentchatme_hermes.leader_lock import lock_path_for
         from agentchatme_hermes.profile_scope import account_fingerprint

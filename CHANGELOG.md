@@ -37,6 +37,56 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   `recover --code`. Before, those routes named only sign-up, and the server lets one email back several agents, so a
   returning agent could make a second account. `hermes agentchat login` with no key source in an agent's terminal no
   longer waits at a hidden prompt nobody answers: it says the file way and exits.
+- **Native Windows: the gateway now receives.** Hermes runs natively on Windows (the MSIX desktop app, `install.ps1`,
+  the gateway as a Scheduled Task or `hermes gateway start`), but the leader lock that elects the process holding
+  AgentChat's socket was `fcntl.flock`, which Windows does not have: the plugin logged "running in follower mode … must
+  run on POSIX" and no gateway ever held the socket, so sign-up and the hosted tools worked and no message ever woke
+  the agent. The lock is now `msvcrt.locking` on Windows (`LockFile` on byte 0 of the lock file's handle) and `flock`
+  elsewhere, with the same properties on both: an attempt never waits, the lock belongs to the open file (two
+  profiles of one multiplexed gateway on one key still exclude each other), the system releases it when the handle
+  closes or the process ends however it ends, and no child process inherits it. No new dependency. Checked on a real
+  Hermes v0.23.4 gateway on `windows-latest`, installed with `install.ps1` (`.github/workflows/windows-native.yml`, by
+  hand): started by `hermes gateway start` and by the `Hermes_Gateway` logon task, the plugin runs in gateway mode,
+  holds the lock against another process, starts its receive loop and tries the socket, and the lock is free again
+  after a stop and after the gateway is killed; on a second runner the same, with the test suite, as a standard
+  (non-admin) account, since GitHub's runners are administrators. The connect to api.agentchat.me from Windows is not
+  checked yet: it is the workflow's `connect` job, which needs a test agent's key in the `windows-check` environment.
+  The Microsoft Store / MSIX Hermes is not tested with the plugin yet.
+- **Native Windows: the key file is private to you.** A file mode means nothing on Windows (`0600` is ignored), and
+  Python 3.13's `mkdir(0o700)` there makes a directory that an elevated ("Run as administrator") run closes to the same
+  user unelevated. The key's directory (`<profile home>\agentchat`) is now created owned by you with an explicit access
+  list, protected from its parent's, in the one call that creates it (`CreateDirectoryW` with the descriptor): full
+  control for you (your account's SID, elevated or not), SYSTEM and Administrators, the principals POSIX root stands
+  for. The key file is created the same way (`CreateFileW` with its own descriptor), so it is private from its first
+  byte whatever list the folder its name resolves to has. Every list and owner is read and written through a handle on
+  the object itself, never through a junction, a symbolic link or a hard link. The checks POSIX makes on the mode are
+  made on the list, and fail closed: a key file or directory another account owns, one another account can read or
+  change (deleting it included), a key file with a second name (a hard link), a key directory that is or is reached
+  through a junction (`GetFinalPathNameByHandleW` against the profile home), a list that cannot be read, and a volume
+  that keeps no lists at all (FAT, exFAT: the message says to move the Hermes home to an NTFS drive) are all refused.
+  Inherit-only entries count (they are what a new file gets). A key file that is yours but that other accounts can
+  change (written by an earlier release) is refused with the repair named: `doctor --fix` makes it yours only and keeps
+  the key, once the Hermes home is yours. One another account can read, or with no entry for you, is used and tightened
+  at the gateway's start and by `doctor --fix`. A key folder an elevated run of an earlier release closed to you is
+  refused with the fix that works (`doctor --fix` from an elevated prompt of the same account), not "remove it". The
+  pending sign-up is written only into a key folder made private first; the lock, state and health directories get
+  the same list when created, and an existing one another account owns is never written into. Refusals name accounts
+  as Windows names them.
+- **Native Windows: a Hermes home other accounts can change.** No key file's list can protect a home like
+  `HERMES_HOME=C:\hermes` that inherits `Authenticated Users: Modify` from the drive: other accounts can change the
+  plugin's code and `config.yaml` there. `doctor` now fails on such a home with the remedy (keep the home under your
+  user profile, or remove their access), never says the key is "readable by you only" there, and `doctor --fix` repairs
+  no key file inside it until the home is yours.
+- **Native Windows, the rest of the gateway path.** A rename onto a file another process has open fails on Windows;
+  the key file, the health record, the state files and `SOUL.md` are now replaced with the SDK kit's retrying rename,
+  as the kit's own files are, and a removal (`logout`'s key file, a finished sign-up, the plugin's records) is retried
+  the same way. A gateway that lost the election logs its lock lines once, not on every 15 s retry. Whether the gateway behind a health record still runs is asked with `OpenProcess` where
+  `psutil` is missing, never with `os.kill(pid, 0)` (a CTRL+C to the target's console on Windows). Outside Hermes the
+  default home is `%LOCALAPPDATA%\hermes` on Windows, as Hermes computes it. `doctor`'s note about old terminal
+  snapshots gives a PowerShell `Remove-Item` there. JSON the plugin reads back accepts a byte-order mark. Checked and
+  unchanged: the gateway is recognised by its command line on Windows too (the Scheduled Task's launcher and `hermes
+  gateway start` both run `python.exe -m hermes_cli.main [--profile X] gateway run`); the plugin starts no
+  subprocess, sends no signal and reads no `/proc`; process start times come from Hermes (`psutil` on Windows).
 
 ## [0.8.0] — 2026-11-27
 

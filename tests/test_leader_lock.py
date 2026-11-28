@@ -1,22 +1,30 @@
 """Tests for ``agentchatme_hermes.leader_lock``.
 
-These tests exercise the actual ``fcntl.flock`` machinery on a real
-tmp-path lock file. They're POSIX-only (skipped on Windows) but the
-plugin is POSIX-only too, so that matches deployment reality.
+These tests exercise the real OS lock on a real tmp-path lock file:
+``fcntl.flock`` on Linux and macOS, ``msvcrt.locking`` (``LockFile``) on
+Windows. Every test runs on every platform: the CI matrix's Windows job is
+where the Windows lock is proven.
 
-The acquire/release contract is the only load-bearing surface:
+The acquire/release contract is the only load-bearing surface, and the
+properties the plugin relies on are each tested here (:class:`TestLockSemantics`):
 
-* First caller acquires successfully → returns fd
-* Second concurrent caller fails fast → returns None
-* After first releases → second acquire succeeds
-* ``is_hermes_gateway_process`` reflects the env var
-* ``describe_lock_holder`` reports the right state without
-  perturbing held locks
+* non-blocking: a held lock answers at once, busy;
+* owned by the open file: a second descriptor of the same process is
+  refused, as two profiles of one multiplexed gateway must be;
+* across processes: another process holding it keeps this one out;
+* released by the OS when the holder ends, cleanly or killed;
+* not inherited by a child process;
+* ``held_lock``'s held / busy / unavailable states;
+* ``describe_lock_holder`` reports the right state without perturbing a
+  held lock.
 """
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
+import textwrap
+import time
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -30,6 +38,7 @@ from agentchatme_hermes.leader_lock import (
     LOCK_DIRNAME,
     _argv_matches_gateway_run,
     describe_lock_holder,
+    held_lock,
     is_hermes_gateway_process,
     legacy_lock_path,
     lock_path_for,
@@ -38,12 +47,7 @@ from agentchatme_hermes.leader_lock import (
 )
 from agentchatme_hermes.profile_scope import account_fingerprint
 
-# The fcntl-using tests only run on POSIX. The is_hermes_gateway_process
-# and argv-detection tests are platform-independent and run everywhere.
-_posix_only = pytest.mark.skipif(
-    sys.platform == "win32",
-    reason="fcntl is POSIX-only",
-)
+_POSIX = sys.platform != "win32"
 
 
 class TestIsHermesGatewayProcess:
@@ -154,7 +158,6 @@ class TestArgvMatchesGatewayRun:
         assert _argv_matches_gateway_run([]) is False
 
 
-@_posix_only
 class TestTryAcquireLeaderLock:
     def test_first_caller_acquires(self, tmp_path: Path) -> None:
         lock = tmp_path / "agentchat-ws.lock"
@@ -166,10 +169,11 @@ class TestTryAcquireLeaderLock:
     def test_second_caller_fails(self, tmp_path: Path) -> None:
         """Two concurrent acquires: only one wins.
 
-        We don't spawn a subprocess — ``fcntl.flock`` is per-fd, not
-        per-process, but the same fd held by the first acquire still
-        blocks the second open+flock attempt from the same process
-        (POSIX semantics for ``LOCK_EX | LOCK_NB``).
+        We don't spawn a subprocess (:class:`TestLockSemantics` does): the
+        lock belongs to the open file on both platforms (flock: the open
+        file description; Windows: the file handle), so the descriptor held
+        by the first acquire blocks the second open-and-lock from the same
+        process.
         """
         lock = tmp_path / "agentchat-ws.lock"
         first = try_acquire_ws_leader_lock(lock)
@@ -195,6 +199,7 @@ class TestTryAcquireLeaderLock:
         )
         release_leader_lock(second)
 
+    @pytest.mark.skipif(not _POSIX, reason="POSIX modes (Windows: the access list, test_owner_only)")
     def test_lock_file_mode_is_0o600(self, tmp_path: Path) -> None:
         """Lock file must NOT be world-readable.
 
@@ -213,18 +218,37 @@ class TestTryAcquireLeaderLock:
 
     def test_missing_lock_directory_is_created(self, tmp_path: Path) -> None:
         """The lock directory is ours — a fresh profile root must not block
-        leader election. Created 0700 when it is the agentchat-locks dir."""
+        leader election. Created owner-only when it is the agentchat-locks
+        dir (0700; on Windows the owner-only access list)."""
         lock = tmp_path / LOCK_DIRNAME / "ws-abc.lock"
         fd = try_acquire_ws_leader_lock(lock)
         assert fd is not None
         try:
             assert lock.parent.is_dir()
-            assert (lock.parent.stat().st_mode & 0o777) == 0o700
+            if _POSIX:
+                assert (lock.parent.stat().st_mode & 0o777) == 0o700
+            else:
+                from agentchatme_hermes import owner_only
+
+                access = owner_only.inspect(lock.parent)
+                assert access is not None and access.private and access.protected
         finally:
             release_leader_lock(fd)
 
+    def test_the_lock_file_stays_empty(self, tmp_path: Path) -> None:
+        """Nothing is written into the lock file (no PID): on Windows the
+        range locked lies past the end of the empty file, which LockFile
+        allows."""
+        lock = tmp_path / "agentchat-ws.lock"
+        fd = try_acquire_ws_leader_lock(lock)
+        assert fd is not None
+        try:
+            assert lock.stat().st_size == 0
+        finally:
+            release_leader_lock(fd)
+        assert lock.stat().st_size == 0
 
-@_posix_only
+
 class TestDescribeLockHolder:
     def test_not_present_when_file_missing(self, tmp_path: Path) -> None:
         lock = tmp_path / "agentchat-ws.lock"
@@ -270,7 +294,6 @@ class TestDescribeLockHolder:
             release_leader_lock(holder_fd)
 
 
-@_posix_only
 class TestReleaseLeaderLock:
     def test_release_invalid_fd_does_not_raise(self) -> None:
         """Double-release / release of closed fd must be silent."""
@@ -281,6 +304,166 @@ class TestReleaseLeaderLock:
         release_leader_lock(r_fd)
         # Cleanup.
         os.close(w_fd)
+
+
+# ───────────────────── the lock's semantics, both platforms ─────────────────────
+
+# A child process that takes the lock and reports, then holds it until its
+# stdin closes (or it is killed).
+_HOLDER = textwrap.dedent(
+    """
+    import sys
+    from pathlib import Path
+
+    from agentchatme_hermes.leader_lock import try_acquire_ws_leader_lock
+
+    fd = try_acquire_ws_leader_lock(Path(sys.argv[1]))
+    print("held" if fd is not None else "busy", flush=True)
+    sys.stdin.readline()
+    """
+)
+
+
+def _holder(lock: Path) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        [sys.executable, "-c", _HOLDER, str(lock)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+    )
+
+
+def _first_line(proc: subprocess.Popen[str]) -> str:
+    assert proc.stdout is not None
+    return proc.stdout.readline().strip()
+
+
+def _acquire_within(lock: Path, seconds: float) -> int | None:
+    """The lock, once free: Windows unlocks a dead holder's range "as
+    resources allow", so a moment may pass after the process is gone."""
+    deadline = time.monotonic() + seconds
+    while True:
+        fd = try_acquire_ws_leader_lock(lock)
+        if fd is not None or time.monotonic() >= deadline:
+            return fd
+        time.sleep(0.05)
+
+
+def _end(proc: subprocess.Popen[str]) -> None:
+    for stream in (proc.stdin, proc.stdout):
+        if stream is not None:
+            stream.close()
+    proc.wait(timeout=30)
+
+
+class TestLockSemantics:
+    """What the plugin relies on, on the platform the suite runs on."""
+
+    def test_another_process_holding_it_keeps_this_one_out(self, tmp_path: Path) -> None:
+        lock = tmp_path / LOCK_DIRNAME / "ws-two.lock"
+        proc = _holder(lock)
+        try:
+            assert _first_line(proc) == "held"
+            assert try_acquire_ws_leader_lock(lock) is None, "the other process holds it"
+            assert describe_lock_holder(lock) == "held"
+            with held_lock(lock, timeout_s=0.2) as state:
+                assert state == "busy"
+        finally:
+            _end(proc)
+        fd = _acquire_within(lock, 10.0)
+        assert fd is not None, "the holder exited: the lock is free"
+        release_leader_lock(fd)
+        assert describe_lock_holder(lock) == "free"
+
+    def test_this_process_holding_it_keeps_another_out(self, tmp_path: Path) -> None:
+        lock = tmp_path / LOCK_DIRNAME / "ws-two.lock"
+        fd = try_acquire_ws_leader_lock(lock)
+        assert fd is not None
+        try:
+            proc = _holder(lock)
+            try:
+                assert _first_line(proc) == "busy"
+            finally:
+                _end(proc)
+        finally:
+            release_leader_lock(fd)
+
+    def test_a_killed_holder_leaves_no_lock_behind(self, tmp_path: Path) -> None:
+        """No cleanup runs in a killed process (SIGKILL; TerminateProcess on
+        Windows): the OS releases its lock when its descriptors go."""
+        lock = tmp_path / LOCK_DIRNAME / "ws-killed.lock"
+        proc = _holder(lock)
+        try:
+            assert _first_line(proc) == "held"
+            assert try_acquire_ws_leader_lock(lock) is None
+            proc.kill()
+            proc.wait(timeout=30)
+        finally:
+            _end(proc)
+        fd = _acquire_within(lock, 10.0)
+        assert fd is not None, "a killed holder must not keep the lock"
+        release_leader_lock(fd)
+
+    def test_two_descriptors_in_one_process_exclude_each_other(self, tmp_path: Path) -> None:
+        """Two profiles of one multiplexed gateway, one key: the second
+        descriptor is refused while the first holds it, through both entry
+        points, and takes it once the first lets go."""
+        lock = tmp_path / LOCK_DIRNAME / "ws-shared.lock"
+        first = try_acquire_ws_leader_lock(lock)
+        assert first is not None
+        try:
+            assert try_acquire_ws_leader_lock(lock) is None
+            with held_lock(lock, timeout_s=0.1) as state:
+                assert state == "busy"
+        finally:
+            release_leader_lock(first)
+        with held_lock(lock, timeout_s=0.1) as state:
+            assert state == "held"
+            assert try_acquire_ws_leader_lock(lock) is None, "held_lock's descriptor holds it"
+        second = try_acquire_ws_leader_lock(lock)
+        assert second is not None, "released at the end of the block"
+        release_leader_lock(second)
+
+    def test_an_attempt_on_a_held_lock_answers_at_once(self, tmp_path: Path) -> None:
+        lock = tmp_path / "agentchat-ws.lock"
+        fd = try_acquire_ws_leader_lock(lock)
+        assert fd is not None
+        try:
+            started = time.monotonic()
+            assert try_acquire_ws_leader_lock(lock) is None
+            assert time.monotonic() - started < 1.0, "non-blocking"
+        finally:
+            release_leader_lock(fd)
+
+    def test_the_descriptor_is_not_inherited(self, tmp_path: Path) -> None:
+        """A child the gateway starts must never keep the lock alive."""
+        lock = tmp_path / "agentchat-ws.lock"
+        fd = try_acquire_ws_leader_lock(lock)
+        assert fd is not None
+        try:
+            assert os.get_inheritable(fd) is False
+        finally:
+            release_leader_lock(fd)
+
+    def test_held_lock_waits_for_a_holder_that_lets_go(self, tmp_path: Path) -> None:
+        lock = tmp_path / LOCK_DIRNAME / "ws-wait.lock"
+        proc = _holder(lock)
+        try:
+            assert _first_line(proc) == "held"
+            assert proc.stdin is not None
+            proc.stdin.write("\n")
+            proc.stdin.flush()
+            with held_lock(lock, timeout_s=15.0) as state:
+                assert state == "held"
+        finally:
+            _end(proc)
+
+    def test_held_lock_is_unavailable_where_no_lock_file_can_be_made(self, tmp_path: Path) -> None:
+        not_a_dir = tmp_path / "file"
+        not_a_dir.write_text("", encoding="utf-8")
+        with held_lock(not_a_dir / "signup.lock", timeout_s=0.1) as state:
+            assert state == "unavailable"
 
 
 def _set_env(name: str, value: str, monkeypatch: Any) -> None:
@@ -344,7 +527,6 @@ class TestLockPathFor:
         assert legacy_lock_path() == tmp_path / ".hermes" / "agentchat-ws.lock"
 
 
-@_posix_only
 class TestTwoProfilesOneMachine:
     """Reproduction of the September 2026 fleet failure, now passing.
 
@@ -407,6 +589,15 @@ class TestArgvGatewayRunOnly:
             ["hermes", "gateway", "--replace", "run"],
             ["python", "-m", "hermes_cli.main", "gateway", "run"],
             ["hermes", "gateway"],  # legacy spelling of "start the gateway"
+            # Native Windows: the Scheduled Task's launcher and `hermes gateway
+            # start` both run `<Hermes' python.exe> -m hermes_cli.main
+            # [--profile X] gateway run` (hermes_cli/gateway_windows.py
+            # _gateway_run_argv); inside it argv[0] is the module's path and
+            # Hermes has stripped the profile selector.
+            [r"C:\Users\me\AppData\Local\hermes\hermes-agent\hermes_cli\main.py", "gateway", "run"],
+            [r"C:\Users\me\AppData\Local\hermes\hermes-agent\hermes_cli\main.py", "gateway", "run", "--quiet"],
+            # Hermes' launcher script runs the entry point inside `python -c`.
+            ["-c", "gateway", "run"],
         ],
     )
     def test_gateway_run_forms_are_candidates(self, argv: list[str]) -> None:

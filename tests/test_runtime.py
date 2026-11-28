@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import contextlib
 import logging
-import sys
 import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -33,9 +32,6 @@ from fake_keys import api_key
 # default, are tests/test_pinned_texts.py.
 pytestmark = pytest.mark.usefixtures("live_texts")
 
-# The tests that take the real leader lock: fcntl is POSIX-only, as in
-# test_leader_lock.py (the plugin receives only where Hermes' gateway runs).
-_posix_only = pytest.mark.skipif(sys.platform == "win32", reason="the real leader lock is fcntl, POSIX-only")
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -608,7 +604,6 @@ class TestUnloadedRuntime:
             runtime_module.forget_runtime(fresh)
 
 
-@_posix_only
 class TestReloadWithALiveTurn:
     """A plugin reload (or stop) while an AgentChat turn runs: the old
     instance keeps the account's leader lock until that turn's thread has
@@ -827,7 +822,6 @@ class _FakeApi:
         self.server.server_close()
 
 
-@_posix_only
 class TestStopRecordsBeforeLettingGo:
     """The real receiver, invoker, SDK clients and leader lock against
     AgentChat's API on loopback (only Hermes is stood in for): a turn that

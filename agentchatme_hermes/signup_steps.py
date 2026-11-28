@@ -43,7 +43,7 @@ from typing import TYPE_CHECKING, Any, cast
 
 from . import allow
 from .key_store import same_home, store_dir
-from .state import read_json, write_json_atomic
+from .state import read_json, remove_file, write_json_atomic
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -145,14 +145,16 @@ def save_pending(home: Path, pending: Pending) -> None:
         value = getattr(pending, name)
         if value:
             record[name] = value
-    write_json_atomic(pending_path(home), record)
+    # The flow answers the emailed code: its folder is made private (and one
+    # that cannot be is refused) before it is written.
+    write_json_atomic(pending_path(home), record, root=Path(home), private_dir=True)
 
 
 def drop_pending(home: Path) -> bool:
     """End the waiting sign-up (its file removed); ``True`` when there was a file."""
     path = pending_path(home)
     try:
-        path.unlink()
+        remove_file(path)
     except FileNotFoundError:
         return False
     except OSError:

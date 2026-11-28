@@ -179,7 +179,6 @@ def test_doctor_lines_for_could_not_process() -> None:
     assert pause_end("2026-11-20T23:13:48.12345+00:00") == pause_end("2026-11-20T23:13:48.123450Z")
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="the leader lock is fcntl, POSIX-only")
 def test_status_shows_could_not_process_from_this_accounts_health_record(capsys: pytest.CaptureFixture[str]) -> None:
     """``hermes agentchat status`` reads the running gateway's record for
     this account (beside its leader lock) and prints the counts and the

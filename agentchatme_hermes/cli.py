@@ -1075,10 +1075,16 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             )
             break
 
+    cmd = cli_prefix(hermes_home)
+    # Windows: a home other accounts can change keeps no key from them.
+    home_problem = key_store.home_problem(hermes_home)
+    if home_problem is not None:
+        fail(home_problem)
+    if getattr(args, "fix", False):
+        _fix_key_file_access(hermes_home, cmd=cmd, ok=ok, fail=fail)
     resolution = resolve_key(hermes_home)
     saved_key = resolution.api_key
-    cmd = cli_prefix(hermes_home)
-    _doctor_key_checks(resolution, cmd=cmd, ok=ok, warn=warn, fail=fail)
+    _doctor_key_checks(resolution, cmd=cmd, ok=ok, warn=warn, fail=fail, home_kept=home_problem is None)
 
     api_base = _api_base()
     if api_base == _DEFAULT_API_BASE:
@@ -1736,8 +1742,11 @@ def _doctor_key_checks(
     ok: Callable[[str], None],
     warn: Callable[[str], None],
     fail: Callable[[str], None],
+    home_kept: bool = True,
 ) -> None:
-    """Where this profile's key is, and whether this profile may act as it."""
+    """Where this profile's key is, and whether this profile may act as it.
+    ``home_kept``: the Hermes home is no other account's to change (Windows,
+    :func:`.key_store.home_problem`); "readable by you only" is said only then."""
     store = resolution.store
     if resolution.refusal is not None:
         fail(resolution.refusal)
@@ -1748,9 +1757,12 @@ def _doctor_key_checks(
         )
         where = _key_file(store.path)
         ok(f"key saved in {where} ({_mask_key(resolution.api_key)}, readable by you only) — {decides}"
-           if not store.loose_mode else
+           if not store.loose_mode and home_kept else
            f"key saved in {where} ({_mask_key(resolution.api_key)}) — {decides}")
-        if store.loose_mode:
+        if store.loose_mode and sys.platform == "win32":
+            warn(f"{store.path}: its access list lets another account read it, or has no entry for you — "
+                 f"`{cmd} doctor --fix` sets it to you, SYSTEM and Administrators only")
+        elif store.loose_mode:
             warn(f"{store.path} can be read by its group or others — `{cmd} doctor --fix` makes it "
                  "readable by you only")
     elif resolution.api_key:
@@ -1781,10 +1793,12 @@ def _doctor_key_checks(
     if resolution.held_key:
         snapshots = _snapshots_holding_the_key(store.path.parent.parent)
         if snapshots:
+            pattern = snapshots[0].parent / "hermes-snap-*.sh"
+            remove = f'Remove-Item "{pattern}"' if sys.platform == "win32" else f"rm {pattern}"
             warn(
                 f"{len(snapshots)} Hermes terminal snapshot(s) in {snapshots[0].parent} still hold "
                 f"{_ENV_API_KEY} from before it was kept out of the agent's commands — delete them "
-                f"(`rm {snapshots[0].parent}/hermes-snap-*.sh`); the agent's commands could read the "
+                f"(`{remove}`); the agent's commands could read the "
                 f"key then, so consider `{cmd} recover` to rotate it"
             )
 
@@ -1890,6 +1904,38 @@ def _hermes_strips_key_from_commands() -> bool | None:
     except Exception:
         logger.debug("doctor: Hermes' env policy raised", exc_info=True)
         return None
+
+
+def _fix_key_file_access(
+    home: Path, *, cmd: str, ok: Callable[[str], None], fail: Callable[[str], None]
+) -> None:
+    """``doctor --fix``, before the key is resolved and without AgentChat: a key
+    file that is yours but other accounts can change (Windows: written by an
+    earlier release in a home whose list lets them) is made yours only, the key
+    kept, once the home itself is yours; never one of another owner, a link or
+    a hard link. A key file others can read, or with no entry for you (a folder
+    an elevated run made, this command run elevated), is tightened."""
+    store = key_store.read_store(home)
+    if store.loose_mode and key_store.tighten(home):
+        if key_store.home_problem(home) is None:
+            ok(f"fix: {store.path} made readable by you only")
+        else:
+            ok(f"fix: {store.path}'s own access list now names only you, SYSTEM and Administrators "
+               "(the Hermes home's does not: see above)")
+        return
+    try:
+        before = key_store.make_yours(home)
+    except key_store.KeyStoreError as exc:
+        fail(f"fix: the key file was not made yours only — {exc}")
+        return
+    if before is None:
+        return
+    after = key_store.read_store(home)
+    handle = after.key.handle if after.key is not None and after.key.handle else "?"
+    ok(
+        f"fix: {before.detail}; it is yours only now and still holds the key for @{handle} — if you did "
+        f"not save that key yourself, run `{cmd} recover` for a new one"
+    )
 
 
 def _fix_key(
