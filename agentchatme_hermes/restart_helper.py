@@ -127,6 +127,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     hermes = [part for part in args.hermes if part != "--"]
     pid = args.pid
+    restart_signal = getattr(signal, "SIGUSR1", None)  # Windows has none: the plugin never starts this there
+    if restart_signal is None:
+        _status(args.status, pid, "failed", "this platform has no graceful-restart signal")
+        return 2
     if not hermes:
         _log("no hermes command given")
         _status(args.status, pid, "failed", "no hermes command given")
@@ -139,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
         _log(f"gateway {pid} already ended")
     else:
         try:
-            os.kill(pid, signal.SIGUSR1)
+            os.kill(pid, restart_signal)
         except OSError as exc:
             _log(f"could not signal gateway {pid}: {exc}")
             _status(args.status, pid, "failed", f"could not signal the gateway: {exc}")

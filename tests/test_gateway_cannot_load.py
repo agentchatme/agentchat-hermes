@@ -114,13 +114,19 @@ class TestWhatIsSaid:
         assert line == credentials.LOAD_RESTART_LINE
         assert "/restart" in line and "hermes gateway restart" in line
 
-    def test_in_an_agents_terminal_the_persons_allow_restarts_it(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("supported", [True, False])
+    def test_in_an_agents_terminal_the_persons_allow_restarts_it_where_it_can(
+        self, monkeypatch: pytest.MonkeyPatch, supported: bool
+    ) -> None:
+        from agentchatme_hermes import gateway_restart
+
         monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
         monkeypatch.setattr(allow, "read_switch", lambda home, *, api_base: allow.Switch("not_allowed_yet"))
+        monkeypatch.setattr(gateway_restart, "supported", lambda: supported)
         monkeypatch.setenv("HERMES_SESSION_ID", "s")
         line = credentials.key_in_use_line(None, "ac_x", serving=False, runs=True, home=profile_home())
-        assert line == credentials.LOAD_ON_ALLOW_LINE_AGENT
-        assert "Never restart it yourself" in line
+        assert line == (credentials.LOAD_ON_ALLOW_LINE_AGENT if supported else credentials.LOAD_RESTART_LINE_AGENT)
+        assert ("Never restart it yourself" if supported else "the person's, not yours") in line
 
     def test_in_an_agents_terminal_allowed_already_the_restart_is_the_persons(
         self, monkeypatch: pytest.MonkeyPatch

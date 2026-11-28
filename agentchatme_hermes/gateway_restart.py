@@ -51,9 +51,11 @@ _FAILED = "failed"
 
 def supported() -> bool:
     """Can a restart be requested from here at all (POSIX, with SIGUSR1, not as root)?"""
-    if os.name == "nt" or not hasattr(signal, "SIGUSR1"):
+    # Looked up, not referenced: Windows has neither (and the code type-checks on every platform).
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None or getattr(signal, "SIGUSR1", None) is None:
         return False
-    return os.geteuid() != 0
+    return bool(geteuid() != 0)
 
 
 def request_load_restart(home: Path) -> bool:
