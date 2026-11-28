@@ -32,6 +32,8 @@ name: windows-native
 # key never is (Hermes' logs and doctor mask it, GitHub masks the secret).
 
 on:
+  push:
+    branches: [feat/windows-native]
   workflow_dispatch:
     inputs:
       hermes_channel:
