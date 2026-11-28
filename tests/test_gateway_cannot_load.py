@@ -201,7 +201,10 @@ class TestWhatIsSaid:
         assert allow._write_answer("no", scope=scope, agent="@a") == allow.NOT_ALLOWED_LINE.format(who="@a")
 
     def test_the_setup_line_asks_for_no_restart_the_allow_will_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import gateway_restart
+
         monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
+        monkeypatch.setattr(gateway_restart, "supported", lambda: True)  # POSIX; Windows: the test below
         text = setup_prompt.section_text(profile_home(), api_base="https://api.agentchat.me")
         assert text == setup_prompt.NOT_SET_UP.format(cmd="hermes agentchat")
 
