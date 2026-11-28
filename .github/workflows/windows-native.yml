@@ -57,8 +57,6 @@ name: windows-native
 # the repository token (persist-credentials: false).
 
 on:
-  push:
-    branches: [feat/windows-native]
   workflow_dispatch:
     inputs:
       hermes_channel:
