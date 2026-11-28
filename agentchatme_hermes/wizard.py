@@ -57,7 +57,6 @@ from .soul_anchor import remove_soul_anchor
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from pathlib import Path
 
     from agentchatme.integration.account import AccountAnswer, AccountQuestion
 
@@ -729,26 +728,21 @@ def _allow_tools_flow(handle: str, *, print_info: Any, print_warning: Any) -> No
     if step.failed:
         print_warning(f"AgentChat tools: nothing changed — {step.detail}")
         return
+    restart = allow.restart_after_yes(resolve_hermes_home(), outcome=step.outcome) if tools.decision == "yes" else None
+    if restart is not None:
+        _show_tools(tools, print_info)
+        _step(restart)
+        return
     if step.outcome == "restart":
         print_warning(f"AgentChat tools: {step.detail}")
         return
     _show_tools(tools, print_info)
-    restart = allow.restart_after_yes(allow_home()) if tools.decision == "yes" else None
-    if restart is not None:
-        _step(restart)
-    elif step.outcome == "applying":
+    if step.outcome == "applying":
         _step(f"The running gateway applies it: {allow.APPLY_WORDS}")
     elif step.outcome == "allowed":
         _step("An open Hermes session uses it after /reload-mcp")
     elif step.outcome == "added" and tools.decision == "yes":
         _step("A running gateway connects them within about a minute")
-
-
-def allow_home() -> Path:
-    """This profile's home (where the wizard runs)."""
-    from .profile_scope import resolve_hermes_home
-
-    return resolve_hermes_home()
 
 
 def _place_or_warn(
@@ -777,6 +771,10 @@ def _place_or_warn(
             print_warning(f"{step.name}: {step.detail}")
         else:
             _step(step.detail)
+    if tools_decision == "yes":
+        # The person's yes at their own terminal starts the restart a first install needs;
+        # the key-in-use line after setup says it is under way.
+        allow.restart_after_yes(resolve_hermes_home(), outcome=mcp_outcome)
     return mcp_outcome
 
 

@@ -91,16 +91,25 @@ NO_RESTART_LINE = (
 _LOAD_WHY = "The running gateway started before the AgentChat plugin was installed, so it cannot run AgentChat yet"
 _LOAD_HOW = "send /restart in a chat with the agent on Telegram or another messaging app, or run `hermes gateway restart`"
 LOAD_RESTART_LINE = f"{_LOAD_WHY}: restart it once, and AgentChat starts by itself ({_LOAD_HOW})."
+# The same restart, asked of the person by the agent (the setup line, the reminder, setup output).
+RESTART_HOW_FOR_AGENT = _LOAD_HOW.replace("the agent", "you")
 LOAD_RESTART_LINE_AGENT = (
     f"{_LOAD_WHY}: it needs one restart, and that restart is the person's, not yours (it stops every turn the "
-    f"gateway serves, this one too). Ask your person to {_LOAD_HOW.replace('the agent', 'you')}."
+    f"gateway serves, this one too). Ask your person to {RESTART_HOW_FOR_AGENT}."
 )
 # Where the plugin can start Hermes' graceful restart itself (:mod:`.gateway_restart`, POSIX): the
 # person's Allow starts it, so nobody runs a restart by hand.
 LOAD_RESTARTING_LINE = (
     "The running gateway started before the AgentChat plugin was installed: it restarts by itself as soon as "
-    "it is idle (a few seconds) to load the plugin. This chat carries on, and AgentChat starts by itself."
+    "it is idle (usually seconds; it lets running work finish) to load the plugin. This chat carries on, and "
+    "AgentChat starts with the gateway."
 )
+# A yes written over a connection the running gateway keeps until it restarts.
+RESTARTING_FOR_YES_LINE = (
+    "The running gateway keeps its earlier AgentChat connection until it restarts: it restarts by itself as soon "
+    "as it is idle (usually seconds; it lets running work finish). This chat carries on."
+)
+
 LOAD_ON_ALLOW_LINE_AGENT = (
     f"{_LOAD_WHY}. Nothing to do for it: when your person sends /agentchat allow and taps Allow, the gateway "
     "restarts by itself once it is idle (a few seconds; their chat carries on). Never restart it yourself."
@@ -154,7 +163,7 @@ def key_in_use_line(
 
     where = home if home is not None else profile_scope.resolve_hermes_home()
     if gateway_cannot_load(where):
-        return _load_line(where, agent=in_agent_terminal())
+        return load_line(where, agent=in_agent_terminal())
     if not serving and runs is False:
         return start_gateway_line(home if home is not None else profile_scope.resolve_hermes_home())
     if not serving or before == api_key:
@@ -162,20 +171,21 @@ def key_in_use_line(
     return RESTART_HINT_AGENT if in_agent_terminal() else RESTART_HINT
 
 
-def _load_line(home: Path, *, agent: bool) -> str:
-    """The gateway cannot load the plugin until it restarts: what setup says. Allowed already, at a
-    person's own terminal, the restart is started now (:func:`.allow.restart_after_yes`). In an
-    agent's terminal it never is: the person's Allow starts it, or, allowed already, the person
-    restarts."""
+def load_line(home: Path, *, agent: bool) -> str:
+    """The gateway cannot load the plugin until it restarts: what to say about it. Reads only: a
+    restart is started by a person's yes (:func:`.allow.restart_after_yes`), never here. Under
+    way: it restarts by itself. In an agent's terminal, not allowed yet: the person's Allow will
+    start it. Otherwise the restart is the person's."""
     from . import allow, gateway_restart
+    from .config import resolve_api_base, stored_api_base
 
-    allowed = allow.read_switch(home, api_base=allow._api_base(home)).by_tier
+    if gateway_restart.restart_state(home) == "under_way":
+        return LOAD_RESTARTING_LINE
+    allowed = allow.read_switch(home, api_base=resolve_api_base(stored_api_base(home), strict=False)).by_tier
     if agent:
         if not allowed and gateway_restart.supported():
             return LOAD_ON_ALLOW_LINE_AGENT
         return LOAD_RESTART_LINE_AGENT
-    if allowed:
-        return allow.restart_after_yes(home) or LOAD_RESTART_LINE
     return LOAD_RESTART_LINE
 
 

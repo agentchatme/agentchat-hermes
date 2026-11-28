@@ -266,6 +266,19 @@ def _dotenv_guard(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
 
 
 @pytest.fixture(autouse=True)
+def _restart_guard(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> Iterator[list[int]]:
+    """No test starts the real restart helper: it would send SIGUSR1 to the gateway it targets,
+    which in a test is pytest itself (``os.getpid()``). A request records the pid instead.
+    ``tests/test_gateway_restart.py`` drives the spawn with Popen recorded (it opts out)."""
+    spawned: list[int] = []
+    if request.node.path.name != "test_gateway_restart.py":
+        from agentchatme_hermes import gateway_restart
+
+        monkeypatch.setattr(gateway_restart, "_spawn_helper", lambda home, pid, status: spawned.append(pid))
+    yield spawned
+
+
+@pytest.fixture(autouse=True)
 def _manual_sync_off(monkeypatch: pytest.MonkeyPatch) -> None:
     """A runtime syncs the manual by itself: once on a daemon thread when it
     is not the leader, and through the kit's ``ManualSync`` on the leader's

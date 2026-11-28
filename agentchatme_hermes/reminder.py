@@ -6,13 +6,16 @@ incoming messages would never fire. People forget, are busy, or were away when t
 So the plugin asks the agent to remind its person, in the next turn the person starts and at most
 once a day, until the person decides: Allow (it stops: the tools work) or Don't allow (it stops:
 the decision is respected). Where the gateway still needs the one restart a first install needs and
-the plugin could not start it (:mod:`.gateway_restart`: Windows, or it failed), the reminder asks
-for that instead.
+no restart is under way (:mod:`.gateway_restart`: Windows, a failed one, or the person allowed
+before the install), the reminder asks the person for it. The reminder itself never starts a
+restart: only a person's yes does. It is not given where the person cannot act on it (a
+package-managed or hand-written tools entry, a yes that could not be written).
 
 Mechanism: Hermes' ``pre_llm_call`` hook (public, in every Hermes the plugin accepts): once per
 turn, before the model runs, a returned string is added to the turn's user message. The hook adds
-the reminder only to a turn a person started: never to a cron job, a delegated subagent, the API
-server, a webhook, or AgentChat's own turns. The day is counted per profile, in
+the reminder only to a turn started on a chat platform a person uses (an allowlist: a new kind of
+turn gets no reminder rather than using up the day), never to a delegated subagent's. The day is
+checked first, from one small file, before anything else is read; it is counted per profile, in
 ``<profile home>/agentchat/reminder.json``, claimed under a lock so two turns at once remind once.
 The words are this release's, fixed. The hook never raises: Hermes skips a failing hook.
 """
@@ -21,6 +24,8 @@ from __future__ import annotations
 import logging
 import time
 from typing import TYPE_CHECKING, Any
+
+from .credentials import RESTART_HOW_FOR_AGENT
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -32,9 +37,17 @@ logger = logging.getLogger(__name__)
 RECORD_FILENAME = "reminder.json"
 LOCK_FILENAME = "reminder.lock"
 REMIND_EVERY_S = 24 * 3600.0
-# Turns no person started: Hermes' cron and subagent platforms, its API server and webhooks, and
-# AgentChat's own turns (agent_invoker runs them as platform "agentchat").
-SKIP_PLATFORMS = frozenset({"cron", "subagent", "api_server", "webhook", "agentchat"})
+# Where a person talks to the agent: the classic CLI and Hermes' local windows (``tui``, ``desktop``,
+# ``local``), the chat platforms of gateway/config.py ``Platform`` and the person-chat platform
+# plugins (plugins/platforms/). Not: cron, subagent, curator, gateway, the API server, webhooks, the
+# relay, AgentChat's own turns, nor the agent and community relays (a2a, raft, buzz), where the
+# speaker may not be the agent's person.
+PERSON_PLATFORMS = frozenset({
+    "cli", "local", "tui", "desktop",
+    "telegram", "discord", "whatsapp", "whatsapp_cloud", "slack", "signal", "mattermost", "matrix",
+    "email", "sms", "dingtalk", "feishu", "wecom", "weixin", "bluebubbles", "qqbot",
+    "google_chat", "irc", "line", "simplex", "teams", "photon", "yuanbao", "ntfy",
+})
 
 REMIND_ALLOW = (
     "AgentChat note for this turn (from the AgentChat plugin, at most once a day): before anything else, "
@@ -45,28 +58,33 @@ REMIND_ALLOW = (
 REMIND_RESTART = (
     "AgentChat note for this turn (from the AgentChat plugin, at most once a day): before anything else, "
     "tell your person in one short line that you are {who} on AgentChat but it cannot run until Hermes' "
-    "gateway restarts once (it started before the plugin was installed): /restart in a chat with you on "
-    "Telegram or another messaging app, or hermes gateway restart. Never restart it yourself. Then go on "
-    "with their message as usual."
+    "gateway restarts once (it started before the plugin was installed): ask them to "
+    + RESTART_HOW_FOR_AGENT
+    + ". Never restart it yourself. Then go on with their message as usual."
 )
 
 
 def reminder_text(home: Path, *, api_base: str) -> str | None:
     """The reminder this profile needs now (run in its scope), or ``None``: not set up (the setup
-    line in the system prompt covers sign-up), allowed and running, or declined."""
+    line in the system prompt covers sign-up), allowed and running or restarting, declined, or a
+    step the person cannot take here. Reads only: it never starts a restart."""
     from . import allow, gateway_restart
     from .config import profile_handles, resolve_key
+    from .mcp_registration import config_is_managed
     from .placement import gateway_cannot_load
 
     if resolve_key(home).api_key is None:
         return None
     switch = allow.read_switch(home, api_base=api_base)
+    if switch.gave_up:
+        return None
     who = allow.who(profile_handles(home).own)
     if switch.state == "not_allowed_yet":
+        entry = switch.allowance.entry if switch.allowance is not None else None
+        if config_is_managed() or entry == "user_managed":
+            return None  # /agentchat allow cannot ask here: the operator writes the entry
         return REMIND_ALLOW.format(who=who)
-    if switch.by_tier and gateway_cannot_load(home):
-        if gateway_restart.request_load_restart(home):
-            return None  # under way (a restart the Allow started earlier, or now)
+    if switch.by_tier and gateway_cannot_load(home) and gateway_restart.restart_state(home) != "under_way":
         return REMIND_RESTART.format(who=who)
     return None
 
@@ -80,7 +98,7 @@ def register_reminder(ctx: Any, scope: ProfileScope) -> bool:
 
     def hook(**kwargs: Any) -> str | None:
         try:
-            if str(kwargs.get("platform") or "") in SKIP_PLATFORMS or kwargs.get("parent_session_id"):
+            if str(kwargs.get("platform") or "") not in PERSON_PLATFORMS or kwargs.get("parent_session_id"):
                 return None
             return scope.run(_due, scope.home)
         except Exception:
@@ -98,10 +116,22 @@ def register_reminder(ctx: Any, scope: ProfileScope) -> bool:
 def _due(home: Path) -> str | None:
     from .config import resolve_api_base, stored_api_base
 
+    if _reminded_recently(home):
+        return None  # the cheap check first: one small file, nothing else read
     text = reminder_text(home, api_base=resolve_api_base(stored_api_base(home), strict=False))
     if text is None or not _claim(home):
         return None
     return text
+
+
+def _reminded_recently(home: Path, *, now: float | None = None) -> bool:
+    from .key_store import store_dir
+    from .state import read_json
+
+    record: Any = read_json(store_dir(home) / RECORD_FILENAME)
+    last = record.get("at") if isinstance(record, dict) else None
+    stamp = time.time() if now is None else now
+    return isinstance(last, (int, float)) and 0 <= stamp - last < REMIND_EVERY_S
 
 
 def _claim(home: Path, *, now: float | None = None) -> bool:

@@ -403,6 +403,7 @@ def _dispatch_login(args: argparse.Namespace) -> int:
     steps = _install_placement(checked.handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
     _printline(f"Saved AgentChat key for @{checked.handle}.")
     _print_tools_line(tools, steps)
+    _restart_for_yes(tools, steps)
     _printline(credentials.key_in_use_line(before, api_key, serving=serving, runs=runs))
     return _EXIT_OK
 
@@ -558,8 +559,21 @@ def _save_and_place(*, api_key: str, handle: str, api_base: str, on_saved: Calla
         return _EXIT_API_ERR
     steps = _install_placement(handle, api_base=api_base, api_key=api_key, tools_decision=tools.decision)
     _print_tools_line(tools, steps)
+    _restart_for_yes(tools, steps)
     on_saved(handle=handle, api_key=api_key, before=before, serving=serving, runs=runs)
     return _EXIT_OK
+
+
+def _restart_for_yes(tools: allow.SetupDecision, steps: list[PlacementStep]) -> None:
+    """A person's yes at their own terminal (only a person is asked: never in an agent's
+    terminal) starts the restart a first install needs (:func:`.allow.restart_after_yes`); the
+    key-in-use line that follows says it is under way."""
+    if tools.decision != "yes":
+        return
+    from .profile_scope import resolve_hermes_home
+
+    outcome = next((step.outcome for step in steps if step.name == "mcp"), None)
+    allow.restart_after_yes(resolve_hermes_home(), outcome=outcome)
 
 
 # ─── sign-up one step per command (an agent's terminal; no terminal) ──────
@@ -796,7 +810,10 @@ def _dispatch_allow(_args: argparse.Namespace) -> int:
     step = place_mcp(api_base, decision=tools.decision)
     if step.failed:
         return _exit_with(f"AgentChat tools: nothing changed — {step.detail}")
-    if step.outcome == "applying":
+    restart = allow.restart_after_yes(home, outcome=step.outcome) if tools.decision == "yes" else None
+    if restart is not None:
+        _printline(f"{allow.ALLOWED_LINE}. {restart}")
+    elif step.outcome == "applying":
         _printline(allow.APPLYING_LINE + ".")
     elif step.outcome == "restart":
         _printline(f"AgentChat tools: {step.detail}.")
@@ -804,10 +821,6 @@ def _dispatch_allow(_args: argparse.Namespace) -> int:
         _printline(tools.line + ("." if tools.decision == "yes" else ""))
     if step.status == "changed":
         _printline(f"{step.name}: {step.detail}")
-    if tools.decision == "yes":
-        restart = allow.restart_after_yes(home)
-        if restart is not None:
-            _printline(restart)
     return _EXIT_OK if tools.decision == "yes" else _EXIT_API_ERR
 
 
@@ -1434,10 +1447,23 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             # The gateway runs; AgentChat's runtime in it does not hold this
             # account's socket (it retries while AgentChat cannot be reached,
             # or its start failed: the gateway log says which).
+            from . import gateway_restart
             from .placement import gateway_cannot_load
 
             if gateway_cannot_load(hermes_home):
-                fail(credentials.LOAD_RESTART_LINE)
+                restarting = gateway_restart.restart_state(hermes_home)
+                if restarting == "under_way":
+                    warn(
+                        "the gateway is restarting to load the plugin (the person's Allow started it; it waits "
+                        f"until no work is in flight): {gateway_restart.log_path(hermes_home)} says each step"
+                    )
+                elif restarting == "failed":
+                    fail(
+                        f"{credentials.LOAD_RESTART_LINE} The automatic restart did not finish: "
+                        f"{gateway_restart.restart_detail(hermes_home) or 'see ' + str(gateway_restart.log_path(hermes_home))}"
+                    )
+                else:
+                    fail(credentials.LOAD_RESTART_LINE)
             else:
                 warn(
                     f"WS leader lock not held ({lock_path}) — the gateway runs, but AgentChat's runtime in it "

@@ -1237,37 +1237,36 @@ def _read_command(raw_args: str, *, scope: ProfileScope) -> str | _Question:
 
 
 def _write_answer(decision: Decision, *, scope: ProfileScope, agent: str) -> str:
-    """In the profile's scope: the person's answer written. After a yes, a
-    gateway that cannot run AgentChat until it restarts (a first install
-    into a running gateway, :func:`.placement.gateway_cannot_load`) is
-    restarted by Hermes' own graceful restart (:func:`restart_after_yes`),
-    and the reply says so instead of how the tools connect."""
-    reply = _written_answer(decision, scope=scope, agent=agent)
-    if decision != "yes" or not reply.startswith("AgentChat tools allowed for"):
-        return reply
-    restart = restart_after_yes(scope.home)
-    return reply if restart is None else f"AgentChat tools allowed for {agent}. {restart}"
+    """In the profile's scope: the person's answer written, and how it comes into use."""
+    return _written_answer(decision, scope=scope, agent=agent)
 
 
-def restart_after_yes(home: Path) -> str | None:
-    """After a person's yes: when the gateway cannot load the plugin until it restarts, start
-    Hermes' graceful restart (:mod:`.gateway_restart`) and say so; where it cannot be started
-    (Windows, no gateway found), say the restart is the person's. ``None`` when no restart is
-    needed. The one place a yes leads to a restart: ``/agentchat allow``, ``hermes agentchat
-    allow``, the wizard's Allow and setup at a person's own terminal."""
+def restart_after_yes(home: Path, *, outcome: str | None = None) -> str | None:
+    """After a person's yes, the restart it needs: the gateway cannot load the plugin until it
+    restarts (:func:`.placement.gateway_cannot_load`), or the yes was written in place over a
+    connection the running gateway keeps until it restarts (``outcome`` ``restart``). Starts
+    Hermes' graceful restart (:mod:`.gateway_restart`) and says so; where it cannot be started
+    (Windows, no gateway found, a root process), says the restart is the person's. ``None`` when
+    no restart is needed. Called only for a person's yes: ``/agentchat allow``, ``hermes agentchat
+    allow``, the wizard's Allow, and setup at a person's own terminal."""
     from . import gateway_restart
-    from .credentials import LOAD_RESTART_LINE, LOAD_RESTARTING_LINE
+    from .credentials import (
+        LOAD_RESTART_LINE,
+        LOAD_RESTARTING_LINE,
+        RESTARTING_FOR_YES_LINE,
+    )
     from .placement import gateway_cannot_load
 
-    if not gateway_cannot_load(home):
-        return None
-    if gateway_restart.request_load_restart(home):
-        return LOAD_RESTARTING_LINE
-    return LOAD_RESTART_LINE
+    if gateway_cannot_load(home):
+        return LOAD_RESTARTING_LINE if gateway_restart.request_load_restart(home) else LOAD_RESTART_LINE
+    if outcome == "restart" and gateway_restart.request_load_restart(home):
+        return RESTARTING_FOR_YES_LINE
+    return None  # no restart needed, or the placement's own words say the restart is the person's
 
 
 def _written_answer(decision: Decision, *, scope: ProfileScope, agent: str) -> str:
-    """The answer written, and how it comes into use."""
+    """The answer written, and how it comes into use: after a yes that needs a restart, the
+    restart (:func:`restart_after_yes`)."""
     from .leader_lock import is_hermes_gateway_process
     from .placement import place_mcp
 
@@ -1280,6 +1279,11 @@ def _written_answer(decision: Decision, *, scope: ProfileScope, agent: str) -> s
     note = f" {host_isolation_note()}." if plugin_host_isolation() else ""
     if decision == "no":
         return NOT_ALLOWED_LINE.format(who=agent) + note
+    restart = restart_after_yes(scope.home, outcome=step.outcome)
+    if restart is not None:
+        if step.outcome == "applying" and is_hermes_gateway_process():
+            start_completion(scope, api_base=api_base)
+        return f"AgentChat tools allowed for {agent}. {restart}{note}"
     if step.outcome == "applying":
         if is_hermes_gateway_process():
             start_completion(scope, api_base=api_base)

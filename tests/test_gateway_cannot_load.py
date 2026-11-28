@@ -133,13 +133,25 @@ class TestWhatIsSaid:
         line = credentials.key_in_use_line(None, "ac_x", serving=False, runs=True, home=profile_home())
         assert line == credentials.LOAD_RESTART_LINE_AGENT
 
-    def test_at_a_persons_terminal_allowed_the_restart_starts(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_a_restart_under_way_is_said(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import gateway_restart
+
         monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
-        monkeypatch.setattr(allow, "read_switch", lambda home, *, api_base: MagicMock(by_tier=True))
-        monkeypatch.setattr(allow, "restart_after_yes", lambda home: credentials.LOAD_RESTARTING_LINE)
+        monkeypatch.setattr(gateway_restart, "restart_state", lambda home: "under_way")
         monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
         line = credentials.key_in_use_line(None, "ac_x", serving=False, runs=True, home=profile_home())
         assert line == credentials.LOAD_RESTARTING_LINE
+
+    def test_the_line_never_starts_a_restart(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from agentchatme_hermes import gateway_restart
+
+        monkeypatch.setattr(placement, "gateway_cannot_load", lambda home: True)
+        monkeypatch.setattr(allow, "read_switch", lambda home, *, api_base: MagicMock(by_tier=True))
+        monkeypatch.setattr(gateway_restart, "restart_state", lambda home: None)
+        monkeypatch.setattr(gateway_restart, "request_load_restart", lambda home: pytest.fail("a line restarted it"))
+        monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+        line = credentials.key_in_use_line(None, "ac_x", serving=False, runs=True, home=profile_home())
+        assert line == credentials.LOAD_RESTART_LINE
 
     @pytest.mark.parametrize("outcome", ["changed", "allowed", "applying"])
     @pytest.mark.parametrize("started", [True, False])
