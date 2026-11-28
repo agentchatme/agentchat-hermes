@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 import time
 from contextlib import suppress
 from pathlib import Path
@@ -108,38 +107,44 @@ def remove_file(path: Path) -> None:
             time.sleep(_REMOVE_DELAY_S)
 
 
-def write_json_atomic(path: Path, record: Any) -> None:
+def write_json_atomic(
+    path: Path, record: Any, *, root: Path | None = None, private_dir: bool = False
+) -> None:
     """Replace ``path`` with ``record`` as JSON, atomically, mode ``0600``.
+
+    The temporary file is created private by its own descriptor (exclusive,
+    an unguessable name: no stale-temp collisions after a crash, no planted
+    link followed), then renamed over the old one. ``private_dir`` (a folder
+    that keeps something a person must not lose to another account: the
+    pending sign-up) makes the folder private first and refuses one that
+    cannot be (:func:`.owner_only.make_private_dir` ``enforce`` and
+    ``strict``, ``root`` as there); otherwise a folder this creates is
+    private and an existing one of another owner is refused.
 
     Raises ``OSError`` when the directory cannot be written; callers decide
     whether that is fatal (it never is for state — the in-memory copy is
     the one in use, the file is for the next start).
     """
-    from .owner_only import make_private_dir
+    import secrets
 
-    make_private_dir(path.parent)
-    temp: Path | None = None
+    from .owner_only import create_private_file, make_private_dir
+
+    make_private_dir(path.parent, root=root, enforce=private_dir, strict=private_dir)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.{secrets.token_hex(6)}.tmp")
+    payload = (json.dumps(record, separators=(",", ":"), sort_keys=True) + "\n").encode("utf-8")
+    created = False
     try:
-        # Exclusive creation: no stale-temp collisions after a crash and no
-        # predictable-name symlink attacks.
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as file:
-            temp = Path(file.name)
-            os.chmod(temp, 0o600)
-            json.dump(record, file, separators=(",", ":"), sort_keys=True)
-            file.write("\n")
+        fd = create_private_file(temp)
+        created = True
+        with os.fdopen(fd, "wb", closefd=True) as file:
+            file.write(payload)
             file.flush()
             os.fsync(file.fileno())
         replace_file(temp, path)
+        created = False
         os.chmod(path, 0o600)
     finally:
-        if temp is not None:
+        if created:
             with suppress(FileNotFoundError):
                 temp.unlink()
 

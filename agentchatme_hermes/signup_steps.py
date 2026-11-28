@@ -145,7 +145,9 @@ def save_pending(home: Path, pending: Pending) -> None:
         value = getattr(pending, name)
         if value:
             record[name] = value
-    write_json_atomic(pending_path(home), record)
+    # The flow answers the emailed code: its folder is made private (and one
+    # that cannot be is refused) before it is written.
+    write_json_atomic(pending_path(home), record, root=Path(home), private_dir=True)
 
 
 def drop_pending(home: Path) -> bool:

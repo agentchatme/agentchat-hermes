@@ -253,6 +253,9 @@ class TestWindowsAccessList:
         monkeypatch.setattr(owner_only, "_open", no_acls)
         assert owner_only.inspect(made) is None
         assert owner_only.ensure_private(made) is False
+        owner_only.make_private_dir(tmp_path / "state")  # a lock or a state file goes on
+        with pytest.raises(owner_only.OwnerOnlyError, match="keeps no access lists"):
+            owner_only.make_private_dir(tmp_path / "agentchat", strict=True)  # a secret does not
 
     def test_a_failure_is_raised_only_when_strict_and_warned_once(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
@@ -298,8 +301,35 @@ class TestWindowsAccessList:
 
 
 def test_describe_sid() -> None:
+    """The account Windows names, else a well-known name, else the SID."""
     assert owner_only.describe_sid(EVERYONE) == "Everyone"
     assert owner_only.describe_sid("S-1-5-21-1-2-3-1001") == "S-1-5-21-1-2-3-1001"
+    if WINDOWS:
+        assert owner_only.describe_sid(USERS).endswith("\\Users")
+        assert os.environ.get("USERNAME", "").lower() in owner_only.describe_sid(owner_only.current_user_sid()).lower()
+
+
+class TestCreatePrivateFile:
+    def test_private_from_its_first_byte_whatever_the_folder(self, tmp_path: Path) -> None:
+        if WINDOWS:
+            icacls(str(tmp_path), "/grant", f"*{EVERYONE}:(OI)(CI)(R)")
+        made = tmp_path / "x.tmp"
+        fd = owner_only.create_private_file(made)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(b"secret")
+        assert made.read_bytes() == b"secret"
+        if WINDOWS:
+            access = owner_only.inspect(made)
+            assert access is not None and access.settled, access
+        else:
+            assert stat.S_IMODE(made.stat().st_mode) == owner_only.FILE_MODE
+
+    def test_something_there_is_never_opened(self, tmp_path: Path) -> None:
+        made = tmp_path / "x.tmp"
+        made.write_text("theirs", encoding="utf-8")
+        with pytest.raises(FileExistsError):
+            owner_only.create_private_file(made)
+        assert made.read_text(encoding="utf-8") == "theirs"
 
 
 # ─── replace_file: Windows refuses a rename onto an open file ──────────────

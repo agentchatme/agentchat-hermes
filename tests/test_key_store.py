@@ -166,24 +166,22 @@ class TestWindowsAccessList:
         assert key_store.tighten(home) is False, "nothing left to change"
 
     def test_writable_by_others_is_refused_and_made_yours_by_doctor_fix(self, tmp_path: Path) -> None:
-        """A key file an earlier release wrote in a home like ``C:\\hermes``
-        (inheriting Authenticated Users: Modify): refused, never used, and the
-        refusal names ``doctor --fix``, which makes it yours only and keeps
-        the key."""
+        """A key file that is yours but another account can change: refused,
+        never used, and the refusal names ``doctor --fix``, which makes it
+        yours only and keeps the key (the home itself being yours)."""
         from agentchatme_hermes import cli, config, owner_only
 
         home = _home(tmp_path)
-        self._icacls(str(home), "/grant", "*S-1-5-11:(OI)(CI)(M)")
         path = key_store.write_store(home, api_key=api_key("k"), handle="alice", api_base="https://a.test")
-        for target in (path.parent, path):  # as an earlier release left them: inheriting the home's list
-            self._icacls(str(target), "/reset")
+        self._icacls(str(path), "/grant", "*S-1-5-11:(M)")
         read = key_store.read_store(home)
         assert read.status == "unsafe" and not read.usable and read.repairable
-        assert "can be changed by other accounts on this computer (Authenticated Users)" in read.detail
+        assert "can be changed by other accounts on this computer" in read.detail
+        assert "Authenticated Users" in read.detail
         refusal = config.resolve_key(home).refusal
         assert refusal is not None and "doctor --fix` makes it yours only and keeps the key" in refusal
         lines: list[tuple[str, str]] = []
-        cli._fix_key_file_others_can_change(
+        cli._fix_key_file_access(
             home, cmd="hermes agentchat", ok=lambda m: lines.append(("ok", m)), fail=lambda m: lines.append(("fail", m))
         )
         assert [level for level, _ in lines] == ["ok"], lines
@@ -195,6 +193,73 @@ class TestWindowsAccessList:
             access = owner_only.inspect(target, root=home)
             assert access is not None and access.settled
         assert key_store.make_yours(home) is None, "nothing left to repair"
+
+    def test_a_home_other_accounts_can_change_keeps_no_key_from_them(self, tmp_path: Path) -> None:
+        """``HERMES_HOME=C:\\hermes`` inheriting Authenticated Users: Modify:
+        they can change the plugin and config.yaml there. doctor fails on the
+        home, and doctor --fix never calls the key file "yours only" then."""
+        from agentchatme_hermes import cli
+
+        home = _home(tmp_path)
+        assert key_store.home_problem(home) is None, "a home under the user's own profile"
+        path = key_store.write_store(home, api_key=api_key("k"), handle="alice", api_base="https://a.test")
+        self._icacls(str(home), "/grant", "*S-1-5-11:(OI)(CI)(M)")
+        problem = key_store.home_problem(home)
+        assert problem is not None and "can be changed by other accounts" in problem
+        assert "move the Hermes home under your user profile" in problem
+        self._icacls(str(path), "/grant", "*S-1-5-11:(M)")
+        assert key_store.read_store(home).repairable
+        with pytest.raises(key_store.KeyStoreError, match="left as it is"):
+            key_store.make_yours(home)
+        lines: list[tuple[str, str]] = []
+        cli._fix_key_file_access(
+            home, cmd="hermes agentchat", ok=lambda m: lines.append(("ok", m)), fail=lambda m: lines.append(("fail", m))
+        )
+        assert [level for level, _ in lines] == ["fail"], lines
+        assert not any("yours only now" in m for _, m in lines)
+        assert key_store.read_store(home).status == "unsafe", "the key file is left as it was"
+
+    def test_a_volume_without_access_lists_keeps_no_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FAT / exFAT: nothing there can be private, so the key is neither
+        saved nor used, as POSIX refuses a file others can write."""
+        from agentchatme_hermes import owner_only
+
+        home = _home(tmp_path)
+        key_store.write_store(home, api_key=api_key("k"), handle="a", api_base="https://a.test")
+        real_open = owner_only._open
+
+        def no_acls(path: Path, access: int, root: Path | None) -> owner_only._Opened:
+            opened = real_open(path, access, root)
+            return owner_only._Opened(opened.handle, opened.is_dir, False)
+
+        monkeypatch.setattr(owner_only, "_open", no_acls)
+        read = key_store.read_store(home)
+        assert read.status == "unsafe" and not read.usable and not read.repairable
+        assert "keeps no access lists" in read.detail and "NTFS" in read.detail
+        with pytest.raises(key_store.KeyStoreError, match="keeps no access lists"):
+            key_store.write_store(home, api_key=api_key("j"), handle="a", api_base="https://a.test")
+        problem = key_store.home_problem(home)
+        assert problem is not None and "keeps no access lists" in problem
+
+    def test_the_key_file_is_private_by_its_own_descriptor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Written into a key folder whose list lets everyone read: the file has
+        its own protected list from its first byte, not the folder's."""
+        from agentchatme_hermes import owner_only
+
+        home = _home(tmp_path)
+        key_store.write_store(home, api_key=api_key("k"), handle="a", api_base="https://a.test")
+        self._icacls(str(key_store.store_dir(home)), "/grant", "*S-1-1-0:(OI)(CI)(R)")
+        # Even were the folder left as it is, the new file would not take its list.
+        monkeypatch.setattr(owner_only, "make_private_dir", lambda *_a, **_k: None)
+        path = key_store.write_store(home, api_key=api_key("j"), handle="a", api_base="https://a.test")
+        access = owner_only.inspect(path, root=home)
+        assert access is not None and access.settled, access
+        folder = owner_only.inspect(path.parent, root=home)
+        assert folder is not None and "S-1-1-0" in folder.others_read, "the folder kept its own list"
 
     def test_a_hard_linked_key_file_is_refused(self, tmp_path: Path) -> None:
         """Another name of the file may be anyone's: never used, never repaired."""
@@ -260,6 +325,54 @@ class TestWindowsAccessList:
         with pytest.raises(key_store.KeyStoreError, match="another account"):
             key_store.write_store(home, api_key=api_key("k"), handle="a", api_base="https://a.test")
         assert not key_store.store_path(home).exists()
+
+
+class TestRefusalRemedies:
+    def test_a_key_folder_windows_refuses_names_the_elevated_fix(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A key folder an elevated run made is closed to the same account
+        unelevated: neither "remove it" nor ``login`` works there, so the
+        refusal names ``doctor --fix`` from an elevated prompt."""
+        from agentchatme_hermes import config
+
+        home = _home(tmp_path)
+        denied = key_store.StoreRead(
+            "unreadable",
+            key_store.store_path(home),
+            detail=f"cannot read {key_store.store_path(home)}: Access is denied",
+            denied=True,
+        )
+        monkeypatch.setattr(key_store, "read_store", lambda _home: denied)
+        refusal = config.resolve_key(home).refusal
+        assert refusal is not None
+        assert "Access is denied" in refusal
+        assert "doctor --fix` from an elevated (Run as administrator) prompt" in refusal
+        assert "Fix or remove it" not in refusal
+
+    def test_the_pending_sign_up_goes_into_a_private_folder(self, tmp_path: Path) -> None:
+        """signup.json (the flow that answers the emailed code) is written only
+        into a folder made private first, never into one left as found."""
+        from agentchatme_hermes import owner_only, signup_steps
+
+        home = _home(tmp_path)
+        folder = key_store.store_dir(home)
+        folder.mkdir()
+        if POSIX:
+            os.chmod(folder, 0o755)
+        else:
+            import subprocess
+
+            subprocess.run(["icacls", str(folder), "/grant", "*S-1-1-0:(OI)(CI)(R)"], check=True, capture_output=True)
+        signup_steps.save_pending(
+            home,
+            signup_steps.Pending(kind="register", flow={"next_step": "verify", "pending_id": "pnd_1"}, api_base="https://a.test"),
+        )
+        if POSIX:
+            assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+        else:
+            access = owner_only.inspect(folder, root=home)
+            assert access is not None and access.settled
 
 
 class TestBoundToItsProfile:

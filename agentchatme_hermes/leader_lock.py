@@ -107,6 +107,8 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from .log_once import log_once
+
 if sys.platform == "win32":
     import msvcrt
 else:
@@ -310,7 +312,8 @@ def try_acquire_ws_leader_lock(path: Path) -> int | None:
     try:
         fd = _open_lock_file(target)
     except OSError as exc:
-        _log_once(
+        log_once(
+            logger,
             f"open:{target}:{exc}",
             logging.WARNING,
             "leader_lock: cannot open %s (%s) — falling back to CLI mode (no WS in this process)",
@@ -323,7 +326,8 @@ def try_acquire_ws_leader_lock(path: Path) -> int | None:
         held = _try_lock(fd)
     except OSError as exc:
         os.close(fd)
-        _log_once(
+        log_once(
+            logger,
             f"lock:{target}:{exc}",
             logging.WARNING,
             "leader_lock: the OS lock failed on %s (%s) — falling back to CLI mode",
@@ -333,7 +337,8 @@ def try_acquire_ws_leader_lock(path: Path) -> int | None:
         return None
     if not held:
         os.close(fd)
-        _log_once(
+        log_once(
+            logger,
             f"held:{target}",
             logging.INFO,
             "leader_lock: %s already held by another process — this "
@@ -342,20 +347,6 @@ def try_acquire_ws_leader_lock(path: Path) -> int | None:
         )
         return None
     return fd
-
-
-_logged: set[str] = set()
-
-
-def _log_once(key: str, level: int, message: str, *args: object) -> None:
-    """``level`` the first time for ``key`` in this process, DEBUG after: a
-    gateway that lost the election retries every 15 s and must not log every
-    15 s (the runtime says once that it is a follower)."""
-    if key in _logged:
-        logger.debug(message, *args)
-        return
-    _logged.add(key)
-    logger.log(level, message, *args)
 
 
 def _open_lock_file(target: Path) -> int:

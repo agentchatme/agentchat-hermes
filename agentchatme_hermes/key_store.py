@@ -101,10 +101,13 @@ class StoreRead:
     # still used, tightened at activation and by ``doctor --fix``.
     loose_mode: bool = False
     # ``unsafe`` only because other accounts can change it, while it is yours
-    # (Windows: a file an earlier release wrote in a home whose list lets them,
-    # e.g. ``C:\hermes`` inheriting Authenticated Users: Modify): ``doctor
-    # --fix`` makes it yours only and keeps the key (:func:`make_yours`).
+    # (Windows: a file an earlier release wrote where their list reached it):
+    # ``doctor --fix`` makes it yours only and keeps the key (:func:`make_yours`),
+    # once the Hermes home is yours too (:func:`home_problem`).
     repairable: bool = False
+    # Windows: this account was refused access to the file or its folder (a
+    # folder an elevated run made): the remedy is an elevated ``doctor --fix``.
+    denied: bool = False
 
     @property
     def usable(self) -> bool:
@@ -146,13 +149,17 @@ def read_store(home: Path) -> StoreRead:
     except FileNotFoundError:
         return StoreRead("missing", path)
     except OSError as exc:
-        return StoreRead("unreadable", path, detail=f"cannot read {path}: {exc.strerror or exc}")
+        return StoreRead(
+            "unreadable", path, detail=f"cannot read {path}: {exc.strerror or exc}", denied=_denied(exc)
+        )
     judged = _judge(path, st, home)
     if judged.problem is not None:
-        return StoreRead("unsafe", path, detail=judged.problem, repairable=judged.repairable)
+        return StoreRead(
+            "unsafe", path, detail=judged.problem, repairable=judged.repairable, denied=judged.denied
+        )
     record = _parse(path)
     if isinstance(record, str):
-        return StoreRead("unreadable", path, detail=record)
+        return StoreRead("unreadable", path, detail=record, denied=not _POSIX and "Access is denied" in record)
     loose = judged.loose
     recorded = Path(record.profile_home) if record.profile_home else None
     if recorded is None or same_home(recorded, home):
@@ -177,6 +184,13 @@ class _Judged:
     loose: bool = False
     # The problem is only that others can change a file that is yours.
     repairable: bool = False
+    # Windows refused this account access to it.
+    denied: bool = False
+
+
+def _denied(exc: OSError) -> bool:
+    """Windows refused this account (``ERROR_ACCESS_DENIED``)."""
+    return not _POSIX and (getattr(exc, "winerror", None) == 5 or isinstance(exc, PermissionError))
 
 
 def _judge(path: Path, st: os.stat_result, home: Path) -> _Judged:
@@ -211,11 +225,16 @@ def _judge_windows(path: Path, home: Path) -> _Judged:
     except owner_only.OwnerOnlyError as exc:
         return _Judged(str(exc.strerror or exc))
     except OSError as exc:
-        return _Judged(f"{path}: its access list cannot be read ({exc.strerror or exc}), so it is not trusted")
+        return _Judged(
+            f"{path}: its access list cannot be read ({exc.strerror or exc}), so it is not trusted",
+            denied=_denied(exc),
+        )
     if access is None:
-        return _Judged(None)  # a volume without access lists
+        # FAT / exFAT: nothing on it can be private; as POSIX refuses a file
+        # others can write, the key is not used there.
+        return _Judged(owner_only.no_access_lists_message(path))
     if not access.owner_trusted:
-        return _Judged(f"{path} is owned by {owner_only.describe_sid(access.owner)}, not by you ({access.user})")
+        return _Judged(owner_only.foreign_owner_message(path, access.owner, "its key is not used"))
     if access.null_dacl:
         return _Judged(f"{path} has no access list: every account on this computer can change it", repairable=True)
     if access.others_write:
@@ -301,9 +320,10 @@ def write_store(home: Path, *, api_key: str, handle: str, api_base: str) -> Path
     }
     payload = (json.dumps(record, indent=2) + "\n").encode("utf-8")
     tmp = directory / f".{STORE_FILENAME}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
     try:
-        fd = os.open(tmp, flags, owner_only.FILE_MODE)
+        # Private from its first byte by its own descriptor, whatever list the
+        # folder its name resolves to has (Windows); 0600 and O_EXCL (POSIX).
+        fd = owner_only.create_private_file(tmp)
         try:
             os.write(fd, payload)
             os.fsync(fd)
@@ -355,6 +375,36 @@ def tighten(home: Path) -> bool:
     return changed
 
 
+def home_problem(home: Path) -> str | None:
+    """Windows: why the Hermes home (the profile's, and the root that holds
+    every profile) cannot keep a key from other accounts, or ``None``. Another
+    account that can change the home can change the plugin's code and the
+    profile's ``config.yaml``, whatever the key file's own list says. A home
+    reached through a link is judged where it is. ``None`` on POSIX (its modes
+    are the person's choice there, as before)."""
+    if _POSIX:
+        return None
+    from .profile_scope import hermes_root_of
+
+    for target in dict.fromkeys(Path(os.path.realpath(h)) for h in (home, hermes_root_of(Path(home)))):
+        try:
+            access = owner_only.inspect(target, root=target)
+        except OSError as exc:
+            return f"who can change the Hermes home {target} cannot be read ({exc.strerror or exc})"
+        if access is None:
+            return owner_only.no_access_lists_message(target)
+        if not access.owner_trusted:
+            return owner_only.foreign_owner_message(target, access.owner, "the plugin's code and settings there are theirs")
+        if access.null_dacl or access.others_write:
+            names = ", ".join(owner_only.describe_sid(sid) for sid in access.others_write) or "everyone"
+            return (
+                f"the Hermes home {target} can be changed by other accounts on this computer ({names}): they can "
+                "change the plugin's code and config.yaml there, so no key in it can be kept from them — move the "
+                "Hermes home under your user profile (HERMES_HOME), or remove their access to it"
+            )
+    return None
+
+
 def make_yours(home: Path) -> StoreRead | None:
     """``doctor --fix`` for a key file that is ``repairable`` (yours, but other
     accounts can change it): its directory and the files in it made yours only,
@@ -364,6 +414,9 @@ def make_yours(home: Path) -> StoreRead | None:
     before = read_store(home)
     if before.status != "unsafe" or not before.repairable:
         return None
+    problem = home_problem(home)
+    if problem is not None:
+        raise KeyStoreError(f"{problem}; the key file is left as it is until then")
     try:
         owner_only.make_private_dir(store_dir(home), root=Path(home), enforce=True, strict=True)
         owner_only.ensure_private(store_path(home), root=Path(home))

@@ -373,7 +373,12 @@ def pid_alive(pid: int) -> bool | None:
     except ImportError:
         pass
     if sys.platform == "win32":
-        return _windows_pid_alive(pid)
+        from .win32 import pid_alive as windows_pid_alive
+
+        try:
+            return windows_pid_alive(pid)
+        except OSError:
+            return None
     else:
         try:
             os.kill(pid, 0)
@@ -384,37 +389,3 @@ def pid_alive(pid: int) -> bool | None:
         except OSError:
             return None
         return True
-
-
-if sys.platform == "win32":
-
-    def _windows_pid_alive(pid: int) -> bool | None:
-        """``OpenProcess`` the pid and wait 0 ms on it: running until it exits.
-        Access denied means it exists (another user's); an invalid parameter
-        means no such process. The shape of Hermes' own stdlib probe
-        (``hermes_cli/_subprocess_compat.py`` ``win32_pid_exists``)."""
-        import ctypes
-        from ctypes import wintypes
-
-        process_query_limited_information, synchronize = 0x1000, 0x00100000
-        wait_timeout, error_access_denied, error_invalid_parameter = 0x102, 5, 87
-        try:
-            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-            kernel32.OpenProcess.restype = ctypes.c_void_p
-            kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, wintypes.DWORD)
-            kernel32.WaitForSingleObject.restype = wintypes.DWORD
-            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
-            kernel32.CloseHandle.restype = wintypes.BOOL
-            handle = kernel32.OpenProcess(process_query_limited_information | synchronize, False, pid)
-            if not handle:
-                error = ctypes.get_last_error()
-                if error == error_access_denied:
-                    return True
-                return False if error == error_invalid_parameter else None
-            try:
-                return bool(kernel32.WaitForSingleObject(handle, 0) == wait_timeout)
-            finally:
-                kernel32.CloseHandle(handle)
-        except (OSError, AttributeError):
-            return None

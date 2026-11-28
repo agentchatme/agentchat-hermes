@@ -326,6 +326,32 @@ def cli_prefix(home: Path) -> str:
     return "hermes agentchat" if label == "default" else f"hermes -p {label} agentchat"
 
 
+def _denied_refusal(store: key_store.StoreRead, cmd: str) -> str:
+    """Windows refused this account its own key file: the folder was made by an
+    elevated ("Run as administrator") run, which Windows then keeps from the
+    same account unelevated. Neither removing it nor ``login`` works from here;
+    an elevated ``doctor --fix`` of this account gives it back and keeps the key."""
+    from . import win32
+
+    directory = store.path.parent
+    line = (
+        f"{store.detail}. Windows refuses this account its own key folder: it was made by an elevated "
+        f"(Run as administrator) run. Run `{cmd} doctor --fix` from an elevated (Run as administrator) "
+        "prompt of this account: it gives the folder back to you and keeps the key; then restart the gateway."
+    )
+    if not win32.split_admin_token():
+        try:
+            user = win32.account_name(win32.current_user_sid()) or "this account"
+        except OSError:
+            user = "this account"
+        line += (
+            f" This account has no administrator rights of its own: an administrator can give the folder back "
+            f'(`icacls "{directory}" /setowner "{user}" /T` and `icacls "{directory}" /grant "{user}:(OI)(CI)F" /T`) '
+            f"or remove it, then `{cmd} login` or `{cmd} recover`."
+        )
+    return line
+
+
 def resolve_key(home: Path | None = None) -> KeyResolution:
     """Which key ``home``'s profile acts as. Never raises for a key problem.
 
@@ -360,6 +386,8 @@ def resolve_key(home: Path | None = None) -> KeyResolution:
                 f"(if you did not save that key yourself, `{cmd} recover` gets a new one instead)."
             ),
         )
+    if store.status in ("unsafe", "unreadable") and store.denied:
+        return KeyResolution(None, KEY_SOURCE_STORE, store, refusal=_denied_refusal(store, cmd))
     if store.status in ("unsafe", "unreadable"):
         return KeyResolution(
             None,
