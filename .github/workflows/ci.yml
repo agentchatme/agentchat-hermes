@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main, legacy-0.1.x]
+    branches: [main, legacy-0.1.x, feat/windows-native]
   pull_request:
     branches: [main]
 
