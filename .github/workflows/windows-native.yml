@@ -17,11 +17,13 @@ name: windows-native
 # Without a key (always): the plugin signs in to a stand-in for the AgentChat
 # API on 127.0.0.1 (.github/scripts/windows-check.py stub; a made-up key,
 # generated here, never stored). The gateway's plugin must run in gateway
-# mode, take this account's leader lock (held against another process, the
-# health record beside it written by the gateway's pid), start its receive
-# loop and try the socket (the stand-in logs the upgrade request and refuses
-# it); after `hermes gateway stop`, and again after the gateway is killed, the
-# lock must be free. A connect is not proven here.
+# mode (its `mode=leader` log line), take this account's leader lock (held
+# against another process; the health record beside it written by the
+# gateway's pid), start its receive loop and try the socket (the stand-in
+# logs `GET /v1/ws` and answers 404); after `hermes gateway stop`, and again
+# after the gateway is killed, the lock must be free. Then, best effort, the
+# same through the logon Scheduled Task `hermes gateway install` registers. A
+# connect is not proven here.
 #
 # With a key (only when the repository secret AGENTCHAT_WINDOWS_CHECK_KEY is
 # set): the same gateway signs in to api.agentchat.me with that key and must
@@ -124,6 +126,10 @@ jobs:
             hermes gateway start
             python .github/scripts/windows-check.py leader $env:HERMES_HOME_DIR 300
             if ($LASTEXITCODE -ne 0) { throw "the leader check failed" }
+            $record = Get-ChildItem (Join-Path $env:HERMES_HOME_DIR 'agentchat-locks') -Filter 'ws-*.health.json' | Select-Object -First 1
+            $holder = (Get-Content $record.FullName | ConvertFrom-Json).pid
+            Write-Output "--- the process holding the lock"
+            Get-CimInstance Win32_Process -Filter "ProcessId = $holder" | Select-Object ProcessId, ParentProcessId, CommandLine | Format-List
             $logs = Join-Path $env:HERMES_HOME_DIR 'logs'
             Write-Output "--- the plugin's lines in the gateway's logs"
             Get-ChildItem $logs -Filter *.log | ForEach-Object {
@@ -135,6 +141,9 @@ jobs:
             Start-Sleep -Seconds 10
             Write-Output "--- requests the stand-in API saw"
             Get-Content $log
+            if (-not (Select-String -Path $log -Pattern '^GET /v1/ws' -Quiet)) {
+              throw "the receive loop never tried the socket (no GET /v1/ws at the stand-in)"
+            }
             Write-Output "--- doctor, from another process"
             hermes agentchat doctor
 
@@ -155,6 +164,38 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw "the lock outlived a killed gateway" }
           } finally {
             try { hermes gateway stop *> $null } catch { }
+            Stop-Process -Id $stub.Id -Force -ErrorAction SilentlyContinue
+          }
+          exit 0
+
+      # The logon task `hermes gateway install` registers runs the same command
+      # through wscript.exe and gateway.vbs. A hosted runner may not let a
+      # logon task run (InteractiveToken), so this leg reports, never fails.
+      - name: "Keyless, best effort: the Scheduled Task's gateway takes the leader lock"
+        continue-on-error: true
+        run: |
+          $stub = Start-Process python -ArgumentList '.github/scripts/windows-check.py', 'stub', $env:STUB_PORT, $env:STUB_LOG -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          try {
+            $env:HERMES_GATEWAY_INSTALL_START_ON_LOGIN = '1'
+            $env:HERMES_GATEWAY_INSTALL_START_NOW = '0'
+            hermes gateway install
+            schtasks /Query /TN Hermes_Gateway /V /FO LIST
+            if ($LASTEXITCODE -ne 0) { throw "no Hermes_Gateway task was registered" }
+            schtasks /Run /TN Hermes_Gateway
+            python .github/scripts/windows-check.py leader $env:HERMES_HOME_DIR 180
+            if ($LASTEXITCODE -ne 0) { throw "the task's gateway did not take the leader lock" }
+            $record = Get-ChildItem (Join-Path $env:HERMES_HOME_DIR 'agentchat-locks') -Filter 'ws-*.health.json' | Select-Object -First 1
+            $gateway = (Get-Content $record.FullName | ConvertFrom-Json).pid
+            Write-Output "--- the process holding the lock"
+            Get-CimInstance Win32_Process -Filter "ProcessId = $gateway" | Select-Object ProcessId, ParentProcessId, CommandLine | Format-List
+            hermes gateway stop
+            python .github/scripts/windows-check.py free $env:HERMES_HOME_DIR 60
+            if ($LASTEXITCODE -ne 0) { throw "the lock outlived the task's gateway" }
+            Write-Output "::notice::the Scheduled Task's gateway took the leader lock and freed it on stop"
+          } finally {
+            try { hermes gateway stop *> $null } catch { }
+            try { hermes gateway uninstall *> $null } catch { }
             Stop-Process -Id $stub.Id -Force -ErrorAction SilentlyContinue
           }
           exit 0
@@ -188,9 +229,10 @@ jobs:
             $env:CHECK_KEY | hermes agentchat login --api-key -
             if ($LASTEXITCODE -ne 0) { throw "login exited $LASTEXITCODE" }
             hermes gateway start
+            # No doctor here: it prints the key's first and last characters,
+            # and this log is public.
             python .github/scripts/windows-check.py leader $env:HERMES_HOME_DIR 300 connected
             if ($LASTEXITCODE -ne 0) { throw "the gateway's plugin did not connect" }
-            hermes agentchat doctor
             hermes gateway stop
             python .github/scripts/windows-check.py free $env:HERMES_HOME_DIR 60
             if ($LASTEXITCODE -ne 0) { throw "the lock outlived a stopped gateway" }
