@@ -14,19 +14,17 @@ import argparse
 import json
 import os
 import stat
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
 import pytest
 import signup_wire as sw
 from fake_keys import api_key
 from key_files import profile_home, save_key
-from sdk_wire import api_error, connect_error, serve
+from sdk_wire import answer, api_error, connect_error, serve
 
 from agentchatme_hermes import allow, cli, signup_steps
 from agentchatme_hermes.cli import _EXIT_API_ERR, _EXIT_ARG_ERR, _EXIT_OK
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 _KEY = api_key("steps_00000000000000")
 _FINISH = (
@@ -507,3 +505,54 @@ def test_a_waiting_file_of_another_profile_is_not_read(monkeypatch: pytest.Monke
     )
     assert signup_steps.read_pending(other) is not None
     assert signup_steps.read_pending(profile_home()) is None
+
+
+class TestReturningAgents:
+    """An agent that already has an account signs in, never up: its key from a
+    file, a lost key recovered; nothing waits at a prompt in its terminal."""
+
+    def test_login_with_no_key_source_names_the_file_way_and_never_prompts(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _Steps(monkeypatch)
+        monkeypatch.setattr(cli, "_prompt_api_key", lambda: pytest.fail("a hidden prompt in an agent's terminal"))
+        monkeypatch.setattr(allow, "stdin_is_tty", lambda: True)  # a PTY
+        wire = serve(monkeypatch, {})
+        assert cli._dispatch_login(argparse.Namespace(api_key_file=None, api_key=None)) == _EXIT_ARG_ERR
+        err = capsys.readouterr().err
+        assert "hermes agentchat login --api-key-file <file>" in err and "then delete the file" in err
+        assert "hermes agentchat recover --email <email> --handle <handle>" in err
+        assert wire.requests == []
+
+    def test_login_from_a_file_in_an_agents_terminal_saves_and_places(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        run = _Steps(monkeypatch)
+        key_file = tmp_path / "key"
+        key_file.write_text(_KEY + "\n")
+        serve(monkeypatch, {sw.ME: answer(200, {"handle": "alice", "status": "active"})})
+        assert cli._dispatch_login(argparse.Namespace(api_key_file=str(key_file), api_key=None)) == _EXIT_OK
+        out = capsys.readouterr().out
+        assert "Saved AgentChat key for @alice." in out and _KEY not in out
+        assert allow.AGENT_TERMINAL_LINE.format(who="@alice") in out
+        assert run.persisted[0]["handle"] == "alice" and run.placed == ["alice"]
+
+    def test_every_route_an_agent_reads_names_both_doors(self) -> None:
+        from agentchatme_hermes import setup_prompt
+
+        line = setup_prompt.NOT_SET_UP.format(cmd="hermes agentchat")
+        after_install = (Path(cli.__file__).parent.parent / "after-install.md").read_text(encoding="utf-8")
+        for text in (line, after_install):
+            assert "register --email <email> --handle <handle>" in text
+            assert "login --api-key-file <file>" in text
+            assert "recover --email <email> --handle <handle>" in text
+            assert "Don't sign up again" in text or "don't sign up again" in text
+
+    def test_the_wizard_in_an_agents_terminal_names_login_and_recover(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _Steps(monkeypatch)
+        assert cli._dispatch_wizard(_ns()) == _EXIT_OK
+        out = capsys.readouterr().out
+        assert "login --api-key-file <file with the key>" in out
+        assert "recover --email <email> --handle <handle>" in out

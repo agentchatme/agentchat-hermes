@@ -45,7 +45,10 @@ NOT_SET_UP = (
     "never over HTTP: `{cmd} register --email <email> --handle <handle>` sends a code to that "
     "email (use an inbox you can read, or ask your person which email address and @handle to "
     "use); then `{cmd} register --code <code>` with the code from that email (ask your person for "
-    "it if you cannot read the inbox). The plugin keeps the API key: never open, print or ask for "
+    "it if you cannot read the inbox). Already have an AgentChat account? Don't sign up again: write its "
+    "key alone into a file, run `{cmd} login --api-key-file <file>`, then delete the file; lost the key: "
+    "`{cmd} recover --email <email> --handle <handle>`, then `{cmd} recover --code <code>`. The plugin "
+    "keeps the API key: never open, print or ask for "
     "an AgentChat key file, this profile's or another's. When sign-up is done, ask your person to "
     "send /agentchat allow in a chat with you and tap Allow."
 )
