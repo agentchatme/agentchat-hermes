@@ -29,12 +29,16 @@ param(
 
 $ErrorActionPreference = 'Stop'
 # Start-Process -Credential hands this process the caller's environment
-# (USERPROFILE, LOCALAPPDATA, TEMP of the administrator account). The
-# account's own folders, from its token, as a logon would set them:
-$env:USERPROFILE = [Environment]::GetFolderPath('UserProfile')
-$env:HOME = $env:USERPROFILE
-$env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
-$env:APPDATA = [Environment]::GetFolderPath('ApplicationData')
+# (USERPROFILE, LOCALAPPDATA, TEMP of the administrator account), and the
+# shell folders expand %USERPROFILE% from it. The account's own folders, from
+# its profile as Windows registered it (-LoadUserProfile made it), as a logon
+# would set them:
+$sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$profileDir = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$sid").ProfileImagePath
+$env:USERPROFILE = $profileDir
+$env:HOME = $profileDir
+$env:LOCALAPPDATA = Join-Path $profileDir 'AppData\Local'
+$env:APPDATA = Join-Path $profileDir 'AppData\Roaming'
 $env:USERNAME = [Environment]::UserName
 $env:TEMP = Join-Path $env:LOCALAPPDATA 'Temp'
 $env:TMP = $env:TEMP

@@ -342,16 +342,21 @@ jobs:
           New-Item -ItemType Directory -Force -Path (Join-Path $shared 'agentchat') | Out-Null
           icacls $shared /grant "${env:AC_USER}:(OI)(CI)F" | Out-Null
           icacls (Join-Path $shared 'agentchat') /setowner $env:USERNAME | Out-Null
+          icacls (Join-Path $shared 'agentchat') | Out-Host
           Invoke-AsStandardUser 'refused' -More @('-KeyHome', $shared)
 
           # A key file only SYSTEM and Administrators can open (what an
           # elevated run of an earlier release could leave): the message.
+          # Python 3.13's mkdir(0o700) run elevated: SYSTEM, Administrators,
+          # OWNER RIGHTS, owned by Administrators; the file written inside.
           $denied = 'C:\acdenied'
-          New-Item -ItemType Directory -Force -Path (Join-Path $denied 'agentchat') | Out-Null
-          '{"api_key": "not a key"}' | Out-File (Join-Path $denied 'agentchat\credentials.json') -Encoding ascii
+          $deniedDir = Join-Path $denied 'agentchat'
+          New-Item -ItemType Directory -Force -Path $deniedDir | Out-Null
           icacls $denied /grant "${env:AC_USER}:(OI)(CI)RX" | Out-Null
-          icacls (Join-Path $denied 'agentchat') /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' /T | Out-Null
-          icacls (Join-Path $denied 'agentchat') /setowner '*S-1-5-32-544' /T | Out-Null
+          icacls $deniedDir /setowner '*S-1-5-32-544' | Out-Null
+          icacls $deniedDir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' '*S-1-3-4:(OI)(CI)F' | Out-Null
+          '{"api_key": "not a key"}' | Out-File (Join-Path $deniedDir 'credentials.json') -Encoding ascii
+          icacls $deniedDir /T | Out-Host
           Invoke-AsStandardUser 'denied' -More @('-KeyHome', $denied)
 
           Invoke-AsStandardUser 'hermes' -More @('-Channel', $env:HERMES_CHANNEL)
@@ -363,7 +368,7 @@ jobs:
             Invoke-AsStandardUser 'gateway' -More @('-Sha', '${{ github.sha }}', '-Source', "https://github.com/${{ github.repository }}.git", '-Port', $env:STUB_PORT)
             Write-Host "--- requests the stand-in API saw"
             Get-Content $log -ErrorAction SilentlyContinue | Out-Host
-            if (-not (Select-String -Path $log -Pattern '^GET /v1/ws' -Quiet -ErrorAction SilentlyContinue)) {
+            if (-not ((Test-Path $log) -and (Select-String -Path $log -Pattern '^GET /v1/ws' -Quiet))) {
               Write-Host "::error::the standard account's receive loop never tried the socket"
               $null = $failed.Add('socket')
             }
