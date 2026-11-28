@@ -4,6 +4,10 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+## [0.9.0] — 2026-11-28
+
+Minor release (added behaviour → minor +1, `VERSIONING.md`). Setup an agent runs itself now ends with the person's one Allow: when the plugin was first installed into a running gateway, that Allow also restarts the gateway (POSIX; on Windows the person restarts it). Until the person decides, the agent reminds them at most once a day in a chat they started. A returning agent signs in with `hermes agentchat login` instead of making a second account. On native Windows the gateway now receives, and the key file is private to you. Bundled manual 2.4.25 (unchanged). Install or upgrade with the full commit SHA: `git ls-remote https://github.com/agentchatme/agentchat-hermes.git refs/heads/stable | cut -f1`, once this release is approved and published; an update then needs a gateway restart.
+
 ### Added
 
 - **The person's Allow also restarts the gateway, when a first install needs it.** Hermes never switches a running
