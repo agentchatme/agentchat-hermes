@@ -387,6 +387,8 @@ def home_problem(home: Path) -> str | None:
     from .profile_scope import hermes_root_of
 
     for target in dict.fromkeys(Path(os.path.realpath(h)) for h in (home, hermes_root_of(Path(home)))):
+        if not target.is_dir():
+            continue  # nothing there yet to protect, or to change
         try:
             access = owner_only.inspect(target, root=target)
         except OSError as exc:

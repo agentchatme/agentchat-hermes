@@ -300,13 +300,17 @@ class TestWindowsAccessList:
             pytest.skip("the remedy is an elevated run; unelevated the file cannot be opened (refused)")
         home = _home(tmp_path)
         path = key_store.write_store(home, api_key=api_key("k"), handle="a", api_base="https://a.test")
+        user = owner_only.current_user_sid()
         for target, inherit in ((path.parent, "(OI)(CI)"), (path, "")):
             self._icacls(
                 str(target), "/inheritance:r", "/grant:r",
                 f"*S-1-5-18:{inherit}F", f"*S-1-5-32-544:{inherit}F",
             )
+            # The entries the plugin wrote for this user go too: only SYSTEM and
+            # Administrators remain, as that elevated run left it.
+            self._icacls(str(target), "/remove", f"*{user}", f"*{owner_only.OWNER_RIGHTS_SID}")
         read = key_store.read_store(home)
-        assert read.loose_mode
+        assert read.loose_mode, read
         assert key_store.tighten(home) is True
         after = owner_only.inspect(path, root=home)
         assert after is not None and after.user_granted and after.settled
