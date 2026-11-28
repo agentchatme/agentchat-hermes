@@ -132,9 +132,11 @@ def cached_texts(state_dir: Path) -> tuple[Texts | None, str | None]:
 
 def remove_legacy_cache(state_dir: Path) -> None:
     """Remove the pre-kit ``texts.json`` (never read; see the module docstring)."""
+    from .state import remove_file
+
     path = state_dir / LEGACY_TEXTS_FILENAME
     try:
-        path.unlink()
+        remove_file(path)
     except FileNotFoundError:
         return
     except OSError as exc:

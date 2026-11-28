@@ -1075,9 +1075,11 @@ def _dispatch_doctor(args: argparse.Namespace) -> int:
             )
             break
 
+    cmd = cli_prefix(hermes_home)
+    if getattr(args, "fix", False):
+        _fix_key_file_others_can_change(hermes_home, cmd=cmd, ok=ok, fail=fail)
     resolution = resolve_key(hermes_home)
     saved_key = resolution.api_key
-    cmd = cli_prefix(hermes_home)
     _doctor_key_checks(resolution, cmd=cmd, ok=ok, warn=warn, fail=fail)
 
     api_base = _api_base()
@@ -1895,6 +1897,28 @@ def _hermes_strips_key_from_commands() -> bool | None:
     except Exception:
         logger.debug("doctor: Hermes' env policy raised", exc_info=True)
         return None
+
+
+def _fix_key_file_others_can_change(
+    home: Path, *, cmd: str, ok: Callable[[str], None], fail: Callable[[str], None]
+) -> None:
+    """``doctor --fix``, before the key is resolved: a key file that is yours but
+    other accounts can change (Windows: written by an earlier release in a home
+    whose access list lets them) is made yours only, the key kept. Never one of
+    another owner, a link or a hard link: those stay refused."""
+    try:
+        before = key_store.make_yours(home)
+    except key_store.KeyStoreError as exc:
+        fail(f"fix: the key file was not made yours only — {exc}")
+        return
+    if before is None:
+        return
+    after = key_store.read_store(home)
+    handle = after.key.handle if after.key is not None and after.key.handle else "?"
+    ok(
+        f"fix: {before.detail}; it is yours only now and still holds the key for @{handle} — if you did "
+        f"not save that key yourself, run `{cmd} recover` for a new one"
+    )
 
 
 def _fix_key(

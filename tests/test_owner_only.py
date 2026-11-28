@@ -33,7 +33,23 @@ def icacls(*args: str) -> None:
     subprocess.run(["icacls", *args], check=True, capture_output=True)
 
 
-# ─── make_private_dir ───────────────────────────────────────────────────────
+def elevated() -> bool:
+    """An administrator's full token (GitHub's Windows runners: UAC off)."""
+    if not WINDOWS:
+        return False
+    import ctypes
+
+    return bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined, unused-ignore]
+
+
+elevated_only = pytest.mark.skipif(not elevated(), reason="needs an administrator's full token")
+
+
+def junction(link: Path, target: Path) -> None:
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
+
+
+# ─── make_private_dir / ensure_private ──────────────────────────────────────
 
 
 @posix_only
@@ -52,6 +68,17 @@ class TestPosixModes:
         owner_only.make_private_dir(target, enforce=True)
         assert stat.S_IMODE(target.stat().st_mode) == 0o700
 
+    def test_ensure_private_sets_the_mode_once_and_leaves_a_link(self, tmp_path: Path) -> None:
+        made = tmp_path / "credentials.json"
+        made.write_text("{}", encoding="utf-8")
+        os.chmod(made, 0o644)
+        assert owner_only.ensure_private(made) is True
+        assert stat.S_IMODE(made.stat().st_mode) == owner_only.FILE_MODE
+        assert owner_only.ensure_private(made) is False
+        link = tmp_path / "link.json"
+        link.symlink_to(made)
+        assert owner_only.ensure_private(link) is False
+
     def test_no_access_list_is_read_off_windows(self, tmp_path: Path) -> None:
         assert owner_only.inspect(tmp_path) is None
         assert owner_only.restrict_children(tmp_path) == 0
@@ -59,13 +86,16 @@ class TestPosixModes:
 
 @windows_only
 class TestWindowsAccessList:
-    def test_a_new_directory_is_private_and_protected(self, tmp_path: Path) -> None:
+    def test_a_new_directory_is_made_private_in_the_call_that_creates_it(self, tmp_path: Path) -> None:
+        """CreateDirectoryW with the descriptor: owned by this user, the three
+        entries, protected, from its first moment."""
+        icacls(str(tmp_path), "/grant", f"*{EVERYONE}:(OI)(CI)(R)", f"*{USERS}:(OI)(CI)(M)")
         target = tmp_path / "agentchat"
         owner_only.make_private_dir(target)
         access = owner_only.inspect(target)
         assert access is not None
-        assert access.private and access.protected
-        assert access.user == owner_only.current_user_sid()
+        assert access.settled, access
+        assert access.owner == access.user == owner_only.current_user_sid()
         assert not access.others_read and not access.others_write
 
     def test_a_file_made_inside_inherits_it_from_its_first_byte(self, tmp_path: Path) -> None:
@@ -78,19 +108,15 @@ class TestWindowsAccessList:
         assert access is not None and access.private, access
         assert not access.protected, "inherited from the directory, not set on the file"
 
-    def test_an_open_parent_is_not_inherited(self, tmp_path: Path) -> None:
+    def test_an_open_parent_is_seen(self, tmp_path: Path) -> None:
         icacls(str(tmp_path), "/grant", f"*{EVERYONE}:(OI)(CI)(R)", f"*{USERS}:(OI)(CI)(M)")
         plain = tmp_path / "plain"
         plain.mkdir()
         before = owner_only.inspect(plain)
         assert before is not None and EVERYONE in before.others_read and USERS in before.others_write
-        assert before.writable_by_others
-        private = tmp_path / "private"
-        owner_only.make_private_dir(private)
-        after = owner_only.inspect(private)
-        assert after is not None and after.private and not after.writable_by_others
+        assert not before.private
 
-    def test_an_existing_directory_is_set_only_when_enforced(self, tmp_path: Path) -> None:
+    def test_an_existing_directory_is_made_private_only_when_enforced(self, tmp_path: Path) -> None:
         icacls(str(tmp_path), "/grant", f"*{EVERYONE}:(OI)(CI)(R)")
         target = tmp_path / "d"
         target.mkdir()
@@ -99,7 +125,21 @@ class TestWindowsAccessList:
         assert access is not None and not access.private
         owner_only.make_private_dir(target, enforce=True)
         access = owner_only.inspect(target)
-        assert access is not None and access.private and access.protected
+        assert access is not None and access.settled
+
+    def test_inherit_only_entries_count(self, tmp_path: Path) -> None:
+        """An inherit-only entry gives the directory's new files to Everyone: the
+        directory is not private, and ensure_private replaces it."""
+        target = tmp_path / "agentchat"
+        owner_only.make_private_dir(target)
+        icacls(str(target), "/grant", f"*{EVERYONE}:(OI)(IO)(R)")
+        access = owner_only.inspect(target)
+        assert access is not None and EVERYONE in access.others_read and not access.private
+        assert owner_only.ensure_private(target) is True
+        made = target / "credentials.json"
+        made.write_text("{}", encoding="utf-8")
+        after = owner_only.inspect(made)
+        assert after is not None and after.private
 
     def test_nothing_propagates_to_existing_children_until_they_are_set(self, tmp_path: Path) -> None:
         """The list is written on the directory's own handle: a file already in
@@ -110,61 +150,138 @@ class TestWindowsAccessList:
         target.mkdir()
         child = target / "signup.json"
         child.write_text("{}", encoding="utf-8")
-        owner_only.restrict(target)
+        assert owner_only.ensure_private(target) is True
         kept = owner_only.inspect(child)
         assert kept is not None and EVERYONE in kept.others_read
         assert owner_only.restrict_children(target) == 1
         fixed = owner_only.inspect(child)
-        assert fixed is not None and fixed.private and fixed.protected
+        assert fixed is not None and fixed.settled
         assert owner_only.restrict_children(target) == 0, "already private: left alone"
 
     def test_a_list_without_the_user_is_not_private(self, tmp_path: Path) -> None:
         """What Python 3.13's ``mkdir(0o700)`` leaves when run elevated (SYSTEM,
-        Administrators, OWNER RIGHTS = Administrators): no entry for the user,
-        so the user unelevated is locked out. Not private: it is set again."""
+        Administrators, OWNER RIGHTS = Administrators): no entry for the user.
+        Not private; set again with the user's own entry and ownership."""
         target = tmp_path / "d"
         target.mkdir()
-        icacls(
-            str(target), "/inheritance:r", "/grant:r",
-            "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F",
-        )
+        icacls(str(target), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F")
         access = owner_only.inspect(target)
-        assert access is not None
-        assert not access.user_granted and not access.private and not access.writable_by_others
+        assert access is not None and not access.user_granted and not access.private
         owner_only.make_private_dir(target, enforce=True)
         access = owner_only.inspect(target)
-        assert access is not None and access.user_granted and access.private
+        assert access is not None and access.settled
 
-    def test_a_junction_is_never_followed(self, tmp_path: Path) -> None:
+    def test_a_junction_at_the_path_is_refused_everywhere(self, tmp_path: Path) -> None:
         real = tmp_path / "real"
         real.mkdir()
         icacls(str(tmp_path), "/grant", f"*{EVERYONE}:(OI)(CI)(R)")
         link = tmp_path / "link"
-        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(real)], check=True, capture_output=True)
+        junction(link, real)
+        with pytest.raises(owner_only.OwnerOnlyError):
+            owner_only.inspect(link)
         with pytest.raises(owner_only.OwnerOnlyError):
             owner_only.restrict(link)
-        with pytest.raises(OSError):
+        with pytest.raises(owner_only.OwnerOnlyError):
+            owner_only.make_private_dir(link)  # not even written into
+        with pytest.raises(owner_only.OwnerOnlyError):
             owner_only.make_private_dir(link, enforce=True, strict=True)
         untouched = owner_only.inspect(real)
         assert untouched is not None and EVERYONE in untouched.others_read
-        assert owner_only.inspect(link) is None, "a link is not read through either"
 
-    def test_a_hard_linked_file_is_never_set(self, tmp_path: Path) -> None:
+    def test_a_junction_between_the_root_and_the_path_is_refused(self, tmp_path: Path) -> None:
+        """``root\\agentchat`` a junction to another folder: the file below it
+        resolves outside ``root``, which GetFinalPathNameByHandleW shows."""
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "credentials.json").write_text("{}", encoding="utf-8")
+        home = tmp_path / "home"
+        home.mkdir()
+        junction(home / "agentchat", elsewhere)
+        target = home / "agentchat" / "credentials.json"
+        with pytest.raises(owner_only.OwnerOnlyError, match="resolves to"):
+            owner_only.inspect(target, root=home)
+        with pytest.raises(owner_only.OwnerOnlyError):
+            owner_only.restrict(target, root=home)
+        assert owner_only.inspect(elsewhere / "credentials.json") is not None, "the real file, by its own name"
+
+    def test_a_root_that_is_itself_a_link_is_the_callers_choice(self, tmp_path: Path) -> None:
+        real = tmp_path / "real-home"
+        real.mkdir()
+        home = tmp_path / "home"
+        junction(home, real)
+        owner_only.make_private_dir(home / "agentchat", root=home)
+        made = home / "agentchat" / "credentials.json"
+        made.write_text("{}", encoding="utf-8")
+        access = owner_only.inspect(made, root=home)
+        assert access is not None and access.private
+
+    def test_a_hard_linked_file_is_refused(self, tmp_path: Path) -> None:
         first = tmp_path / "a.json"
         first.write_text("{}", encoding="utf-8")
         os.link(first, tmp_path / "b.json")
+        with pytest.raises(owner_only.OwnerOnlyError, match="hard link"):
+            owner_only.inspect(first)
         with pytest.raises(owner_only.OwnerOnlyError):
             owner_only.restrict(first)
 
-    def test_a_failure_is_only_raised_when_strict(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        def refuse(path: Path) -> None:
+    def test_a_volume_without_access_lists_has_nothing_to_judge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """FAT / exFAT (no FILE_PERSISTENT_ACLS): ``None``, and nothing to set;
+        the only case that is not an error."""
+        real_open = owner_only._open
+
+        def no_acls(path: Path, access: int, root: Path | None) -> owner_only._Opened:
+            opened = real_open(path, access, root)
+            return owner_only._Opened(opened.handle, opened.is_dir, False)
+
+        made = tmp_path / "x.json"
+        made.write_text("{}", encoding="utf-8")
+        monkeypatch.setattr(owner_only, "_open", no_acls)
+        assert owner_only.inspect(made) is None
+        assert owner_only.ensure_private(made) is False
+
+    def test_a_failure_is_raised_only_when_strict_and_warned_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        def refuse(path: Path, *, root: Path | None = None) -> None:
             raise OSError("no access lists on this file system")
 
+        icacls(str(tmp_path), "/grant", f"*{EVERYONE}:(OI)(CI)(R)")
+        lax = tmp_path / "lax"
+        lax.mkdir()
         monkeypatch.setattr(owner_only, "restrict", refuse)
-        owner_only.make_private_dir(tmp_path / "lax")  # logged, used as it is
-        assert (tmp_path / "lax").is_dir()
+        caplog.set_level(logging.DEBUG, logger="agentchatme_hermes.owner_only")
+        owner_only.make_private_dir(lax, enforce=True)  # logged, used as it is
+        owner_only.make_private_dir(lax, enforce=True)  # every 15 s on a follower
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING and str(lax) in r.getMessage()]
+        assert len(warnings) == 1, "warned once, then DEBUG"
+        strict = tmp_path / "strict"
+        strict.mkdir()
         with pytest.raises(OSError):
-            owner_only.make_private_dir(tmp_path / "strict", strict=True)
+            owner_only.make_private_dir(strict, enforce=True, strict=True)
+
+    @elevated_only
+    def test_another_owner_is_never_taken_over_or_written_into(self, tmp_path: Path) -> None:
+        """A directory another account made (and opened to us): refused by every
+        writer, as a POSIX directory of another uid is. Users stands for the
+        other account; setting another owner needs an administrator."""
+        theirs = tmp_path / "agentchat"
+        theirs.mkdir()
+        icacls(str(theirs), "/grant", f"*{USERS}:(OI)(CI)F")
+        icacls(str(theirs), "/setowner", f"*{USERS}")
+        access = owner_only.inspect(theirs)
+        assert access is not None and not access.owner_trusted
+        with pytest.raises(owner_only.OwnerOnlyError, match="another account"):
+            owner_only.make_private_dir(theirs)
+        with pytest.raises(owner_only.OwnerOnlyError, match="another account"):
+            owner_only.make_private_dir(theirs, enforce=True)
+        with pytest.raises(owner_only.OwnerOnlyError, match="not taken over"):
+            owner_only.ensure_private(theirs)
+        still = owner_only.inspect(theirs)
+        assert still is not None and still.owner == USERS
 
 
 def test_describe_sid() -> None:
@@ -208,6 +325,39 @@ def test_replace_file_retries_while_a_reader_has_the_file_open(
     assert target.read_text(encoding="utf-8") == "new"
     assert not source.exists()
     assert bool(pauses) is WINDOWS
+
+
+def test_remove_file_retries_while_a_reader_has_the_file_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``logout`` while another process reads the key file: on Windows the
+    removal fails with a sharing violation for that moment and is retried;
+    here the reader closes during the pause."""
+    import time
+
+    from agentchatme_hermes.state import remove_file
+
+    target = tmp_path / "credentials.json"
+    target.write_text("{}", encoding="utf-8")
+    reader = open(target, encoding="utf-8")  # noqa: SIM115 - held across the removal on purpose
+    pauses: list[float] = []
+
+    def pause(seconds: float) -> None:
+        pauses.append(seconds)
+        reader.close()
+
+    monkeypatch.setattr(time, "sleep", pause)
+    try:
+        if WINDOWS:
+            with pytest.raises(PermissionError):
+                os.remove(target)
+        remove_file(target)
+    finally:
+        reader.close()
+    assert not target.exists()
+    assert bool(pauses) is WINDOWS
+    with pytest.raises(FileNotFoundError):
+        remove_file(target)
 
 
 # ─── pid_alive without psutil ──────────────────────────────────────────────

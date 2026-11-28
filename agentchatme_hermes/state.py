@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -80,6 +82,30 @@ def replace_file(source: Path, target: Path) -> None:
         os.replace(source, target)
         return
     rename_with_retry(source, target)
+
+
+# remove_file's retry: the SDK kit's rename retry, the same budget (~100 ms).
+_REMOVE_ATTEMPTS = 6
+_REMOVE_DELAY_S = 0.02
+
+
+def remove_file(path: Path) -> None:
+    """``path.unlink()``. On Windows a file another process has open without
+    sharing delete (a reader, an antivirus scan) cannot be removed for that
+    moment (a sharing violation): the removal is retried for about 100 ms, as
+    :func:`replace_file` retries a rename. Raises ``FileNotFoundError`` when
+    there is no file, and the last ``OSError`` otherwise."""
+    attempts = _REMOVE_ATTEMPTS if sys.platform == "win32" else 1
+    for attempt in range(1, attempts + 1):
+        try:
+            Path(path).unlink()
+            return
+        except FileNotFoundError:
+            raise
+        except PermissionError:
+            if attempt >= attempts:
+                raise
+            time.sleep(_REMOVE_DELAY_S)
 
 
 def write_json_atomic(path: Path, record: Any) -> None:

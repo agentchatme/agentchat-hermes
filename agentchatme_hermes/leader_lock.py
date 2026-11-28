@@ -309,32 +309,53 @@ def try_acquire_ws_leader_lock(path: Path) -> int | None:
     target = path
     try:
         fd = _open_lock_file(target)
-    except OSError:
-        logger.exception(
-            "leader_lock: cannot open %s — falling back to CLI mode "
-            "(no WS in this process)",
+    except OSError as exc:
+        _log_once(
+            f"open:{target}:{exc}",
+            logging.WARNING,
+            "leader_lock: cannot open %s (%s) — falling back to CLI mode (no WS in this process)",
             target,
+            exc,
         )
         return None
 
     try:
         held = _try_lock(fd)
-    except OSError:
+    except OSError as exc:
         os.close(fd)
-        logger.exception(
-            "leader_lock: the OS lock failed on %s — falling back to CLI mode",
+        _log_once(
+            f"lock:{target}:{exc}",
+            logging.WARNING,
+            "leader_lock: the OS lock failed on %s (%s) — falling back to CLI mode",
             target,
+            exc,
         )
         return None
     if not held:
         os.close(fd)
-        logger.info(
+        _log_once(
+            f"held:{target}",
+            logging.INFO,
             "leader_lock: %s already held by another process — this "
             "process will run in CLI mode (no WS, no invoker)",
             target,
         )
         return None
     return fd
+
+
+_logged: set[str] = set()
+
+
+def _log_once(key: str, level: int, message: str, *args: object) -> None:
+    """``level`` the first time for ``key`` in this process, DEBUG after: a
+    gateway that lost the election retries every 15 s and must not log every
+    15 s (the runtime says once that it is a follower)."""
+    if key in _logged:
+        logger.debug(message, *args)
+        return
+    _logged.add(key)
+    logger.log(level, message, *args)
 
 
 def _open_lock_file(target: Path) -> int:

@@ -165,13 +165,64 @@ class TestWindowsAccessList:
         assert not key_store.read_store(home).loose_mode
         assert key_store.tighten(home) is False, "nothing left to change"
 
-    def test_writable_by_others_is_refused(self, tmp_path: Path) -> None:
+    def test_writable_by_others_is_refused_and_made_yours_by_doctor_fix(self, tmp_path: Path) -> None:
+        """A key file an earlier release wrote in a home like ``C:\\hermes``
+        (inheriting Authenticated Users: Modify): refused, never used, and the
+        refusal names ``doctor --fix``, which makes it yours only and keeps
+        the key."""
+        from agentchatme_hermes import cli, config, owner_only
+
+        home = _home(tmp_path)
+        self._icacls(str(home), "/grant", "*S-1-5-11:(OI)(CI)(M)")
+        path = key_store.write_store(home, api_key=api_key("k"), handle="alice", api_base="https://a.test")
+        for target in (path.parent, path):  # as an earlier release left them: inheriting the home's list
+            self._icacls(str(target), "/reset")
+        read = key_store.read_store(home)
+        assert read.status == "unsafe" and not read.usable and read.repairable
+        assert "can be changed by other accounts on this computer (Authenticated Users)" in read.detail
+        refusal = config.resolve_key(home).refusal
+        assert refusal is not None and "doctor --fix` makes it yours only and keeps the key" in refusal
+        lines: list[tuple[str, str]] = []
+        cli._fix_key_file_others_can_change(
+            home, cmd="hermes agentchat", ok=lambda m: lines.append(("ok", m)), fail=lambda m: lines.append(("fail", m))
+        )
+        assert [level for level, _ in lines] == ["ok"], lines
+        assert "still holds the key for @alice" in lines[0][1]
+        after = key_store.read_store(home)
+        assert after.usable and after.key is not None and after.key.api_key == api_key("k")
+        assert not after.loose_mode
+        for target in (path.parent, path):
+            access = owner_only.inspect(target, root=home)
+            assert access is not None and access.settled
+        assert key_store.make_yours(home) is None, "nothing left to repair"
+
+    def test_a_hard_linked_key_file_is_refused(self, tmp_path: Path) -> None:
+        """Another name of the file may be anyone's: never used, never repaired."""
         home = _home(tmp_path)
         path = key_store.write_store(home, api_key=api_key("k"), handle="a", api_base="https://a.test")
-        self._icacls(str(path), "/grant", "*S-1-5-32-545:(M)")
+        os.link(path, tmp_path / "another-name.json")
         read = key_store.read_store(home)
-        assert read.status == "unsafe" and not read.usable
-        assert "can be changed by other accounts on this computer (Users)" in read.detail
+        assert read.status == "unsafe" and not read.usable and not read.repairable
+        assert "hard link" in read.detail
+        assert key_store.make_yours(home) is None, "never repaired"
+
+    def test_a_key_directory_that_is_a_junction_is_refused(self, tmp_path: Path) -> None:
+        """``<home>\\agentchat`` pointing elsewhere: the key file there is not this
+        profile's, whatever its list says."""
+        import subprocess
+
+        other = _home(tmp_path, "other")
+        key_store.write_store(other, api_key=api_key("k"), handle="a", api_base="https://a.test")
+        home = _home(tmp_path)
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(key_store.store_dir(home)), str(key_store.store_dir(other))],
+            check=True, capture_output=True,
+        )
+        read = key_store.read_store(home)
+        assert read.status == "unsafe" and not read.usable and "resolves to" in read.detail
+        with pytest.raises(key_store.KeyStoreError):
+            key_store.write_store(home, api_key=api_key("j"), handle="a", api_base="https://a.test")
+        assert key_store.read_store(other).key.api_key == api_key("k")  # type: ignore[union-attr]
 
     def test_a_key_directory_closed_to_the_user_is_given_back(self, tmp_path: Path) -> None:
         """What an elevated run of an earlier release could leave on Python 3.13+
@@ -185,13 +236,28 @@ class TestWindowsAccessList:
                 str(target), "/inheritance:r", "/grant:r",
                 f"*S-1-5-18:{inherit}F", f"*S-1-5-32-544:{inherit}F",
             )
-        if owner_only.inspect(path) is None:
-            pytest.skip("this account cannot read the file without its own entry")
         read = key_store.read_store(home)
+        if read.status == "unreadable":
+            pytest.skip("only an administrator reads it now (the elevated remedy); this account cannot")
         assert read.loose_mode
         assert key_store.tighten(home) is True
-        after = owner_only.inspect(path)
-        assert after is not None and after.user_granted and after.private
+        after = owner_only.inspect(path, root=home)
+        assert after is not None and after.user_granted and after.settled
+
+    def test_a_key_directory_of_another_owner_is_refused(self, tmp_path: Path) -> None:
+        """As POSIX refuses a directory of another uid: nothing is saved into it."""
+        import ctypes
+
+        if not ctypes.windll.shell32.IsUserAnAdmin():  # type: ignore[attr-defined, unused-ignore]
+            pytest.skip("setting another owner needs an administrator")
+        home = _home(tmp_path)
+        theirs = key_store.store_dir(home)
+        theirs.mkdir()
+        self._icacls(str(theirs), "/grant", "*S-1-5-32-545:(OI)(CI)F")
+        self._icacls(str(theirs), "/setowner", "*S-1-5-32-545")
+        with pytest.raises(key_store.KeyStoreError, match="another account"):
+            key_store.write_store(home, api_key=api_key("k"), handle="a", api_base="https://a.test")
+        assert not key_store.store_path(home).exists()
 
 
 class TestBoundToItsProfile:

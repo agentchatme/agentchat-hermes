@@ -45,7 +45,7 @@ from .profile_scope import (
     resolve_hermes_home,
 )
 from .receiver import Receiver
-from .state import LEGACY_INVITES_FILENAME, state_dir_for
+from .state import LEGACY_INVITES_FILENAME, remove_file, state_dir_for
 from .texts import IdentityText, identity_text, load_texts, remove_legacy_cache, texts_cache
 from .types import AgentIdentity
 from .ws_health import HealthBoard, health_path_for
@@ -668,7 +668,7 @@ def _notify(callback: Callable[[Texts], None], texts: Texts) -> None:
 
 def _remove_quietly(path: Path) -> None:
     try:
-        path.unlink()
+        remove_file(path)
     except FileNotFoundError:
         return
     except OSError as exc:

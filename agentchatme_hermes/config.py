@@ -350,6 +350,16 @@ def resolve_key(home: Path | None = None) -> KeyResolution:
     cmd = cli_prefix(home)
     store = key_store.read_store(home)
 
+    if store.status == "unsafe" and store.repairable:
+        return KeyResolution(
+            None,
+            KEY_SOURCE_STORE,
+            store,
+            refusal=(
+                f"{store.detail}. It is yours: `{cmd} doctor --fix` makes it yours only and keeps the key "
+                f"(if you did not save that key yourself, `{cmd} recover` gets a new one instead)."
+            ),
+        )
     if store.status in ("unsafe", "unreadable"):
         return KeyResolution(
             None,
