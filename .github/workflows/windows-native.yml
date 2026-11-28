@@ -49,7 +49,7 @@ concurrency:
 
 jobs:
   gateway:
-    name: Hermes ${{ inputs.hermes_channel }} gateway on windows-latest
+    name: Hermes ${{ inputs.hermes_channel || 'stable' }} gateway on windows-latest
     runs-on: windows-latest
     timeout-minutes: 75
     defaults:
@@ -63,6 +63,7 @@ jobs:
       HERMES_GATEWAY_INSTALL_START_ON_LOGIN: "0"
       PYTHONUTF8: "1"
       STUB_PORT: "18787"
+      HERMES_CHANNEL: ${{ inputs.hermes_channel || 'stable' }}
       CHECK_KEY: ${{ secrets.AGENTCHAT_WINDOWS_CHECK_KEY }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -78,7 +79,7 @@ jobs:
       - name: Install Hermes (install.ps1, as Nous documents for native Windows)
         run: |
           $script = (Invoke-RestMethod https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.ps1).TrimStart([char]0xFEFF)
-          & ([scriptblock]::Create($script)) -NonInteractive -Channel '${{ inputs.hermes_channel }}'
+          & ([scriptblock]::Create($script)) -NonInteractive -Channel $env:HERMES_CHANNEL
           $bin = Join-Path $env:LOCALAPPDATA 'hermes\bin'
           if (-not (Test-Path (Join-Path $bin 'hermes.exe')) -and -not (Test-Path (Join-Path $bin 'hermes.cmd'))) {
             Get-ChildItem $bin -ErrorAction SilentlyContinue | Format-Table Name
@@ -172,7 +173,7 @@ jobs:
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
-          name: windows-native-${{ inputs.hermes_channel }}
+          name: windows-native-${{ inputs.hermes_channel || 'stable' }}
           path: ${{ runner.temp }}/windows-native
           if-no-files-found: warn
           retention-days: 14
