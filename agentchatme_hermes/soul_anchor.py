@@ -142,15 +142,18 @@ def render_anchor_block(identity_line: str, *, handle: str) -> str:
 def resolve_soul_path() -> Path:
     """Resolve ``$HERMES_HOME/SOUL.md`` via Hermes' canonical helper.
 
-    Falls back to ``~/.hermes/SOUL.md`` if ``hermes_constants`` is not
-    importable. Inside a real Hermes process the import always succeeds;
+    Falls back to the platform default home's ``SOUL.md``
+    (:func:`.profile_scope.platform_default_home`) if ``hermes_constants`` is
+    not importable. Inside a real Hermes process the import always succeeds;
     the fallback exists for unit tests and for environments where the
     plugin is being inspected outside Hermes.
     """
     try:
         from hermes_constants import get_hermes_home  # type: ignore[import-not-found]
     except ImportError:
-        return Path.home() / ".hermes" / "SOUL.md"
+        from .profile_scope import platform_default_home
+
+        return platform_default_home() / "SOUL.md"
 
     hermes_home: Path = get_hermes_home()
     return hermes_home / "SOUL.md"
@@ -291,7 +294,9 @@ def write_text_atomic(path: Path, text: str, *, unless_changed_from: str | None 
             os.chmod(tmp, mode)
         if unless_changed_from is not None and not _still(target, unless_changed_from):
             raise _ChangedMeanwhile(str(target))
-        os.replace(tmp, target)
+        from .state import replace_file
+
+        replace_file(tmp, target)
     except BaseException:
         with contextlib.suppress(OSError):
             tmp.unlink()

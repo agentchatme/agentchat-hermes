@@ -822,7 +822,6 @@ class TestLogoutWithAGatewayRunning:
         monkeypatch.setattr(cli, "_uninstall_secrets_registration", lambda: None)
         monkeypatch.setattr(cli, "_uninstall_mcp_registration", lambda: None)
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="the leader lock is fcntl, POSIX-only")
     def test_a_live_gateway_for_the_account_is_said(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:

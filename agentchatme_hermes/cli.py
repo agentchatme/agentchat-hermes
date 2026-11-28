@@ -1781,10 +1781,12 @@ def _doctor_key_checks(
     if resolution.held_key:
         snapshots = _snapshots_holding_the_key(store.path.parent.parent)
         if snapshots:
+            pattern = snapshots[0].parent / "hermes-snap-*.sh"
+            remove = f'Remove-Item "{pattern}"' if sys.platform == "win32" else f"rm {pattern}"
             warn(
                 f"{len(snapshots)} Hermes terminal snapshot(s) in {snapshots[0].parent} still hold "
                 f"{_ENV_API_KEY} from before it was kept out of the agent's commands — delete them "
-                f"(`rm {snapshots[0].parent}/hermes-snap-*.sh`); the agent's commands could read the "
+                f"(`{remove}`); the agent's commands could read the "
                 f"key then, so consider `{cmd} recover` to rotate it"
             )
 

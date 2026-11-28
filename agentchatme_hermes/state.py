@@ -13,9 +13,11 @@ profiles that share one key share one account, and the texts carry that
 account's handle. ``AGENTCHATME_STATE_DIR`` overrides the base directory for
 read-only homes, the way ``AGENTCHATME_LOCK_DIR`` does for the locks.
 
-Writes are atomic (temp file + ``os.replace``) with mode ``0600``; a crash
-mid-write leaves the previous file intact. Reads never raise: a missing or
-corrupt file reads as "nothing stored".
+Writes are atomic (temp file + ``os.replace``, on Windows retried for a moment
+while another process has the file open: :func:`replace_file`) with mode
+``0600`` in an owner-only directory (:mod:`.owner_only`); a crash mid-write
+leaves the previous file intact. Reads never raise: a missing or corrupt file
+reads as "nothing stored".
 """
 from __future__ import annotations
 
@@ -65,6 +67,21 @@ def state_dir_for_account(
     )
 
 
+def replace_file(source: Path, target: Path) -> None:
+    """``os.replace(source, target)``. On Windows a rename onto a file another
+    process has open (a reader, an antivirus scan) fails with a sharing
+    violation; the SDK kit's ``rename_with_retry`` retries it for about
+    100 ms, as the kit does for its own files (the texts cache, the
+    manual). Plain ``os.replace`` when the SDK cannot be imported (a plugin
+    load that only reports the missing SDK)."""
+    try:
+        from agentchatme.integration import rename_with_retry
+    except ImportError:
+        os.replace(source, target)
+        return
+    rename_with_retry(source, target)
+
+
 def write_json_atomic(path: Path, record: Any) -> None:
     """Replace ``path`` with ``record`` as JSON, atomically, mode ``0600``.
 
@@ -72,7 +89,9 @@ def write_json_atomic(path: Path, record: Any) -> None:
     whether that is fatal (it never is for state — the in-memory copy is
     the one in use, the file is for the next start).
     """
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    from .owner_only import make_private_dir
+
+    make_private_dir(path.parent)
     temp: Path | None = None
     try:
         # Exclusive creation: no stale-temp collisions after a crash and no
@@ -91,7 +110,7 @@ def write_json_atomic(path: Path, record: Any) -> None:
             file.write("\n")
             file.flush()
             os.fsync(file.fileno())
-        os.replace(temp, path)
+        replace_file(temp, path)
         os.chmod(path, 0o600)
     finally:
         if temp is not None:
@@ -102,6 +121,6 @@ def write_json_atomic(path: Path, record: Any) -> None:
 def read_json(path: Path) -> Any:
     """The decoded JSON at ``path``, or ``None`` when absent or unreadable."""
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError):
         return None

@@ -14,6 +14,7 @@ from __future__ import annotations
 import functools
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -146,7 +147,10 @@ def write_ws_health(
         record["worker"] = dict(worker)
     record["plugin"] = dict(plugin_build())
 
-    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    from .owner_only import make_private_dir
+    from .state import replace_file
+
+    make_private_dir(target.parent)
     temp: Path | None = None
     try:
         # NamedTemporaryFile uses exclusive creation, avoiding both stale-temp
@@ -165,7 +169,7 @@ def write_ws_health(
             file.write("\n")
             file.flush()
             os.fsync(file.fileno())
-        os.replace(temp, target)
+        replace_file(temp, target)
         os.chmod(target, 0o600)
     finally:
         if temp is not None:
@@ -177,7 +181,7 @@ def write_ws_health(
 def read_ws_health(path: Path | None = None) -> WSHealth | None:
     target = path or default_health_path()
     try:
-        raw: Any = json.loads(target.read_text(encoding="utf-8"))
+        raw: Any = json.loads(target.read_text(encoding="utf-8-sig"))
     except (OSError, ValueError, TypeError):
         return None
 
@@ -357,7 +361,10 @@ def live_health(api_base: str, api_key: str, hermes_home: Path | None = None) ->
 
 def pid_alive(pid: int) -> bool | None:
     """Whether a process with ``pid`` exists here; ``None`` when that cannot be
-    told (Windows without ``psutil``: ``os.kill`` there would end the process)."""
+    told. ``psutil`` when installed (Hermes depends on it); else on Windows
+    ``OpenProcess`` + a zero wait — never ``os.kill(pid, 0)``, which there
+    sends CTRL+C to the target's console group (bpo-14484) — and on POSIX
+    ``os.kill(pid, 0)``."""
     try:
         import importlib
 
@@ -365,14 +372,49 @@ def pid_alive(pid: int) -> bool | None:
         return bool(psutil.pid_exists(pid))
     except ImportError:
         pass
-    if os.name == "nt":
-        return None
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # it exists, owned by another user
-    except OSError:
-        return None
-    return True
+    if sys.platform == "win32":
+        return _windows_pid_alive(pid)
+    else:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True  # it exists, owned by another user
+        except OSError:
+            return None
+        return True
+
+
+if sys.platform == "win32":
+
+    def _windows_pid_alive(pid: int) -> bool | None:
+        """``OpenProcess`` the pid and wait 0 ms on it: running until it exits.
+        Access denied means it exists (another user's); an invalid parameter
+        means no such process. The shape of Hermes' own stdlib probe
+        (``hermes_cli/_subprocess_compat.py`` ``win32_pid_exists``)."""
+        import ctypes
+        from ctypes import wintypes
+
+        process_query_limited_information, synchronize = 0x1000, 0x00100000
+        wait_timeout, error_access_denied, error_invalid_parameter = 0x102, 5, 87
+        try:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel32.OpenProcess.restype = ctypes.c_void_p
+            kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, wintypes.DWORD)
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(process_query_limited_information | synchronize, False, pid)
+            if not handle:
+                error = ctypes.get_last_error()
+                if error == error_access_denied:
+                    return True
+                return False if error == error_invalid_parameter else None
+            try:
+                return bool(kernel32.WaitForSingleObject(handle, 0) == wait_timeout)
+            finally:
+                kernel32.CloseHandle(handle)
+        except (OSError, AttributeError):
+            return None

@@ -17,8 +17,9 @@ reached places it never should (found testing on a real Hermes box, 2026-11-17):
 
 The key is the agent's password on AgentChat. It now lives in
 ``<profile home>/agentchat/credentials.json``: one file per profile, mode
-``0600`` in a ``0700`` directory, written atomically, read only by this
-plugin — the socket, the CLI, and the secret source that hands it to Hermes'
+``0600`` in a ``0700`` directory (on Windows, a directory whose access list
+names only the user, SYSTEM and Administrators — :mod:`.owner_only`),
+written atomically, read only by this plugin — the socket, the CLI, and the secret source that hands it to Hermes'
 MCP client for the hosted tools (:mod:`.key_source`). Hermes copies no part
 of it on ``profile create`` / ``--clone``.
 
@@ -53,6 +54,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from . import owner_only
+from .state import replace_file
+
 logger = logging.getLogger(__name__)
 
 STORE_DIRNAME = "agentchat"
@@ -62,8 +66,9 @@ STORE_VERSION = 1
 _FILE_MODE = 0o600
 _DIR_MODE = 0o700
 # POSIX file modes and owners mean something; on Windows they do not (every
-# file reads 0o666 whatever was asked). A constant rather than a platform
-# check inline, so the type checker on each platform sees both branches.
+# file reads 0o666 whatever was asked): there the access list says who may
+# use the file (:mod:`.owner_only`). A constant rather than a platform check
+# inline, so the type checker on each platform sees both branches.
 _POSIX = os.name != "nt"
 
 StoreStatus = Literal["missing", "ok", "moved", "copied", "unsafe", "unreadable"]
@@ -92,7 +97,9 @@ class StoreRead:
     detail: str = ""
     # ``copied`` / ``moved``: the profile home the file names.
     origin_home: Path | None = None
-    # Readable by the group or others (POSIX): still used, tightened on the next write.
+    # Readable by the group or others (POSIX; on Windows by any account but the
+    # user, SYSTEM and Administrators, or not granted to the user itself):
+    # still used, tightened at activation and by ``doctor --fix``.
     loose_mode: bool = False
 
     @property
@@ -142,7 +149,7 @@ def read_store(home: Path) -> StoreRead:
     record = _parse(path)
     if isinstance(record, str):
         return StoreRead("unreadable", path, detail=record)
-    loose = _is_loose(st)
+    loose = _is_loose(path, st)
     recorded = Path(record.profile_home) if record.profile_home else None
     if recorded is None or same_home(recorded, home):
         return StoreRead("ok", path, key=record, loose_mode=loose)
@@ -170,7 +177,7 @@ def _ownership_problem(path: Path, st: os.stat_result) -> str | None:
     if not stat.S_ISREG(st.st_mode):
         return f"{path} is not a regular file"
     if not _POSIX:
-        return None
+        return _windows_problem(path)
     getuid = getattr(os, "getuid", None)
     if callable(getuid) and st.st_uid != getuid():
         return f"{path} is owned by uid {st.st_uid}, not by you (uid {getuid()})"
@@ -179,13 +186,34 @@ def _ownership_problem(path: Path, st: os.stat_result) -> str | None:
     return None
 
 
-def _is_loose(st: os.stat_result) -> bool:
-    return _POSIX and bool(st.st_mode & 0o044)
+def _windows_problem(path: Path) -> str | None:
+    """The POSIX owner and group/other-write checks, read from the access list.
+    ``None`` when the list cannot be read (a file system without one): the
+    file is then judged as before this check existed, by its contents."""
+    access = owner_only.inspect(path)
+    if access is None:
+        return None
+    if not access.owner_trusted:
+        return f"{path} is owned by {owner_only.describe_sid(access.owner)}, not by you ({access.user})"
+    if access.null_dacl:
+        return f"{path} has no access list: every account on this computer can change it"
+    if access.others_write:
+        names = ", ".join(owner_only.describe_sid(sid) for sid in access.others_write)
+        return f"{path} can be changed by other accounts on this computer ({names})"
+    return None
+
+
+def _is_loose(path: Path, st: os.stat_result) -> bool:
+    if _POSIX:
+        return bool(st.st_mode & 0o044)
+    access = owner_only.inspect(path)
+    return access is not None and not access.private
 
 
 def _parse(path: Path) -> StoredKey | str:
     try:
-        raw = path.read_text(encoding="utf-8")
+        # utf-8-sig: a byte-order mark from a Windows editor is not a broken file.
+        raw = path.read_text(encoding="utf-8-sig")
     except OSError as exc:
         return f"cannot read {path}: {exc.strerror or exc}"
     try:
@@ -228,10 +256,13 @@ def write_store(home: Path, *, api_key: str, handle: str, api_base: str) -> Path
     """Save the key for ``home``; return the file's path.
 
     The directory is ``0700`` and the file ``0600`` from its first byte (it
-    is created with that mode, never chmod'ed after the key is in it). The
-    write goes to a temporary file in the same directory, is flushed to disk,
-    then renamed over the old one, so a crash leaves the old file or the new
-    one, never half of either. The file is read back before this returns.
+    is created with that mode, never chmod'ed after the key is in it); on
+    Windows the directory gets the owner-only access list and the file
+    inherits it as it is created. The write goes to a temporary file in the
+    same directory, is flushed to disk, then renamed over the old one (on
+    Windows retried for a moment while another process has the file open),
+    so a crash leaves the old file or the new one, never half of either. The
+    file is read back before this returns.
 
     Raises:
         KeyStoreError: the key was not saved; whatever file was there is
@@ -243,9 +274,7 @@ def write_store(home: Path, *, api_key: str, handle: str, api_base: str) -> Path
     directory = store_dir(home)
     path = store_path(home)
     try:
-        directory.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        if _POSIX:
-            os.chmod(directory, _DIR_MODE)
+        owner_only.make_private_dir(directory, enforce=True, strict=True)
     except OSError as exc:
         raise KeyStoreError(f"cannot create {directory}: {exc.strerror or exc}") from exc
     record = {
@@ -266,7 +295,7 @@ def write_store(home: Path, *, api_key: str, handle: str, api_base: str) -> Path
             os.fsync(fd)
         finally:
             os.close(fd)
-        os.replace(tmp, path)
+        replace_file(tmp, path)
     except OSError as exc:
         with contextlib.suppress(OSError):
             tmp.unlink()
@@ -294,9 +323,11 @@ def _fsync_dir(directory: Path) -> None:
 
 
 def tighten(home: Path) -> bool:
-    """Make an existing key file ``0600`` and its directory ``0700``. ``True`` when changed."""
+    """Make an existing key file ``0600`` and its directory ``0700`` (on Windows:
+    the owner-only access list on the directory and on the files in it).
+    ``True`` when changed."""
     if not _POSIX:
-        return False
+        return _tighten_windows(home)
     path = store_path(home)
     changed = False
     for target, mode in ((store_dir(home), _DIR_MODE), (path, _FILE_MODE)):
@@ -313,6 +344,24 @@ def tighten(home: Path) -> bool:
             except OSError:
                 logger.debug("key_store: chmod of %s failed", target, exc_info=True)
     return changed
+
+
+def _tighten_windows(home: Path) -> bool:
+    directory = store_dir(home)
+    if not directory.is_dir():
+        return False
+    changed = False
+    current = owner_only.inspect(directory)
+    if current is None or not (current.private and current.protected):
+        try:
+            owner_only.restrict(directory)
+        except OSError:
+            logger.debug("key_store: the access list of %s was not set", directory, exc_info=True)
+            return False
+        changed = True
+    # The files already in it keep the list they were created with (nothing
+    # propagates): each one is set too.
+    return owner_only.restrict_children(directory) > 0 or changed
 
 
 def delete_store(home: Path) -> bool:

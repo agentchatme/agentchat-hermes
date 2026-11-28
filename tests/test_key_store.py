@@ -127,6 +127,73 @@ class TestUnusable:
         assert not key_store.read_store(home).loose_mode
 
 
+@pytest.mark.skipif(POSIX, reason="Windows access lists")
+class TestWindowsAccessList:
+    """The POSIX mode checks, read from the access list (``owner_only``)."""
+
+    @staticmethod
+    def _icacls(*args: str) -> None:
+        import subprocess
+
+        subprocess.run(["icacls", *args], check=True, capture_output=True)
+
+    def test_the_directory_is_owner_only_and_the_file_inherits_it(self, tmp_path: Path) -> None:
+        from agentchatme_hermes import owner_only
+
+        home = _home(tmp_path)
+        # A Hermes home outside the user profile: its parent lets everyone read.
+        self._icacls(str(home), "/grant", "*S-1-1-0:(OI)(CI)(R)")
+        path = key_store.write_store(home, api_key=api_key("k"), handle="a", api_base="https://a.test")
+        directory = owner_only.inspect(path.parent)
+        assert directory is not None and directory.private and directory.protected
+        made = owner_only.inspect(path)
+        assert made is not None and made.private
+        read = key_store.read_store(home)
+        assert read.status == "ok" and not read.loose_mode
+
+    def test_readable_by_others_is_used_flagged_and_tightened(self, tmp_path: Path) -> None:
+        from agentchatme_hermes import owner_only
+
+        home = _home(tmp_path)
+        path = key_store.write_store(home, api_key=api_key("k"), handle="a", api_base="https://a.test")
+        self._icacls(str(path), "/grant", "*S-1-1-0:(R)")
+        read = key_store.read_store(home)
+        assert read.usable and read.loose_mode
+        assert key_store.tighten(home) is True
+        after = owner_only.inspect(path)
+        assert after is not None and after.private
+        assert not key_store.read_store(home).loose_mode
+        assert key_store.tighten(home) is False, "nothing left to change"
+
+    def test_writable_by_others_is_refused(self, tmp_path: Path) -> None:
+        home = _home(tmp_path)
+        path = key_store.write_store(home, api_key=api_key("k"), handle="a", api_base="https://a.test")
+        self._icacls(str(path), "/grant", "*S-1-5-32-545:(M)")
+        read = key_store.read_store(home)
+        assert read.status == "unsafe" and not read.usable
+        assert "can be changed by other accounts on this computer (Users)" in read.detail
+
+    def test_a_key_directory_closed_to_the_user_is_given_back(self, tmp_path: Path) -> None:
+        """What an elevated run of an earlier release could leave on Python 3.13+
+        (SYSTEM and Administrators only): loose, and tightening names the user."""
+        from agentchatme_hermes import owner_only
+
+        home = _home(tmp_path)
+        path = key_store.write_store(home, api_key=api_key("k"), handle="a", api_base="https://a.test")
+        for target, inherit in ((path.parent, "(OI)(CI)"), (path, "")):
+            self._icacls(
+                str(target), "/inheritance:r", "/grant:r",
+                f"*S-1-5-18:{inherit}F", f"*S-1-5-32-544:{inherit}F",
+            )
+        if owner_only.inspect(path) is None:
+            pytest.skip("this account cannot read the file without its own entry")
+        read = key_store.read_store(home)
+        assert read.loose_mode
+        assert key_store.tighten(home) is True
+        after = owner_only.inspect(path)
+        assert after is not None and after.user_granted and after.private
+
+
 class TestBoundToItsProfile:
     """A copied profile must not become the same agent."""
 

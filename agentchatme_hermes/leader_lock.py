@@ -25,8 +25,8 @@ whether *this* process should own the live WebSocket:
    one-shot, or cron-spawned Python — none of which should host
    a live inbound stream.
 
-2. **OS-enforced singleton per account** — ``fcntl.flock(LOCK_EX |
-   LOCK_NB)`` on ``<hermes root>/agentchat-locks/ws-<fingerprint>.lock``,
+2. **OS-enforced singleton per account** — an exclusive, non-blocking
+   OS file lock (:func:`_try_lock`) on ``<hermes root>/agentchat-locks/ws-<fingerprint>.lock``,
    where the fingerprint identifies the (server, API key) pair (see
    :func:`profile_scope.account_fingerprint`). Even if two
    ``_HERMES_GATEWAY=1`` processes for the same account ever coexist
@@ -50,22 +50,56 @@ whether *this* process should own the live WebSocket:
    * two profiles configured with the *same* key → same lock file →
      one leader, so one account never drives two concurrent turns.
 
-The lock file descriptor is held open for the process lifetime. POSIX
-``flock`` is released automatically when the fd closes (process exit,
-SIGKILL, or explicit :func:`release_leader_lock`). No stale lock
-files survive a crash; no special cleanup hook is needed.
+The lock file descriptor is held open for the process lifetime. The OS
+releases the lock when the descriptor closes (process exit, a crash, a
+kill, or explicit :func:`release_leader_lock`). No stale lock files
+survive a crash; no special cleanup hook is needed.
 
-POSIX-only by design. ``fcntl`` is Unix-only — and the only Hermes
-deployment targets are Linux and macOS, so this matches reality.
-We don't import ``fcntl`` at module level so that **Windows dev
-machines** can still import the package for tests / type-checks /
-local exploration. On Windows the acquire path returns ``None``
-(no leader) and the runtime falls back to follower mode — safe
-because no production gateway ever runs on Windows.
+One lock, two operating systems
+───────────────────────────────
+The code relies on four properties of the lock, and both primitives give
+all four:
+
+* **non-blocking**: an attempt returns at once, held or busy;
+* **released by the OS** when the descriptor closes or the process ends
+  in any way, so a crashed holder never leaves a lock behind;
+* **owned by the open file, not by the process**: two ``os.open`` of the
+  same file in one process exclude each other, which is how two profiles
+  of one multiplexed gateway that share a key elect one leader;
+* **not inherited**: Python opens descriptors non-inheritable (PEP 446),
+  so a child process the gateway starts never keeps the lock alive.
+
+POSIX (Linux, macOS): ``fcntl.flock(LOCK_EX | LOCK_NB)``. flock locks
+belong to the open file description; contention is ``BlockingIOError``.
+
+Windows: ``msvcrt.locking(fd, LK_NBLCK, 1)`` on byte 0, which is the C
+runtime's ``_locking``, i.e. ``LockFile`` on the descriptor's handle: an
+exclusive byte-range lock that fails at once when another handle holds
+the range. Windows byte-range locks belong to the file handle (the file
+object): a second handle opened by the same process cannot take a range
+the first one holds, exactly like a second flock descriptor. The system
+unlocks them when the handle is closed or the process terminates
+(``LockFile``/``LockFileEx`` documentation). Contention reads as
+``EACCES`` (``ERROR_LOCK_VIOLATION``) from the C runtime. The range is
+locked past the end of the empty file, which Windows allows; nothing ever
+reads the lock file, so the mandatory nature of Windows locks is moot.
+Hermes itself locks the same way on Windows (``hermes_cli/auth.py``,
+``pm/filesystem.py``: one byte at offset 0). Rejected: ``LockFileEx``
+through ctypes (the same kernel lock, more code), a named mutex (owned by
+a thread, re-entrant for that thread, so two profiles on one thread would
+not exclude each other), ``O_EXCL`` marker files (left behind by a crash)
+and third-party lock packages (``filelock``/``portalocker`` wrap the same
+calls and add a dependency).
+
+One difference is documented by Microsoft: the unlock at process exit is
+done by the system "as resources allow", so a lock can outlive its holder
+by a moment. A gateway that lost the election retries every
+:data:`.runtime.LEADER_RETRY_INTERVAL_S` seconds, which covers it.
 """
 from __future__ import annotations
 
 import contextlib
+import errno
 import logging
 import os
 import sys
@@ -73,16 +107,54 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
 if TYPE_CHECKING:
-    # Module-level import is purely for the type-checker — gives mypy
-    # the ``flock``/``LOCK_*`` symbols without running the real import
-    # on Windows. Runtime callsites still lazy-import below.
-    import fcntl  # noqa: F401
     from collections.abc import Iterator
 
 logger = logging.getLogger(__name__)
 
-_IS_POSIX = sys.platform != "win32"
+# Windows: the byte range locked (byte 0, one byte) and the C runtime's
+# errno for "another handle holds it" (``ERROR_LOCK_VIOLATION`` → EACCES;
+# EDEADLOCK is what the blocking mode reports after its retries; EAGAIN is
+# accepted as Hermes' own lock helper accepts it, ``pm/filesystem.py``).
+_WINDOWS_LOCK_BYTES = 1
+_WINDOWS_BUSY_ERRNOS = frozenset({errno.EACCES, errno.EAGAIN, errno.EDEADLK})
+
+
+def _try_lock(fd: int) -> bool:
+    """One non-blocking attempt at the exclusive lock on ``fd``'s open file.
+
+    ``True``: this descriptor holds it now. ``False``: another open file
+    holds it (this process's or another's). Raises ``OSError`` for anything
+    else (a file system without locks, a bad descriptor)."""
+    if sys.platform == "win32":
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, _WINDOWS_LOCK_BYTES)
+        except OSError as exc:
+            if exc.errno in _WINDOWS_BUSY_ERRNOS:
+                return False
+            raise
+    else:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return False
+    return True
+
+
+def _unlock(fd: int) -> None:
+    """Release the lock ``fd`` holds. Raises ``OSError`` when it holds none."""
+    if sys.platform == "win32":
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, _WINDOWS_LOCK_BYTES)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
 
 GATEWAY_ENV_MARKER = "_HERMES_GATEWAY"
 GATEWAY_ENV_VALUE = "1"
@@ -216,37 +288,24 @@ def try_acquire_ws_leader_lock(path: Path) -> int | None:
 
     Returns the file descriptor on success (the caller MUST keep this
     open for the process lifetime), or ``None`` if another process
-    already holds it.
+    already holds it, or no lock could be taken here (logged).
 
     Implementation notes:
 
-    * ``fcntl.flock(LOCK_EX | LOCK_NB)`` is atomic and non-blocking.
-      Two callers racing for the lock cannot both succeed — POSIX
-      guarantees one wins, the other gets ``BlockingIOError``.
+    * :func:`_try_lock` is atomic and non-blocking on both platforms
+      (``flock`` on POSIX, ``LockFile`` through ``msvcrt.locking`` on
+      Windows). Two callers racing for the lock cannot both succeed.
     * We deliberately do NOT write the PID into the file. The lock
-      semantics are tied to the fd, not to file content; PID-tracking
-      would be a separate concern (and the kernel's flock state is
-      observable via ``lslocks`` for operators who need it).
+      semantics are tied to the open file, not to file content;
+      PID-tracking would be a separate concern (the health record beside
+      the lock carries the holder's pid).
     * We do not delete the lock file on release. Lock files are
       stateless markers — leaving the file around lets a re-acquire
-      succeed without recreating the inode (cheaper and avoids a
-      race where two processes both create-and-lock the file
-      simultaneously). Stale files are harmless: they only carry
-      "lock currently held by some process" semantics WHILE that
-      process holds the fcntl lock.
+      succeed without recreating it (cheaper and avoids a race where two
+      processes both create-and-lock the file simultaneously). Stale
+      files are harmless: they only carry "lock currently held by some
+      process" semantics WHILE that process holds the OS lock.
     """
-    try:
-        import fcntl
-    except ImportError:
-        # Windows / non-POSIX: no leader election possible. Caller
-        # treats this as "lost the race" and runs in follower mode.
-        logger.warning(
-            "leader_lock: fcntl unavailable on this platform — "
-            "running in follower mode (no WS in this process). "
-            "Production gateways must run on POSIX."
-        )
-        return None
-
     target = path
     try:
         fd = _open_lock_file(target)
@@ -259,8 +318,15 @@ def try_acquire_ws_leader_lock(path: Path) -> int | None:
         return None
 
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined, unused-ignore]
-    except BlockingIOError:
+        held = _try_lock(fd)
+    except OSError:
+        os.close(fd)
+        logger.exception(
+            "leader_lock: the OS lock failed on %s — falling back to CLI mode",
+            target,
+        )
+        return None
+    if not held:
         os.close(fd)
         logger.info(
             "leader_lock: %s already held by another process — this "
@@ -268,26 +334,25 @@ def try_acquire_ws_leader_lock(path: Path) -> int | None:
             target,
         )
         return None
-    except OSError:
-        os.close(fd)
-        logger.exception(
-            "leader_lock: flock failed on %s — falling back to CLI mode",
-            target,
-        )
-        return None
-
     return fd
 
 
 def _open_lock_file(target: Path) -> int:
     """Open (creating) a lock file in our lock directory; raises ``OSError``."""
+    from .owner_only import make_private_dir
+
     # The lock directory is ours (``agentchat-locks/``), so creating it is in
-    # scope — unlike the Hermes home itself. 0700: it sits in the Hermes root.
-    target.parent.mkdir(parents=True, exist_ok=True)
+    # scope — unlike the Hermes home itself — and it is kept owner-only (0700;
+    # on Windows the owner-only access list, best effort): it sits in the
+    # Hermes root. Any other directory (``AGENTCHATME_LOCK_DIR``, the key
+    # directory for the sign-up lock) is created as ``mkdir`` creates it.
     if target.parent.name == LOCK_DIRNAME:
-        os.chmod(target.parent, 0o700)
+        make_private_dir(target.parent, enforce=True)
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
     # Open RW + create-if-missing. Mode 0600 so the key adjacent in the
-    # Hermes home isn't loosened by lock-file mode bits.
+    # Hermes home isn't loosened by lock-file mode bits (POSIX; on Windows
+    # the file takes its directory's access list).
     return os.open(target, os.O_RDWR | os.O_CREAT, 0o600)
 
 
@@ -296,21 +361,16 @@ HeldLock = Literal["held", "busy", "unavailable"]
 
 @contextlib.contextmanager
 def held_lock(path: Path, *, timeout_s: float = 2.0, poll_s: float = 0.05) -> Iterator[HeldLock]:
-    """Hold an exclusive ``flock`` on ``path`` for the block.
+    """Hold the exclusive OS lock (:func:`_try_lock`) on ``path`` for the block.
 
     Yields ``"held"`` while held; ``"busy"`` when another holder kept it
     past ``timeout_s`` (the caller does not do its step now);
-    ``"unavailable"`` when no lock can be had here at all (no ``fcntl`` —
-    Windows, never a gateway — or the lock directory cannot be written), so
-    there is nothing to exclude with and the caller decides. ``flock`` locks
-    belong to the open file, so two profiles of one multiplexed gateway
-    exclude each other as two processes do.
+    ``"unavailable"`` when no lock can be had here at all (the lock
+    directory cannot be written, or the file system takes no locks), so
+    there is nothing to exclude with and the caller decides. The lock
+    belongs to the open file on both platforms, so two profiles of one
+    multiplexed gateway exclude each other as two processes do.
     """
-    try:
-        import fcntl
-    except ImportError:
-        yield "unavailable"
-        return
     try:
         fd = _open_lock_file(path)
     except OSError:
@@ -322,22 +382,21 @@ def held_lock(path: Path, *, timeout_s: float = 2.0, poll_s: float = 0.05) -> It
     try:
         while True:
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined, unused-ignore]
-                state = "held"
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
+                if _try_lock(fd):
+                    state = "held"
                     break
-                time.sleep(poll_s)
             except OSError:
-                logger.warning("leader_lock: flock failed on %s", path, exc_info=True)
+                logger.warning("leader_lock: the OS lock failed on %s", path, exc_info=True)
                 state = "unavailable"
                 break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(poll_s)
         yield state
     finally:
         if state == "held":
             with contextlib.suppress(OSError):
-                fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined, unused-ignore]
+                _unlock(fd)
         with contextlib.suppress(OSError):
             os.close(fd)
 
@@ -347,16 +406,14 @@ def release_leader_lock(fd: int) -> None:
 
     Idempotent on the fd: a second call after the fd is closed will
     raise ``OSError`` which we swallow at DEBUG. Production callers
-    typically don't need to call this explicitly — the kernel
-    releases the lock on process exit — but it's exposed for clean
-    test teardown and for the in-process stop()/start() cycle.
+    typically don't need to call this explicitly — the OS releases the
+    lock on process exit — but it's exposed for clean test teardown and
+    for the in-process stop()/start() cycle.
     """
     try:
-        import fcntl
-
-        fcntl.flock(fd, fcntl.LOCK_UN)  # type: ignore[attr-defined, unused-ignore]
-    except (ImportError, OSError):
-        logger.debug("leader_lock: LOCK_UN raised", exc_info=True)
+        _unlock(fd)
+    except OSError:
+        logger.debug("leader_lock: unlock raised", exc_info=True)
     try:
         os.close(fd)
     except OSError:
@@ -369,13 +426,14 @@ def describe_lock_holder(path: Path) -> str:
     Used by :command:`hermes agentchat doctor` to tell the operator
     whether THIS process is the leader, another process is, or no one
     is. We can detect "held by someone" via a non-blocking probe, but
-    POSIX gives us no portable way to read the holder's PID without
-    parsing ``/proc/locks`` (Linux-specific).
+    neither OS gives a portable way to read the holder's PID (the health
+    record beside the lock names it).
 
     Returns one of:
 
     * ``"not present"`` — file doesn't exist (no gateway has run yet)
-    * ``"held"`` — lock is currently held by some process
+    * ``"held"`` — lock is currently held by some open file (another
+      process, or another descriptor of this one)
     * ``"free"`` — file exists but no one holds the lock
     * ``"unknown: <reason>"`` — couldn't probe
     """
@@ -383,25 +441,17 @@ def describe_lock_holder(path: Path) -> str:
     if not target.exists():
         return "not present"
 
-    try:
-        import fcntl
-    except ImportError:
-        return "unknown: fcntl unavailable (non-POSIX platform)"
-
     # Open a probe fd. If we can grab and immediately release the lock,
-    # nobody else has it. If we can't grab it (BlockingIOError), someone
-    # else does.
+    # nobody else has it. If we can't grab it, someone else does.
     try:
         probe_fd = os.open(target, os.O_RDONLY)
     except OSError as exc:
         return f"unknown: {exc!r}"
     try:
-        try:
-            fcntl.flock(probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined, unused-ignore]
-        except BlockingIOError:
+        if not _try_lock(probe_fd):
             return "held"
         # We grabbed it — nobody else had it. Release immediately.
-        fcntl.flock(probe_fd, fcntl.LOCK_UN)  # type: ignore[attr-defined, unused-ignore]
+        _unlock(probe_fd)
         return "free"
     except OSError as exc:
         return f"unknown: {exc!r}"
