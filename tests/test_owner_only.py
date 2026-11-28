@@ -166,9 +166,10 @@ class TestWindowsAccessList:
         target.mkdir()
         user = owner_only.current_user_sid()
         icacls(str(target), "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F")
-        icacls(str(target), "/remove:g", f"*{user}")  # an entry a parent's CREATOR OWNER left (C:\\Windows\\Temp)
+        icacls(str(target), "/remove", f"*{user}")  # any entry of its own a parent left
         access = owner_only.inspect(target)
-        assert access is not None and not access.user_granted and not access.private
+        listing = subprocess.run(["icacls", str(target)], capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
+        assert access is not None and not access.user_granted and not access.private, (access, listing)
         owner_only.make_private_dir(target, enforce=True)
         access = owner_only.inspect(target)
         assert access is not None and access.settled
