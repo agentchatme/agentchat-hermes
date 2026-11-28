@@ -108,8 +108,10 @@ What differs on Windows:
   may be closed to you unelevated (`doctor` then says the key file cannot be read): run `hermes agentchat doctor --fix`
   once from an elevated prompt, which sets the list again with your account in it.
 - **Checked on a real gateway.** `.github/workflows/windows-native.yml` installs Hermes with `install.ps1` on a
-  `windows-latest` runner, installs the plugin from a commit, starts the gateway and checks from a second process that
-  the plugin holds the leader lock and that the lock is free after a stop and after a kill.
+  `windows-latest` runner, installs the plugin from a commit, starts the gateway (`hermes gateway start`, then the
+  logon task) and checks from a second process that the plugin holds the leader lock and that the lock is free after
+  a stop and after a kill. With a test agent's key as the repository secret `AGENTCHAT_WINDOWS_CHECK_KEY` it also
+  checks the connect to api.agentchat.me.
 
 ### Let your agent set it up
 

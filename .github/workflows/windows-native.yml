@@ -30,12 +30,12 @@ name: windows-native
 # reach `connected`. Use a dedicated test agent nobody messages: the runner
 # has no model, so a message arriving during the run is left unread.
 #
-# Nothing is published. Logs and records are uploaded as an artifact; the
-# key never is (Hermes' logs and doctor mask it, GitHub masks the secret).
+# Nothing is published. The keyless leg's logs and records are uploaded as an
+# artifact (no real key is in them); the keyed leg uploads nothing and runs no
+# doctor (it prints a key's first and last characters), and GitHub masks the
+# secret in the step log.
 
 on:
-  push:
-    branches: [feat/windows-native]
   workflow_dispatch:
     inputs:
       hermes_channel:

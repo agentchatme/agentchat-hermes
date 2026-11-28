@@ -590,7 +590,7 @@ class TestArgvGatewayRunOnly:
             ["python", "-m", "hermes_cli.main", "gateway", "run"],
             ["hermes", "gateway"],  # legacy spelling of "start the gateway"
             # Native Windows: the Scheduled Task's launcher and `hermes gateway
-            # start` both run `<venv>\\Scripts\\python.exe -m hermes_cli.main
+            # start` both run `<Hermes' python.exe> -m hermes_cli.main
             # [--profile X] gateway run` (hermes_cli/gateway_windows.py
             # _gateway_run_argv); inside it argv[0] is the module's path and
             # Hermes has stripped the profile selector.

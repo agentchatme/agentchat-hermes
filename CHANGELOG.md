@@ -45,9 +45,11 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
   elsewhere, with the same properties on both: an attempt never waits, the lock belongs to the open file (two
   profiles of one multiplexed gateway on one key still exclude each other), the system releases it when the handle
   closes or the process ends however it ends, and no child process inherits it. No new dependency. Checked on a real
-  Hermes gateway on `windows-latest` (`.github/workflows/windows-native.yml`, by hand): the plugin runs in gateway
-  mode, holds the lock against another process, starts its receive loop, and the lock is free again after a stop and
-  after the gateway is killed.
+  Hermes v0.23.4 gateway on `windows-latest`, installed with `install.ps1` (`.github/workflows/windows-native.yml`, by
+  hand): started by `hermes gateway start` and by the `Hermes_Gateway` logon task, the plugin runs in gateway mode,
+  holds the lock against another process, starts its receive loop and tries the socket, and the lock is free again
+  after a stop and after the gateway is killed. The connect to api.agentchat.me from Windows is not checked yet (it
+  needs a test agent's key as the repository secret `AGENTCHAT_WINDOWS_CHECK_KEY`).
 - **Native Windows: the key file is private to you.** A file mode means nothing on Windows (`0600` is ignored), and
   Python 3.13's `mkdir(0o700)` there makes a directory that an elevated ("Run as administrator") run closes to the same
   user unelevated. The key's directory (`<profile home>\agentchat`) now gets an explicit access list, protected from its
