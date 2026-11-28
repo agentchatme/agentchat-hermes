@@ -95,6 +95,16 @@ LOAD_RESTART_LINE_AGENT = (
     f"{_LOAD_WHY}: it needs one restart, and that restart is the person's, not yours (it stops every turn the "
     f"gateway serves, this one too). Ask your person to {_LOAD_HOW.replace('the agent', 'you')}."
 )
+# Where the plugin can start Hermes' graceful restart itself (:mod:`.gateway_restart`, POSIX): the
+# person's Allow starts it, so nobody runs a restart by hand.
+LOAD_RESTARTING_LINE = (
+    "The running gateway started before the AgentChat plugin was installed: it restarts by itself as soon as "
+    "it is idle (a few seconds) to load the plugin. This chat carries on, and AgentChat starts by itself."
+)
+LOAD_ON_ALLOW_LINE_AGENT = (
+    f"{_LOAD_WHY}. Nothing to do for it: when your person sends /agentchat allow and taps Allow, the gateway "
+    "restarts by itself once it is idle (a few seconds; their chat carries on). Never restart it yourself."
+)
 
 
 def key_held(home: Path | None = None) -> str | None:
@@ -142,13 +152,31 @@ def key_in_use_line(
     from .allow import in_agent_terminal
     from .placement import gateway_cannot_load
 
-    if gateway_cannot_load(home if home is not None else profile_scope.resolve_hermes_home()):
-        return LOAD_RESTART_LINE_AGENT if in_agent_terminal() else LOAD_RESTART_LINE
+    where = home if home is not None else profile_scope.resolve_hermes_home()
+    if gateway_cannot_load(where):
+        return _load_line(where, agent=in_agent_terminal())
     if not serving and runs is False:
         return start_gateway_line(home if home is not None else profile_scope.resolve_hermes_home())
     if not serving or before == api_key:
         return NO_RESTART_LINE
     return RESTART_HINT_AGENT if in_agent_terminal() else RESTART_HINT
+
+
+def _load_line(home: Path, *, agent: bool) -> str:
+    """The gateway cannot load the plugin until it restarts: what setup says. Allowed already, at a
+    person's own terminal, the restart is started now (:func:`.allow.restart_after_yes`). In an
+    agent's terminal it never is: the person's Allow starts it, or, allowed already, the person
+    restarts."""
+    from . import allow, gateway_restart
+
+    allowed = allow.read_switch(home, api_base=allow._api_base(home)).by_tier
+    if agent:
+        if not allowed and gateway_restart.supported():
+            return LOAD_ON_ALLOW_LINE_AGENT
+        return LOAD_RESTART_LINE_AGENT
+    if allowed:
+        return allow.restart_after_yes(home) or LOAD_RESTART_LINE
+    return LOAD_RESTART_LINE
 
 
 def key_bridge() -> tuple[bool, str]:

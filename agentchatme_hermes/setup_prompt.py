@@ -73,13 +73,21 @@ RESTART_TO_LOAD = (
 def section_text(home: Path, *, api_base: str) -> str:
     """The section for the profile at ``home`` (run in its scope); ``""`` when
     there is nothing to say."""
-    from . import allow, signup_steps
+    from . import allow, gateway_restart, signup_steps
     from .config import cli_prefix, profile_handles, resolve_key
     from .placement import gateway_cannot_load
 
     cmd = cli_prefix(home)
-    restart = RESTART_TO_LOAD if gateway_cannot_load(home) else ""
     resolution = resolve_key(home)
+    switch_state = allow.read_switch(home, api_base=api_base).state if resolution.api_key is not None else None
+    # The person's Allow restarts the gateway where the plugin can (gateway_restart); until then,
+    # and where it cannot, the restart is asked for here.
+    restart = (
+        RESTART_TO_LOAD
+        if gateway_cannot_load(home)
+        and (switch_state not in (None, "not_allowed_yet") or not gateway_restart.supported())
+        else ""
+    )
     if resolution.store.status in ("unsafe", "unreadable"):
         # A key file this profile cannot use still names its agent: no sign-up line.
         return restart
@@ -88,8 +96,7 @@ def section_text(home: Path, *, api_base: str) -> str:
         if pending is not None:
             return _joined(WAITING.format(waiting=signup_steps.waiting_line(pending, cmd)), restart)
         return _joined(NOT_SET_UP.format(cmd=cmd), restart)
-    switch = allow.read_switch(home, api_base=api_base)
-    if switch.state == "not_allowed_yet":
+    if switch_state == "not_allowed_yet":
         return _joined(NOT_ALLOWED_YET.format(who=allow.who(profile_handles(home).own)), restart)
     return restart
 

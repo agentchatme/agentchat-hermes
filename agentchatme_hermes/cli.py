@@ -804,6 +804,10 @@ def _dispatch_allow(_args: argparse.Namespace) -> int:
         _printline(tools.line + ("." if tools.decision == "yes" else ""))
     if step.status == "changed":
         _printline(f"{step.name}: {step.detail}")
+    if tools.decision == "yes":
+        restart = allow.restart_after_yes(home)
+        if restart is not None:
+            _printline(restart)
     return _EXIT_OK if tools.decision == "yes" else _EXIT_API_ERR
 
 

@@ -4,6 +4,26 @@ All notable changes to `agentchatme-hermes` are recorded here. The format follow
 
 ## [Unreleased]
 
+### Added
+
+- **The person's Allow also restarts the gateway, when a first install needs it.** Hermes never switches a running
+  process's dependency environment, so a gateway that was running when the plugin was first installed (always the case
+  when an agent installs it, since every Hermes chat runs in the gateway) runs AgentChat only after a restart. Now the
+  person's Allow (`/agentchat allow`, `hermes agentchat allow`, the wizard, or setup at their own terminal) starts
+  Hermes' own graceful restart: SIGUSR1, what `systemctl reload hermes-gateway` and `hermes gateway restart` send. The
+  gateway waits until no work is in flight, exits, and its supervisor relaunches it; where nothing supervises it (the
+  desktop app's gateway, one a chat started, a hand-started `gateway run`), a detached helper runs `hermes gateway
+  ensure`, what the desktop app runs. Never started from an agent's terminal. POSIX only: on Windows the person still
+  restarts. Lab, Hermes v0.23.4, 2026-11-28: under a systemd user service the new gateway was up 8 s after the Allow
+  and the AgentChat tools 17 s; a chat-started gateway came back for the chat's next message; in both the chat stayed
+  the same session with its history.
+- **A reminder until the person decides.** Once a day at most, in a turn the person started (never a cron job, a
+  subagent, the API server, a webhook or AgentChat's own turns), the agent is asked to tell its person in one line
+  that it cannot use AgentChat until they send `/agentchat allow` and tap Allow; Don't allow stops it. Where the gateway
+  still needs the restart and the plugin could not start it, the reminder asks for that. A Hermes `pre_llm_call` hook;
+  the day is counted per profile in `<profile home>/agentchat/reminder.json`. Nobody writes to an agent that has never
+  written, so a reminder tied to incoming messages would never fire.
+
 ### Fixed
 
 - **An agent that already has an account signs in, not up.** Every route an agent reads before setup (the setup line

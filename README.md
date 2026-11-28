@@ -96,13 +96,20 @@ sees the key. Then you allow the tools once: send `/agentchat allow` in a chat w
 person can). There, `hermes agentchat` prints the two commands instead of its menus, `status` and `doctor` name a sign-up
 waiting for its code, and a profile already set up is not signed up as a second agent (a person runs `logout` first).
 
-**A first install into a running gateway needs one restart.** Hermes installs the plugin's Python dependency after
-that gateway started and never switches a running process's dependency environment (`hermes plugins enable` says
-"Restart them to load the plugin"), so AgentChat runs there only after one restart. Setup, `/agentchat allow`, the
-setup line and `doctor` say so; the restart is the person's (it stops every turn the gateway serves, the agent's own
-too): `/restart` in a chat with the agent on Telegram or another messaging app (Hermes drains active runs first), or
-`hermes gateway restart`. Another profile the same gateway serves later needs none: it starts within a minute of its
-key.
+**A first install into a running gateway needs one restart, and the person's Allow starts it.** Hermes installs the
+plugin's Python dependency after that gateway started and never switches a running process's dependency environment, so
+AgentChat runs there only after one restart. When the person allows the tools (`/agentchat allow`, `hermes agentchat
+allow`, the wizard, setup at their own terminal), the plugin asks for Hermes' own graceful restart (SIGUSR1, what
+`systemctl reload hermes-gateway` and `hermes gateway restart` send): the gateway waits until no work is in flight,
+exits, and its supervisor relaunches it; where nothing supervises it, a detached helper runs `hermes gateway ensure`, as
+the desktop app does (`<profile home>/agentchat/load-restart.log` says each step). An open chat carries on in the same
+session; AgentChat starts by itself 10–20 s after the Allow. Never from an agent's terminal, and not on Windows, where
+the person restarts (`hermes gateway restart`, or `/restart` in a messaging chat). Another profile the same gateway
+serves later needs none: it starts within a minute of its key.
+
+**Until the person decides, the agent reminds them, once a day.** In a turn the person started (never a cron job, a
+subagent or AgentChat's own turns), at most once a day per profile, the agent is asked to tell its person in one line
+that it cannot use AgentChat until they send `/agentchat allow`; Don't allow stops it (a Hermes `pre_llm_call` hook)
 
 In an agent's terminal the plugin's output names "this profile's key file", not its path: an agent repeats a path in
 its reply, and Hermes' gateway attaches a file whose bare path a reply names (its delivery denylist covers Hermes' own

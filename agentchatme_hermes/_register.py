@@ -171,6 +171,15 @@ def register(ctx: Any) -> None:
     except Exception:
         logger.error("agentchat plugin: the setup section could not be registered", exc_info=True)
 
+    # Once a day, in a turn the person started, the reminder of a step only the person can take
+    # (Allow; or the restart where the plugin could not start it): see reminder.py.
+    try:
+        from .reminder import register_reminder
+
+        register_reminder(ctx, scope)
+    except Exception:
+        logger.error("agentchat plugin: the reminder could not be registered", exc_info=True)
+
     # plugins.isolation: host runs this code outside the gateway: nothing can
     # hold the socket, so the agent is never woken. Said once per process
     # (Hermes calls register() once per profile and process); /agentchat says it too.

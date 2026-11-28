@@ -269,6 +269,31 @@ def test_the_setup_line_is_rendered_into_a_new_sessions_prompt_until_setup_is_do
         sections.pop(setup_prompt.SECTION_ID, None)
 
 
+def test_the_reminder_hook_is_one_hermes_runs_before_each_turn() -> None:
+    """The reminder is a ``pre_llm_call`` hook: a valid hook name here, registered with
+    ``ctx.register_hook(name, callback)``, called with the turn's platform and
+    ``parent_session_id`` (how the reminder skips turns no person started)."""
+    plugins = _import("hermes_cli.plugins")
+    assert "pre_llm_call" in plugins.VALID_HOOKS
+    assert {"hook_name", "callback"} <= _params(plugins.PluginContext.register_hook)
+    source = inspect.getsource(_import("agent.turn_context"))
+    assert '"pre_llm_call"' in source and "parent_session_id=" in source and "platform=" in source
+
+
+def test_the_graceful_restart_is_sigusr1_and_ensure_exists() -> None:
+    """The restart the person's Allow starts (gateway_restart): Hermes' gateway handles SIGUSR1 as
+    its drain-first restart, and ``hermes gateway ensure`` is a command (what the helper runs when no
+    supervisor relaunches)."""
+    import signal
+
+    if not hasattr(signal, "SIGUSR1"):
+        pytest.skip("no SIGUSR1 here (Windows): the person restarts")
+    handler = inspect.getsource(_import("gateway.run")._start_gateway_make_restart_signal_handler)
+    assert "request_restart(" in handler, "SIGUSR1 is the drain-first restart"
+    gateway_cli = inspect.getsource(_import("hermes_cli.subcommands.gateway"))
+    assert "Pending startup is not readiness" in gateway_cli, "`hermes gateway ensure` and its exit codes"
+
+
 # ─── the manual: a plugin skill whose file the plugin keeps current ────────
 
 
