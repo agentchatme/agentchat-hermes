@@ -1750,7 +1750,10 @@ def _doctor_key_checks(
         ok(f"key saved in {where} ({_mask_key(resolution.api_key)}, readable by you only) — {decides}"
            if not store.loose_mode else
            f"key saved in {where} ({_mask_key(resolution.api_key)}) — {decides}")
-        if store.loose_mode:
+        if store.loose_mode and sys.platform == "win32":
+            warn(f"{store.path}: its access list lets another account read it, or has no entry for you — "
+                 f"`{cmd} doctor --fix` sets it to you, SYSTEM and Administrators only")
+        elif store.loose_mode:
             warn(f"{store.path} can be read by its group or others — `{cmd} doctor --fix` makes it "
                  "readable by you only")
     elif resolution.api_key:

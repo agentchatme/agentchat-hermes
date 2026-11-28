@@ -46,14 +46,20 @@ class TestResolveHermesHome:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profiles" / "growth"))
         assert resolve_hermes_home() == tmp_path / "profiles" / "growth"
 
-    def test_default_is_dot_hermes_under_home(
+    def test_default_is_the_platform_default(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        """``~/.hermes`` on POSIX, ``%LOCALAPPDATA%\\hermes`` on Windows, as Hermes
+        computes it (tests/test_owner_only.py covers both on every platform)."""
         import pathlib
+        import sys
 
         monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.delenv("HERMES_DATA_DIR_SUFFIX", raising=False)
         monkeypatch.setattr(pathlib.Path, "home", staticmethod(lambda: tmp_path))
-        assert resolve_hermes_home() == tmp_path / ".hermes"
+        monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "Local"))
+        expected = tmp_path / "Local" / "hermes" if sys.platform == "win32" else tmp_path / ".hermes"
+        assert resolve_hermes_home() == expected
 
 
 class TestRootAndLabel:

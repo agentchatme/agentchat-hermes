@@ -193,6 +193,7 @@ if sys.platform == "win32":
 
     _INVALID_HANDLE = ctypes.c_void_p(-1).value
     _READ_CONTROL = 0x00020000
+    _FILE_READ_ATTRIBUTES = 0x0080  # the attribute and link-count queries in _open
     _FILE_SHARE_ALL = 0x00000007  # read | write | delete: never in another process's way
     _OPEN_EXISTING = 3
     _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000  # needed to open a directory
@@ -230,15 +231,15 @@ if sys.platform == "win32":
 
     class _Acl(ctypes.Structure):
         _fields_ = (
-            ("AclRevision", wintypes.BYTE),
-            ("Sbz1", wintypes.BYTE),
+            ("AclRevision", ctypes.c_ubyte),
+            ("Sbz1", ctypes.c_ubyte),
             ("AclSize", wintypes.WORD),
             ("AceCount", wintypes.WORD),
             ("Sbz2", wintypes.WORD),
         )
 
     class _AceHeader(ctypes.Structure):
-        _fields_ = (("AceType", wintypes.BYTE), ("AceFlags", wintypes.BYTE), ("AceSize", wintypes.WORD))
+        _fields_ = (("AceType", ctypes.c_ubyte), ("AceFlags", ctypes.c_ubyte), ("AceSize", wintypes.WORD))
 
     class _SidAndAttributes(ctypes.Structure):
         _fields_ = (("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD))
@@ -350,7 +351,7 @@ if sys.platform == "win32":
         for a name surrogate or a file with more than one name."""
         api = _api()
         handle = api.CreateFileW(
-            str(path), access, _FILE_SHARE_ALL, None, _OPEN_EXISTING,
+            str(path), access | _FILE_READ_ATTRIBUTES, _FILE_SHARE_ALL, None, _OPEN_EXISTING,
             _FILE_FLAG_BACKUP_SEMANTICS | _FILE_FLAG_OPEN_REPARSE_POINT, None,
         )
         if not handle or handle == _INVALID_HANDLE:
